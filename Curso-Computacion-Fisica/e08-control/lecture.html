@@ -144,6 +144,145 @@ Estable = una pelota en el fondo de un bowl (la empujás, vuelve). Inestable = u
   <li><a href="https://www.youtube.com/watch?v=4Y7zG48uHRo" target="_blank">PID sin las matemáticas (Brian Douglas)</a> — la mejor intro visual.</li>
 </ul>
 
+<!-- ═══════════ SIMULADOR PID INTERACTIVO ═══════════ -->
+<div class="pidsim">
+<style>
+.pidsim{--ps-bg:#0a0f0b;--ps-grid:#1c2620;--ps-set:#58a6ff;--ps-vel:#f0883e;--ps-ok:#3fb950;--ps-bad:#ef4444;
+  background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.pidsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.pidsim .ps-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.pidsim canvas{width:100%;height:230px;background:var(--ps-bg);border:1px solid #1c2620;border-radius:10px;display:block}
+.pidsim .ps-ctrls{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:14px}
+.pidsim .ps-sl label{display:flex;justify-content:space-between;font-size:.82rem;color:#e8efe9;margin-bottom:4px}
+.pidsim .ps-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.pidsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.pidsim .ps-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
+.pidsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.85rem;font-family:inherit;transition:.15s}
+.pidsim button:hover{border-color:#f0883e;color:#f0883e}
+.pidsim .ps-toggle{font-size:.8rem;color:#8fa394;display:flex;align-items:center;gap:5px;cursor:pointer}
+.pidsim .ps-metrics{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.82rem;color:#8fa394}
+.pidsim .ps-metrics b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.pidsim .ps-hint{margin-top:12px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.84rem;color:#c9d4cc;min-height:1.2em}
+.pidsim .ps-preset{background:#1a211b;border:1px solid #2d3a31;font-size:.78rem;padding:6px 10px}
+</style>
+  <h4>🎛️ Simulador PID interactivo — altitud de un dron</h4>
+  <div class="ps-sub">La gravedad tira siempre hacia abajo. Sintonizá <b style="color:#f0883e">kp/ki/kd</b> para que el dron llegue a la altura objetivo (línea azul) y flote ahí. Probá los presets para ver cada falla en vivo.</div>
+  <canvas id="psCanvas" width="900" height="230"></canvas>
+  <div class="ps-ctrls">
+    <div class="ps-sl"><label>P — proporcional <b id="psKpV">3.0</b></label><input type="range" id="psKp" min="0" max="9" step="0.1" value="3"></div>
+    <div class="ps-sl"><label>I — integral <b id="psKiV">1.0</b></label><input type="range" id="psKi" min="0" max="4" step="0.05" value="1"></div>
+    <div class="ps-sl"><label>D — derivativo <b id="psKdV">4.0</b></label><input type="range" id="psKd" min="0" max="9" step="0.1" value="4"></div>
+    <div class="ps-sl"><label>Altura objetivo <b id="psSpV">60</b> m</label><input type="range" id="psSp" min="30" max="90" step="5" value="60"></div>
+  </div>
+  <div class="ps-row">
+    <button id="psDist">💨 Ráfaga (empuja abajo)</button>
+    <button id="psReset">↺ Reset</button>
+    <label class="ps-toggle"><input type="checkbox" id="psNoise"> sensor con ruido</label>
+    <label class="ps-toggle"><input type="checkbox" id="psClamp" checked> anti-windup (clamp I)</label>
+  </div>
+  <div class="ps-row">
+    <button class="ps-preset" data-p="3,1,4">✅ Buen tuning</button>
+    <button class="ps-preset" data-p="6,0,0">🔴 Mucho P → rebota</button>
+    <button class="ps-preset" data-p="6,0,5">🟠 Sin I → no llega</button>
+    <button class="ps-preset" data-p="2.5,3,1">🟡 Mucho I → windup</button>
+    <button class="ps-preset" data-p="0,0,0">⚪ Sin control → cae</button>
+  </div>
+  <div class="ps-metrics">
+    <span>Altitud: <b id="psVel">0</b> m</span>
+    <span>Error: <b id="psErr">60</b></span>
+    <span>Overshoot máx: <b id="psOs">0</b>%</span>
+    <span>Estado: <b id="psState">—</b></span>
+  </div>
+  <div class="ps-hint" id="psHint">Tip: empezá con "Buen tuning". Después probá "Mucho P" (rebota), "Sin I" (no llega) y "Mucho I" (windup) para sentir qué hace cada término.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("psCanvas"), ctx=cv.getContext("2d");
+  let kp=3,ki=1,kd=4,sp=60,noise=false,clamp=true;
+  let y=0,vy=0,integ=0,prevErr=60,t=0,osMax=0,hist=[],settleT=null;
+  const DT=0.05, G=10, DRAG=0.06, N=170;
+  function reset(){y=0;vy=0;integ=0;prevErr=sp;t=0;osMax=0;hist=[];settleT=null;}
+  [["psKp","psKpV",x=>kp=x],["psKi","psKiV",x=>ki=x],["psKd","psKdV",x=>kd=x],["psSp","psSpV",x=>{sp=x;reset();}]]
+    .forEach(([s,l,f])=>{const el=$(s);el.addEventListener("input",()=>{f(parseFloat(el.value));$(l).textContent=el.value;});});
+  $("psNoise").addEventListener("change",e=>noise=e.target.checked);
+  $("psClamp").addEventListener("change",e=>clamp=e.target.checked);
+  $("psDist").addEventListener("click",()=>{vy-=16;});
+  $("psReset").addEventListener("click",reset);
+  document.querySelectorAll(".pidsim .ps-preset").forEach(b=>b.addEventListener("click",()=>{
+    const[a,i,d]=b.dataset.p.split(",").map(Number);
+    kp=a;ki=i;kd=d;$("psKp").value=a;$("psKi").value=i;$("psKd").value=d;
+    $("psKpV").textContent=a.toFixed(1);$("psKiV").textContent=i.toFixed(2);$("psKdV").textContent=d.toFixed(1);
+    reset();
+  }));
+  function step(){
+    const meas=y+(noise?(Math.random()-0.5)*5:0);
+    const err=sp-meas;
+    const P=kp*err;
+    integ+=err*DT;
+    if(clamp) integ=Math.max(-150,Math.min(150,integ)); else integ=Math.max(-1000,Math.min(1000,integ));
+    const I=ki*integ;
+    const D=kd*(err-prevErr)/DT; prevErr=err;
+    const thrust=P+I+D;                 // empuje del controlador
+    vy+=(thrust-G-DRAG*vy)*DT;          // gravedad tira siempre
+    y+=vy*DT;
+    if(y<0){y=0;if(vy<0)vy=0;}          // suelo
+    t+=DT;
+    if(y>sp){const os=(y-sp)/sp*100; if(os>osMax)osMax=os;}
+    hist.push(y); if(hist.length>N)hist.shift();
+    if(Math.abs(y-sp)<sp*0.02){ if(settleT===null)settleT=t; } else settleT=null;
+  }
+  function draw(){
+    const w=cv.width,h=cv.height;
+    ctx.clearRect(0,0,w,h);
+    const vmax=Math.max(120, sp*1.8);
+    const Y=val=>h-12-(val/vmax)*(h-24);
+    ctx.strokeStyle="#1c2620";ctx.lineWidth=1;
+    for(let g=0;g<=vmax;g+=20){const yy=Y(g);ctx.beginPath();ctx.moveTo(0,yy);ctx.lineTo(w,yy);ctx.stroke();}
+    // suelo
+    ctx.strokeStyle="#3a4a40";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,Y(0));ctx.lineTo(w,Y(0));ctx.stroke();
+    // objetivo
+    ctx.strokeStyle="#58a6ff";ctx.setLineDash([6,5]);ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(0,Y(sp));ctx.lineTo(w,Y(sp));ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle="#58a6ff";ctx.font="11px monospace";ctx.fillText("objetivo "+sp+"m",8,Y(sp)-5);
+    // banda ±2%
+    ctx.fillStyle="rgba(63,185,80,0.08)";ctx.fillRect(0,Y(sp*1.02),w,Y(sp*0.98)-Y(sp*1.02));
+    // trayectoria de altitud
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2;ctx.beginPath();
+    hist.forEach((val,i)=>{const xx=i/(N-1)*w;i?ctx.lineTo(xx,Y(val)):ctx.moveTo(xx,Y(val));});
+    ctx.stroke();
+    // dron actual
+    if(hist.length){const xx=(hist.length-1)/(N-1)*w;ctx.fillStyle="#f0883e";ctx.font="14px serif";ctx.fillText("🚁",xx-7,Y(y)+5);}
+  }
+  function loop(){
+    for(let k=0;k<2;k++) step();
+    draw();
+    $("psVel").textContent=y.toFixed(1);
+    $("psErr").textContent=(sp-y).toFixed(1);
+    $("psOs").textContent=osMax.toFixed(0);
+    let st,col;
+    if(kp===0&&ki===0&&kd===0){st="sin control (cae)";col="#8fa394";}
+    else if(osMax>45){st="inestable / rebota";col="#ef4444";}
+    else if(settleT!==null&&t-settleT>1){st="estable ✓";col="#3fb950";}
+    else if(ki===0&&Math.abs(sp-y)>1&&osMax<15){st="estable pero con offset";col="#f59e0b";}
+    else if(Math.abs(sp-y)>sp*0.1){st="corrigiendo…";col="#f59e0b";}
+    else {st="acercándose";col="#f59e0b";}
+    const se=$("psState");se.textContent=st;se.style.color=col;
+    let hint="";
+    if(kp===0&&ki===0&&kd===0) hint="Sin control, la gravedad gana y el dron cae al suelo. Subí P para que reaccione.";
+    else if(osMax>45) hint="Demasiado P sin freno → el dron sobrepasa y rebota (oscila). Subí D para amortiguar el overshoot.";
+    else if(ki<0.1&&Math.abs(sp-y)>1.5&&osMax<15) hint="Estable pero NUNCA llega al objetivo: sin I, P necesita un error permanente para generar el empuje que vence la gravedad. Por eso existe el término I.";
+    else if(ki>0&&Math.abs(sp-y)<1.2&&osMax<20) hint="El término I anuló el error: el dron flota EXACTO en el objetivo pese a la gravedad. Eso es lo que P solo no logra.";
+    else if(kd>4&&noise) hint="Con ruido en el sensor, el D lo amplifica y agita el empuje. Por eso muchos sistemas usan solo PI o filtran (E07) antes del D.";
+    else if(kd>1&&osMax<12&&osMax>0) hint="El D frena el overshoot: el dron llega rápido pero sin pasarse. Es el 'anticipador' que predice y amortigua.";
+    else hint="Tocá UNA ganancia a la vez y observá. Probá la ráfaga 💨 para ver cómo el dron se recupera.";
+    $("psHint").textContent=hint;
+    requestAnimationFrame(loop);
+  }
+  reset();loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR PID ═══════════ -->
+
 <h2>10. Errores típicos</h2>
 <div class="mistake"><strong>Integral windup</strong>: si el actuador se satura, la integral sigue acumulando y el sistema "se pasa" feo al recuperarse. Solución: limitar (clamp) la integral.</div>
 <div class="mistake"><strong>Término D con sensor ruidoso</strong>: amplifica el ruido. Filtrá la medición (E07) o usá solo PI.</div>
