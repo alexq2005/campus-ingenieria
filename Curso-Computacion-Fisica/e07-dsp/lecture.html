@@ -146,6 +146,135 @@ conv:    [1.5, 2.5, 3.5, 4.5]   ← cada salida = combinación local</code></pre
   <li><code>scipy.signal</code> docs — filtros listos para usar</li>
 </ul>
 
+<!-- ═══════════ VISUALIZADOR FFT INTERACTIVO ═══════════ -->
+<div class="fftsim">
+<style>
+.fftsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.fftsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.fftsim .fs-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.fftsim .fs-canvases{display:grid;gap:10px}
+.fftsim .fs-lab{font-size:.78rem;color:#8fa394;margin:0 0 3px}
+.fftsim canvas{width:100%;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.fftsim #fsTime{height:120px} .fftsim #fsFreq{height:150px}
+.fftsim .fs-ctrls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:14px}
+.fftsim .fs-tone{background:#1a211b;border:1px solid #2d3a31;border-radius:8px;padding:8px 10px}
+.fftsim .fs-tone .fs-th{font-size:.78rem;color:#e8efe9;display:flex;justify-content:space-between;margin-bottom:5px}
+.fftsim .fs-tone b{color:#f0883e;font-variant-numeric:tabular-nums}
+.fftsim .fs-tone label{font-size:.72rem;color:#8fa394;display:block;margin-top:5px}
+.fftsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.fftsim .fs-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.fftsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:.8rem;font-family:inherit;transition:.15s}
+.fftsim button:hover{border-color:#f0883e;color:#f0883e}
+.fftsim .fs-toggle{font-size:.8rem;color:#8fa394;display:flex;align-items:center;gap:5px;cursor:pointer}
+.fftsim .fs-hint{margin-top:12px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #58a6ff;font-size:.84rem;color:#c9d4cc;min-height:1.2em}
+</style>
+  <h4>📊 Visualizador FFT — del tiempo a la frecuencia</h4>
+  <div class="fs-sub">Armá una señal en el tiempo (arriba) y mirá cómo la <b style="color:#58a6ff">FFT</b> revela las frecuencias que la componen (abajo). Subí los tonos o probá los presets: una onda cuadrada "esconde" infinitos armónicos impares.</div>
+  <div class="fs-canvases">
+    <div><div class="fs-lab">⏱ Dominio del TIEMPO (la señal cruda)</div><canvas id="fsTime" width="900" height="120"></canvas></div>
+    <div><div class="fs-lab">📊 Dominio de la FRECUENCIA (espectro = qué frecuencias hay)</div><canvas id="fsFreq" width="900" height="150"></canvas></div>
+  </div>
+  <div class="fs-ctrls">
+    <div class="fs-tone"><div class="fs-th">Tono 1 <b id="fsA1v">1.0</b></div>
+      <label>frecuencia <span id="fsF1v">8</span></label><input type="range" id="fsF1" min="1" max="48" step="1" value="8">
+      <label>amplitud</label><input type="range" id="fsA1" min="0" max="1" step="0.05" value="1"></div>
+    <div class="fs-tone"><div class="fs-th">Tono 2 <b id="fsA2v">0.0</b></div>
+      <label>frecuencia <span id="fsF2v">16</span></label><input type="range" id="fsF2" min="1" max="48" step="1" value="16">
+      <label>amplitud</label><input type="range" id="fsA2" min="0" max="1" step="0.05" value="0"></div>
+    <div class="fs-tone"><div class="fs-th">Tono 3 <b id="fsA3v">0.0</b></div>
+      <label>frecuencia <span id="fsF3v">25</span></label><input type="range" id="fsF3" min="1" max="48" step="1" value="25">
+      <label>amplitud</label><input type="range" id="fsA3" min="0" max="1" step="0.05" value="0"></div>
+  </div>
+  <div class="fs-row">
+    <button class="fs-pr" data-w="seno">🔵 1 seno puro</button>
+    <button class="fs-pr" data-w="dos">🎵 2 tonos</button>
+    <button class="fs-pr" data-w="square">⬜ Onda cuadrada</button>
+    <button class="fs-pr" data-w="saw">📐 Diente de sierra</button>
+    <button class="fs-pr" data-w="noise">🌫 Ruido blanco</button>
+    <label class="fs-toggle"><input type="checkbox" id="fsNoise"> + ruido de fondo</label>
+  </div>
+  <div class="fs-hint" id="fsHint">La FFT "desarma" cualquier señal en sus frecuencias puras. Un seno = 1 pico. Una cuadrada = picos en los armónicos impares que decrecen como 1/n.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const N=128, tc=$("fsTime").getContext("2d"), fc=$("fsFreq").getContext("2d");
+  let mode="tones", noiseOn=false;
+  const T=[{f:8,a:1},{f:16,a:0},{f:25,a:0}];
+  function buildSignal(){
+    const s=new Array(N).fill(0);
+    for(let n=0;n<N;n++){
+      let v=0;
+      if(mode==="tones"){ T.forEach(t=>{ v+=t.a*Math.sin(2*Math.PI*t.f*n/N); }); }
+      else if(mode==="square"){ v=0.9*Math.sign(Math.sin(2*Math.PI*5*n/N)); }
+      else if(mode==="saw"){ v=0.9*(2*((5*n/N)%1)-1); }
+      else if(mode==="noise"){ v=(Math.random()*2-1); }
+      if(noiseOn) v+=(Math.random()*2-1)*0.18;
+      s[n]=v;
+    }
+    return s;
+  }
+  function dft(re){
+    const half=N/2, mag=new Array(half);
+    for(let k=0;k<half;k++){ let sr=0,si=0;
+      for(let n=0;n<N;n++){ const a=-2*Math.PI*k*n/N; sr+=re[n]*Math.cos(a); si+=re[n]*Math.sin(a); }
+      mag[k]=Math.sqrt(sr*sr+si*si)*2/N; }
+    return mag;
+  }
+  function drawTime(s){
+    const w=$("fsTime").width,h=$("fsTime").height; tc.clearRect(0,0,w,h);
+    tc.strokeStyle="#1c2620";tc.beginPath();tc.moveTo(0,h/2);tc.lineTo(w,h/2);tc.stroke();
+    let max=Math.max(1,...s.map(Math.abs));
+    tc.strokeStyle="#3fb950";tc.lineWidth=2;tc.beginPath();
+    s.forEach((v,n)=>{const x=n/(N-1)*w,y=h/2-(v/max)*(h/2-8);n?tc.lineTo(x,y):tc.moveTo(x,y);});
+    tc.stroke();
+  }
+  function drawFreq(m){
+    const w=$("fsFreq").width,h=$("fsFreq").height; fc.clearRect(0,0,w,h);
+    const max=Math.max(0.05,...m), bw=w/m.length;
+    fc.strokeStyle="#1c2620";for(let g=0;g<=4;g++){const y=h-12-g/4*(h-22);fc.beginPath();fc.moveTo(0,y);fc.lineTo(w,y);fc.stroke();}
+    m.forEach((v,k)=>{
+      const bh=(v/max)*(h-24), x=k*bw;
+      fc.fillStyle = v/max>0.12 ? "#f0883e" : "#3a4a40";
+      fc.fillRect(x+1,h-12-bh,Math.max(1,bw-1.5),bh);
+    });
+    fc.fillStyle="#8fa394";fc.font="10px monospace";
+    fc.fillText("← frecuencia (bins) →   Nyquist = "+(N/2),w/2-70,h-2);
+  }
+  function render(){
+    const s=buildSignal(), m=dft(s);
+    drawTime(s); drawFreq(m);
+    const mx=Math.max(...m);
+    const peaks=m.map((v,k)=>[v,k]).filter(([v])=>v>mx*0.25).map(([,k])=>k);
+    let hint="";
+    if(mode==="square") hint="Onda cuadrada: el espectro muestra picos solo en armónicos IMPARES (5, 15, 25, 35…) que decrecen como 1/n. ¡Una cuadrada ES una suma infinita de senos impares!";
+    else if(mode==="saw") hint="Diente de sierra: tiene TODOS los armónicos (pares e impares), decreciendo como 1/n. Más rico que la cuadrada.";
+    else if(mode==="noise") hint="Ruido blanco: energía en TODAS las frecuencias por igual → espectro plano. Por eso 'blanco' (como la luz blanca = todas las frecuencias juntas).";
+    else if(peaks.length>=2) hint="La FFT separó los "+peaks.length+" tonos en picos distintos: en el tiempo se ven mezclados, en frecuencia cada uno es un pico limpio. Eso es 'desmezclar' una señal.";
+    else if(peaks.length===1) hint="Un seno puro = UN solo pico en su frecuencia. La FFT lo ubica exacto. Subí el Tono 2 para agregar otra frecuencia.";
+    else hint="Subí la amplitud de algún tono para ver su pico aparecer en el espectro.";
+    if(noiseOn) hint+=" El 'piso' bajo los picos es el ruido de fondo repartido en todo el espectro.";
+    $("fsHint").textContent=hint;
+  }
+  for(let i=0;i<3;i++){
+    const fEl=$("fsF"+(i+1)),aEl=$("fsA"+(i+1));
+    fEl.addEventListener("input",()=>{T[i].f=+fEl.value;$("fsF"+(i+1)+"v").textContent=fEl.value;mode="tones";render();});
+    aEl.addEventListener("input",()=>{T[i].a=+aEl.value;$("fsA"+(i+1)+"v").textContent=(+aEl.value).toFixed(1);mode="tones";render();});
+  }
+  $("fsNoise").addEventListener("change",e=>{noiseOn=e.target.checked;render();});
+  document.querySelectorAll(".fftsim .fs-pr").forEach(b=>b.addEventListener("click",()=>{
+    const w=b.dataset.w;
+    if(w==="seno"){mode="tones";T[0]={f:8,a:1};T[1].a=0;T[2].a=0;}
+    else if(w==="dos"){mode="tones";T[0]={f:8,a:1};T[1]={f:20,a:0.8};T[2].a=0;}
+    else mode=w;
+    if(mode==="tones"){for(let i=0;i<3;i++){$("fsF"+(i+1)).value=T[i].f;$("fsA"+(i+1)).value=T[i].a;$("fsF"+(i+1)+"v").textContent=T[i].f;$("fsA"+(i+1)+"v").textContent=T[i].a.toFixed(1);}}
+    render();
+  }));
+  render();
+})();
+</script>
+</div>
+<!-- ═══════════ /VISUALIZADOR FFT ═══════════ -->
+
 <h2>✅ Checkpoint</h2>
 
 <details><summary>1. ¿Qué hace la FFT y por qué importa su complejidad?</summary>
