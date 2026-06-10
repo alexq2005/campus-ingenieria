@@ -135,6 +135,79 @@ float voltaje = valor * 3.3 / 4095.0;</code></pre>
 <pre><code class="lang-c">analogWrite(5, 128);  // 50% duty cycle → LED a media intensidad
 analogWrite(5, 255);  // 100% → máximo brillo</code></pre>
 
+<!-- ═══════════ SIMULADOR DE PWM ═══════════ -->
+<div class="pwmsim">
+<style>
+.pwmsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.pwmsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.pwmsim .pw-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.pwmsim .pw-top{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.pwmsim canvas{flex:1;min-width:280px;height:130px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.pwmsim .pw-led{text-align:center;min-width:90px}
+.pwmsim .pw-bulb{width:60px;height:60px;border-radius:50%;margin:0 auto 6px;background:#1a211b;border:2px solid #2d3a31;transition:.1s}
+.pwmsim .pw-led small{font-size:.72rem;color:#8fa394}
+.pwmsim .pw-sl{margin-top:14px}
+.pwmsim .pw-sl label{display:flex;justify-content:space-between;font-size:.85rem;color:#e8efe9;margin-bottom:4px}
+.pwmsim .pw-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.pwmsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.pwmsim .pw-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.85rem;color:#8fa394}
+.pwmsim .pw-stats b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.pwmsim .pw-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🔆 Simulador de PWM — analógico desde un pin digital</h4>
+  <div class="pw-sub">Un pin solo da 0 o 5V (digital). Pero prendiéndolo y apagándolo rápido, el <b style="color:#f0883e">duty cycle</b> (% encendido) controla el voltaje PROMEDIO → brillo de LED, velocidad de motor. <code>analogWrite(pin, 0-255)</code>.</div>
+  <div class="pw-top">
+    <canvas id="pwCv" width="600" height="130"></canvas>
+    <div class="pw-led"><div class="pw-bulb" id="pwBulb"></div><small>LED<br>(brillo = promedio)</small></div>
+  </div>
+  <div class="pw-sl"><label>Duty cycle <b id="pwDv">50</b>% &nbsp;·&nbsp; analogWrite = <b id="pwAw">128</b></label><input type="range" id="pwD" min="0" max="100" step="1" value="50"></div>
+  <div class="pw-stats">
+    <span>Voltaje promedio: <b id="pwVavg">2.50</b> V</span>
+    <span>de 5.0 V máx</span>
+  </div>
+  <div class="pw-hint" id="pwHint">El pin nunca da 2.5V de verdad — salta entre 0 y 5V. Pero como lo hace miles de veces por segundo, el LED (o un motor, o tu oído) "promedia" y ve 2.5V. Subí el duty cycle y mirá el LED brillar más.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("pwCv"), ctx=cv.getContext("2d");
+  let duty=50, phase=0;
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const hi=18,lo=h-18,VS=5;
+    // nivel promedio
+    const avgY=lo-(duty/100)*(lo-hi);
+    ctx.strokeStyle="#3fb95066";ctx.setLineDash([5,4]);ctx.beginPath();ctx.moveTo(0,avgY);ctx.lineTo(w,avgY);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle="#3fb950";ctx.font="10px monospace";ctx.fillText("promedio "+(duty/100*VS).toFixed(2)+"V",8,avgY-4);
+    // onda PWM (varios ciclos, animada)
+    const cycles=5, cw=w/cycles, onw=cw*duty/100;
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2.2;ctx.beginPath();
+    let x=-(phase%cw);ctx.moveTo(0,duty>0?(x< onw?hi:lo):lo);
+    for(let cyc=-1;cyc<=cycles+1;cyc++){const sx=cyc*cw - (phase%cw);
+      ctx.moveTo(sx,lo);if(duty>0){ctx.lineTo(sx,hi);ctx.lineTo(sx+onw,hi);ctx.lineTo(sx+onw,lo);}ctx.lineTo(sx+cw,lo);}
+    ctx.stroke();
+    ctx.fillStyle="#8fa394";ctx.fillText("5V",w-22,hi+4);ctx.fillText("0V",w-22,lo+2);
+  }
+  function update(){
+    $("pwDv").textContent=duty;$("pwAw").textContent=Math.round(duty/100*255);
+    $("pwVavg").textContent=(duty/100*5).toFixed(2);
+    const b=$("pwBulb"),g=duty/100;
+    b.style.background="rgba(240,200,80,"+g+")";
+    b.style.boxShadow=g>0.05?"0 0 "+(g*30)+"px rgba(240,200,80,"+g+")":"none";
+    b.style.borderColor=g>0.1?"#f0c850":"#2d3a31";
+    let h;
+    if(duty===0)h="Duty 0%: el pin siempre apagado → 0V promedio → LED apagado.";
+    else if(duty===100)h="Duty 100%: el pin siempre encendido → 5V → brillo máximo. Ya no es PWM, es DC.";
+    else h="Duty "+duty+"%: encendido "+duty+"% del tiempo → promedio "+(duty/100*5).toFixed(2)+"V. El LED ve ese promedio y brilla proporcional.";
+    $("pwHint").textContent=h;
+  }
+  function loop(){phase=(phase+2);draw();requestAnimationFrame(loop);}
+  $("pwD").addEventListener("input",e=>{duty=+e.target.value;update();});
+  update();loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR PWM ═══════════ -->
+
 <h2>7. Interrupciones: el scheduler del hardware</h2>
 
 <div class="concept">Una <strong>interrupción</strong> pausa instantáneamente tu código cuando ocurre un evento (un pin cambió, un timer venció) para ejecutar una función especial (ISR), y luego retoma. Permite reaccionar sin estar chequeando constantemente (polling).</div>
