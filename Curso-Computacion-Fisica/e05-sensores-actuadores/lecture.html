@@ -153,6 +153,82 @@ void loop() {
   <li>Reto: termostato que lee temp y controla un LED (simulando calefactor) con histéresis.</li>
 </ul>
 
+<!-- ═══════════ SIMULADOR DE HISTÉRESIS ═══════════ -->
+<div class="hystsim">
+<style>
+.hystsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.hystsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.hystsim .hy-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.hystsim canvas{width:100%;height:210px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.hystsim .hy-ctrls{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.hystsim .hy-sl label{display:flex;justify-content:space-between;font-size:.83rem;color:#e8efe9;margin-bottom:4px}
+.hystsim .hy-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.hystsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.hystsim .hy-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.85rem;color:#8fa394}
+.hystsim .hy-stats b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.hystsim .hy-on{color:#3fb950} .hystsim .hy-off{color:#5a6b60}
+.hystsim .hy-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🌡️ Simulador de histéresis — el termostato</h4>
+  <div class="hy-sub">La temperatura (naranja) oscila cerca del objetivo. Con <b style="color:#f0883e">1 solo umbral</b> el calefactor prende/apaga sin parar (chattering). Subí la <b>banda de histéresis</b> (2 umbrales) y mirá los toggles desplomarse.</div>
+  <canvas id="hyCv" width="900" height="210"></canvas>
+  <div class="hy-ctrls">
+    <div class="hy-sl"><label>Banda de histéresis <b id="hyBv">0.0</b> °C</label><input type="range" id="hyB" min="0" max="4" step="0.2" value="0"></div>
+    <div class="hy-sl"><label>Ruido del sensor <b id="hyNv">0.4</b></label><input type="range" id="hyN" min="0" max="1.2" step="0.1" value="0.4"></div>
+  </div>
+  <div class="hy-stats">
+    <span>Calefactor: <b id="hyState" class="hy-off">OFF</b></span>
+    <span>Cambios (toggles): <b id="hyTog">0</b></span>
+    <span>en los últimos ~8s</span>
+  </div>
+  <div class="hy-hint" id="hyHint">Con banda 0 (un umbral), el ruido hace que el calefactor cambie de estado decenas de veces — desgasta el relé y consume. Subí la banda: con 2 umbrales separados, el estado solo cambia al cruzar el umbral lejano.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("hyCv"), ctx=cv.getContext("2d");
+  const SP=22, N=240; let band=0, noise=0.4, t=0, on=false, hist=[], togHist=[];
+  function temp(tt){return SP + Math.sin(tt*0.045)*2.0 + Math.sin(tt*1.9)*noise + Math.sin(tt*0.7)*noise*0.5;}
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const lo=SP-4,hi=SP+4; const Y=v=>h-(v-lo)/(hi-lo)*h;
+    // umbrales
+    const tHi=SP+band/2, tLo=SP-band/2;
+    ctx.fillStyle="rgba(63,185,80,.06)";ctx.fillRect(0,Y(tHi),w,Y(tLo)-Y(tHi));
+    ctx.strokeStyle="#58a6ff";ctx.setLineDash([5,4]);ctx.lineWidth=1;
+    [tHi,tLo].forEach(v=>{ctx.beginPath();ctx.moveTo(0,Y(v));ctx.lineTo(w,Y(v));ctx.stroke();});
+    ctx.setLineDash([]);
+    ctx.fillStyle="#58a6ff";ctx.font="10px monospace";
+    if(band>0.1){ctx.fillText("umbral alto "+tHi.toFixed(1),8,Y(tHi)-4);ctx.fillText("umbral bajo "+tLo.toFixed(1),8,Y(tLo)+12);}
+    else ctx.fillText("umbral "+SP,8,Y(SP)-4);
+    // banda inferior: estado del calefactor (verde=ON)
+    hist.forEach((p,i)=>{const x=i/(N-1)*w;ctx.fillStyle=p.on?"rgba(63,185,80,.5)":"rgba(90,107,96,.25)";ctx.fillRect(x,h-8,w/N+1,8);});
+    // curva temperatura
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2;ctx.beginPath();
+    hist.forEach((p,i)=>{const x=i/(N-1)*w,y=Y(p.v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  }
+  function loop(){
+    const v=temp(t), tHi=SP+band/2, tLo=SP-band/2, was=on;
+    if(v>tHi)on=false; else if(v<tLo)on=true;
+    if(on!==was)togHist.push(t);
+    hist.push({v,on}); if(hist.length>N)hist.shift();
+    togHist=togHist.filter(x=>x>t-160); // ventana ~8s
+    t++;
+    draw();
+    const se=$("hyState");se.textContent=on?"ON":"OFF";se.className=on?"hy-on":"hy-off";
+    $("hyTog").textContent=togHist.length;
+    if(band<0.3) $("hyHint").textContent="Banda ≈ 0 (un umbral): el ruido cruza el umbral constantemente → "+togHist.length+" cambios. Eso destruye relés y desperdicia energía.";
+    else if(band>=2.5) $("hyHint").textContent="Banda amplia: solo "+togHist.length+" cambios. El calefactor prende, deja subir bien la temp, y recién apaga arriba. Estable. (Esto es lo que hace tu termostato real.)";
+    else $("hyHint").textContent="Con histéresis los toggles bajan a "+togHist.length+". El estado solo cambia al cruzar el umbral LEJANO, no con cada vibración del ruido.";
+    requestAnimationFrame(loop);
+  }
+  $("hyB").addEventListener("input",e=>{band=+e.target.value;$("hyBv").textContent=band.toFixed(1);togHist=[];});
+  $("hyN").addEventListener("input",e=>{noise=+e.target.value;$("hyNv").textContent=noise.toFixed(1);});
+  loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR HISTÉRESIS ═══════════ -->
+
 <h2>11. Errores típicos</h2>
 <div class="mistake"><strong>Alimentar motor/servo desde el pin del MCU</strong>: piden más corriente de la que el pin da → quema el chip. Fuente separada + driver.</div>
 <div class="mistake"><strong>GND no común entre MCU y driver/fuente</strong>: sin tierra compartida (E00), las señales no se interpretan. Siempre unir los GND.</div>
