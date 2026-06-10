@@ -71,6 +71,87 @@ void loop() {
   <span class="bridge-icon">🔗</span> El timer de hardware es como el <strong>tick del reloj del sistema</strong> que en M14 dispara el scheduler. Acá vos lo configurás directamente. Es también el "clock" de E02 (electrónica digital) expuesto como recurso programable.
 </div>
 
+<!-- ═══════════ SIMULADOR delay() vs millis() ═══════════ -->
+<div class="blocksim">
+<style>
+.blocksim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.blocksim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.blocksim .bs-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.blocksim .bs-modes{display:flex;gap:8px;margin-bottom:14px}
+.blocksim .bs-mode{flex:1;background:#1a211b;border:1px solid #2d3a31;border-radius:8px;padding:9px;cursor:pointer;color:#8fa394;font-size:.84rem;font-family:inherit;transition:.15s}
+.blocksim .bs-mode.act{border-color:#f0883e;color:#f0883e;background:rgba(240,136,62,.1)}
+.blocksim .bs-stage{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap;padding:10px 0}
+.blocksim .bs-led{text-align:center}
+.blocksim .bs-bulb{width:54px;height:54px;border-radius:50%;margin:0 auto 6px;background:#1a211b;border:2px solid #2d3a31;transition:.05s}
+.blocksim .bs-bulb.on{background:radial-gradient(#f0c850,#f0883e);border-color:#f0c850;box-shadow:0 0 20px #f0883eaa}
+.blocksim .bs-led small{font-size:.74rem;color:#8fa394}
+.blocksim .bs-cpu{text-align:center;padding:8px 14px;border-radius:8px;font-size:.82rem;font-weight:600;min-width:160px}
+.blocksim .bs-cpu.free{background:rgba(63,185,80,.12);color:#3fb950}
+.blocksim .bs-cpu.busy{background:rgba(239,68,68,.12);color:#ef4444}
+.blocksim .bs-sl label{display:flex;justify-content:space-between;font-size:.8rem;color:#8fa394;margin:8px 0 3px}
+.blocksim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.blocksim .bs-hint{margin-top:12px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🚦 delay() vs millis() — por qué delay() bloquea todo</h4>
+  <div class="bs-sub">Dos LEDs que deberían parpadear a ritmos distintos. Con <code>delay()</code> la CPU queda atascada y el segundo LED no puede parpadear. Con <code>millis()</code> (no bloqueante) los dos corren libres.</div>
+  <div class="bs-modes">
+    <button class="bs-mode act" id="bsMd" data-m="delay">😴 con delay() (bloqueante)</button>
+    <button class="bs-mode" id="bsMm" data-m="millis">⚡ con millis() (no bloqueante)</button>
+  </div>
+  <div class="bs-stage">
+    <div class="bs-led"><div class="bs-bulb" id="bsL1"></div><small>LED 1</small></div>
+    <div class="bs-cpu free" id="bsCpu">CPU libre ✓</div>
+    <div class="bs-led"><div class="bs-bulb" id="bsL2"></div><small>LED 2</small></div>
+  </div>
+  <div class="bs-sl"><label>Intervalo LED 1 <b id="bsP1v">600</b> ms</label><input type="range" id="bsP1" min="200" max="1200" step="100" value="600"></div>
+  <div class="bs-sl"><label>Intervalo LED 2 <b id="bsP2v">300</b> ms</label><input type="range" id="bsP2" min="200" max="1200" step="100" value="300"></div>
+  <div class="bs-hint" id="bsHint">En modo delay(): mirá cómo el LED 2 parpadea irregular o se congela mientras la CPU está "dormida" en el delay() del LED 1. Cambiá a millis() y los dos parpadean perfectos a su ritmo.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  let mode="delay", p1=600, p2=300, vt=0, last=0;
+  // estado modo delay (programa secuencial): fase del "loop" bloqueante
+  let dPhase=0, dTimer=0, l1=false, cpuBusy=false;
+  function setBulb(el,on){el.classList.toggle("on",on);}
+  function tick(now){
+    const dt=Math.min(50, now-last); last=now; vt+=dt;
+    if(mode==="millis"){
+      // no bloqueante: cada LED toggle independiente
+      setBulb($("bsL1"), (vt%(2*p1))<p1);
+      setBulb($("bsL2"), (vt%(2*p2))<p2);
+      const c=$("bsCpu");c.className="bs-cpu free";c.textContent="CPU libre ✓";
+    } else {
+      // bloqueante: programa secuencial loop(){ led1=HIGH; delay(p1); led1=LOW; delay(p1); led2 toggle... }
+      // la CPU pasa casi todo el tiempo en delay() → LED2 sólo cambia en su breve turno
+      dTimer-=dt;
+      if(dTimer<=0){
+        dPhase=(dPhase+1)%4;
+        if(dPhase===0){l1=true;dTimer=p1;}
+        else if(dPhase===1){l1=false;dTimer=p1;}
+        else if(dPhase===2){/* breve turno LED2 */ $("bsL2").classList.toggle("on");dTimer=20;}
+        else {dTimer=20;}
+      }
+      setBulb($("bsL1"),l1);
+      cpuBusy = dPhase<2;
+      const c=$("bsCpu");
+      if(cpuBusy){c.className="bs-cpu busy";c.textContent="CPU bloqueada en delay()";}
+      else {c.className="bs-cpu free";c.textContent="...turno del LED2";}
+    }
+    requestAnimationFrame(tick);
+  }
+  function setMode(m){mode=m;vt=0;dPhase=0;dTimer=0;l1=false;
+    $("bsMd").classList.toggle("act",m==="delay");$("bsMm").classList.toggle("act",m==="millis");
+    $("bsHint").textContent=m==="delay"?"Modo delay(): la CPU pasa casi todo el tiempo DORMIDA en el delay() del LED 1. El LED 2 sólo logra cambiar en breves turnos → parpadeo irregular. Este es el bug #1 del principiante.":"Modo millis(): en vez de dormir, el código revisa el reloj y actúa cuando toca. La CPU nunca se bloquea → ambos LEDs parpadean perfectos a su ritmo, en paralelo.";}
+  $("bsMd").addEventListener("click",()=>setMode("delay"));
+  $("bsMm").addEventListener("click",()=>setMode("millis"));
+  $("bsP1").addEventListener("input",e=>{p1=+e.target.value;$("bsP1v").textContent=p1;});
+  $("bsP2").addEventListener("input",e=>{p2=+e.target.value;$("bsP2v").textContent=p2;});
+  requestAnimationFrame(tick);
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR delay vs millis ═══════════ -->
+
 <h2>3. DMA — mover datos sin el CPU</h2>
 
 <div class="concept"><strong>DMA</strong> (Direct Memory Access): un periférico que copia datos entre memoria y periféricos SIN involucrar al CPU. El CPU pide "copiá estos 1000 bytes del ADC a este buffer" y se va a hacer otra cosa; el DMA avisa cuando terminó.</div>
