@@ -92,6 +92,107 @@ Ese LED con 9V y 0.02A: la resistencia disipa <code>P = (9V - 2V) × 0.02A = 0.1
   <span class="bridge-icon">🔗</span> <strong>Por qué tu laptop tiene ventilador:</strong> tu CPU (que estudiaste en <a href="../../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m13-arquitectura-computadoras/lecture.html">M13 Arquitectura</a>) tiene miles de millones de transistores. Cada switch consume energía → genera calor (P = V×I a escala masiva). Por eso "optimizar código" también es "consumir menos watts". En embebido (E03) esto es CRÍTICO: un wearable a batería muere si tu código mantiene el chip despierto.
 </div>
 
+<!-- ═══════════ CALCULADORA LEY DE OHM ═══════════ -->
+<div class="ohmsim">
+<style>
+.ohmsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.ohmsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.ohmsim .oh-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.ohmsim canvas{width:100%;height:180px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.ohmsim .oh-ctrls{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.ohmsim .oh-sl label{display:flex;justify-content:space-between;font-size:.85rem;color:#e8efe9;margin-bottom:4px}
+.ohmsim .oh-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.ohmsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.ohmsim .oh-out{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-size:.95rem}
+.ohmsim .oh-out .oh-card{background:#1a211b;border:1px solid #2d3a31;border-radius:9px;padding:10px 14px;flex:1;min-width:120px}
+.ohmsim .oh-card .oh-k{font-size:.74rem;color:#8fa394}
+.ohmsim .oh-card .oh-v{font-size:1.4rem;font-weight:800;color:#3fb950;font-variant-numeric:tabular-nums}
+.ohmsim .oh-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.ohmsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:.8rem;font-family:inherit;transition:.15s}
+.ohmsim button:hover{border-color:#f0883e;color:#f0883e}
+.ohmsim .oh-hint{margin-top:12px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.84rem;color:#c9d4cc}
+</style>
+  <h4>⚡ Calculadora interactiva de la Ley de Ohm</h4>
+  <div class="oh-sub">Movés el <b style="color:#58a6ff">voltaje</b> y la <b style="color:#f0883e">resistencia</b> → la corriente fluye en el circuito (los puntos), y la resistencia se calienta según la potencia. Probá el preset del LED.</div>
+  <canvas id="ohCv" width="900" height="180"></canvas>
+  <div class="oh-ctrls">
+    <div class="oh-sl"><label>Voltaje (V) <b id="ohVv">9.0</b> V</label><input type="range" id="ohV" min="0.5" max="24" step="0.5" value="9"></div>
+    <div class="oh-sl"><label>Resistencia (R) <b id="ohRv">220</b> Ω</label><input type="range" id="ohR" min="10" max="2000" step="10" value="220"></div>
+  </div>
+  <div class="oh-out">
+    <div class="oh-card"><div class="oh-k">Corriente · I = V / R</div><div class="oh-v" id="ohI">40.9 mA</div></div>
+    <div class="oh-card"><div class="oh-k">Potencia · P = V × I</div><div class="oh-v" id="ohP">0.37 W</div></div>
+  </div>
+  <div class="oh-row">
+    <button class="oh-pr" data-v="2" data-r="100">💡 LED (2V) + R 100Ω</button>
+    <button class="oh-pr" data-v="5" data-r="10">🔥 R muy baja → mucha I</button>
+    <button class="oh-pr" data-v="12" data-r="1000">🪫 R alta → poca I</button>
+  </div>
+  <div class="oh-hint" id="ohHint">Bajá la resistencia y mirá: la corriente sube (I = V/R) y la resistencia se pone roja (más potencia = más calor). Sin resistencia, el LED se quema.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("ohCv"), ctx=cv.getContext("2d");
+  let V=9,R=220,phase=0;
+  function calc(){return {I:V/R, P:V*V/R};}  // I en A, P en W
+  function draw(){
+    const w=cv.width,h=cv.height; ctx.clearRect(0,0,w,h);
+    const {I,P}=calc();
+    // loop rectangular
+    const L=70,Rx=w-70,Ty=40,By=h-40;
+    ctx.strokeStyle="#3a4a40";ctx.lineWidth=3;ctx.strokeRect(L,Ty,Rx-L,By-Ty);
+    // batería (izquierda)
+    ctx.fillStyle="#58a6ff";ctx.fillRect(L-4,(Ty+By)/2-22,8,18);
+    ctx.fillStyle="#26302a";ctx.fillRect(L-3,(Ty+By)/2+4,6,18);
+    ctx.fillStyle="#58a6ff";ctx.font="12px monospace";ctx.fillText(V.toFixed(1)+"V",L-30,(Ty+By)/2-26);
+    // resistencia (derecha) — color por potencia
+    const heat=Math.min(1,P/2); // 2W = full rojo
+    const rg=Math.round(58+heat*197), gb=Math.round(74-heat*40);
+    ctx.fillStyle="rgb("+rg+","+gb+","+(gb)+")";
+    ctx.fillRect(Rx-8,(Ty+By)/2-26,16,52);
+    ctx.strokeStyle="#0a0f0b";ctx.lineWidth=2;
+    for(let z=0;z<5;z++){ctx.beginPath();ctx.moveTo(Rx-8,(Ty+By)/2-22+z*11);ctx.lineTo(Rx+8,(Ty+By)/2-17+z*11);ctx.stroke();}
+    ctx.fillStyle="#f0883e";ctx.font="12px monospace";ctx.fillText(R+"Ω",Rx+14,(Ty+By)/2);
+    if(heat>0.7){ctx.fillStyle="#ef4444";ctx.fillText("🔥",Rx+14,(Ty+By)/2+18);}
+    // electrones fluyendo — densidad/velocidad ∝ I
+    const speed=Math.min(6,0.4+I*45);          // px/frame
+    const perim=2*((Rx-L)+(By-Ty));
+    const count=Math.max(4,Math.min(40,Math.round(I*400)));
+    phase=(phase+speed)%(perim/count);
+    ctx.fillStyle="#3fb950";
+    for(let k=0;k<count;k++){
+      let d=(phase+k*perim/count)%perim, x,y;
+      const wTop=Rx-L, hRt=By-Ty;
+      if(d<wTop){x=L+d;y=Ty;}
+      else if(d<wTop+hRt){x=Rx;y=Ty+(d-wTop);}
+      else if(d<2*wTop+hRt){x=Rx-(d-wTop-hRt);y=By;}
+      else {x=L;y=By-(d-2*wTop-hRt);}
+      ctx.beginPath();ctx.arc(x,y,2.5,0,7);ctx.fill();
+    }
+    requestAnimationFrame(draw);
+  }
+  function fmtI(I){return I>=1 ? I.toFixed(2)+" A" : (I*1000).toFixed(1)+" mA";}
+  function update(){
+    const {I,P}=calc();
+    $("ohVv").textContent=V.toFixed(1); $("ohRv").textContent=R;
+    $("ohI").textContent=fmtI(I); $("ohP").textContent=P.toFixed(2)+" W";
+    let h;
+    if(I>0.5) h="¡Corriente alta ("+fmtI(I)+")! Con R tan baja, P="+P.toFixed(1)+"W — un resistor común (¼W) se quemaría. Por eso importan los watts.";
+    else if(R>=1500) h="R alta → corriente baja ("+fmtI(I)+"). Poca potencia, todo frío. Útil para limitar corriente (ej: pull-up).";
+    else h="I = V/R = "+V.toFixed(1)+"/"+R+" = "+fmtI(I)+". P = V×I = "+P.toFixed(2)+"W. Bajá R y mirá subir la corriente y el calor.";
+    $("ohHint").textContent=h;
+  }
+  $("ohV").addEventListener("input",e=>{V=+e.target.value;update();});
+  $("ohR").addEventListener("input",e=>{R=+e.target.value;update();});
+  document.querySelectorAll(".ohmsim .oh-pr").forEach(b=>b.addEventListener("click",()=>{
+    V=+b.dataset.v;R=+b.dataset.r;$("ohV").value=V;$("ohR").value=R;update();
+  }));
+  update();draw();
+})();
+</script>
+</div>
+<!-- ═══════════ /CALCULADORA OHM ═══════════ -->
+
 <h2>4. Circuito serie vs paralelo</h2>
 
 <div class="concept"><strong>Serie</strong>: componentes uno tras otro. La MISMA corriente pasa por todos. Las resistencias se SUMAN: <code>R_total = R1 + R2 + R3</code>.</div>
