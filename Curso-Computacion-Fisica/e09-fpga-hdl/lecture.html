@@ -82,6 +82,72 @@ endmodule</code></pre>
   <span class="bridge-icon">🔗</span> <strong>E02 cobra vida:</strong> el <code>&amp;</code> es la compuerta AND de E02. El <code>always @(posedge clk)</code> son los flip-flops sincronizados por reloj de E02. El sumador es el circuito que viste construido con XOR/AND. Verilog es el lenguaje para describir TODO lo de E02 sin dibujar compuertas a mano — y M01 (álgebra booleana) es la matemática que lo gobierna.
 </div>
 
+<!-- ═══════════ SIMULADOR DE FLIP-FLOP (timing) ═══════════ -->
+<div class="ffsim">
+<style>
+.ffsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.ffsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.ffsim .ff-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.ffsim canvas{width:100%;height:200px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.ffsim .ff-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.ffsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.84rem;font-family:inherit;transition:.15s}
+.ffsim button:hover{border-color:#f0883e;color:#f0883e}
+.ffsim button.dhi{border-color:#3fb950;color:#3fb950}
+.ffsim .ff-sl{flex:1;min-width:150px}
+.ffsim .ff-sl label{display:flex;justify-content:space-between;font-size:.8rem;color:#8fa394;margin-bottom:3px}
+.ffsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.ffsim .ff-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+.ffsim code{background:#0a0f0b;padding:1px 5px;border-radius:4px;color:#58a6ff}
+</style>
+  <h4>⏱️ Flip-flop D — el reloj captura el dato</h4>
+  <div class="ff-sub">El corazón de la lógica secuencial (<code>always @(posedge clk)</code>). La salida <b style="color:#58a6ff">Q</b> NO sigue a <b style="color:#3fb950">D</b> al instante — solo copia su valor en el <b>flanco de subida</b> del reloj. Cambiá D entre flancos y mirá que Q espera.</div>
+  <canvas id="ffCv" width="900" height="200"></canvas>
+  <div class="ff-row">
+    <button id="ffD">D = 0  (clic para cambiar)</button>
+    <div class="ff-sl"><label>Velocidad del reloj <b id="ffSpv">1.0</b>×</label><input type="range" id="ffSp" min="0.3" max="2.5" step="0.1" value="1"></div>
+  </div>
+  <div class="ff-hint" id="ffHint">Cambiá D (verde) en cualquier momento. Q (azul) lo ignora hasta el próximo flanco ↑ del reloj — ahí "muestrea" D y lo mantiene hasta el siguiente flanco. Eso es un registro: memoria sincronizada por el clock.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("ffCv"), ctx=cv.getContext("2d");
+  const N=120; let d=0, q=0, speed=1, t=0, half=14, clkPrev=0;
+  const hist=[]; // {clk,d,q}
+  for(let i=0;i<N;i++)hist.push({clk:0,d:0,q:0});
+  function clkAt(tt){return Math.floor(tt/half)%2;} // square wave
+  function step(){
+    t+=speed;
+    const clk=clkAt(t);
+    if(clk===1&&clkPrev===0){q=d;} // flanco de subida → captura
+    clkPrev=clk;
+    hist.push({clk,d,q}); if(hist.length>N)hist.shift();
+  }
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const rows=[{lab:"CLK",col:"#f0883e",key:"clk",y:40},{lab:"D",col:"#3fb950",key:"d",y:100},{lab:"Q",col:"#58a6ff",key:"q",y:160}];
+    rows.forEach(r=>{
+      ctx.fillStyle=r.col;ctx.font="bold 13px monospace";ctx.fillText(r.lab,8,r.y+4);
+      ctx.strokeStyle=r.col;ctx.lineWidth=2;ctx.beginPath();
+      const hi=r.y-22,lo=r.y+22,x0=40,ww=(w-50)/N;
+      for(let i=0;i<hist.length;i++){const v=hist[i][r.key],x=x0+i*ww,y=v?hi:lo;
+        if(i===0)ctx.moveTo(x,y);else{const pv=hist[i-1][r.key];if(pv!==v)ctx.lineTo(x,pv?hi:lo);ctx.lineTo(x,y);}}
+      ctx.stroke();
+    });
+    // marcar flancos de subida del clock con línea vertical
+    ctx.strokeStyle="#f0883e33";ctx.lineWidth=1;ctx.setLineDash([3,3]);
+    const x0=40,ww=(w-50)/N;
+    for(let i=1;i<hist.length;i++){if(hist[i].clk===1&&hist[i-1].clk===0){const x=x0+i*ww;ctx.beginPath();ctx.moveTo(x,18);ctx.lineTo(x,182);ctx.stroke();}}
+    ctx.setLineDash([]);
+  }
+  function loop(){step();draw();requestAnimationFrame(loop);}
+  $("ffD").addEventListener("click",()=>{d=d?0:1;const b=$("ffD");b.textContent="D = "+d+"  (clic para cambiar)";b.classList.toggle("dhi",d===1);});
+  $("ffSp").addEventListener("input",e=>{speed=+e.target.value;$("ffSpv").textContent=speed.toFixed(1);});
+  loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR FLIP-FLOP ═══════════ -->
+
 <h2>4. El flujo: de Verilog a silicio</h2>
 
 <pre><code>Verilog (descripción)
