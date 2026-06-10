@@ -77,6 +77,88 @@ Muchos sensores (luz, temperatura) son una resistencia variable; medís su valor
   <span class="bridge-icon">🔗</span> <strong>Acá vive el cálculo de M03:</strong> la carga de un capacitor es <code>V(t) = Vcc·(1 - e^(-t/RC))</code> — una ecuación diferencial resuelta. El <a href="../../../Curso%20ingenieria%20sistemas/area-01-matematicas-y-teoria/m03-calculo/lecture.html">cálculo de M03</a> que parecía abstracto describe LITERALMENTE cómo se carga este componente. La constante de tiempo τ=RC es por qué un circuito "tarda" en responder.
 </div>
 
+<!-- ═══════════ SIMULADOR DE CIRCUITO RC ═══════════ -->
+<div class="rcsim">
+<style>
+.rcsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.rcsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.rcsim .rc-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.rcsim canvas{width:100%;height:200px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.rcsim .rc-ctrls{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.rcsim .rc-sl label{display:flex;justify-content:space-between;font-size:.83rem;color:#e8efe9;margin-bottom:4px}
+.rcsim .rc-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.rcsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.rcsim .rc-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.rcsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:.82rem;font-family:inherit}
+.rcsim button:hover{border-color:#f0883e;color:#f0883e}
+.rcsim .rc-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.85rem;color:#8fa394}
+.rcsim .rc-stats b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.rcsim .rc-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🔋 Simulador de circuito RC — carga del capacitor</h4>
+  <div class="rc-sub">El capacitor se carga con una curva exponencial: <code>V(t) = Vs·(1 − e<sup>−t/τ</sup>)</code>, con <b style="color:#f0883e">τ = R·C</b>. A los <b>τ</b> segundos llega al 63%; a los 5τ está casi lleno. Cambiá R y C y mirá cómo cambia la velocidad.</div>
+  <canvas id="rcCv" width="900" height="200"></canvas>
+  <div class="rc-ctrls">
+    <div class="rc-sl"><label>Resistencia R <b id="rcRv">1000</b> Ω</label><input type="range" id="rcR" min="100" max="10000" step="100" value="1000"></div>
+    <div class="rc-sl"><label>Capacitor C <b id="rcCv2">100</b> µF</label><input type="range" id="rcC" min="10" max="470" step="10" value="100"></div>
+  </div>
+  <div class="rc-row">
+    <button id="rcCharge">⚡ Cargar</button>
+    <button id="rcDis">🔌 Descargar</button>
+  </div>
+  <div class="rc-stats">
+    <span>τ = R·C = <b id="rcTau">100</b> ms</span>
+    <span>V capacitor: <b id="rcV">0.0</b> / 5.0 V</span>
+    <span>Carga: <b id="rcPct">0</b>%</span>
+  </div>
+  <div class="rc-hint" id="rcHint">Tocá "Cargar". La curva sube rápido al principio y se va frenando — nunca llega "de golpe". Con R o C más grandes, τ crece y todo tarda más. Esa es la base de los temporizadores y los filtros.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("rcCv"), ctx=cv.getContext("2d");
+  const VS=5; let R=1000, C=100, V=0, charging=null, hist=[];
+  function tau(){return R*C*1e-6;} // segundos
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const PY=v=>h-8-(v/VS)*(h-16);
+    // grid + 63% + Vs
+    ctx.strokeStyle="#1c2620";for(let g=0;g<=5;g++){const y=PY(g);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+    ctx.strokeStyle="#3fb95066";ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(0,PY(VS*0.632));ctx.lineTo(w,PY(VS*0.632));ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle="#3fb950";ctx.font="10px monospace";ctx.fillText("63% (en t=τ)",8,PY(VS*0.632)-4);
+    ctx.fillStyle="#58a6ff";ctx.fillText("Vs="+VS+"V",8,PY(VS)+12);
+    // curva histórica
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2.2;ctx.beginPath();
+    hist.forEach((v,i)=>{const x=i/(hist.length-1||1)*w,y=PY(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+    // capacitor lleno (barra derecha)
+    const bx=w-26;ctx.strokeStyle="#2d3a31";ctx.strokeRect(bx,12,16,h-24);
+    ctx.fillStyle="#f0883e";const fh=(V/VS)*(h-26);ctx.fillRect(bx+1,h-12-fh,14,fh);
+  }
+  function update(){
+    $("rcRv").textContent=R;$("rcCv2").textContent=C;
+    $("rcTau").textContent=(tau()*1000).toFixed(0);
+    $("rcV").textContent=V.toFixed(2);$("rcPct").textContent=Math.round(V/VS*100);
+    draw();
+  }
+  function loop(){
+    if(charging!==null){
+      const target=charging?VS:0, k=1-Math.exp(-0.016/tau()); // dt~16ms
+      V+=(target-V)*Math.min(1,k);
+      hist.push(V); if(hist.length>260)hist.shift();
+      update();
+      if(Math.abs(V-target)<0.01){V=target;}
+    }
+    requestAnimationFrame(loop);
+  }
+  $("rcR").addEventListener("input",e=>{R=+e.target.value;update();});
+  $("rcC").addEventListener("input",e=>{C=+e.target.value;update();});
+  $("rcCharge").addEventListener("click",()=>{charging=true;hist=[V];$("rcHint").textContent="Cargando: la curva sube exponencial. A τ="+(tau()*1000).toFixed(0)+"ms llega al 63%, y necesita ~5τ para llenarse. Nunca llega 'instantáneo' — el capacitor se opone a cambios bruscos.";});
+  $("rcDis").addEventListener("click",()=>{charging=false;hist=[V];$("rcHint").textContent="Descargando: misma curva exponencial pero bajando. La energía guardada se libera a través de R con la misma constante τ.";});
+  update();loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR RC ═══════════ -->
+
 <h2>3. Inductor — almacenar en campo magnético</h2>
 
 <div class="concept">El <strong>inductor</strong> (bobina) almacena energía en un campo magnético y se opone a cambios de CORRIENTE (el dual del capacitor). Clave en fuentes conmutadas, motores y radio.</div>
