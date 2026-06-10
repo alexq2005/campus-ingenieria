@@ -99,6 +99,77 @@ El oído humano llega a ~20 kHz. Por eso el audio se muestrea a <strong>44.1 kHz
   <span class="bridge-icon">🔗</span> <strong>Por qué un píxel es muestreo:</strong> una cámara (M42 Visión) muestrea la luz en una grilla espacial. La resolución es la "frecuencia de muestreo espacial". El aliasing en imágenes son los patrones moiré. La misma teoría de Nyquist que rige el audio rige por qué una foto de baja resolución pierde detalle.
 </div>
 
+<!-- ═══════════ SIMULADOR DE MUESTREO / ALIASING ═══════════ -->
+<div class="alisim">
+<style>
+.alisim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.alisim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.alisim .al-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.alisim canvas{width:100%;height:200px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.alisim .al-ctrls{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.alisim .al-sl label{display:flex;justify-content:space-between;font-size:.83rem;color:#e8efe9;margin-bottom:4px}
+.alisim .al-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.alisim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.alisim .al-status{margin-top:12px;padding:9px 12px;border-radius:8px;font-size:.88rem;font-weight:600;text-align:center}
+.alisim .al-ok{background:rgba(63,185,80,.12);color:#3fb950;border:1px solid #3fb95055}
+.alisim .al-bad{background:rgba(239,68,68,.12);color:#ef4444;border:1px solid #ef444455}
+.alisim .al-leg{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:.78rem;color:#8fa394}
+.alisim .al-leg span b{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:4px}
+.alisim .al-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>📡 Simulador de muestreo y aliasing (Nyquist)</h4>
+  <div class="al-sub">La señal real (naranja) se muestrea a una tasa fs (puntos). Si <b>fs < 2·f</b>, los puntos reconstruyen una señal FALSA de menor frecuencia (azul) — eso es aliasing. Es el "efecto rueda de carro".</div>
+  <canvas id="alCv" width="900" height="200"></canvas>
+  <div class="al-leg">
+    <span><b style="background:#f0883e"></b>señal real</span>
+    <span><b style="background:#58a6ff"></b>reconstrucción (lo que "ve" el sistema)</span>
+    <span>● muestras</span>
+  </div>
+  <div class="al-ctrls">
+    <div class="al-sl"><label>Frecuencia de la señal <b id="alFv">9</b> Hz</label><input type="range" id="alF" min="1" max="14" step="1" value="9"></div>
+    <div class="al-sl"><label>Tasa de muestreo fs <b id="alFsv">10</b> Hz</label><input type="range" id="alFs" min="3" max="32" step="1" value="10"></div>
+  </div>
+  <div class="al-status" id="alStatus"></div>
+  <div class="al-hint" id="alHint"></div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("alCv"), ctx=cv.getContext("2d");
+  let f=9, fs=10; const T=1; // ventana 1 segundo
+  function aliasSigned(){return f - fs*Math.round(f/fs);}
+  function draw(){
+    const w=cv.width,h=cv.height,mid=h/2,amp=h*0.36;ctx.clearRect(0,0,w,h);
+    ctx.strokeStyle="#1c2620";ctx.beginPath();ctx.moveTo(0,mid);ctx.lineTo(w,mid);ctx.stroke();
+    // señal real
+    ctx.strokeStyle="rgba(240,136,62,.55)";ctx.lineWidth=2;ctx.beginPath();
+    for(let p=0;p<=w;p++){const t=p/w*T,y=mid-Math.sin(2*Math.PI*f*t)*amp;p?ctx.lineTo(p,y):ctx.moveTo(p,y);}ctx.stroke();
+    // reconstrucción (alias)
+    const fa=aliasSigned();
+    ctx.strokeStyle="#58a6ff";ctx.lineWidth=2.2;ctx.beginPath();
+    for(let p=0;p<=w;p++){const t=p/w*T,y=mid-Math.sin(2*Math.PI*fa*t)*amp;p?ctx.lineTo(p,y):ctx.moveTo(p,y);}ctx.stroke();
+    // muestras
+    const ns=Math.round(fs*T);
+    for(let k=0;k<=ns;k++){const t=k/fs;if(t>T)break;const x=t/T*w,y=mid-Math.sin(2*Math.PI*f*t)*amp;
+      ctx.fillStyle="#e8efe9";ctx.beginPath();ctx.arc(x,y,3.5,0,7);ctx.fill();}
+  }
+  function update(){
+    $("alFv").textContent=f;$("alFsv").textContent=fs;
+    draw();
+    const fa=Math.abs(aliasSigned()), nyq=fs/2;
+    const st=$("alStatus");
+    if(fs>=2*f){st.className="al-status al-ok";st.textContent="✅ fs ("+fs+") ≥ 2·f ("+(2*f)+") — muestreo CORRECTO, sin aliasing. La reconstrucción azul = la señal real.";
+      $("alHint").textContent="Con suficiente muestreo, los puntos capturan fielmente la señal. Las dos curvas coinciden. (Por eso el CD usa 44.1 kHz para audio de hasta ~20 kHz.)";}
+    else {st.className="al-status al-bad";st.textContent="🔴 fs ("+fs+") < 2·f ("+(2*f)+") — ALIASING. La señal de "+f+" Hz aparenta ser de "+fa+" Hz.";
+      $("alHint").textContent="Muestreás muy lento: los puntos también pasan por una onda de "+fa+" Hz (azul), y el sistema NO puede distinguirla de la real. La frecuencia alta se 'disfrazó' de baja — frecuencia fantasma. Solución: filtro anti-aliasing o subir fs por encima de "+(2*f)+".";}
+  }
+  $("alF").addEventListener("input",e=>{f=+e.target.value;update();});
+  $("alFs").addEventListener("input",e=>{fs=+e.target.value;update();});
+  update();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR ALIASING ═══════════ -->
+
 <h2>6. Filtros: dejar pasar ciertas frecuencias</h2>
 
 <table>
