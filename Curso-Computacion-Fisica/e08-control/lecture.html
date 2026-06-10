@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E08 — Sistemas de Control · Computación Física</title>
+<meta name="description" content="Feedback, lazo cerrado y PID: el algoritmo que estabiliza drones, termostatos y autos.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E08</span>
+  <span class="badge">⏱ ~85 min</span>
+  <span class="badge">🎯 Pre-req: E05 + M03 Cálculo</span>
+  <span class="badge">Fase 3</span>
+</div>
+
+<article>
+
+<h1>E08 — Sistemas de Control</h1>
+
+<blockquote class="author">"El control es cómo un sistema se corrige a sí mismo. Sin él, los drones se caen, los autos no frenan a tiempo y tu termostato oscila para siempre." — la ingeniería de la auto-corrección</blockquote>
+
+<blockquote>El control responde a una pregunta: <strong>¿cómo hago que un sistema físico llegue a un objetivo y se mantenga ahí, a pesar de las perturbaciones?</strong> Es el cerebro de los sistemas autónomos, y donde la derivada e integral de M03 se vuelven un algoritmo que corre en tiempo real.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El cálculo de M03 hecho algoritmo:</strong> el controlador PID usa literalmente la <strong>derivada</strong> (qué tan rápido cambia el error) y la <strong>integral</strong> (error acumulado) del <a href="../../../Curso%20ingenieria%20sistemas/area-01-matematicas-y-teoria/m03-calculo/lecture.html">cálculo de M03</a>. Lo que parecía abstracto —"la integral acumula, la derivada predice"— es exactamente cómo un dron se mantiene estable en el aire.
+</div>
+
+<h2>1. Lazo abierto vs lazo cerrado</h2>
+
+<div class="concept"><strong>Lazo abierto</strong>: actuás sin mirar el resultado. "Prendé el calefactor 10 minutos." Simple pero ciego — si hace más frío, no se entera.</div>
+
+<div class="concept"><strong>Lazo cerrado (feedback)</strong>: medís el resultado y corregís. "Prendé el calefactor HASTA que el termómetro marque 22°." Se auto-corrige. <strong>Es la base de todo control serio.</strong></div>
+
+<pre><code>LAZO ABIERTO:   [Comando] → [Actuador] → [Sistema] → resultado (sin medir)
+
+LAZO CERRADO:   objetivo → (Σ) → [Controlador] → [Actuador] → [Sistema] → salida
+                          ↑                                              │
+                          └──────────── sensor (feedback) ──────────────┘
+                          el error = objetivo - salida realimenta la corrección</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Feedback = el patrón universal:</strong> el lazo cerrado es el mismo concepto que el "loop de mejora" de cualquier sistema — A/B testing (M39), el ciclo OODA, hasta el gradient descent de <a href="../../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html">M40 Deep Learning</a> (medir error → ajustar → repetir). Control es feedback aplicado al mundo físico en tiempo real.
+</div>
+
+<h2>2. El problema del control simple (on/off)</h2>
+
+<div class="concept">El control más básico es on/off (como la histéresis del termostato de E05): si está por debajo, prendé; por encima, apagá. Funciona, pero <strong>oscila</strong> alrededor del objetivo y reacciona tarde.</div>
+
+<div class="mini-ex">
+Un termostato on/off: la temperatura sube de más (overshoot) porque el calefactor sigue caliente al apagarse, luego baja de más. Oscila ±2° eternamente. Para precisión (un dron, un brazo robótico), esto no alcanza — necesitás PID.
+</div>
+
+<h2>3. El controlador PID</h2>
+
+<div class="rule"><strong>PID</strong> combina 3 términos sobre el <strong>error</strong> (= objetivo − medición actual):
+<ul>
+  <li><strong>P</strong>roporcional: corrige proporcional al error actual. "Mucho error → mucha corrección."</li>
+  <li><strong>I</strong>ntegral: corrige según el error ACUMULADO. Elimina el error residual permanente.</li>
+  <li><strong>D</strong>erivativo: corrige según qué tan RÁPIDO cambia el error. Anticipa y frena el overshoot.</li>
+</ul>
+</div>
+
+<pre><code class="lang-c">// PID en C — corre cada ciclo (ej, cada 10ms)
+float kp = 2.0, ki = 0.5, kd = 1.0;   // ganancias a ajustar
+float integral = 0, error_previo = 0;
+
+float pid(float objetivo, float medicion, float dt) {
+  float error = objetivo - medicion;
+
+  float P = kp * error;                          // proporcional
+  integral += error * dt;
+  float I = ki * integral;                       // integral (acumula)
+  float D = kd * (error - error_previo) / dt;    // derivada (cambio)
+  error_previo = error;
+
+  return P + I + D;                              // señal de control (ej, PWM al motor)
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Mirá el cálculo de M03 EN el código:</strong> <code>integral += error * dt</code> es una integral numérica (suma de Riemann). <code>(error - error_previo) / dt</code> es una derivada numérica (cociente incremental). El PID es M03 discretizado corriendo en un microcontrolador a 100 Hz. La teoría matemática literalmente vuela un dron.
+</div>
+
+<h2>4. Qué hace cada término (intuición)</h2>
+
+<table>
+<thead><tr><th>Término</th><th>Pregunta que responde</th><th>Si falta...</th></tr></thead>
+<tbody>
+<tr><td><strong>P</strong></td><td>¿Cuán lejos estoy del objetivo AHORA?</td><td>No corrige nada (sistema pasivo)</td></tr>
+<tr><td><strong>I</strong></td><td>¿Vengo arrastrando un error?</td><td>Queda error permanente (nunca llega exacto)</td></tr>
+<tr><td><strong>D</strong></td><td>¿Me estoy acercando muy rápido?</td><td>Overshoot y oscilación</td></tr>
+</tbody>
+</table>
+
+<h2>5. Sintonización (tuning)</h2>
+
+<div class="concept">Ajustar <code>kp</code>, <code>ki</code>, <code>kd</code> es un arte. Mucho P → oscila. Mucho I → lento e inestable. Mucho D → sensible al ruido. Métodos: prueba y error guiada, Ziegler-Nichols, o auto-tuning.</div>
+
+<div class="warn">El término D amplifica el ruido (porque deriva). Si tu sensor es ruidoso, el D puede volver loco al sistema. Por eso muchos sistemas usan solo PI, o filtran (E07) la medición antes del D.</div>
+
+<h2>6. Estabilidad</h2>
+
+<div class="concept">Un sistema es <strong>estable</strong> si, ante una perturbación, vuelve al objetivo. <strong>Inestable</strong> si la corrección lo empuja cada vez más lejos (oscilación creciente → catástrofe). El análisis de estabilidad (polos, Laplace de E06) predice esto matemáticamente.</div>
+
+<div class="analogy">
+Estable = una pelota en el fondo de un bowl (la empujás, vuelve). Inestable = una pelota en la cima de una colina (la empujás, se va). Un control mal sintonizado convierte un bowl en una colina — el sistema "se va" en vez de corregirse.
+</div>
+
+<h2>7. Control moderno: del PID al ML</h2>
+
+<div class="concept">El PID domina la industria, pero para sistemas complejos (robots con muchas articulaciones, autos autónomos) se usa <strong>control óptimo</strong>, <strong>MPC</strong> (Model Predictive Control) y <strong>reinforcement learning</strong>.</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El cierre con la IA (M39):</strong> el <a href="../../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m39-machine-learning-clasico/lecture.html">reinforcement learning</a> es control donde el agente APRENDE la política de control en vez de que un ingeniero ajuste kp/ki/kd. Un robot que aprende a caminar usa RL = control + ML. El PID es el "control clásico"; el RL es el "control aprendido" — el mismo problema (llevar un sistema a un objetivo), distinta solución. Espejo exacto de DSP (kernel diseñado) vs CNN (kernel aprendido) de E07.
+</div>
+
+<h2>8. Dónde está el control</h2>
+<ul>
+  <li><strong>Drones</strong>: PID en cada eje mantiene el equilibrio 400 veces/seg.</li>
+  <li><strong>Cruise control</strong>: mantiene velocidad ajustando el acelerador.</li>
+  <li><strong>Impresora 3D / CNC</strong>: control de posición y temperatura.</li>
+  <li><strong>Cohetes (SpaceX)</strong>: control de vectorización del empuje para aterrizar.</li>
+  <li><strong>Data centers</strong>: control de temperatura y carga.</li>
+</ul>
+
+<figure class="foto">
+  <img src="../assets/img/dron.jpg" alt="Dron cuadricóptero en vuelo estabilizado">
+  <figcaption>Un cuadricóptero se mantiene en el aire gracias a un PID corriendo en cada eje (pitch, roll, yaw) cientos de veces por segundo: lee el giroscopio (E05), calcula el error contra la orientación deseada y ajusta la velocidad de cada motor. Foto: Josh Sorenson, vía <a href="https://commons.wikimedia.org/wiki/File:Quadcopter_camera_drone_in_flight.jpg" target="_blank">Wikimedia Commons</a> (CC0).</figcaption>
+</figure>
+
+<h2>9. Práctica</h2>
+<ul>
+  <li>Simulá un PID en Python: un "auto" que debe llegar a una velocidad objetivo. Graficá con distintos kp/ki/kd.</li>
+  <li>Reto físico: balanceá una pelota en una viga, o un robot auto-balanceado (2 ruedas) con PID + giroscopio (E05).</li>
+  <li><a href="https://www.youtube.com/watch?v=4Y7zG48uHRo" target="_blank">PID sin las matemáticas (Brian Douglas)</a> — la mejor intro visual.</li>
+</ul>
+
+<h2>10. Errores típicos</h2>
+<div class="mistake"><strong>Integral windup</strong>: si el actuador se satura, la integral sigue acumulando y el sistema "se pasa" feo al recuperarse. Solución: limitar (clamp) la integral.</div>
+<div class="mistake"><strong>Término D con sensor ruidoso</strong>: amplifica el ruido. Filtrá la medición (E07) o usá solo PI.</div>
+<div class="mistake"><strong>No considerar el <code>dt</code></strong>: si el loop no corre a intervalo constante, la integral y derivada se calculan mal. Usá un timer (E04) para dt fijo.</div>
+<div class="mistake"><strong>Sintonizar a ciegas</strong>: cambiá UNA ganancia a la vez y observá. Cambiar las 3 juntas hace imposible entender qué pasó.</div>
+
+<h2>11. Recursos</h2>
+<ul>
+  <li><a href="https://www.youtube.com/playlist?list=PLUMWjy5jgHK1NC52DXXrriwihVrYZKqjk" target="_blank">Control Systems Lectures (Brian Douglas)</a> — la mejor serie de control</li>
+  <li>"Feedback Control of Dynamic Systems" (Franklin) — el clásico</li>
+  <li><code>python-control</code> library para simular</li>
+</ul>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Diferencia entre lazo abierto y cerrado?</summary>
+<p>Lazo abierto actúa sin medir el resultado (ciego). Lazo cerrado mide la salida y corrige según el error (objetivo − medición), auto-corrigiéndose ante perturbaciones. El feedback es la base del control serio.</p></details>
+
+<details><summary>2. ¿Qué hace cada término del PID?</summary>
+<p>P: corrige proporcional al error actual. I: corrige según error acumulado (elimina error residual). D: corrige según qué tan rápido cambia el error (anticipa, frena overshoot). Juntos llevan el sistema al objetivo de forma suave y precisa.</p></details>
+
+<details><summary>3. ¿Cómo aparece el cálculo de M03 en el PID?</summary>
+<p><code>integral += error*dt</code> es una integral numérica (suma de Riemann); <code>(error−error_previo)/dt</code> es una derivada numérica. El PID es cálculo de M03 discretizado corriendo en tiempo real en un MCU.</p></details>
+
+<details><summary>4. ¿Qué es la estabilidad de un sistema?</summary>
+<p>Un sistema estable vuelve al objetivo tras una perturbación (pelota en un bowl). Uno inestable se aleja cada vez más (pelota en una colina → oscilación creciente). El análisis con Laplace/polos (E06) lo predice matemáticamente.</p></details>
+
+<details><summary>5. ¿Qué relación hay entre PID y reinforcement learning?</summary>
+<p>Ambos llevan un sistema a un objetivo. En PID un ingeniero ajusta kp/ki/kd; en RL (M39) el agente APRENDE la política de control. PID = control clásico, RL = control aprendido — espejo de DSP (kernel diseñado) vs CNN (kernel aprendido).</p></details>
+
+<details><summary>6. ¿Qué es integral windup y cómo se evita?</summary>
+<p>Cuando el actuador se satura, el término integral sigue acumulando error, causando una recuperación brusca y con overshoot. Se evita limitando (clamp) el valor de la integral.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e07-dsp/lecture.html">← E07 DSP</a>
+  <a href="../e09-fpga-hdl/lecture.html">Siguiente: E09 FPGA y HDL →</a>
+</nav>
+
+</div>
+</body>
+</html>

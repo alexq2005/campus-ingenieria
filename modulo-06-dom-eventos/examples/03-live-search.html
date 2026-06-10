@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live search con debounce</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2rem auto; padding: 1rem; }
+    input { width: 100%; padding: 0.8rem; font-size: 1.1rem; border: 2px solid #cbd5e1; border-radius: 8px; }
+    input:focus { border-color: #0ea5e9; outline: none; }
+    .meta { color: #64748b; font-size: 0.85em; margin: 0.5rem 0 1rem; }
+    ul { list-style: none; padding: 0; }
+    li { padding: 0.8rem; background: #f1f5f9; border-radius: 6px; margin-bottom: 0.4rem; }
+    li mark { background: #fef08a; padding: 0 2px; border-radius: 2px; }
+    .counter { font-family: monospace; background: #fef3c7; color: #78350f; padding: 0.15rem 0.4rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+  <h1>Búsqueda en vivo con debounce</h1>
+  <p>Tipeá rápido — sin debounce se dispararía una búsqueda por cada tecla (malo). Con debounce, espera a que termines de escribir.</p>
+
+  <input type="search" id="busqueda" placeholder="Buscar libros..." autocomplete="off">
+  <div class="meta">
+    Disparos sin debounce: <span class="counter" id="naive">0</span>
+    &nbsp;·&nbsp;
+    Disparos con debounce: <span class="counter" id="debounced">0</span>
+  </div>
+
+  <ul id="resultados"></ul>
+
+  <script>
+    const LIBROS = [
+      'Clean Code', 'The Pragmatic Programmer', 'Refactoring',
+      'JavaScript: The Good Parts', 'Eloquent JavaScript',
+      'You Don\'t Know JS', 'CSS Secrets', 'Every Layout',
+      'Don\'t Make Me Think', 'The Design of Everyday Things',
+      'Working Effectively with Legacy Code', 'Domain-Driven Design',
+      'Test-Driven Development by Example', 'Cracking the Coding Interview',
+      'Structure and Interpretation of Computer Programs',
+      'Designing Data-Intensive Applications',
+      'High Performance Browser Networking',
+    ];
+
+    const input = document.getElementById('busqueda');
+    const resultados = document.getElementById('resultados');
+    const naive = document.getElementById('naive');
+    const debounced = document.getElementById('debounced');
+
+    function debounce(fn, ms) {
+      let timer;
+      return function(...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), ms);
+      };
+    }
+
+    function buscar(query) {
+      debounced.textContent = +debounced.textContent + 1;
+
+      const q = query.trim().toLowerCase();
+      if (!q) { resultados.innerHTML = ''; return; }
+
+      const hits = LIBROS.filter(l => l.toLowerCase().includes(q));
+
+      resultados.replaceChildren(
+        ...hits.map(libro => {
+          const li = document.createElement('li');
+          // Resaltamos la coincidencia (usamos HTML controlado, no input del usuario)
+          const idx = libro.toLowerCase().indexOf(q);
+          const antes = libro.slice(0, idx);
+          const match = libro.slice(idx, idx + q.length);
+          const despues = libro.slice(idx + q.length);
+          li.append(antes);
+          const mark = document.createElement('mark');
+          mark.textContent = match;
+          li.append(mark, despues);
+          return li;
+        })
+      );
+    }
+
+    const buscarDebounced = debounce(buscar, 300);
+
+    input.addEventListener('input', (e) => {
+      naive.textContent = +naive.textContent + 1;
+      buscarDebounced(e.target.value);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event Loop Visualizer — interactivo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      margin: 0; padding: 1.5rem;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh;
+    }
+    h1 { margin-top: 0; font-size: 1.6rem; color: #38bdf8; }
+    .sub { color: #94a3b8; margin-bottom: 1rem; font-size: 0.95em; }
+
+    .app {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    @media (max-width: 800px) { .app { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1rem;
+    }
+    .panel h2 {
+      font-size: 0.9em;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8;
+      margin: 0 0 0.5rem;
+    }
+
+    /* Código */
+    .code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88em;
+      white-space: pre;
+      line-height: 1.6;
+    }
+    .code .line {
+      padding: 0 0.5rem;
+      border-radius: 3px;
+      transition: background 0.2s;
+    }
+    .code .line.active {
+      background: #fde047;
+      color: #0f172a;
+      font-weight: bold;
+    }
+    .code .line.done { color: #64748b; }
+    .comment { color: #64748b; font-style: italic; }
+
+    /* Controles */
+    .controls {
+      display: flex;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+      margin: 1rem 0;
+    }
+    button {
+      background: #38bdf8;
+      color: #0f172a;
+      border: 0;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+    }
+    button:hover:not(:disabled) { background: #0ea5e9; transform: translateY(-1px); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.secondary { background: #334155; color: #e2e8f0; }
+    button.danger    { background: #ef4444; color: white; }
+
+    /* Ejemplo selector */
+    select {
+      background: #334155; color: #e2e8f0; border: 1px solid #475569;
+      padding: 0.5rem; border-radius: 6px; font-family: inherit;
+    }
+
+    /* ─── Cajas del runtime ─── */
+    .runtime {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.7rem;
+    }
+
+    .box {
+      background: #0f172a;
+      border: 2px solid #334155;
+      border-radius: 8px;
+      padding: 0.6rem;
+      min-height: 70px;
+      position: relative;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .box.active { border-color: #38bdf8; box-shadow: 0 0 12px rgba(56, 189, 248, 0.4); }
+
+    .box-label {
+      position: absolute;
+      top: -10px; left: 10px;
+      background: #1e293b;
+      padding: 0 0.5rem;
+      font-size: 0.75em;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8;
+    }
+    .box.stack .box-label    { color: #f87171; }
+    .box.micro .box-label    { color: #fbbf24; }
+    .box.macro .box-label    { color: #a78bfa; }
+    .box.web .box-label      { color: #34d399; }
+
+    .items {
+      display: flex;
+      flex-direction: column-reverse; /* stack crece de abajo hacia arriba */
+      gap: 0.3rem;
+      margin-top: 0.3rem;
+    }
+    .box.micro .items,
+    .box.macro .items,
+    .box.web .items { flex-direction: row; flex-wrap: wrap; }
+
+    .item {
+      padding: 0.35rem 0.7rem;
+      border-radius: 5px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      font-weight: 600;
+      animation: pop 0.3s ease;
+      cursor: default;
+    }
+    @keyframes pop {
+      from { transform: scale(0.5); opacity: 0; }
+      to   { transform: scale(1); opacity: 1; }
+    }
+    .item.stack { background: rgba(248, 113, 113, 0.2); border: 1px solid #f87171; color: #fca5a5; }
+    .item.micro { background: rgba(251, 191, 36, 0.2); border: 1px solid #fbbf24; color: #fcd34d; }
+    .item.macro { background: rgba(167, 139, 250, 0.2); border: 1px solid #a78bfa; color: #c4b5fd; }
+    .item.web   { background: rgba(52, 211, 153, 0.2); border: 1px solid #34d399; color: #6ee7b7; }
+
+    .item.leaving { animation: leave 0.3s ease forwards; }
+    @keyframes leave { to { transform: scale(0.3); opacity: 0; } }
+
+    /* Consola */
+    .console {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 0.7rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      min-height: 100px;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .console .log {
+      padding: 2px 6px;
+      border-left: 3px solid transparent;
+      margin-bottom: 2px;
+      animation: slideIn 0.2s ease;
+    }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: translateX(0); } }
+    .console .log.sync   { color: #34d399; border-color: #34d399; }
+    .console .log.micro  { color: #fbbf24; border-color: #fbbf24; }
+    .console .log.macro  { color: #a78bfa; border-color: #a78bfa; }
+
+    /* Explicación */
+    .explain {
+      background: rgba(56, 189, 248, 0.08);
+      border-left: 3px solid #38bdf8;
+      padding: 0.6rem 0.9rem;
+      border-radius: 4px;
+      font-size: 0.88em;
+      min-height: 50px;
+      color: #e0f2fe;
+    }
+
+    /* Leyenda */
+    .legend {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      font-size: 0.8em;
+      margin-top: 0.5rem;
+      color: #94a3b8;
+    }
+    .legend span::before {
+      content: '';
+      display: inline-block;
+      width: 12px; height: 12px;
+      border-radius: 3px;
+      margin-right: 0.3rem;
+      vertical-align: middle;
+    }
+    .legend .sync::before  { background: #34d399; }
+    .legend .micro::before { background: #fbbf24; }
+    .legend .macro::before { background: #a78bfa; }
+    .legend .webapi::before { background: #52525b; border: 1px solid #34d399; }
+
+    .speed-label { font-size: 0.85em; color: #94a3b8; }
+    input[type="range"] { accent-color: #38bdf8; }
+  </style>
+</head>
+<body>
+
+  <div class="app">
+
+    <!-- COLUMNA IZQUIERDA: código y controles -->
+    <div>
+      <h1>🔄 Event Loop Visualizer</h1>
+      <p class="sub">
+        Mirá cómo JavaScript orquesta call stack, microtasks y macrotasks. Presioná <strong>Paso</strong> o <strong>Play</strong>.
+      </p>
+
+      <div class="panel">
+        <h2>Ejemplo</h2>
+        <select id="ejemplo" style="margin-bottom: 0.7rem; width: 100%;">
+          <option value="0">1. Orden básico (sync + micro + macro)</option>
+          <option value="1">2. Microtasks vacían antes que macrotasks</option>
+          <option value="3">3. async/await + Promises</option>
+          <option value="2">4. Caso real: fetch</option>
+        </select>
+
+        <div class="code" id="code"></div>
+
+        <div class="controls">
+          <button id="play">▶ Play</button>
+          <button id="step" class="secondary">⏭ Paso</button>
+          <button id="reset" class="danger">↺ Reset</button>
+          <label class="speed-label">
+            Velocidad:
+            <input type="range" id="speed" min="200" max="2000" step="100" value="900" style="vertical-align: middle;">
+          </label>
+        </div>
+
+        <div class="explain" id="explain">
+          Presioná <strong>Paso</strong> para avanzar línea por línea, o <strong>Play</strong> para ejecución automática.
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 1rem;">
+        <h2>📋 Console output</h2>
+        <div class="console" id="console"></div>
+      </div>
+    </div>
+
+    <!-- COLUMNA DERECHA: runtime -->
+    <div>
+      <div class="panel">
+        <h2>Runtime</h2>
+        <div class="legend">
+          <span class="sync">sync</span>
+          <span class="micro">microtask</span>
+          <span class="macro">macrotask</span>
+          <span class="webapi">Web APIs</span>
+        </div>
+
+        <div class="runtime" style="margin-top: 1rem;">
+          <div class="box stack" id="box-stack">
+            <span class="box-label">Call Stack (LIFO)</span>
+            <div class="items" id="stack"></div>
+          </div>
+
+          <div class="box web" id="box-web">
+            <span class="box-label">Web APIs (navegador)</span>
+            <div class="items" id="web"></div>
+          </div>
+
+          <div class="box micro" id="box-micro">
+            <span class="box-label">Microtask Queue (Promises)</span>
+            <div class="items" id="micro"></div>
+          </div>
+
+          <div class="box macro" id="box-macro">
+            <span class="box-label">Macrotask Queue (setTimeout, I/O)</span>
+            <div class="items" id="macro"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 1rem; font-size: 0.85em; color: #cbd5e1;">
+        <h2>🎯 Regla del event loop</h2>
+        <p>Cuando el call stack está vacío:</p>
+        <ol style="padding-left: 1.2rem; margin: 0.3rem 0;">
+          <li><strong>Vaciar TODA la microtask queue</strong> (en orden).</li>
+          <li>Tomar <strong>UNA</strong> macrotask.</li>
+          <li>Volver al paso 1.</li>
+        </ol>
+        <p style="margin-top: 0.5rem; color: #fbbf24;">
+          Por eso Promises siempre corren antes que setTimeout(..., 0).
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  // ═══════════════════════════════════════════════
+  // Configuración de los ejemplos
+  // Cada "step" representa una acción de la VM:
+  //   push-stack / pop-stack / to-web / schedule-micro / schedule-macro / log / note
+  // ═══════════════════════════════════════════════
+
+  const EXAMPLES = [
+    // ─── 0: orden básico ───
+    {
+      code: [
+        "console.log('1');",
+        "setTimeout(() => console.log('2'), 0);",
+        "Promise.resolve().then(() => console.log('3'));",
+        "console.log('4');",
+      ],
+      steps: [
+        { line: 0, action: 'log', text: "1", kind: 'sync',  note: "Código sync ejecuta directo en el call stack." },
+        { line: 1, action: 'to-web', id: 'setTimeout(→2)', note: "setTimeout delega al navegador. El timer corre en Web APIs." },
+        { line: 2, action: 'schedule-micro', id: '.then(→3)', note: "Promise.resolve() ya resolvió → el callback va a MICROtask queue." },
+        { line: 3, action: 'log', text: "4", kind: 'sync', note: "Seguimos con código sync: imprime '4'." },
+        { line: null, action: 'note', note: "⚡ Stack vacío. Event loop: vaciar microtasks primero." },
+        { line: 2, action: 'run-micro', text: "3", note: "Toma .then(→3) de micro queue. Corre en el stack." },
+        { line: null, action: 'note', note: "Microtask queue vacía. Ahora toma UNA macrotask." },
+        { line: 1, action: 'timer-ready', id: 'setTimeout(→2)', note: "El timer de 0ms expiró → pasa de Web APIs a MACROtask queue." },
+        { line: 1, action: 'run-macro', text: "2", note: "Se ejecuta setTimeout callback: imprime '2'." },
+        { line: null, action: 'note', note: "✅ Salida final: 1, 4, 3, 2 — microtasks siempre antes que macrotasks." },
+      ]
+    },
+
+    // ─── 1: muchas microtasks vencen a una macro ───
+    {
+      code: [
+        "setTimeout(() => console.log('macro-1'), 0);",
+        "Promise.resolve().then(() => console.log('micro-1'));",
+        "Promise.resolve().then(() => {",
+        "  console.log('micro-2');",
+        "  Promise.resolve().then(() => console.log('micro-3'));",
+        "});",
+        "setTimeout(() => console.log('macro-2'), 0);",
+      ],
+      steps: [
+        { line: 0, action: 'to-web', id: 'setTimeout(→macro-1)', note: "Timer macro-1 va a Web APIs." },
+        { line: 1, action: 'schedule-micro', id: '.then(→micro-1)', note: "micro-1 encolado." },
+        { line: 2, action: 'schedule-micro', id: '.then(→micro-2)', note: "micro-2 encolado." },
+        { line: 6, action: 'to-web', id: 'setTimeout(→macro-2)', note: "Timer macro-2 va a Web APIs." },
+        { line: null, action: 'note', note: "Stack vacío → vaciar microtasks." },
+        { line: 1, action: 'run-micro', text: "micro-1", note: "Corre micro-1." },
+        { line: 4, action: 'run-micro', text: "micro-2", note: "Corre micro-2. Adentro se encola micro-3 EN LA MISMA VACIADA." },
+        { line: 4, action: 'schedule-micro', id: '.then(→micro-3)', note: "micro-3 se suma a la cola activa." },
+        { line: 4, action: 'run-micro', text: "micro-3", note: "Se vacían TODAS las micros acumuladas antes de pasar a macros." },
+        { line: null, action: 'note', note: "Micro queue vacía. Ahora timers → macros." },
+        { line: 0, action: 'timer-ready', id: 'setTimeout(→macro-1)', note: "macro-1 listo." },
+        { line: 6, action: 'timer-ready', id: 'setTimeout(→macro-2)', note: "macro-2 listo." },
+        { line: 0, action: 'run-macro', text: "macro-1", note: "Corre macro-1." },
+        { line: 6, action: 'run-macro', text: "macro-2", note: "Corre macro-2." },
+        { line: null, action: 'note', note: "✅ Orden: micro-1, micro-2, micro-3, macro-1, macro-2. Las macros ESPERAN." },
+      ]
+    },
+
+    // ─── 2: fetch realista ───
+    {
+      code: [
+        "console.log('antes');",
+        "fetch('/api/datos')",
+        "  .then(r => r.json())",
+        "  .then(data => console.log('llegó', data));",
+        "console.log('después');",
+      ],
+      steps: [
+        { line: 0, action: 'log', text: "antes", kind: 'sync', note: "Log sync: 'antes'." },
+        { line: 1, action: 'to-web', id: 'fetch(/api/datos)', note: "fetch() crea un request HTTP. El navegador lo maneja." },
+        { line: 4, action: 'log', text: "después", kind: 'sync', note: "Mientras el request viaja, seguimos con sync: 'después'." },
+        { line: null, action: 'note', note: "Stack vacío. No hay microtasks ni macrotasks aún. Esperamos la red..." },
+        { line: 2, action: 'schedule-micro', id: '.then(r=>r.json())', note: "⚡ Llegó la respuesta. El .then se encola como microtask." },
+        { line: 2, action: 'run-micro', text: "(parseando JSON)", note: "Parsea el body como JSON (devuelve una nueva Promise)." },
+        { line: 3, action: 'schedule-micro', id: '.then(data=>...)', note: "Cuando el JSON resuelve, encola el próximo .then." },
+        { line: 3, action: 'run-micro', text: "llegó, {...}", note: "Corre el callback final con los datos." },
+        { line: null, action: 'note', note: "✅ La app nunca se congeló: la red es asíncrona y el UI siguió respondiendo." },
+      ]
+    },
+
+    // ─── 3: async/await ───
+    {
+      code: [
+        "async function demo() {",
+        "  console.log('A');",
+        "  await null;",
+        "  console.log('B');",
+        "}",
+        "demo();",
+        "console.log('C');",
+      ],
+      steps: [
+        { line: 5, action: 'push-stack', id: 'demo()', note: "Llamamos demo() — sube al call stack." },
+        { line: 1, action: 'log', text: "A", kind: 'sync', note: "Imprime 'A' antes del await." },
+        { line: 2, action: 'schedule-micro', id: 'resume-demo', note: "await pausa la función y encola la continuación como microtask." },
+        { line: 5, action: 'pop-stack', id: 'demo()', note: "demo() sale del stack (está suspendida)." },
+        { line: 6, action: 'log', text: "C", kind: 'sync', note: "Seguimos con sync: imprime 'C'." },
+        { line: null, action: 'note', note: "Stack vacío → vaciar micros." },
+        { line: 3, action: 'run-micro', text: "B", note: "Resume demo() después del await → imprime 'B'." },
+        { line: null, action: 'note', note: "✅ Orden: A, C, B. await es azúcar para .then — genera una microtask." },
+      ]
+    },
+  ];
+
+  // ═══════════════════════════════════════════════
+  // Estado e interacción
+  // ═══════════════════════════════════════════════
+
+  const state = {
+    example: 0,
+    stepIdx: 0,
+    stack: [],
+    web: [],
+    micro: [],
+    macro: [],
+    playing: false,
+    speed: 900,
+    timer: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  // Render del código
+  function renderCode() {
+    const ex = EXAMPLES[state.example];
+    const currentLine = state.stepIdx > 0 ? EXAMPLES[state.example].steps[state.stepIdx - 1]?.line : null;
+    $('code').innerHTML = ex.code.map((line, i) => {
+      const cls = i === currentLine ? 'active' : '';
+      return `<div class="line ${cls}">${String(i).padStart(2,' ')}  ${escapeHtml(line)}</div>`;
+    }).join('');
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // Render de las cajas
+  function renderBox(id, items, kind) {
+    $(id).innerHTML = items.map(it => `<div class="item ${kind}">${it}</div>`).join('');
+    $('box-' + id).classList.toggle('active', items.length > 0);
+  }
+
+  function renderAll() {
+    renderBox('stack', state.stack, 'stack');
+    renderBox('web',   state.web,   'web');
+    renderBox('micro', state.micro, 'micro');
+    renderBox('macro', state.macro, 'macro');
+  }
+
+  // Log en consola
+  function logToConsole(text, kind) {
+    const el = document.createElement('div');
+    el.className = `log ${kind}`;
+    el.textContent = `› ${text}`;
+    $('console').appendChild(el);
+    $('console').scrollTop = $('console').scrollHeight;
+  }
+
+  // Ejecutar un step
+  function runStep() {
+    const ex = EXAMPLES[state.example];
+    if (state.stepIdx >= ex.steps.length) {
+      pause();
+      return false;
+    }
+    const s = ex.steps[state.stepIdx];
+
+    switch (s.action) {
+      case 'log':
+        // push, "ejecuta", pop rápido
+        state.stack.push(`console.log('${s.text}')`);
+        renderAll();
+        setTimeout(() => {
+          state.stack.pop();
+          logToConsole(s.text, s.kind || 'sync');
+          renderAll();
+        }, state.speed / 2);
+        break;
+      case 'push-stack':
+        state.stack.push(s.id);
+        break;
+      case 'pop-stack':
+        state.stack = state.stack.filter(x => x !== s.id);
+        break;
+      case 'to-web':
+        state.web.push(s.id);
+        break;
+      case 'schedule-micro':
+        state.micro.push(s.id);
+        break;
+      case 'schedule-macro':
+        state.macro.push(s.id);
+        break;
+      case 'timer-ready':
+        state.web = state.web.filter(x => x !== s.id);
+        state.macro.push(s.id);
+        break;
+      case 'run-micro': {
+        const item = state.micro.shift();
+        if (item !== undefined) state.stack.push(item);
+        renderAll();
+        setTimeout(() => {
+          state.stack.pop();
+          if (s.text) logToConsole(s.text, 'micro');
+          renderAll();
+        }, state.speed / 2);
+        break;
+      }
+      case 'run-macro': {
+        const item = state.macro.shift();
+        if (item !== undefined) state.stack.push(item);
+        renderAll();
+        setTimeout(() => {
+          state.stack.pop();
+          if (s.text) logToConsole(s.text, 'macro');
+          renderAll();
+        }, state.speed / 2);
+        break;
+      }
+      case 'note':
+        // no side effect, solo explicación
+        break;
+    }
+
+    $('explain').innerHTML = s.note;
+    state.stepIdx++;
+    renderCode();
+    renderAll();
+    return true;
+  }
+
+  function play() {
+    if (state.playing) return;
+    state.playing = true;
+    $('play').textContent = '⏸ Pause';
+    const tick = () => {
+      if (!state.playing) return;
+      const ok = runStep();
+      if (!ok) return;
+      state.timer = setTimeout(tick, state.speed);
+    };
+    tick();
+  }
+
+  function pause() {
+    state.playing = false;
+    clearTimeout(state.timer);
+    $('play').textContent = '▶ Play';
+  }
+
+  function reset() {
+    pause();
+    state.stepIdx = 0;
+    state.stack = []; state.web = []; state.micro = []; state.macro = [];
+    $('console').innerHTML = '';
+    $('explain').innerHTML = 'Listo para arrancar. Presioná <strong>Paso</strong> o <strong>Play</strong>.';
+    renderCode();
+    renderAll();
+  }
+
+  // Wire up
+  $('ejemplo').addEventListener('change', (e) => {
+    state.example = Number(e.target.value);
+    reset();
+  });
+  $('play').addEventListener('click', () => {
+    if (state.playing) pause(); else play();
+  });
+  $('step').addEventListener('click', () => { pause(); runStep(); });
+  $('reset').addEventListener('click', reset);
+  $('speed').addEventListener('input', (e) => {
+    state.speed = 2200 - Number(e.target.value); // invertido: izquierda=lento, derecha=rápido
+  });
+
+  // Init
+  reset();
+  </script>
+
+</body>
+</html>

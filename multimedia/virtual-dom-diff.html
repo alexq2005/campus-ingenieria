@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Virtual DOM Diff — cómo piensa React</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0; padding: 1.5rem;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 { color: #61dafb; margin-top: 0; }
+    .sub { color: #94a3b8; font-size: 0.95em; margin-bottom: 1rem; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 1rem;
+    }
+    .panel h2 {
+      margin: 0 0 0.5rem; font-size: 0.8em;
+      text-transform: uppercase; letter-spacing: 0.1em;
+      color: #94a3b8;
+    }
+
+    pre.code {
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 0.8rem;
+      overflow: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      margin: 0;
+      line-height: 1.6;
+    }
+    pre.code .tag { color: #61dafb; }
+    pre.code .attr { color: #fbbf24; }
+    pre.code .val { color: #a7f3d0; }
+    pre.code .text { color: #e2e8f0; }
+
+    /* Árbol del DOM */
+    .tree {
+      padding: 0.5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88em;
+    }
+    .tnode {
+      position: relative;
+      padding: 3px 8px;
+      margin: 3px 0;
+      border-radius: 5px;
+      border-left: 3px solid #475569;
+      background: #0f172a;
+      transition: all 0.4s ease;
+    }
+    .tnode .kind { color: #61dafb; font-weight: bold; }
+    .tnode .k-attr { color: #fbbf24; font-size: 0.85em; }
+    .tnode .k-val  { color: #a7f3d0; font-size: 0.85em; }
+    .tnode .k-text { color: #e2e8f0; }
+    .tnode .children { margin-left: 18px; padding-left: 6px; border-left: 1px dashed #334155; margin-top: 4px; }
+
+    .tnode.unchanged { opacity: 0.55; }
+    .tnode.patch-update {
+      border-left-color: #fbbf24;
+      background: rgba(251, 191, 36, 0.12);
+      box-shadow: 0 0 0 1px #fbbf24 inset;
+      animation: pulseY 1s ease 0s 2;
+    }
+    .tnode.patch-add {
+      border-left-color: #34d399;
+      background: rgba(52, 211, 153, 0.12);
+      box-shadow: 0 0 0 1px #34d399 inset;
+      animation: pulseG 1s ease 0s 2;
+    }
+    .tnode.patch-remove {
+      border-left-color: #ef4444;
+      background: rgba(239, 68, 68, 0.12);
+      box-shadow: 0 0 0 1px #ef4444 inset;
+      animation: pulseR 1s ease 0s 2;
+      text-decoration: line-through;
+    }
+    @keyframes pulseY { 50% { transform: scale(1.03); box-shadow: 0 0 20px rgba(251,191,36,0.5); } }
+    @keyframes pulseG { 50% { transform: scale(1.03); box-shadow: 0 0 20px rgba(52,211,153,0.5); } }
+    @keyframes pulseR { 50% { transform: scale(1.03); box-shadow: 0 0 20px rgba(239,68,68,0.5); } }
+
+    /* Controles */
+    .controls {
+      display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem;
+    }
+    button {
+      background: #61dafb; color: #0f172a;
+      border: 0; padding: 0.55rem 1rem;
+      border-radius: 6px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s, transform 0.1s;
+    }
+    button:hover:not(:disabled) { background: #38bdf8; transform: translateY(-1px); }
+    button.secondary { background: #334155; color: #e2e8f0; }
+    button.danger { background: #ef4444; color: white; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Leyenda */
+    .legend {
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      font-size: 0.82em; color: #94a3b8; margin-bottom: 0.5rem;
+    }
+    .legend b { padding: 2px 6px; border-radius: 3px; font-weight: normal; }
+    .legend .l-update { background: rgba(251,191,36,0.15); color: #fbbf24; }
+    .legend .l-add    { background: rgba(52,211,153,0.15); color: #34d399; }
+    .legend .l-remove { background: rgba(239,68,68,0.15); color: #ef4444; }
+
+    /* Patches */
+    .patches {
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 0.7rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      min-height: 80px;
+    }
+    .patch {
+      padding: 4px 8px;
+      margin: 3px 0;
+      border-radius: 4px;
+      border-left: 3px solid;
+      animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; } }
+    .patch.update { border-color: #fbbf24; background: rgba(251,191,36,0.08); color: #fde047; }
+    .patch.add    { border-color: #34d399; background: rgba(52,211,153,0.08); color: #6ee7b7; }
+    .patch.remove { border-color: #ef4444; background: rgba(239,68,68,0.08); color: #fca5a5; }
+
+    /* Explicación */
+    .explain {
+      background: rgba(97, 218, 251, 0.08);
+      border-left: 3px solid #61dafb;
+      padding: 0.7rem 1rem;
+      border-radius: 4px;
+      margin-bottom: 1rem;
+      font-size: 0.92em;
+      color: #e0f7fa;
+    }
+
+    .state-btn {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      background: #334155; padding: 0.3rem 0.6rem; border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace; font-size: 0.85em;
+    }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-top: 0.5rem; }
+    .two-col .panel h2 { text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>⚛️ Virtual DOM Diff</h1>
+    <p class="sub">
+      Cuando llamás <code>setState</code>, React no re-dibuja todo — solo compara el árbol nuevo con el anterior y aplica los <strong>patches</strong> mínimos al DOM real.
+    </p>
+
+    <div class="explain" id="explain">
+      Presioná un escenario para ver el algoritmo de <em>reconciliación</em> en acción.
+    </div>
+
+    <div class="panel">
+      <h2>Escenarios</h2>
+      <div class="controls">
+        <button data-scene="0">1 · Cambiar texto</button>
+        <button data-scene="1">2 · Toggle className</button>
+        <button data-scene="2">3 · Agregar un &lt;li&gt;</button>
+        <button data-scene="3">4 · Reordenar lista (con key)</button>
+        <button data-scene="4" class="secondary">5 · Reordenar SIN key (anti-pattern)</button>
+        <button id="reset" class="danger">↺ Reset</button>
+      </div>
+      <div class="legend">
+        <b class="l-update">▣ UPDATE — mismo nodo, cambió algo</b>
+        <b class="l-add">▣ ADD — nuevo nodo</b>
+        <b class="l-remove">▣ REMOVE — desapareció</b>
+      </div>
+    </div>
+
+    <div class="layout" style="margin-top: 1rem;">
+      <div class="panel">
+        <h2>Antes (árbol actual)</h2>
+        <div class="tree" id="tree-before"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Después (árbol nuevo, tras setState)</h2>
+        <div class="tree" id="tree-after"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top: 1rem;">
+      <h2>🔧 Patches que React aplica al DOM real</h2>
+      <div class="patches" id="patches">
+        <div style="color: #64748b;">— sin cambios aún —</div>
+      </div>
+      <p style="color: #94a3b8; font-size: 0.85em; margin-top: 0.5rem;">
+        ⚡ React NO re-renderiza nodos "unchanged". Solo aplica estos patches al DOM real
+        → <strong>mucho más rápido</strong> que reconstruir todo.
+      </p>
+    </div>
+
+    <div class="panel" style="margin-top: 1rem;">
+      <h2>🔑 La magia de las keys</h2>
+      <p style="color: #cbd5e1; font-size: 0.9em; line-height: 1.6; margin: 0;">
+        Cuando tenés listas, React necesita saber cuál item es cuál entre renders. Si usás
+        <code style="color:#fbbf24;">key={'{index}'}</code>, al reordenar React piensa que
+        TODOS cambiaron (patches = N). Con <code style="color:#34d399;">key={'{id}'}</code>
+        estable, React mueve los nodos existentes (patches ≈ 1–2). Probá los escenarios 4 y 5
+        y compará el número de patches.
+      </p>
+    </div>
+  </div>
+
+  <script>
+  // ═══════════════════════════════════════════════
+  // Representación de vnodes (JSON plano)
+  //   { tag, attrs, children, key?, text? }
+  // ═══════════════════════════════════════════════
+
+  const SCENES = [
+    // 0 — cambiar texto
+    {
+      desc: `Cambia solo el texto del <code>&lt;h1&gt;</code>. React detecta un UPDATE sobre un solo nodo de texto. <strong>1 patch al DOM</strong>.`,
+      before: {
+        tag: 'div', attrs: { className: 'card' }, children: [
+          { tag: 'h1', attrs: {}, children: [{ text: 'Hola' }] },
+          { tag: 'p', attrs: {}, children: [{ text: 'Contador: 0' }] },
+        ]
+      },
+      after: {
+        tag: 'div', attrs: { className: 'card' }, children: [
+          { tag: 'h1', attrs: {}, children: [{ text: 'Chau' }] },
+          { tag: 'p', attrs: {}, children: [{ text: 'Contador: 0' }] },
+        ]
+      }
+    },
+
+    // 1 — cambiar atributo
+    {
+      desc: `Toggle de <code>className</code> (ej: agregar <code>.active</code>). React detecta un UPDATE de atributo. <strong>1 patch</strong>.`,
+      before: {
+        tag: 'button', attrs: { className: 'btn' }, children: [{ text: 'Click' }]
+      },
+      after: {
+        tag: 'button', attrs: { className: 'btn active' }, children: [{ text: 'Click' }]
+      }
+    },
+
+    // 2 — agregar un li
+    {
+      desc: `Agregamos un ítem al final de la lista. React lo detecta como ADD. Los items existentes quedan intactos. <strong>1 patch</strong>.`,
+      before: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', key: 'a', attrs: {}, children: [{ text: 'Manzana' }] },
+          { tag: 'li', key: 'b', attrs: {}, children: [{ text: 'Banana' }] },
+        ]
+      },
+      after: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', key: 'a', attrs: {}, children: [{ text: 'Manzana' }] },
+          { tag: 'li', key: 'b', attrs: {}, children: [{ text: 'Banana' }] },
+          { tag: 'li', key: 'c', attrs: {}, children: [{ text: 'Cereza' }] },
+        ]
+      }
+    },
+
+    // 3 — reordenar con keys
+    {
+      desc: `Invertimos el orden. <strong>Con keys estables (id)</strong>, React <em>mueve</em> los nodos en vez de destruirlos y recrearlos. <strong>~1 move patch</strong>. Los inputs con foco/estado se preservan.`,
+      before: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', key: '1', attrs: {}, children: [{ text: 'A (key=1)' }] },
+          { tag: 'li', key: '2', attrs: {}, children: [{ text: 'B (key=2)' }] },
+          { tag: 'li', key: '3', attrs: {}, children: [{ text: 'C (key=3)' }] },
+        ]
+      },
+      after: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', key: '3', attrs: {}, children: [{ text: 'C (key=3)' }] },
+          { tag: 'li', key: '2', attrs: {}, children: [{ text: 'B (key=2)' }] },
+          { tag: 'li', key: '1', attrs: {}, children: [{ text: 'A (key=1)' }] },
+        ]
+      }
+    },
+
+    // 4 — reordenar sin keys (anti-pattern)
+    {
+      desc: `⚠️ Sin <code>key</code> estable (o usando <code>key={'{index}'}</code>), React compara por posición: cree que TODOS los textos cambiaron → <strong>3 UPDATE patches</strong>. Si había un input con foco, lo pierde.`,
+      before: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', attrs: {}, children: [{ text: 'A' }] },
+          { tag: 'li', attrs: {}, children: [{ text: 'B' }] },
+          { tag: 'li', attrs: {}, children: [{ text: 'C' }] },
+        ]
+      },
+      after: {
+        tag: 'ul', attrs: {}, children: [
+          { tag: 'li', attrs: {}, children: [{ text: 'C' }] },
+          { tag: 'li', attrs: {}, children: [{ text: 'B' }] },
+          { tag: 'li', attrs: {}, children: [{ text: 'A' }] },
+        ]
+      }
+    },
+  ];
+
+  // ═══════════════════════════════════════════════
+  // Algoritmo simplificado de diff
+  // Devuelve una lista de patches y un árbol decorado con marcas
+  // ═══════════════════════════════════════════════
+
+  function diff(before, after, patches = [], path = 'root') {
+    // ambos iguales por valor → sin cambios
+    if (!before && !after) return { mark: null };
+
+    // Nodo removido
+    if (before && !after) {
+      patches.push({ type: 'remove', path, desc: describe(before) });
+      return { mark: 'remove', node: before };
+    }
+    // Nodo nuevo
+    if (!before && after) {
+      patches.push({ type: 'add', path, desc: describe(after) });
+      return { mark: 'add', node: after };
+    }
+
+    // Text node
+    if ('text' in before && 'text' in after) {
+      if (before.text !== after.text) {
+        patches.push({ type: 'update', path, desc: `"${before.text}" → "${after.text}"` });
+        return { mark: 'update', node: after };
+      }
+      return { mark: null, node: after };
+    }
+
+    // Tag distinto → reemplazar entero
+    if (before.tag !== after.tag) {
+      patches.push({ type: 'update', path, desc: `<${before.tag}> → <${after.tag}>` });
+      return { mark: 'update', node: after };
+    }
+
+    // Comparar attrs
+    let attrChanged = false;
+    const attrsBefore = before.attrs || {};
+    const attrsAfter  = after.attrs  || {};
+    const keys = new Set([...Object.keys(attrsBefore), ...Object.keys(attrsAfter)]);
+    for (const k of keys) {
+      if (attrsBefore[k] !== attrsAfter[k]) {
+        patches.push({ type: 'update', path: `${path}.${k}`, desc: `${k}: "${attrsBefore[k] ?? ''}" → "${attrsAfter[k] ?? ''}"` });
+        attrChanged = true;
+      }
+    }
+
+    // Children — con o sin keys
+    const resultChildren = [];
+    const beforeChildren = before.children || [];
+    const afterChildren  = after.children  || [];
+
+    const anyHasKey = beforeChildren.some(c => c?.key) || afterChildren.some(c => c?.key);
+
+    if (anyHasKey) {
+      // Diff by key
+      const beforeByKey = new Map(beforeChildren.map(c => [c.key, c]));
+      const afterByKey  = new Map(afterChildren.map(c => [c.key, c]));
+
+      // Detectar moves
+      const beforeKeys = beforeChildren.map(c => c.key).join(',');
+      const afterKeys = afterChildren.map(c => c.key).join(',');
+      if (beforeKeys !== afterKeys && new Set(beforeChildren.map(c=>c.key)).size === new Set(afterChildren.map(c=>c.key)).size
+          && beforeChildren.every(c => afterByKey.has(c.key))) {
+        patches.push({ type: 'update', path: `${path}/children`, desc: `reordenar (move only)` });
+      }
+
+      // Diff por key
+      for (const afterChild of afterChildren) {
+        const matchBefore = beforeByKey.get(afterChild.key);
+        const sub = diff(matchBefore, afterChild, patches, `${path}>${afterChild.tag || 'text'}[key=${afterChild.key}]`);
+        resultChildren.push(sub);
+      }
+      // Los que estaban y ya no están
+      for (const beforeChild of beforeChildren) {
+        if (!afterByKey.has(beforeChild.key)) {
+          patches.push({ type: 'remove', path: `${path}>${beforeChild.tag}[key=${beforeChild.key}]`, desc: describe(beforeChild) });
+        }
+      }
+    } else {
+      // Diff posicional (sin keys)
+      const max = Math.max(beforeChildren.length, afterChildren.length);
+      for (let i = 0; i < max; i++) {
+        const sub = diff(beforeChildren[i], afterChildren[i], patches, `${path}>child[${i}]`);
+        resultChildren.push(sub);
+      }
+    }
+
+    return {
+      mark: attrChanged ? 'update' : null,
+      node: { ...after, _children: resultChildren, _attrChanged: attrChanged }
+    };
+  }
+
+  function describe(n) {
+    if (!n) return '';
+    if ('text' in n) return `"${n.text}"`;
+    return `<${n.tag}${n.key ? ` key=${n.key}` : ''}>`;
+  }
+
+  // ═══════════════════════════════════════════════
+  // Render de los árboles
+  // ═══════════════════════════════════════════════
+
+  function renderTree(node, markings, side) {
+    if (!node) return '';
+    if ('text' in node) {
+      const mark = markings.get(node);
+      const cls = mark ? `patch-${mark}` : 'unchanged';
+      return `<div class="tnode ${cls}"><span class="k-text">"${escape(node.text)}"</span></div>`;
+    }
+    const mark = markings.get(node);
+    const cls = mark ? `patch-${mark}` : 'unchanged';
+    const key = node.key !== undefined ? ` <span class="k-attr">key</span>=<span class="k-val">"${node.key}"</span>` : '';
+    const attrs = Object.entries(node.attrs || {})
+      .map(([k, v]) => ` <span class="k-attr">${k}</span>=<span class="k-val">"${v}"</span>`).join('');
+    const children = (node.children || []).map(c => renderTree(c, markings, side)).join('');
+    return `
+      <div class="tnode ${cls}">
+        &lt;<span class="kind">${node.tag}</span>${attrs}${key}&gt;
+        ${children ? `<div class="children">${children}</div>` : ''}
+      </div>`;
+  }
+
+  function escape(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // Marca los nodos del árbol con un tipo de cambio basado en los patches
+  function buildMarkings(before, after, patches) {
+    const markings = new Map();
+
+    // Recorremos before y after y asignamos marca cuando coincide el path
+    function walk(n, isBefore) {
+      if (!n) return;
+      if (!('text' in n)) {
+        (n.children || []).forEach(c => walk(c, isBefore));
+      }
+    }
+
+    // Algoritmo simple: re-hacer el diff y marcar
+    function markDiff(b, a) {
+      if (!b && !a) return;
+      if (b && !a) { markings.set(b, 'remove'); return; }
+      if (!b && a) { markings.set(a, 'add'); return; }
+
+      if ('text' in b && 'text' in a) {
+        if (b.text !== a.text) { markings.set(a, 'update'); markings.set(b, 'update'); }
+        return;
+      }
+      if (b.tag !== a.tag) {
+        markings.set(b, 'remove'); markings.set(a, 'add');
+        return;
+      }
+      // attrs
+      const A = b.attrs || {}, B = a.attrs || {};
+      const keys = new Set([...Object.keys(A), ...Object.keys(B)]);
+      let changed = false;
+      for (const k of keys) if (A[k] !== B[k]) changed = true;
+      if (changed) { markings.set(a, 'update'); markings.set(b, 'update'); }
+
+      // children
+      const bc = b.children || [], ac = a.children || [];
+      const anyHasKey = bc.some(c => c?.key) || ac.some(c => c?.key);
+      if (anyHasKey) {
+        const bByK = new Map(bc.map(c => [c.key, c]));
+        const aByK = new Map(ac.map(c => [c.key, c]));
+        for (const ch of ac) markDiff(bByK.get(ch.key), ch);
+        for (const ch of bc) if (!aByK.has(ch.key)) markings.set(ch, 'remove');
+      } else {
+        const max = Math.max(bc.length, ac.length);
+        for (let i = 0; i < max; i++) markDiff(bc[i], ac[i]);
+      }
+    }
+    markDiff(before, after);
+
+    return markings;
+  }
+
+  // ═══════════════════════════════════════════════
+  // Wire up
+  // ═══════════════════════════════════════════════
+
+  function runScene(sceneIdx) {
+    const scene = SCENES[sceneIdx];
+    const patches = [];
+    diff(scene.before, scene.after, patches);
+    const markings = buildMarkings(scene.before, scene.after, patches);
+
+    document.getElementById('explain').innerHTML = scene.desc;
+    document.getElementById('tree-before').innerHTML = renderTree(scene.before, markings, 'before');
+    document.getElementById('tree-after').innerHTML  = renderTree(scene.after,  markings, 'after');
+
+    const patchesEl = document.getElementById('patches');
+    if (patches.length === 0) {
+      patchesEl.innerHTML = '<div style="color: #64748b;">— sin cambios —</div>';
+    } else {
+      patchesEl.innerHTML = patches.map(p =>
+        `<div class="patch ${p.type}">
+          [${p.type.toUpperCase()}] ${p.path} — ${p.desc}
+        </div>`
+      ).join('') + `<div style="margin-top: 0.5rem; color: #94a3b8;">Total de patches: <strong>${patches.length}</strong></div>`;
+    }
+  }
+
+  document.querySelectorAll('[data-scene]').forEach(btn => {
+    btn.addEventListener('click', () => runScene(Number(btn.dataset.scene)));
+  });
+  document.getElementById('reset').addEventListener('click', () => {
+    document.getElementById('tree-before').innerHTML = '';
+    document.getElementById('tree-after').innerHTML = '';
+    document.getElementById('patches').innerHTML = '<div style="color: #64748b;">— sin cambios aún —</div>';
+    document.getElementById('explain').innerHTML = 'Presioná un escenario para ver el algoritmo de <em>reconciliación</em> en acción.';
+  });
+  </script>
+</body>
+</html>

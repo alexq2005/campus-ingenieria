@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TODO App — DOM + localStorage + event delegation</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 500px; margin: 2rem auto; padding: 1rem; background: #f1f5f9; }
+    h1 { margin-top: 0; }
+    .app { background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+
+    form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    input[type=text] { flex: 1; padding: 0.6rem; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 1rem; }
+    button { padding: 0.6rem 1rem; background: #0ea5e9; color: white; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #0284c7; }
+
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem; border-bottom: 1px solid #e2e8f0; }
+    li:last-child { border-bottom: 0; }
+    li.done span.text { text-decoration: line-through; color: #94a3b8; }
+    li span.text { flex: 1; }
+    li button.del { background: #fee2e2; color: #b91c1c; font-size: 0.8em; padding: 0.3rem 0.6rem; }
+    li button.del:hover { background: #fecaca; }
+
+    .empty { color: #94a3b8; text-align: center; padding: 2rem; }
+    .stats { font-size: 0.85em; color: #64748b; margin-top: 1rem; display: flex; justify-content: space-between; }
+    .filters button { background: transparent; color: #475569; padding: 0.3rem 0.6rem; font-size: 0.85em; }
+    .filters button.activo { background: #0ea5e9; color: white; }
+  </style>
+</head>
+<body>
+
+  <div class="app">
+    <h1>Mis TODOs</h1>
+
+    <form id="form">
+      <input type="text" id="entrada" placeholder="¿Qué tenés que hacer?" required maxlength="120" autocomplete="off">
+      <button type="submit">Agregar</button>
+    </form>
+
+    <div class="filters" id="filtros">
+      <button data-filtro="todos" class="activo">Todos</button>
+      <button data-filtro="pendientes">Pendientes</button>
+      <button data-filtro="completados">Completados</button>
+    </div>
+
+    <ul id="lista"></ul>
+
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <script>
+    // Estado
+    const STORAGE_KEY = 'todos_v1';
+    let todos = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+    let filtro = 'todos';
+
+    // Referencias DOM
+    const form = document.getElementById('form');
+    const entrada = document.getElementById('entrada');
+    const lista = document.getElementById('lista');
+    const stats = document.getElementById('stats');
+    const filtros = document.getElementById('filtros');
+
+    function guardar() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(todos));
+    }
+
+    function render() {
+      // Filtrar
+      const visibles = todos.filter(t =>
+        filtro === 'todos' ? true :
+        filtro === 'pendientes' ? !t.done :
+        t.done
+      );
+
+      if (visibles.length === 0) {
+        lista.innerHTML = '<li class="empty">Sin tareas</li>';
+      } else {
+        // Document fragment para no disparar re-layout por cada item
+        const frag = document.createDocumentFragment();
+        for (const t of visibles) {
+          const li = document.createElement('li');
+          li.dataset.id = t.id;
+          if (t.done) li.classList.add('done');
+          li.innerHTML = `
+            <input type="checkbox" data-action="toggle" ${t.done ? 'checked' : ''}>
+            <span class="text"></span>
+            <button class="del" data-action="del">Borrar</button>
+          `;
+          // textContent para evitar XSS — NUNCA innerHTML con input del usuario
+          li.querySelector('.text').textContent = t.texto;
+          frag.appendChild(li);
+        }
+        lista.replaceChildren(frag);
+      }
+
+      // Stats
+      const total = todos.length;
+      const pend = todos.filter(t => !t.done).length;
+      stats.innerHTML = `
+        <span>${pend} pendiente${pend !== 1 ? 's' : ''} de ${total}</span>
+        <button id="limpiar" style="background:#fee2e2;color:#b91c1c;font-size:0.85em;">Borrar completados</button>
+      `;
+      document.getElementById('limpiar').onclick = () => {
+        todos = todos.filter(t => !t.done);
+        guardar(); render();
+      };
+
+      // Filtros activos
+      [...filtros.children].forEach(b => {
+        b.classList.toggle('activo', b.dataset.filtro === filtro);
+      });
+    }
+
+    // Crear
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const texto = entrada.value.trim();
+      if (!texto) return;
+      todos.unshift({ id: Date.now(), texto, done: false });
+      entrada.value = '';
+      guardar(); render();
+    });
+
+    // Delegation para toggle y borrar
+    lista.addEventListener('click', (e) => {
+      const action = e.target.dataset.action;
+      if (!action) return;
+      const li = e.target.closest('li');
+      const id = Number(li.dataset.id);
+      const t = todos.find(x => x.id === id);
+      if (!t) return;
+
+      if (action === 'toggle') t.done = !t.done;
+      if (action === 'del')    todos = todos.filter(x => x.id !== id);
+
+      guardar(); render();
+    });
+
+    // Filtros (también por delegation)
+    filtros.addEventListener('click', (e) => {
+      const f = e.target.dataset.filtro;
+      if (!f) return;
+      filtro = f;
+      render();
+    });
+
+    render();
+  </script>
+</body>
+</html>

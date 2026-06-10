@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 06 — Acortador de URLs · Campus CS-FE</title>
+<meta name="description" content="Servicio fullstack tipo bit.ly: API REST, base de datos, redirects, analytics.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 06</span>
+  <span class="badge nivel-avan">🟠 Avanzado</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">Fullstack</span>
+</div>
+
+<article>
+
+<h1>🔗 Acortador de URLs (Fullstack)</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un servicio tipo bit.ly. El usuario pega una URL larga, recibe una corta (<code>tusitio.com/aZ3k</code>), y al visitarla redirige a la original. Con analytics de clicks. Es <strong>EL proyecto fullstack canónico</strong>: simple de explicar, rico en conceptos de backend.
+</div>
+
+<h2>Por qué este proyecto enseña tanto</h2>
+<p>Parece trivial pero toca: diseño de API REST, base de datos, generación de IDs únicos, redirects HTTP, rate limiting, caching, y analytics. Es pequeño en alcance pero profundo en conceptos de sistemas.</p>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Diseñar una <strong>API REST</strong> (endpoints, métodos, status codes).</li>
+  <li>Modelar y consultar una <strong>base de datos</strong> (SQL).</li>
+  <li>Generar <strong>códigos cortos únicos</strong> (base62, colisiones).</li>
+  <li><strong>Redirects HTTP</strong> (301 vs 302) y por qué importa.</li>
+  <li><strong>Rate limiting</strong> e idempotencia (anti-abuso).</li>
+  <li>Frontend que consume tu propia API.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>Backend: Next.js API routes (o Express/FastAPI). DB: Postgres (Neon) + Drizzle/Prisma. Frontend: React. Deploy: Vercel.</p>
+
+<h2>Arquitectura</h2>
+
+<pre><code>[Frontend React] ──POST /api/shorten──► [Backend] ──► [Postgres]
+                                            │            id | code | url_larga | clicks
+   visitar tusitio.com/aZ3k ──GET /aZ3k──► [Backend] ──► busca code, +1 click, redirige (302)</code></pre>
+
+<h2>Fases</h2>
+
+<div class="fase"><strong>Fase 1 — Schema + endpoint de creación.</strong> Tabla <code>links</code>. Endpoint <code>POST /api/shorten</code> que recibe una URL, genera un code, lo guarda y lo devuelve.</div>
+
+<pre><code>// Generar code corto base62 (a-z A-Z 0-9)
+function generarCode(len = 6) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  return Array.from({ length: len }, () =>
+    chars[Math.floor(Math.random() * chars.length)]
+  ).join('');
+}
+
+// POST /api/shorten
+export async function POST(req) {
+  const { url } = await req.json();
+  if (!esUrlValida(url)) return Response.json({ error: 'URL inválida' }, { status: 400 });
+
+  let code;
+  do { code = generarCode(); } while (await existeCode(code)); // evitar colisión
+  await db.insert(links).values({ code, urlLarga: url, clicks: 0 });
+
+  return Response.json({ code, short: `${BASE}/${code}` });
+}</code></pre>
+
+<div class="fase"><strong>Fase 2 — Redirect.</strong> Endpoint <code>GET /:code</code> que busca el code, incrementa el contador de clicks y redirige a la URL original.</div>
+
+<pre><code>// GET /[code]
+export async function GET(req, { params }) {
+  const link = await db.query.links.findFirst({
+    where: eq(links.code, params.code),
+  });
+  if (!link) return new Response('No encontrado', { status: 404 });
+
+  await db.update(links).set({ clicks: link.clicks + 1 }).where(eq(links.code, params.code));
+
+  return Response.redirect(link.urlLarga, 302);  // temporal: permite contar clicks
+}</code></pre>
+
+<blockquote>302 (temporal) vs 301 (permanente): con 301 el browser cachea el redirect y deja de pegar a tu server → NO contás clicks. Por eso para analytics usás 302.</blockquote>
+
+<div class="fase"><strong>Fase 3 — Rate limiting + validación.</strong> Limitar cuántas URLs puede crear una IP por minuto (anti-spam). Validar que la URL sea real y no apunte a tu propio dominio (loop).</div>
+
+<div class="fase"><strong>Fase 4 — Frontend + analytics.</strong> Página para crear links, listar los tuyos, copiar al portapapeles, y ver clicks por link en un gráfico.</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong> este proyecto materializa
+  <a href="../../Curso ingenieria sistemas/area-04-bases-de-datos/m19-modelado-y-sql/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M19 SQL</a> (schema, queries),
+  <a href="../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m15-redes-de-computadoras/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M15 Redes</a> (HTTP, status codes, redirects),
+  <a href="../../Curso ingenieria sistemas/area-06-seguridad/m31-seguridad-aplicaciones/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M31 Seguridad</a> (rate limiting, validación, SSRF),
+  <a href="../../Curso ingenieria sistemas/area-07-desarrollo-aplicado/m33-desarrollo-web-fullstack/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M33 Fullstack</a> y el
+  <a href="../Curso-React/index.html">Curso de React</a> para el frontend.
+</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Creás una URL corta desde el frontend.</li>
+    <li>Al visitarla, redirige a la original.</li>
+    <li>El contador de clicks sube en cada visita.</li>
+    <li>Hay rate limiting y validación de URL.</li>
+    <li>Ves analytics (clicks por link) en un gráfico.</li>
+    <li>Está deployado con DB real y URL pública.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Códigos personalizados (<code>tusitio.com/mi-promo</code>).</li>
+  <li>Expiración: links que mueren tras N días o N clicks.</li>
+  <li>QR code automático para cada link.</li>
+  <li>Auth: cada usuario ve solo sus links (se conecta con M31 auth).</li>
+  <li>Analytics avanzado: país, dispositivo, referer de cada click.</li>
+  <li>Cache con Redis para los redirects más usados (M21 NoSQL).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./04-notas-markdown.html">← Notas Markdown</a>
+  <a href="./09-semaforo-inteligente.html">Siguiente: Semáforo Inteligente →</a>
+</nav>
+
+</div>
+</body>
+</html>

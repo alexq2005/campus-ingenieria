@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Impacto · Screening de Salud por Imagen · Campus CS-FE</title>
+<meta name="description" content="Modelo que pre-filtra imágenes médicas (lesiones de piel, radiografías) para priorizar casos en zonas sin especialistas. Apoyo, no diagnóstico.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html">🎓 M40 Deep Learning</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Impacto · Salud</span>
+  <span class="badge nivel-avan">Avanzado</span>
+  <span class="badge">⏱ ~3 semanas</span>
+  <span class="badge">Visión + Ética</span>
+</div>
+
+<article>
+
+<h1>🩺 Screening de Salud por Imagen</h1>
+
+<div class="impacto">
+  <strong>🌍 El problema:</strong> en gran parte del mundo no hay dermatólogos ni radiólogos cerca. Una persona con una lesión sospechosa puede tardar meses en ser vista — y en cáncer de piel o tuberculosis, el tiempo es vida. <strong>A quién ayuda:</strong> comunidades rurales y centros de atención primaria sin especialistas, donde un modelo que <em>prioriza</em> los casos que más urge derivar puede acelerar el diagnóstico.
+</div>
+
+<div class="danger">
+  ⚠️ <strong>Esto NO diagnostica ni reemplaza a un médico.</strong> Es una herramienta de <em>triage</em> y educación: ayuda a priorizar a quién derivar primero. Todo resultado debe ser confirmado por un profesional. Un modelo mal usado en medicina puede dañar — por eso la ética y los límites son parte central del proyecto.
+</div>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> entrenar un clasificador que, dada una foto de una lesión de piel (o una radiografía de tórax), estime la probabilidad de que sea un caso que requiere atención prioritaria, y explique en qué se fija. El foco no es "acertar", sino construir un sistema <strong>honesto sobre su incertidumbre</strong> y útil para priorizar.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html">M40 Deep Learning</a> (CNN, transfer learning),
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m42-vision-por-computadora/lecture.html">M42 Visión</a>,
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m39-machine-learning-clasico/lecture.html">M39 ML</a> (métricas, sesgo) y el
+  <a href="./16-clasificador-imagenes.html">Proyecto 16 (CNN)</a>.
+</div>
+
+<h2>Por qué accuracy NO alcanza en medicina</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 180" role="img" aria-label="Matriz de confusión: un falso negativo en medicina es mucho más grave que un falso positivo">
+  <text x="380" y="20" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui" font-weight="700">No todos los errores cuestan igual</text>
+  <!-- grid 2x2 -->
+  <rect x="250" y="45" width="130" height="55" fill="rgba(16,185,129,0.15)" stroke="#3fb950" stroke-width="1.5"/>
+  <rect x="380" y="45" width="130" height="55" fill="rgba(245,158,11,0.15)" stroke="#fbbf24" stroke-width="1.5"/>
+  <rect x="250" y="100" width="130" height="55" fill="rgba(239,68,68,0.20)" stroke="#fb7185" stroke-width="2"/>
+  <rect x="380" y="100" width="130" height="55" fill="rgba(16,185,129,0.15)" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="315" y="70" text-anchor="middle" fill="#3fb950" font-size="11" font-family="system-ui">✓ Sano detectado</text>
+  <text x="315" y="86" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">correcto</text>
+  <text x="445" y="68" text-anchor="middle" fill="#fbbf24" font-size="11" font-family="system-ui">Falso positivo</text>
+  <text x="445" y="84" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">susto, derivación de más</text>
+  <text x="315" y="123" text-anchor="middle" fill="#fb7185" font-size="11" font-family="system-ui" font-weight="700">Falso NEGATIVO</text>
+  <text x="315" y="139" text-anchor="middle" fill="#fb7185" font-size="9" font-family="system-ui">enfermo dado por sano ⚠️</text>
+  <text x="445" y="123" text-anchor="middle" fill="#3fb950" font-size="11" font-family="system-ui">✓ Enfermo detectado</text>
+  <text x="445" y="139" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">correcto</text>
+  <!-- labels -->
+  <text x="180" y="76" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">dice "sano"</text>
+  <text x="180" y="130" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">dice "derivar"</text>
+  <text x="170" y="172" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">En triage médico, el falso negativo (rojo) es el error grave: hay que minimizarlo (alta sensibilidad).</text>
+</svg>
+<figcaption>Un modelo con 95% de accuracy puede ser inútil si los errores que comete son falsos negativos. En screening médico priorizás <strong>sensibilidad/recall</strong>: preferís derivar de más antes que dejar pasar un caso real.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li><strong>Transfer learning</strong>: ajustar una red preentrenada a un dataset médico chico (M40).</li>
+  <li>Por qué <strong>accuracy engaña</strong> y cómo usar sensibilidad, especificidad, AUC (M39).</li>
+  <li><strong>Sesgo en datos</strong>: un modelo entrenado solo con cierta piel falla en otras — equidad.</li>
+  <li><strong>Explicabilidad</strong> (Grad-CAM): mostrar en qué parte de la imagen se fijó.</li>
+  <li>Calibración de confianza y cuándo el modelo debe decir "no estoy seguro, derivá".</li>
+  <li>Los <strong>límites éticos</strong>: triage ≠ diagnóstico, y por qué documentarlos.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>Python · PyTorch/TensorFlow · datasets públicos y éticos: <strong>HAM10000</strong> (lesiones de piel) o radiografías de tórax abiertas · Grad-CAM para explicabilidad · matplotlib. Corre en Colab con GPU gratis.</p>
+
+<h2>Código clave (transfer learning + métrica correcta)</h2>
+
+<pre><code class="lang-python">import torch, torchvision.models as models
+from sklearn.metrics import recall_score, roc_auc_score
+
+# Transfer learning: red preentrenada, ajustamos la última capa (M40)
+model = models.resnet18(weights="IMAGENET1K_V1")
+model.fc = torch.nn.Linear(model.fc.in_features, 2)   # sano / derivar
+
+# Tras entrenar, evaluamos con la métrica que importa en salud
+preds = predict(model, test_loader)
+print("Recall (sensibilidad):", recall_score(y_true, preds))   # ¡el que cuenta!
+print("AUC:", roc_auc_score(y_true, probs))
+# Un recall bajo = casos reales que se escapan = inaceptable en triage</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <strong>transfer learning</strong> (M40) es lo que hace viable esto: una red ya aprendió a "ver" con millones de fotos; vos solo la reajustás a tu dominio con pocos datos. Y elegir <code>recall</code> en vez de <code>accuracy</code> es una decisión ética codificada en una métrica — M39 te enseña por qué.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> explorá el dataset (P18 EDA). ¿Está balanceado? ¿Qué tipos de piel/pacientes representa? Documentá sesgos.</div>
+<div class="fase"><strong>Fase 2:</strong> baseline con transfer learning. Medí recall, especificidad y AUC (no solo accuracy).</div>
+<div class="fase"><strong>Fase 3:</strong> ajustá el umbral para priorizar sensibilidad. Mostrá el trade-off con la curva ROC.</div>
+<div class="fase"><strong>Fase 4:</strong> Grad-CAM: visualizá en qué parte de la imagen se fija. ¿Mira la lesión o el fondo?</div>
+<div class="fase"><strong>Fase 5:</strong> escribí la "ficha del modelo": para qué sirve, para qué NO, en qué población falla, su incertidumbre.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Reportás sensibilidad/especificidad/AUC, no solo accuracy.</li>
+    <li>Grad-CAM muestra que el modelo mira la lesión, no artefactos del fondo.</li>
+    <li>Documentaste los sesgos del dataset y dónde el modelo NO se debe usar.</li>
+    <li>El sistema dice "incierto, derivá" en casos ambiguos en vez de arriesgar.</li>
+    <li>Está claro en toda la interfaz que es triage, no diagnóstico.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>App offline en el teléfono (TinyML/ONNX) para zonas sin internet.</li>
+  <li>Detección de retinopatía diabética (otra causa enorme de ceguera evitable).</li>
+  <li>Cola de priorización: ordenar pacientes por urgencia estimada para el especialista.</li>
+  <li>Estudio de equidad: medir el rendimiento por subgrupo y corregir sesgos.</li>
+  <li>Integración con RAG (P17) para explicar al paciente próximos pasos.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./impacto-01-detector-caidas.html">← Detector de Caídas</a>
+  <a href="./impacto-03-oximetro.html">Siguiente: Monitor de Signos Vitales →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Feature Flags Simulator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0a0e1a; color: #e2e8f0;
+      min-height: 100vh; padding: 1.5rem;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 {
+      background: linear-gradient(135deg, #06b6d4, #34d399);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      font-size: 1.8rem; margin-bottom: 0.3rem;
+    }
+    .sub { color: #94a3b8; margin-bottom: 1.5rem; }
+    a { color: #06b6d4; text-decoration: none; }
+    .back { color: #94a3b8; font-size: 0.9em; display: inline-block; margin-bottom: 1rem; }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem;
+      margin-bottom: 1rem;
+    }
+    .panel h2 {
+      font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #94a3b8; margin-bottom: 0.7rem;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+    }
+    .ctrl label {
+      font-size: 0.82em; color: #cbd5e1; margin-bottom: 0.3rem; display: block;
+    }
+    .ctrl input[type=range] { width: 100%; accent-color: #06b6d4; }
+    .ctrl .value { font-family: monospace; color: #34d399; font-weight: 700; }
+
+    /* Grid de usuarios */
+    .users-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(35px, 1fr));
+      gap: 4px;
+      max-width: 700px;
+      margin-top: 1rem;
+    }
+    .user {
+      aspect-ratio: 1;
+      border-radius: 4px;
+      background: #334155;
+      transition: all 0.3s;
+      position: relative;
+      cursor: help;
+    }
+    .user.variant-a { background: #06b6d4; }
+    .user.variant-b { background: #f472b6; }
+    .user.disabled { background: #334155; }
+    .user:hover::after {
+      content: attr(data-info);
+      position: absolute;
+      bottom: 100%; left: 50%;
+      transform: translateX(-50%);
+      background: #0f172a;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.75em;
+      white-space: nowrap;
+      pointer-events: none;
+      z-index: 10;
+      border: 1px solid #334155;
+    }
+
+    .legend {
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      margin-top: 1rem; font-size: 0.85em;
+    }
+    .legend-item {
+      display: flex; align-items: center; gap: 0.4rem;
+    }
+    .legend-swatch {
+      width: 16px; height: 16px; border-radius: 3px;
+    }
+
+    /* Stats */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.7rem; margin-top: 1rem;
+    }
+    .stat {
+      background: #0f172a;
+      padding: 0.8rem;
+      border-radius: 6px;
+      text-align: center;
+    }
+    .stat-num {
+      font-size: 1.8rem; font-weight: 800;
+      font-family: monospace;
+    }
+    .stat-label {
+      font-size: 0.72em; color: #94a3b8;
+      text-transform: uppercase; letter-spacing: 0.08em;
+    }
+    .stat[data-kind="a"] .stat-num { color: #06b6d4; }
+    .stat[data-kind="b"] .stat-num { color: #f472b6; }
+    .stat[data-kind="off"] .stat-num { color: #64748b; }
+
+    /* Mode tabs */
+    .mode-tabs {
+      display: flex; gap: 0.3rem; margin-bottom: 1rem;
+    }
+    .mode-tab {
+      background: #0f172a; color: #cbd5e1;
+      border: 1px solid #334155;
+      padding: 0.5rem 1rem;
+      border-radius: 5px; cursor: pointer;
+      font-family: inherit; font-size: 0.9em;
+    }
+    .mode-tab.active {
+      background: #06b6d4; color: #0f172a;
+      border-color: #06b6d4; font-weight: 700;
+    }
+
+    .info-box {
+      background: rgba(6, 182, 212, 0.08);
+      border-left: 3px solid #06b6d4;
+      padding: 0.7rem 1rem;
+      border-radius: 4px;
+      font-size: 0.88em;
+      color: #e0f2fe;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a href="../lecture.html" class="back">← Volver al lecture</a>
+    <h1>🚩 Feature Flags Simulator</h1>
+    <p class="sub">Visualizá cómo funcionan canary releases y A/B testing en una población de usuarios.</p>
+
+    <div class="panel">
+      <h2>Modo</h2>
+      <div class="mode-tabs">
+        <button class="mode-tab active" data-mode="canary">📊 Canary release</button>
+        <button class="mode-tab" data-mode="ab">⚖️ A/B testing</button>
+      </div>
+
+      <div class="controls" id="controls"></div>
+
+      <div class="info-box" id="modeDesc"></div>
+    </div>
+
+    <div class="panel">
+      <h2>1000 usuarios</h2>
+      <div class="users-grid" id="usersGrid"></div>
+
+      <div class="legend" id="legend"></div>
+
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="panel">
+      <h2>💡 Decisión hipotética</h2>
+      <div id="advice"></div>
+    </div>
+  </div>
+
+  <script>
+  const N_USERS = 1000;
+
+  // Generar usuarios (con userId determinístico)
+  const users = Array.from({ length: N_USERS }, (_, i) => ({
+    id: `user-${i}`,
+    hash: i,  // hash simple
+  }));
+
+  let mode = 'canary';
+  let state = {
+    canaryRollout: 5,
+    abSplit: 50,
+    conversionA: 8,   // % conversión variant A (control)
+    conversionB: 10,  // % conversión variant B (test)
+  };
+
+  function renderControls() {
+    if (mode === 'canary') {
+      document.getElementById('controls').innerHTML = `
+        <div class="ctrl">
+          <label>Rollout: <span class="value" id="canaryVal">${state.canaryRollout}%</span></label>
+          <input type="range" min="0" max="100" value="${state.canaryRollout}" id="canarySlider">
+        </div>
+      `;
+      document.getElementById('canarySlider').addEventListener('input', (e) => {
+        state.canaryRollout = +e.target.value;
+        document.getElementById('canaryVal').textContent = state.canaryRollout + '%';
+        update();
+      });
+      document.getElementById('modeDesc').innerHTML = `
+        <strong>Canary release</strong>: deployás la nueva versión a un % de usuarios. Si todo va bien, escalás. Si algo se rompe, los afectados son pocos.
+        <br><strong>Práctica</strong>: 5% → monitorás errores 1h → 25% → 50% → 100% en ~24h.
+      `;
+    } else {
+      document.getElementById('controls').innerHTML = `
+        <div class="ctrl">
+          <label>Split A vs B: <span class="value" id="splitVal">${state.abSplit}/${100-state.abSplit}</span></label>
+          <input type="range" min="10" max="90" value="${state.abSplit}" id="splitSlider">
+        </div>
+        <div class="ctrl">
+          <label>Conversión variant A: <span class="value" id="convAVal">${state.conversionA}%</span></label>
+          <input type="range" min="0" max="30" value="${state.conversionA}" id="convA">
+        </div>
+        <div class="ctrl">
+          <label>Conversión variant B: <span class="value" id="convBVal">${state.conversionB}%</span></label>
+          <input type="range" min="0" max="30" value="${state.conversionB}" id="convB">
+        </div>
+      `;
+      document.getElementById('splitSlider').addEventListener('input', (e) => {
+        state.abSplit = +e.target.value;
+        document.getElementById('splitVal').textContent = `${state.abSplit}/${100-state.abSplit}`;
+        update();
+      });
+      document.getElementById('convA').addEventListener('input', (e) => {
+        state.conversionA = +e.target.value;
+        document.getElementById('convAVal').textContent = state.conversionA + '%';
+        update();
+      });
+      document.getElementById('convB').addEventListener('input', (e) => {
+        state.conversionB = +e.target.value;
+        document.getElementById('convBVal').textContent = state.conversionB + '%';
+        update();
+      });
+      document.getElementById('modeDesc').innerHTML = `
+        <strong>A/B testing</strong>: dividís usuarios en 2 (o más) variantes. Medís métrica de éxito (ej: conversión). Si la diferencia es estadísticamente significativa, ganador.
+        <br><strong>Trampa</strong>: con N pequeño, lo que parece "B gana" puede ser ruido.
+      `;
+    }
+  }
+
+  function getVariant(user) {
+    if (mode === 'canary') {
+      return user.hash % 100 < state.canaryRollout ? 'a' : 'off';
+    } else {
+      return user.hash % 100 < state.abSplit ? 'a' : 'b';
+    }
+  }
+
+  function update() {
+    const grid = document.getElementById('usersGrid');
+    let countA = 0, countB = 0, countOff = 0;
+    let convA = 0, convB = 0;
+
+    grid.innerHTML = users.map(u => {
+      const v = getVariant(u);
+      let cls, info;
+      if (v === 'a') {
+        countA++;
+        cls = 'variant-a';
+        info = mode === 'canary' ? 'En el canary' : 'Variant A';
+      } else if (v === 'b') {
+        countB++;
+        cls = 'variant-b';
+        info = 'Variant B';
+      } else {
+        countOff++;
+        cls = 'disabled';
+        info = 'Versión vieja';
+      }
+      return `<div class="user ${cls}" data-info="${u.id} · ${info}"></div>`;
+    }).join('');
+
+    // Stats
+    if (mode === 'canary') {
+      // Simular conversión = errores
+      convA = Math.round(countA * 0.02);  // 2% error rate
+      document.getElementById('legend').innerHTML = `
+        <div class="legend-item"><div class="legend-swatch" style="background:#06b6d4"></div>Versión nueva (${countA} usuarios)</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#334155"></div>Versión vieja (${countOff} usuarios)</div>
+      `;
+      document.getElementById('stats').innerHTML = `
+        <div class="stat" data-kind="a">
+          <div class="stat-num">${countA}</div>
+          <div class="stat-label">En canary</div>
+        </div>
+        <div class="stat" data-kind="off">
+          <div class="stat-num">${countOff}</div>
+          <div class="stat-label">Versión estable</div>
+        </div>
+        <div class="stat" data-kind="a">
+          <div class="stat-num">~${convA}</div>
+          <div class="stat-label">Errores estimados (2%)</div>
+        </div>
+      `;
+      const blast = countA;
+      document.getElementById('advice').innerHTML = `
+        <p>Si la nueva versión tiene un bug crítico, <strong>${blast} usuarios</strong> serían afectados (vs 1000 si fuera 100%).</p>
+        <p style="margin-top:0.5rem; color:#94a3b8;">Recomendación: empezá en 5%, monitoreá Sentry 1-2 hs, escalá si todo OK.</p>
+      `;
+    } else {
+      convA = Math.round(countA * state.conversionA / 100);
+      convB = Math.round(countB * state.conversionB / 100);
+      document.getElementById('legend').innerHTML = `
+        <div class="legend-item"><div class="legend-swatch" style="background:#06b6d4"></div>Variant A: control (${countA})</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#f472b6"></div>Variant B: test (${countB})</div>
+      `;
+      document.getElementById('stats').innerHTML = `
+        <div class="stat" data-kind="a">
+          <div class="stat-num">${convA}</div>
+          <div class="stat-label">Conversiones A (${state.conversionA}%)</div>
+        </div>
+        <div class="stat" data-kind="b">
+          <div class="stat-num">${convB}</div>
+          <div class="stat-label">Conversiones B (${state.conversionB}%)</div>
+        </div>
+      `;
+      // Análisis estadístico simple (chi-square approximation)
+      const lift = ((state.conversionB - state.conversionA) / state.conversionA * 100).toFixed(1);
+      const isSig = Math.abs(state.conversionB - state.conversionA) >= 2 && Math.min(countA, countB) > 200;
+      const winner = state.conversionB > state.conversionA ? 'B' : state.conversionB < state.conversionA ? 'A' : '—';
+
+      document.getElementById('advice').innerHTML = `
+        <p>Lift de B vs A: <strong style="color:${state.conversionB>state.conversionA?'#34d399':'#f87171'}">${lift}%</strong></p>
+        <p>Significancia estadística (aprox.): <strong>${isSig ? '✅ probable' : '⚠️ insuficiente N o lift muy chico'}</strong></p>
+        <p style="margin-top:0.5rem; color:#94a3b8;">
+          ${isSig ? `Recomendación: deployar variant ${winner}.` : 'Recomendación: correr el experimento más tiempo o aumentar N. Resultado actual no concluyente.'}
+        </p>
+      `;
+    }
+  }
+
+  document.querySelectorAll('.mode-tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.mode-tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      mode = t.dataset.mode;
+      renderControls();
+      update();
+    });
+  });
+
+  renderControls();
+  update();
+  </script>
+</body>
+</html>

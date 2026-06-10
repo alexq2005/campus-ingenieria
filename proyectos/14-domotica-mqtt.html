@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 14 — Domótica con MQTT · Campus CS-FE</title>
+<meta name="description" content="Casa inteligente: ESP32 + sensores → broker MQTT → dashboard web en tiempo real. Une electrónica, redes y fullstack.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/e03-microcontroladores-1/lecture.html">⚡ E03 MCU</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 14</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2-3 semanas</span>
+  <span class="badge">ESP32 + MQTT + Web</span>
+</div>
+
+<article>
+
+<h1>🏠 Domótica con MQTT</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> controlar y monitorear tu casa desde el navegador. Sensores físicos (temperatura, movimiento, luz) y actuadores (relés, luces) publican y reciben mensajes a través de un <strong>broker MQTT</strong>, y un dashboard web muestra todo en tiempo real. Es el patrón <strong>publish/subscribe</strong> que mueve el IoT del mundo real.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong> integra
+  <a href="../Curso-Computacion-Fisica/e03-microcontroladores-1/lecture.html">E03/E04</a> (ESP32, WiFi),
+  <a href="../Curso-Computacion-Fisica/e05-sensores-actuadores/lecture.html">E05</a> (sensores y relés),
+  <a href="../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m15-redes-de-computadoras/lecture.html">M15 Redes</a> (TCP, protocolos),
+  <a href="../../Curso%20ingenieria%20sistemas/area-07-desarrollo-aplicado/m37-desarrollo-embebido-iot/lecture.html">M37 IoT</a> y
+  <a href="../Curso-React/m10-data-fetching/lecture.html">React</a> (dashboard).
+</div>
+
+<h2>Cómo funciona — el patrón publish/subscribe</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 230" role="img" aria-label="Diagrama: dispositivos publican y se suscriben a topics en un broker MQTT central">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- broker central -->
+  <rect x="300" y="90" width="160" height="60" rx="10" fill="#1f2638" stroke="#f0883e" stroke-width="2.5"/>
+  <text x="380" y="115" text-anchor="middle" fill="#e8edf4" font-size="15" font-family="system-ui" font-weight="700">Broker MQTT</text>
+  <text x="380" y="135" text-anchor="middle" fill="#8b95a8" font-size="11" font-family="system-ui">Mosquitto / HiveMQ</text>
+
+  <!-- publisher: ESP32 sensor -->
+  <rect x="20" y="20" width="150" height="55" rx="8" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="95" y="42" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">🌡️ ESP32 sensor</text>
+  <text x="95" y="60" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">publish casa/temp</text>
+  <line x1="170" y1="60" x2="300" y2="105" stroke="#f0883e" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- publisher: ESP32 relé -->
+  <rect x="20" y="155" width="150" height="55" rx="8" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="95" y="177" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">💡 ESP32 relé</text>
+  <text x="95" y="195" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">subscribe casa/luz</text>
+  <line x1="300" y1="135" x2="170" y2="180" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- subscriber: dashboard -->
+  <rect x="590" y="20" width="150" height="55" rx="8" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="665" y="42" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">📊 Dashboard</text>
+  <text x="665" y="60" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">subscribe casa/#</text>
+  <line x1="460" y1="105" x2="590" y2="60" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- control: dashboard publica -->
+  <rect x="590" y="155" width="150" height="55" rx="8" fill="#1f2638" stroke="#fb7185" stroke-width="2"/>
+  <text x="665" y="177" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">🖱️ Control web</text>
+  <text x="665" y="195" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">publish casa/luz</text>
+  <line x1="590" y1="180" x2="460" y2="135" stroke="#f0883e" stroke-width="2" marker-end="url(#arr)"/>
+</svg>
+<figcaption>Nadie habla directo con nadie: todos publican y se suscriben a <em>topics</em> en el broker. Desacoplá productor y consumidor — esa es la idea clave del pub/sub.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>El protocolo <strong>MQTT</strong>: topics, QoS, retained messages, last will.</li>
+  <li>Conectar un <strong>ESP32 a WiFi</strong> y publicar/suscribir (E03/E04).</li>
+  <li>Leer sensores y accionar <strong>relés</strong> de forma segura (E05).</li>
+  <li>Levantar un <strong>broker</strong> (Mosquitto local o un broker cloud).</li>
+  <li>Un <strong>dashboard web</strong> que se suscribe vía MQTT-over-WebSockets.</li>
+  <li>Diseño <strong>desacoplado</strong>: agregar dispositivos sin tocar el resto.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>ESP32 + sensores (DHT22, PIR, LDR) + módulo relé · broker <strong>Mosquitto</strong> (Docker) o HiveMQ Cloud · librería <code>PubSubClient</code> (Arduino) · dashboard React + <code>mqtt.js</code> sobre WebSockets. Simulable en <a href="https://wokwi.com" target="_blank">Wokwi</a> + broker público de pruebas.</p>
+
+<h2>Código clave (el nodo ESP32)</h2>
+
+<pre><code class="lang-cpp">#include &lt;WiFi.h&gt;
+#include &lt;PubSubClient.h&gt;
+
+WiFiClient wifi;
+PubSubClient mqtt(wifi);
+
+void callback(char* topic, byte* payload, unsigned int len) {
+  // Llega un mensaje a un topic suscrito (ej: casa/luz = "ON")
+  if ((char)payload[0] == 'O' &amp;&amp; (char)payload[1] == 'N')
+    digitalWrite(RELE, HIGH);          // accionar relé (E05)
+  else
+    digitalWrite(RELE, LOW);
+}
+
+void loop() {
+  if (!mqtt.connected()) reconectar();
+  mqtt.loop();
+
+  float t = leerDHT22();               // sensor (E05)
+  char msg[8];
+  dtostrf(t, 4, 1, msg);
+  mqtt.publish("casa/temp", msg);      // publicar lectura
+  delay(2000);
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <code>callback</code> es el patrón <strong>observer</strong> (M24 Patrones de Diseño) sobre la red: el dispositivo "reacciona" a mensajes sin saber quién los envió. Y MQTT corre sobre <strong>TCP</strong> (M15 Redes), por eso garantiza orden y entrega.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> ESP32 publica una lectura de sensor a un broker público de pruebas. Verificá con <code>mosquitto_sub</code> desde tu PC (Linux).</div>
+<div class="fase"><strong>Fase 2:</strong> levantá tu propio broker Mosquitto en Docker. Asegurá con usuario/contraseña.</div>
+<div class="fase"><strong>Fase 3:</strong> segundo ESP32 que se suscribe y acciona un relé/LED al recibir un comando.</div>
+<div class="fase"><strong>Fase 4:</strong> dashboard React que muestra las lecturas en vivo y tiene botones para controlar los actuadores.</div>
+<div class="fase"><strong>Fase 5:</strong> persistí el histórico en una base de datos y graficá tendencias (conecta con P23).</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Un sensor físico publica y lo ves cambiar en el dashboard en &lt;1 segundo.</li>
+    <li>Un botón del dashboard enciende/apaga un dispositivo real.</li>
+    <li>El broker exige autenticación (no está abierto al mundo).</li>
+    <li>Podés agregar un dispositivo nuevo sin tocar el código de los demás.</li>
+    <li>Usaste <em>retained</em> + <em>last will</em> para estado y detección de caídas.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Reglas de automatización ("si temp &gt; 26 → encender ventilador") — conecta con E08 Control.</li>
+  <li>Integración con Home Assistant o Google Home.</li>
+  <li>App móvil en vez de web (M34 Mobile).</li>
+  <li>Cifrado TLS en el broker (M29 Criptografía) — ver también P19.</li>
+  <li>Modo offline: el nodo guarda lecturas y las sincroniza al reconectar.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./13-robot-balanceado.html">← Robot Auto-balanceado</a>
+  <a href="./15-invernadero-automatizado.html">Siguiente: Invernadero Automatizado →</a>
+</nav>
+
+</div>
+</body>
+</html>

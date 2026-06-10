@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FSD Visualizer — Feature-Sliced Design</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0a0e1a; color: #e2e8f0;
+      min-height: 100vh; padding: 1.5rem;
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; }
+    h1 {
+      background: linear-gradient(135deg, #f472b6, #a78bfa);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      font-size: 1.8rem; margin-bottom: 0.3rem;
+    }
+    .sub { color: #94a3b8; margin-bottom: 1.5rem; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      gap: 1.5rem;
+    }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+    /* ───── Pyramid de capas ───── */
+    .pyramid {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .layer {
+      padding: 0.9rem 1.2rem;
+      margin: 0 auto 0.4rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border: 2px solid;
+    }
+    .layer:hover { transform: translateX(4px); }
+    .layer.active { box-shadow: 0 0 20px rgba(244, 114, 182, 0.4); }
+
+    /* Pirámide: arriba ancho 100%, abajo 60% */
+    .layer[data-layer="app"]      { width: 100%; background: rgba(244, 114, 182, 0.15); border-color: #f472b6; color: #f9a8d4; }
+    .layer[data-layer="pages"]    { width: 92%;  background: rgba(167, 139, 250, 0.15); border-color: #a78bfa; color: #c4b5fd; }
+    .layer[data-layer="widgets"]  { width: 84%;  background: rgba(96, 165, 250, 0.15); border-color: #60a5fa; color: #93c5fd; }
+    .layer[data-layer="features"] { width: 76%;  background: rgba(56, 189, 248, 0.15); border-color: #38bdf8; color: #7dd3fc; }
+    .layer[data-layer="entities"] { width: 68%;  background: rgba(52, 211, 153, 0.15); border-color: #34d399; color: #6ee7b7; }
+    .layer[data-layer="shared"]   { width: 60%;  background: rgba(251, 191, 36, 0.15); border-color: #fbbf24; color: #fde047; }
+
+    .layer-num {
+      font-family: monospace;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+
+    /* ───── Detalle de la capa ───── */
+    .detail {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem;
+      position: sticky;
+      top: 1rem;
+      height: fit-content;
+    }
+    .detail h2 {
+      font-size: 1.2rem;
+      margin-bottom: 0.5rem;
+    }
+    .detail .what {
+      color: #cbd5e1;
+      margin-bottom: 1rem;
+      font-size: 0.92em;
+    }
+    .detail h3 {
+      font-size: 0.85em;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8;
+      margin: 1rem 0 0.4rem;
+    }
+    .detail ul {
+      padding-left: 1.2rem;
+      font-size: 0.88em;
+    }
+    .detail li { margin-bottom: 0.3rem; }
+    .detail .imports-from {
+      background: rgba(52, 211, 153, 0.1);
+      border-left: 3px solid #34d399;
+      padding: 0.5rem 0.8rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+      margin-top: 0.5rem;
+      font-family: monospace;
+    }
+    .detail .never-imports {
+      background: rgba(239, 68, 68, 0.1);
+      border-left: 3px solid #ef4444;
+      padding: 0.5rem 0.8rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+      margin-top: 0.5rem;
+      font-family: monospace;
+    }
+    .detail code {
+      background: #0f172a;
+      padding: 1px 6px;
+      border-radius: 3px;
+      color: #fbbf24;
+      font-family: monospace;
+      font-size: 0.88em;
+    }
+
+    /* Tree example */
+    .tree-example {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 0.8rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      line-height: 1.7;
+      color: #cbd5e1;
+      margin-top: 0.5rem;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+    .tree-example .folder { color: #fbbf24; }
+    .tree-example .file { color: #94a3b8; }
+    .tree-example .layer-current { color: #f472b6; font-weight: bold; }
+
+    /* ───── Rules box ───── */
+    .rules {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem;
+      margin-top: 1.5rem;
+      grid-column: 1 / -1;
+    }
+    .rules h2 { color: #fbbf24; font-size: 1.1rem; margin-bottom: 0.7rem; }
+    .rules ol { padding-left: 1.3rem; }
+    .rules li { margin-bottom: 0.4rem; color: #cbd5e1; font-size: 0.92em; }
+    .rules li strong { color: #f472b6; }
+
+    .back { display: inline-flex; gap: 0.4rem; color: #94a3b8; font-size: 0.9em; margin-bottom: 1rem; }
+    .back:hover { color: #f472b6; text-decoration: none; }
+    a { color: #f472b6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a href="../lecture.html" class="back">← Volver al lecture</a>
+
+    <h1>🏛 Feature-Sliced Design</h1>
+    <p class="sub">Las 6 capas de FSD. Cliqueá una para ver qué va, qué importa y qué no.</p>
+
+    <div class="layout">
+      <div class="pyramid">
+
+        <div class="layer" data-layer="app">
+          <span>① <strong>app</strong> — composition root, providers, router</span>
+          <span class="layer-num">1</span>
+        </div>
+
+        <div class="layer" data-layer="pages">
+          <span>② <strong>pages</strong> — una página = composición de widgets</span>
+          <span class="layer-num">2</span>
+        </div>
+
+        <div class="layer" data-layer="widgets">
+          <span>③ <strong>widgets</strong> — composiciones grandes</span>
+          <span class="layer-num">3</span>
+        </div>
+
+        <div class="layer" data-layer="features">
+          <span>④ <strong>features</strong> — acciones del usuario</span>
+          <span class="layer-num">4</span>
+        </div>
+
+        <div class="layer" data-layer="entities">
+          <span>⑤ <strong>entities</strong> — entidades de negocio</span>
+          <span class="layer-num">5</span>
+        </div>
+
+        <div class="layer" data-layer="shared">
+          <span>⑥ <strong>shared</strong> — UI base, utils, lib</span>
+          <span class="layer-num">6</span>
+        </div>
+
+        <p style="margin-top: 1rem; color: #94a3b8; font-size: 0.85em; text-align: center;">
+          ⬇️ Las capas inferiores son más reusables y agnósticas.<br>
+          Las superiores conocen el dominio del negocio.
+        </p>
+      </div>
+
+      <aside class="detail" id="detail">
+        <h2>👈 Cliqueá una capa</h2>
+        <p class="what">Cliqueá cualquier capa de la pirámide para ver qué contiene, qué puede importar y qué nunca debería importar.</p>
+      </aside>
+    </div>
+
+    <div class="rules">
+      <h2>📐 Las 3 reglas duras de FSD</h2>
+      <ol>
+        <li><strong>Imports descendentes solamente</strong>. Una capa solo puede importar de capas <em>inferiores</em>. Nunca de superiores ni de su mismo nivel.</li>
+        <li><strong>Slices del mismo nivel no se hablan</strong>. <code>features/auth</code> no importa de <code>features/cart</code>. Si necesitan compartir, lo hacen via <code>entities</code> o <code>shared</code>.</li>
+        <li><strong>Public API explícito</strong>. Cada slice exporta solo lo que considera "público" via <code>index.ts</code>. El resto es privado.</li>
+      </ol>
+    </div>
+  </div>
+
+  <script>
+  const DATA = {
+    app: {
+      title: '① app',
+      what: 'El "composition root" — donde se conecta todo. Inicialización, providers globales, router de alto nivel.',
+      contains: [
+        '<code>main.tsx</code> — entry de React',
+        '<code>App.tsx</code> — providers + Router',
+        '<code>providers/</code> — ThemeProvider, QueryClientProvider, AuthProvider',
+        '<code>styles/global.css</code>',
+      ],
+      imports: 'pages, widgets, features, entities, shared (todas)',
+      neverImports: 'Nada lo importa — es la cumbre',
+      tree: [
+        ['folder', 'app/'],
+        ['file', '├── main.tsx              ← entry'],
+        ['file', '├── App.tsx               ← providers + router'],
+        ['folder', '└── providers/'],
+        ['file', '    ├── QueryProvider.tsx'],
+        ['file', '    └── AuthProvider.tsx'],
+      ],
+    },
+    pages: {
+      title: '② pages',
+      what: 'Una página = una ruta en el router. Compone widgets y a veces features. **No** tiene lógica de negocio propia — orquesta.',
+      contains: [
+        'Componentes de página (<code>HomePage</code>, <code>ProductPage</code>)',
+        'Lógica específica de la ruta (params, redirects)',
+      ],
+      imports: 'widgets, features, entities, shared',
+      neverImports: 'No importa de app ni de otras pages',
+      tree: [
+        ['folder', 'pages/'],
+        ['folder', '├── home/'],
+        ['file', '│   └── ui/HomePage.tsx'],
+        ['folder', '└── product/'],
+        ['file', '    └── ui/ProductPage.tsx'],
+      ],
+    },
+    widgets: {
+      title: '③ widgets',
+      what: 'Composiciones grandes y reusables: Header, Sidebar, ProductCard. Combinan features y entities. Independientes entre sí.',
+      contains: [
+        'Header con login + nav',
+        'Sidebar con menú + búsqueda',
+        'ProductCard con imagen + precio + botón comprar',
+      ],
+      imports: 'features, entities, shared',
+      neverImports: 'No importa de pages ni de otros widgets',
+      tree: [
+        ['folder', 'widgets/'],
+        ['folder', '├── Header/'],
+        ['file', '│   └── ui/Header.tsx'],
+        ['folder', '└── ProductCard/'],
+        ['file', '    └── ui/ProductCard.tsx'],
+      ],
+    },
+    features: {
+      title: '④ features',
+      what: 'Una "acción del usuario" o "intención". Nombrado con <strong>verbo</strong>: <code>auth/login</code>, <code>cart/add-item</code>. Cada feature es autocontenido.',
+      contains: [
+        '<code>login</code> — formulario + validación + dispatch',
+        '<code>add-to-cart</code> — botón + lógica',
+        '<code>filter-products</code> — selector de filtros',
+      ],
+      imports: 'entities, shared',
+      neverImports: 'No importa de otras features (regla #2 de FSD)',
+      tree: [
+        ['folder', 'features/'],
+        ['folder', '├── auth/'],
+        ['folder', '│   └── login/'],
+        ['file', '│       ├── ui/LoginForm.tsx'],
+        ['file', '│       ├── model/useLogin.ts'],
+        ['file', '│       ├── api/loginRequest.ts'],
+        ['file', '│       └── index.ts        ← public API'],
+        ['folder', '└── cart/'],
+        ['folder', '    └── add-item/'],
+        ['file', '        └── ui/AddToCartButton.tsx'],
+      ],
+    },
+    entities: {
+      title: '⑤ entities',
+      what: 'Entidades del dominio del negocio: User, Product, Order. Tipos, modelos, store de su data. <strong>Nombrado con sustantivo</strong>.',
+      contains: [
+        '<code>User</code> — type + model + UserAvatar component',
+        '<code>Product</code> — type + lista, single, filtros',
+        '<code>Cart</code> — lógica pura del carrito (Hexagonal core)',
+      ],
+      imports: 'Solo shared',
+      neverImports: 'No importa de features (las features importan a entities, no al revés)',
+      tree: [
+        ['folder', 'entities/'],
+        ['folder', '├── user/'],
+        ['file', '│   ├── model/types.ts'],
+        ['file', '│   ├── model/store.ts'],
+        ['file', '│   └── ui/UserAvatar.tsx'],
+        ['folder', '└── product/'],
+        ['file', '    ├── model/types.ts'],
+        ['file', '    └── ui/ProductCard.tsx (mini)'],
+      ],
+    },
+    shared: {
+      title: '⑥ shared',
+      what: 'Lo más bajo y reusable: UI primitives (Button, Modal), utilidades (formatDate), wrapper de fetch, libs externas. <strong>Sin lógica de negocio</strong>.',
+      contains: [
+        '<code>ui/</code> — Button, Input, Modal, Spinner',
+        '<code>lib/</code> — debounce, formatDate, cn (classNames helper)',
+        '<code>api/</code> — apiClient (fetch wrapper)',
+        '<code>config/</code> — constants, env vars',
+      ],
+      imports: 'NADA del proyecto. Solo libs de npm.',
+      neverImports: 'Cuidado: si necesitás importar de entities/features acá, está MAL diseñado',
+      tree: [
+        ['folder', 'shared/'],
+        ['folder', '├── ui/'],
+        ['file', '│   ├── Button.tsx'],
+        ['file', '│   ├── Modal.tsx'],
+        ['file', '│   └── Spinner.tsx'],
+        ['folder', '├── lib/'],
+        ['file', '│   ├── debounce.ts'],
+        ['file', '│   └── formatDate.ts'],
+        ['folder', '└── api/'],
+        ['file', '    └── apiClient.ts'],
+      ],
+    },
+  };
+
+  const detail = document.getElementById('detail');
+
+  function render(layer) {
+    const d = DATA[layer];
+    if (!d) return;
+
+    document.querySelectorAll('.layer').forEach(l => {
+      l.classList.toggle('active', l.dataset.layer === layer);
+    });
+
+    detail.innerHTML = `
+      <h2>${d.title}</h2>
+      <p class="what">${d.what}</p>
+
+      <h3>Qué contiene</h3>
+      <ul>${d.contains.map(c => `<li>${c}</li>`).join('')}</ul>
+
+      <h3>Qué puede importar</h3>
+      <div class="imports-from">✓ ${d.imports}</div>
+
+      <h3>Qué nunca importa</h3>
+      <div class="never-imports">✗ ${d.neverImports}</div>
+
+      <h3>Estructura ejemplo</h3>
+      <div class="tree-example">${d.tree.map(([type, text]) => `
+        <div class="${type === 'folder' ? 'folder' : 'file'} ${text.includes(layer) ? 'layer-current' : ''}">${text}</div>
+      `).join('')}</div>
+    `;
+  }
+
+  document.querySelectorAll('.layer').forEach(l => {
+    l.addEventListener('click', () => render(l.dataset.layer));
+  });
+
+  // Auto-select primer
+  render('app');
+  </script>
+</body>
+</html>

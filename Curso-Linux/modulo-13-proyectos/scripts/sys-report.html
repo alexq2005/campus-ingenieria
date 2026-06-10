@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>sys-report.sh · Curso de Linux</title>
+  <meta name="description" content="Reporte rápido del sistema en Bash — Proyecto 2 del curso de Linux.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+  <!-- highlight.js dark theme (CDN) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+  <style>
+    .script-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }
+    .btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9em;
+      font-family: inherit;
+      text-decoration: none;
+      transition: all 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .btn.copied { background: var(--success); color: var(--bg); border-color: var(--success); }
+    article pre { max-height: 600px; overflow-y: auto; }
+    .hljs { background: var(--code-bg) !important; padding: 1.2rem !important; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../../index.html">← Curso de Linux</a>
+  <a href="../lecture.html">← Módulo 13</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">📜 sys-report.sh</span>
+  <span class="badge">Bash</span>
+  <span class="badge">~120 líneas</span>
+  <span class="badge">Proyecto 2 del Módulo 13</span>
+</div>
+
+<article>
+
+<h1>sys-report.sh — Reporte del sistema</h1>
+
+<p>Script bash que reúne información del sistema en un reporte legible: hostname, kernel, memoria, disco, usuarios conectados, top de procesos, puertos escuchando y servicios fallidos.</p>
+
+<h2>¿Qué hace?</h2>
+
+<ul>
+  <li>Recolecta métricas en vivo del sistema con <code>uname</code>, <code>uptime</code>, <code>free</code>, <code>df</code>, <code>ps</code>, <code>ss</code>, <code>systemctl</code>.</li>
+  <li>Imprime el reporte por secciones con headers visuales.</li>
+  <li>Soporta 4 modos: <code>quick</code> (lo esencial), estándar (default), <code>all</code> (todo + servicios fallidos + dmesg + logins), <code>--json</code> (machine-readable).</li>
+  <li>Puede guardarse a archivo con <code>--save reporte.txt</code> usando <code>tee</code>.</li>
+  <li>Aplica <code>set -euo pipefail</code> — modo estricto de bash.</li>
+</ul>
+
+<h2>Cómo ejecutar</h2>
+
+<pre><code class="language-bash"># 1) Hacerlo ejecutable (solo la primera vez)
+chmod +x sys-report.sh
+
+# 2) Correrlo
+./sys-report.sh                    # reporte estándar
+./sys-report.sh --quick            # solo lo crítico
+./sys-report.sh --all              # todo, incluyendo servicios fallidos
+./sys-report.sh --save reporte.txt # guardar a archivo
+./sys-report.sh --json             # salida en JSON
+
+# 3) Ver la ayuda
+./sys-report.sh --help</code></pre>
+
+<div class="tip">El script usa solo herramientas estándar del sistema — no requiere instalar nada extra. Compatible con cualquier distro moderna que tenga systemd.</div>
+
+<h2>Código fuente</h2>
+
+<div class="script-actions">
+  <button class="btn" id="copyBtn">📋 Copiar código</button>
+  <a class="btn" href="./sys-report.sh" download>⬇ Descargar .sh</a>
+</div>
+
+<pre><code class="language-bash" id="code">#!/usr/bin/env bash
+# sys-report.sh — Reporte rápido del sistema
+# Proyecto 2 del curso de Linux.
+#
+# Uso:
+#   ./sys-report.sh                 # reporte estándar
+#   ./sys-report.sh --quick         # solo lo crítico
+#   ./sys-report.sh --all           # todo, incluyendo servicios fallidos
+#   ./sys-report.sh --save out.txt  # guardar a archivo
+#   ./sys-report.sh --json          # salida en JSON
+
+set -euo pipefail
+
+# --- Defaults ---
+MODE="standard"
+SAVE_FILE=""
+JSON=false
+
+# --- Parsing de argumentos ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --quick)   MODE="quick"; shift ;;
+        --all)     MODE="all"; shift ;;
+        --save)    SAVE_FILE="$2"; shift 2 ;;
+        --json)    JSON=true; shift ;;
+        -h|--help)
+            grep '^#' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Opción desconocida: $1" &gt;&amp;2
+            exit 1
+            ;;
+    esac
+done
+
+# --- Helpers ---
+header() {
+    echo
+    echo "═══ $1 ═══"
+}
+
+# --- Recolección de datos ---
+HOSTNAME_VAL=$(hostname)
+KERNEL_VAL=$(uname -r)
+UPTIME_VAL=$(uptime -p 2&gt;/dev/null || uptime)
+LOAD_VAL=$(awk '{print $1, $2, $3}' /proc/loadavg)
+CORES_VAL=$(nproc)
+MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
+MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
+DISK_ROOT=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
+USERS_NOW=$(who | wc -l)
+
+# --- Salida JSON ---
+if $JSON; then
+    cat &lt;&lt;EOF
+{
+  "hostname": "$HOSTNAME_VAL",
+  "kernel": "$KERNEL_VAL",
+  "uptime": "$UPTIME_VAL",
+  "load_avg": "$LOAD_VAL",
+  "cores": $CORES_VAL,
+  "memory": {"total": "$MEM_TOTAL", "used": "$MEM_USED"},
+  "disk_root": "$DISK_ROOT",
+  "users_logged_in": $USERS_NOW,
+  "timestamp": "$(date -Iseconds)"
+}
+EOF
+    exit 0
+fi
+
+# --- Salida en texto, posiblemente redirigida ---
+{
+    header "Sistema"
+    echo "Hostname:  $HOSTNAME_VAL"
+    echo "Kernel:    $KERNEL_VAL"
+    echo "Uptime:    $UPTIME_VAL"
+    echo "Load avg:  $LOAD_VAL  (sobre $CORES_VAL cores)"
+
+    header "Memoria"
+    free -h
+
+    header "Disco"
+    df -h --output=source,size,used,avail,pcent,target | grep -vE '^tmpfs|^devtmpfs'
+
+    header "Usuarios conectados"
+    who || true
+
+    if [[ "$MODE" != "quick" ]]; then
+        header "Top 5 procesos por CPU"
+        ps -eo pid,user,pcpu,pmem,comm --sort=-pcpu | head -n 6
+
+        header "Top 5 procesos por memoria"
+        ps -eo pid,user,pcpu,pmem,comm --sort=-pmem | head -n 6
+
+        header "Puertos escuchando"
+        ss -tlnp 2&gt;/dev/null | head -n 20 || netstat -tlnp 2&gt;/dev/null | head -n 20
+    fi
+
+    if [[ "$MODE" == "all" ]]; then
+        header "Servicios fallidos"
+        systemctl --failed --no-legend || true
+
+        header "Últimos errores del kernel"
+        sudo dmesg --level=err,warn 2&gt;/dev/null | tail -n 10 || \
+            echo "(requiere sudo para leer dmesg)"
+
+        header "Últimos logins"
+        last -n 10
+    fi
+} | { [[ -n "$SAVE_FILE" ]] &amp;&amp; tee "$SAVE_FILE" || cat; }
+
+if [[ -n "$SAVE_FILE" ]]; then
+    echo
+    echo "✓ Reporte guardado en: $SAVE_FILE"
+fi
+</code></pre>
+
+<h2>Conceptos aplicados</h2>
+
+<ul>
+  <li><strong>Módulo 05</strong> (procesos): <code>ps</code> con <code>--sort</code></li>
+  <li><strong>Módulo 09</strong> (bash scripting):
+    <ul>
+      <li><code>set -euo pipefail</code> — modo estricto</li>
+      <li>Parsing de argumentos con <code>case ... esac</code> y <code>shift</code></li>
+      <li>Sustitución de comandos con <code>$(...)</code></li>
+      <li>Condicionales <code>[[ ... ]]</code> con <code>!=</code> y <code>==</code></li>
+      <li>Heredoc <code>&lt;&lt;EOF ... EOF</code> para el JSON</li>
+      <li>Pipes y subshells: <code>{ ... } | tee</code></li>
+      <li>Redirección de errores <code>2&gt;/dev/null</code></li>
+    </ul>
+  </li>
+  <li><strong>Módulo 12</strong> (administración): <code>df</code>, <code>free</code>, <code>ss</code>, <code>journalctl</code>, <code>last</code>, <code>dmesg</code></li>
+</ul>
+
+<h2>Ejercicios para extenderlo</h2>
+
+<ol>
+  <li>Agregar una sección <strong>Temperatura</strong> leyendo <code>/sys/class/thermal/thermal_zone*/temp</code>.</li>
+  <li>Agregar opción <code>--mail destinatario@example.com</code> que envíe el reporte por email con <code>mail</code> o <code>msmtp</code>.</li>
+  <li>Crear un timer systemd que ejecute el script diariamente (ver Módulo 10).</li>
+  <li>Soportar formato Markdown con <code>--md</code> para pegarlo en un issue de GitHub.</li>
+  <li>Validar argumentos con un mensaje de error claro si <code>--save</code> no recibe valor.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../lecture.html">← Volver al Módulo 13</a>
+  <a href="../../modulo-09-bash-scripting/scripts/backup.html">Ver backup.sh →</a>
+</nav>
+
+</div>
+
+<script>
+  // Syntax highlight
+  hljs.highlightAll();
+
+  // Copy button
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const code = document.getElementById('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      const btn = document.getElementById('copyBtn');
+      const original = btn.textContent;
+      btn.textContent = '✓ Copiado';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('copied');
+      }, 2000);
+    } catch (err) {
+      alert('No se pudo copiar. Seleccioná el código manualmente.');
+    }
+  });
+</script>
+
+</body>
+</html>

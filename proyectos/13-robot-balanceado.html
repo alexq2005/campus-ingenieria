@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 13 — Robot Auto-balanceado · Campus CS-FE</title>
+<meta name="description" content="Péndulo invertido sobre 2 ruedas: giroscopio + PID. El control de E08 en movimiento.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/e08-control/lecture.html">⚡ E08 Control</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 13</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2-3 semanas</span>
+  <span class="badge">ESP32 + IMU + PID</span>
+</div>
+
+<article>
+
+<h1>🛴 Robot Auto-balanceado</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un robot de DOS ruedas que se mantiene parado solo, como un Segway en miniatura. Si lo empujás, se corrige. Es el <strong>PID de E08 hecho equilibrio físico</strong> — el proyecto de control por excelencia, porque sin control el robot simplemente se cae.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong> es la aplicación canónica de
+  <a href="../Curso-Computacion-Fisica/e08-control/lecture.html">E08 Control</a> (PID, lazo cerrado, estabilidad),
+  <a href="../Curso-Computacion-Fisica/e05-sensores-actuadores/lecture.html">E05</a> (IMU + motores),
+  <a href="../Curso-Computacion-Fisica/e04-microcontroladores-2/lecture.html">E04</a> (loop a dt fijo con timer) y el
+  <a href="../../Curso%20ingenieria%20sistemas/area-01-matematicas-y-teoria/m03-calculo/lecture.html">cálculo de M03</a> (derivada e integral del error).
+</div>
+
+<h2>El problema: un péndulo invertido</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 240" role="img" aria-label="Robot de dos ruedas balanceándose, mostrando el ángulo de inclinación">
+  <!-- piso -->
+  <line x1="40" y1="200" x2="720" y2="200" stroke="#3fb950" stroke-width="2"/>
+  <text x="380" y="225" text-anchor="middle" fill="#8b95a8" font-size="11" font-family="system-ui">piso</text>
+
+  <!-- estado 1: equilibrio -->
+  <g transform="translate(150,0)">
+    <!-- rueda -->
+    <circle cx="0" cy="185" r="15" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+    <!-- cuerpo vertical -->
+    <rect x="-8" y="90" width="16" height="80" rx="4" fill="#1f2638" stroke="#f0883e" stroke-width="2"/>
+    <circle cx="0" cy="90" r="10" fill="#f0883e"/>
+    <!-- línea vertical de referencia -->
+    <line x1="0" y1="185" x2="0" y2="60" stroke="#2a3247" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="0" y="50" text-anchor="middle" fill="#3fb950" font-size="12" font-family="system-ui" font-weight="700">✓ θ = 0°</text>
+    <text x="0" y="35" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">equilibrio</text>
+  </g>
+
+  <!-- estado 2: inclinado (cae) -->
+  <g transform="translate(400,0)">
+    <circle cx="0" cy="185" r="15" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+    <!-- cuerpo inclinado -->
+    <g transform="rotate(22 0 185)">
+      <rect x="-8" y="90" width="16" height="80" rx="4" fill="#1f2638" stroke="#fb7185" stroke-width="2"/>
+      <circle cx="0" cy="90" r="10" fill="#fb7185"/>
+    </g>
+    <line x1="0" y1="185" x2="0" y2="60" stroke="#2a3247" stroke-width="1" stroke-dasharray="3,3"/>
+    <!-- arco del ángulo -->
+    <path d="M0,120 A65,65 0 0,1 24,127" fill="none" stroke="#fb7185" stroke-width="2"/>
+    <text x="40" y="115" fill="#fb7185" font-size="12" font-family="system-ui" font-weight="700">θ = 22°</text>
+    <text x="0" y="35" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">cae...</text>
+  </g>
+
+  <!-- estado 3: corrigiendo -->
+  <g transform="translate(620,0)">
+    <circle cx="0" cy="185" r="15" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+    <!-- flecha del motor (corrección) -->
+    <line x1="-35" y1="185" x2="-12" y2="185" stroke="#3fb950" stroke-width="3" marker-end="url(#arrowG)"/>
+    <g transform="rotate(8 0 185)">
+      <rect x="-8" y="90" width="16" height="80" rx="4" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+      <circle cx="0" cy="90" r="10" fill="#3fb950"/>
+    </g>
+    <line x1="0" y1="185" x2="0" y2="60" stroke="#2a3247" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="0" y="35" text-anchor="middle" fill="#3fb950" font-size="10" font-family="system-ui">motor corrige</text>
+  </g>
+  <defs>
+    <marker id="arrowG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#3fb950"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>El robot es un "péndulo invertido": inestable por naturaleza. Cuando se inclina (θ crece), el motor acelera hacia donde cae para enderezarlo — 100 veces por segundo.</figcaption>
+</figure>
+
+<h2>El cerebro: el lazo de control PID</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 220" role="img" aria-label="Diagrama del lazo de control cerrado PID">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#f0883e"/>
+    </marker>
+  </defs>
+  <!-- objetivo -->
+  <text x="50" y="65" text-anchor="middle" fill="#3fb950" font-size="12" font-family="system-ui" font-weight="700">objetivo</text>
+  <text x="50" y="82" text-anchor="middle" fill="#8b95a8" font-size="11" font-family="system-ui">θ = 0°</text>
+  <line x1="90" y1="70" x2="125" y2="70" stroke="#f0883e" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- suma (error) -->
+  <circle cx="140" cy="70" r="16" fill="#1f2638" stroke="#f0883e" stroke-width="2"/>
+  <text x="140" y="75" text-anchor="middle" fill="#e8edf4" font-size="16" font-family="system-ui">Σ</text>
+  <text x="140" y="40" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">error = objetivo − θ</text>
+  <line x1="156" y1="70" x2="195" y2="70" stroke="#f0883e" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- bloque PID -->
+  <rect x="200" y="35" width="160" height="70" rx="8" fill="#1f2638" stroke="#f0883e" stroke-width="2"/>
+  <text x="280" y="58" text-anchor="middle" fill="#f0883e" font-size="14" font-family="system-ui" font-weight="700">PID (E08)</text>
+  <text x="280" y="76" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">P·error + I·∫error + D·dérror</text>
+  <text x="280" y="92" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">(integral y derivada = M03)</text>
+  <line x1="360" y1="70" x2="400" y2="70" stroke="#f0883e" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- motores -->
+  <rect x="405" y="45" width="100" height="50" rx="8" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="455" y="68" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">Motores</text>
+  <text x="455" y="84" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">PWM (E05)</text>
+  <line x1="505" y1="70" x2="545" y2="70" stroke="#f0883e" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- robot (sistema) -->
+  <rect x="550" y="45" width="100" height="50" rx="8" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="600" y="68" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">🛴 Robot</text>
+  <text x="600" y="84" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">se inclina θ</text>
+
+  <!-- realimentación (feedback) -->
+  <line x1="600" y1="95" x2="600" y2="160" stroke="#58a6ff" stroke-width="2"/>
+  <line x1="600" y1="160" x2="140" y2="160" stroke="#58a6ff" stroke-width="2"/>
+  <line x1="140" y1="160" x2="140" y2="88" stroke="#58a6ff" stroke-width="2" marker-end="url(#arB)"/>
+  <defs>
+    <marker id="arB" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+  <rect x="330" y="148" width="120" height="26" rx="6" fill="#0b0f1a" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="390" y="165" text-anchor="middle" fill="#58a6ff" font-size="11" font-family="system-ui">📐 Giroscopio (IMU) mide θ</text>
+  <text x="370" y="200" text-anchor="middle" fill="#8b95a8" font-size="11" font-family="system-ui">FEEDBACK: el sensor mide el ángulo real y lo realimenta — esto cierra el lazo</text>
+</svg>
+<figcaption>El lazo cerrado de E08: el giroscopio mide el ángulo, el PID calcula la corrección (usando derivada e integral de M03), los motores actúan, y el ciclo se repite 100×/seg. Sin el feedback (línea azul), el robot se cae.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Leer un <strong>IMU</strong> (giroscopio + acelerómetro, ej MPU6050) por I2C (E03).</li>
+  <li><strong>Fusión de sensores</strong> (filtro complementario o Kalman) para un ángulo estable.</li>
+  <li>Implementar y <strong>sintonizar un PID</strong> real (E08) — el corazón del proyecto.</li>
+  <li>Loop de control a <strong>dt fijo</strong> con timer (E04).</li>
+  <li>Control de motores con driver + PWM (E05, E01).</li>
+  <li>Entender <strong>estabilidad</strong> en carne propia: un PID mal sintonizado = robot en el piso.</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>ESP32 · IMU MPU6050 · 2 motores DC con encoder (o steppers) · driver L298N/TB6612 · chasis de 2 ruedas · batería LiPo. La sintonización requiere el robot físico (la simulación no captura la dinámica real).</p>
+
+<h2>Código clave — el lazo de control</h2>
+
+<pre><code class="lang-cpp">float kp = 25.0, ki = 0.5, kd = 1.2;   // ⚠️ estos valores se SINTONIZAN
+float integral = 0, errorPrev = 0;
+const float OBJETIVO = 0.0;            // queremos θ = 0° (vertical)
+
+void loopControl(float dt) {           // llamado a dt fijo (timer, E04)
+  float angulo = leerIMU();            // SENSAR — giroscopio (E05/E03)
+  float error = OBJETIVO - angulo;
+
+  // PID — derivada e integral = cálculo de M03
+  float P = kp * error;
+  integral += error * dt;
+  integral = constrain(integral, -50, 50);   // anti-windup (E08)
+  float I = ki * integral;
+  float D = kd * (error - errorPrev) / dt;
+  errorPrev = error;
+
+  float salida = P + I + D;             // señal de control
+
+  // ACTUAR — ambos motores aceleran hacia donde cae (E05)
+  moverMotores(constrain(salida, -255, 255));
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> Mirá los conceptos de E08 en el código: <code>integral += error*dt</code> (integral numérica de M03), <code>(error-errorPrev)/dt</code> (derivada numérica), <code>constrain(integral,...)</code> (anti-windup). Y el <code>dt</code> fijo viene de un timer de E04 — si el loop no corre a intervalo constante, el PID calcula mal.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> leé el IMU y mostrá el ángulo por serial. Aplicá filtro complementario para un valor estable (sin deriva ni ruido).</div>
+<div class="fase"><strong>Fase 2:</strong> hacé andar los motores en ambos sentidos con PWM. Verificá el driver y la fuente.</div>
+<div class="fase"><strong>Fase 3:</strong> implementá el PID. Empezá SOLO con P, sumá D, después I. <strong>Sintonizá una ganancia a la vez</strong> (regla de E08).</div>
+<div class="fase"><strong>Fase 4:</strong> ajuste fino hasta que aguante empujones. Agregá control de posición/giro por Bluetooth (manejarlo como un Segway).</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El robot se mantiene parado solo sobre 2 ruedas.</li>
+    <li>Si lo empujás suavemente, se corrige y vuelve a la vertical.</li>
+    <li>El PID está sintonizado (no oscila violentamente ni se cae).</li>
+    <li>El loop corre a dt fijo con timer.</li>
+    <li>Implementaste anti-windup en la integral.</li>
+    <li>Grabaste un video del robot balanceándose y resistiendo empujones.</li>
+  </ul>
+</div>
+
+<h2>Variantes (hacia robótica avanzada)</h2>
+<ol>
+  <li><strong>Control remoto</strong>: manejarlo por Bluetooth/WiFi como un mini-Segway (M37 IoT).</li>
+  <li><strong>Telemetría</strong>: graficar el ángulo y la señal PID en vivo en un dashboard (Curso-React).</li>
+  <li><strong>Filtro de Kalman</strong> en vez del complementario (fusión de sensores avanzada, conecta con M04 Probabilidad).</li>
+  <li><strong>Auto-tuning</strong>: que el robot ajuste sus propias ganancias.</li>
+  <li><strong>RL en vez de PID</strong>: entrenar el balanceo con reinforcement learning (M39) — el "control aprendido" de E08.</li>
+</ol>
+
+<div class="bridge">
+  <span>🔗</span> <strong>El cierre del campus:</strong> la última variante —reemplazar el PID por reinforcement learning— es literalmente el espejo que E08 describe: control clásico (ingeniero ajusta ganancias) vs control aprendido (el agente las descubre). Hacer ambas versiones del MISMO robot es ver los dos mundos —ingeniería de control e IA— resolviendo el mismo problema. La complementariedad total.
+</div>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./12-vumetro-fft.html">← Vúmetro con FFT</a>
+  <a href="./index.html">🏠 Galería de Proyectos</a>
+</nav>
+
+</div>
+</body>
+</html>

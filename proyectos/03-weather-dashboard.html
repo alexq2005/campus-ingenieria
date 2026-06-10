@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 03 — Weather Dashboard · Campus CS-FE</title>
+<meta name="description" content="App de clima con API real, gráficos, búsqueda y favoritos. fetch async, estado, errores.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-React/index.html">⚛️ Curso React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 03</span>
+  <span class="badge nivel-inter">🔵 Intermedio</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">React + APIs</span>
+</div>
+
+<article>
+
+<h1>🌦️ Weather Dashboard</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> una app que muestra el clima actual y el pronóstico de cualquier ciudad, con gráfico de temperatura, búsqueda y ciudades favoritas. Es EL proyecto para dominar <strong>consumir APIs reales</strong> — la habilidad #1 del frontend moderno.
+</div>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li><strong>Fetch async</strong> a una API externa con loading / error / success states.</li>
+  <li>Manejar <strong>API keys</strong> y variables de entorno (<code>.env</code>).</li>
+  <li><strong>Data fetching con TanStack Query</strong> (cache, refetch).</li>
+  <li>Renderizar <strong>gráficos</strong> (Recharts).</li>
+  <li>Persistir favoritos con <strong>custom hook + localStorage</strong>.</li>
+  <li><strong>Debounce</strong> en la búsqueda para no spamear la API.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>React + Vite + TanStack Query + Recharts. API gratuita: <a href="https://open-meteo.com">Open-Meteo</a> (no requiere API key) o OpenWeatherMap (con key gratis).</p>
+
+<h2>Fases</h2>
+
+<div class="fase"><strong>Fase 1 — Fetch básico.</strong> Pedí el clima de una ciudad fija y mostralo. Manejá los 3 estados.</div>
+
+<pre><code>import { useQuery } from '@tanstack/react-query';
+
+function useClima(lat, lon) {
+  return useQuery({
+    queryKey: ['clima', lat, lon],
+    queryFn: async () => {
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m&hourly=temperature_2m`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Error al obtener el clima');
+      return res.json();
+    },
+  });
+}
+
+function App() {
+  const { data, isLoading, error } = useClima(-34.6, -58.4); // Buenos Aires
+  if (isLoading) return <p>Cargando...</p>;
+  if (error) return <p>Error: {error.message}</p>;
+  return <h1>{data.current.temperature_2m}°C</h1>;
+}</code></pre>
+
+<div class="fase"><strong>Fase 2 — Búsqueda de ciudad.</strong> Input que busca ciudades (geocoding API) con <strong>debounce</strong>, y al elegir una, carga su clima.</div>
+
+<pre><code>// Custom hook de M08 — evita llamar la API en cada tecla
+function useDebounce(value, delay = 400) {
+  const [d, setD] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setD(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return d;
+}</code></pre>
+
+<div class="fase"><strong>Fase 3 — Gráfico de pronóstico.</strong> Con Recharts, graficá la temperatura de las próximas 24h.</div>
+
+<pre><code>import { LineChart, Line, XAxis, YAxis, Tooltip } from 'recharts';
+
+const datos = data.hourly.time.slice(0, 24).map((t, i) => ({
+  hora: t.slice(11, 16),
+  temp: data.hourly.temperature_2m[i],
+}));
+
+<LineChart width={600} height={300} data={datos}>
+  <XAxis dataKey="hora" /><YAxis /><Tooltip />
+  <Line dataKey="temp" stroke="#38bdf8" />
+</LineChart></code></pre>
+
+<div class="fase"><strong>Fase 4 — Favoritos persistentes.</strong> Botón "⭐ guardar ciudad". Lista de favoritos que persiste a F5 con localStorage.</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong> integra
+  <a href="../Curso-React/m10-data-fetching/lecture.html">M10 Data Fetching</a> (TanStack Query),
+  <a href="../Curso-React/m08-custom-hooks/lecture.html">M08 Custom Hooks</a> (useDebounce, useLocalStorage),
+  <a href="../Curso-React/m06-useeffect/lecture.html">M06 useEffect</a> y
+  <a href="../Curso-Python/index.html">conceptos de APIs REST</a>. Si querés, el backend que cachea las respuestas se conecta con M33 Fullstack.
+</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Buscás cualquier ciudad y ves su clima actual.</li>
+    <li>Hay un gráfico del pronóstico de las próximas horas.</li>
+    <li>Podés guardar/quitar favoritos y persisten al recargar.</li>
+    <li>Maneja errores (ciudad no encontrada, API caída) sin romperse.</li>
+    <li>Está deployado en Vercel con URL pública.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Geolocalización: detectar la ubicación del usuario con <code>navigator.geolocation</code>.</li>
+  <li>Mapa con la ciudad (Leaflet).</li>
+  <li>Alertas: notificar si va a llover en las próximas horas.</li>
+  <li>Comparar 2 ciudades lado a lado.</li>
+  <li>Modo offline: mostrar el último dato cacheado si no hay red.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./01-tic-tac-toe.html">← Tic-Tac-Toe</a>
+  <a href="./04-notas-markdown.html">Siguiente: Notas Markdown →</a>
+</nav>
+
+</div>
+</body>
+</html>

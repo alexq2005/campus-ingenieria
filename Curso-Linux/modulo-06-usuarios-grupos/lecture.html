@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 06 — Usuarios y Grupos · Curso de Linux</title>
+  <meta name="description" content="/etc/passwd, useradd, sudo, /etc/sudoers, ssh keys, sesiones.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 06</span>
+  <span class="badge">⏱ ~70 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 05</span>
+</div>
+
+<article>
+
+<h1>Módulo 06 — Usuarios y Grupos</h1>
+
+<h2>Modelo</h2>
+<figure class="foto">
+  <img src="../assets/img/06-usuarios.jpg" alt="Multitud de personas en una calle">
+  <figcaption>Una multitud: Linux es multiusuario por diseño — usuarios y grupos separan permisos y recursos entre muchas personas. Foto: Jennifer Woodard Maderazo, vía <a href="https://commons.wikimedia.org/wiki/File:Corner_of_Stockton_and_Jackson_Street%2C_crowd%2C_San_Francisco_%28April_2007%29.jpg" target="_blank">Wikimedia Commons</a> (CC BY 2.0).</figcaption>
+</figure>
+
+
+<p>Linux es <strong>multiusuario</strong>. Cada usuario tiene:</p>
+<ul>
+  <li><strong>Username</strong> y <strong>UID</strong> (User ID)</li>
+  <li>Uno o más <strong>grupos</strong> (cada uno con <strong>GID</strong>)</li>
+  <li>Un <strong>home</strong> y un <strong>shell</strong> asignados</li>
+  <li>Una contraseña hasheada</li>
+</ul>
+
+<p>Convención de UIDs:</p>
+
+<table>
+<thead><tr><th>Rango</th><th>Uso</th></tr></thead>
+<tbody>
+<tr><td><code>0</code></td><td>root</td></tr>
+<tr><td><code>1-999</code></td><td>Usuarios de sistema (servicios, daemons)</td></tr>
+<tr><td><code>1000+</code></td><td>Usuarios humanos</td></tr>
+</tbody>
+</table>
+
+<h2>Archivos clave</h2>
+
+<h3><code>/etc/passwd</code></h3>
+
+<p>Una línea por usuario. <strong>Lectura pública</strong> (no contiene contraseñas reales):</p>
+
+<pre><code>ana:x:1000:1000:Ana Pérez,,,:/home/ana:/bin/bash
+│   │ │    │    │           │         │
+│   │ │    │    │           │         shell
+│   │ │    │    │           home
+│   │ │    │    GECOS (info)
+│   │ │    GID primario
+│   │ UID
+│   x = ver /etc/shadow
+username</code></pre>
+
+<h3><code>/etc/shadow</code></h3>
+
+<p>Contraseñas hasheadas. <strong>Solo root</strong> puede leer:</p>
+
+<pre><code>ana:$6$abc...:19000:0:99999:7:::
+│   │         │     │ │     │
+│   hash      │     │ │     warn antes de expirar
+│   (formato $algo$salt$hash)
+│             │     │ vida máxima
+│             │     min antes de poder cambiar
+│             días desde 1970 del último cambio
+username</code></pre>
+
+<p>Algoritmos de hash (<code>$id$</code>):</p>
+<ul>
+  <li><code>$1$</code> MD5 (inseguro)</li>
+  <li><code>$5$</code> SHA-256</li>
+  <li><code>$6$</code> SHA-512 (default moderno)</li>
+  <li><code>$y$</code> yescrypt (más nuevo)</li>
+</ul>
+
+<h3><code>/etc/group</code></h3>
+
+<pre><code>devs:x:1001:ana,luis,eva
+│    │ │    │
+│    │ │    miembros (separados por coma)
+│    │ GID
+│    x (no usado típicamente)
+nombre del grupo</code></pre>
+
+<h3><code>/etc/gshadow</code></h3>
+<p>Contraseñas de grupos (raras de usar).</p>
+
+<h2>Crear y eliminar usuarios</h2>
+
+<pre><code class="lang-bash">sudo useradd ana                          # mínimo (no crea home)
+sudo useradd -m ana                       # con home
+sudo useradd -m -s /bin/bash ana          # especificar shell
+sudo useradd -m -G devs,docker ana        # con grupos suplementarios
+sudo passwd ana                           # asignar contraseña
+
+sudo adduser ana                          # ⭐ wrapper interactivo (Debian/Ubuntu)</code></pre>
+
+<p><code>adduser</code> es más amigable: pregunta nombre, contraseña, etc. y crea home con skeleton (<code>/etc/skel</code>).</p>
+
+<h3>Eliminar</h3>
+
+<pre><code class="lang-bash">sudo userdel ana                          # eliminar usuario
+sudo userdel -r ana                       # también borrar home y mail
+sudo deluser --remove-home ana            # Debian/Ubuntu</code></pre>
+
+<h2>Modificar usuarios</h2>
+
+<pre><code class="lang-bash">sudo usermod -aG docker ana               # AGREGAR a grupo (cuidado con -a)
+sudo usermod -G devs,docker ana           # ⚠️ REEMPLAZA grupos suplementarios
+sudo usermod -L ana                       # bloquear contraseña
+sudo usermod -U ana                       # desbloquear
+sudo usermod -s /bin/zsh ana              # cambiar shell
+sudo usermod -d /nuevo/home -m ana        # mover home
+sudo usermod -e 2025-12-31 ana            # fecha de expiración
+sudo chage -l ana                         # ver info de aging</code></pre>
+
+<div class="mistake"><strong>Trampa típica</strong>: <code>usermod -G grupo ana</code> sin <code>-a</code> te BORRA todos los grupos suplementarios anteriores. Usá siempre <code>-aG</code> cuando agregás.</div>
+
+<h2>Cambiar contraseña</h2>
+
+<pre><code class="lang-bash">passwd                                     # tu propia (interactivo)
+sudo passwd ana                            # de otro usuario
+sudo passwd -l ana                         # bloquear
+sudo passwd -u ana                         # desbloquear
+sudo passwd -e ana                         # forzar cambio en próximo login</code></pre>
+
+<h2>Grupos</h2>
+
+<pre><code class="lang-bash">sudo groupadd devs
+sudo groupadd -g 1500 devs                # con GID específico
+sudo groupdel devs
+sudo groupmod -n nuevos viejos            # renombrar
+
+groups                                     # tus grupos
+groups ana                                 # los de ana
+id                                         # tu UID, GID y grupos
+id ana                                     # los de ana</code></pre>
+
+<h3>Cambiar grupo de archivos</h3>
+
+<pre><code class="lang-bash">sudo chgrp devs archivo
+newgrp devs                                # cambiar GID activo en la sesión</code></pre>
+
+<h2>El comando <code>su</code> — Switch User</h2>
+
+<pre><code class="lang-bash">su                                         # convertirse en root (pide contraseña)
+su -                                       # como root con su entorno completo
+su ana                                     # convertirse en ana
+su - ana                                   # ana con su entorno
+exit                                       # volver</code></pre>
+
+<h2>El comando <code>sudo</code></h2>
+
+<p>Permite ejecutar comandos como otro usuario (usualmente root) <strong>sin compartir contraseña</strong>.</p>
+
+<pre><code class="lang-bash">sudo comando
+sudo -i                                    # shell interactivo de root
+sudo -u ana comando                        # como ana
+sudo -l                                    # qué puedo hacer con sudo
+sudo !!                                    # repetir el último con sudo</code></pre>
+
+<h3>Configuración — <code>/etc/sudoers</code></h3>
+
+<p><strong>Editar SIEMPRE con <code>visudo</code></strong> (valida sintaxis antes de guardar):</p>
+
+<pre><code class="lang-bash">sudo visudo</code></pre>
+
+<p>Sintaxis:</p>
+
+<pre><code># usuario   host=(usuarios)   comandos
+root        ALL=(ALL:ALL) ALL
+%sudo       ALL=(ALL:ALL) ALL              # %grupo
+ana         ALL=(ALL) NOPASSWD: /usr/bin/systemctl</code></pre>
+
+<p>Archivos modulares en <code>/etc/sudoers.d/</code>:</p>
+
+<pre><code class="lang-bash">sudo visudo -f /etc/sudoers.d/ana-deploys</code></pre>
+
+<blockquote>El archivo debe terminar sin extensión y permisos <code>0440</code>.</blockquote>
+
+<h3>Logs de sudo</h3>
+<p>Cada <code>sudo</code> se loguea en <code>/var/log/auth.log</code> (Debian) o <code>/var/log/secure</code> (RHEL).</p>
+
+<h2>Sesiones activas — <code>who</code> y <code>w</code></h2>
+
+<pre><code class="lang-bash">who                                        # quiénes están logueados
+w                                          # más detalle (carga, idle, comando)
+last                                       # historial de logins
+last -F | head                             # con fechas completas
+lastb                                      # logins fallidos (root)
+finger ana                                 # info detallada (instalable)
+whoami                                     # tu username
+logname                                    # username del login original</code></pre>
+
+<h2>Skeleton de home — <code>/etc/skel</code></h2>
+
+<p>Cuando se crea un usuario con <code>useradd -m</code>, se copia el contenido de <code>/etc/skel/</code> a su home. Es el lugar para configurar defaults globales (<code>.bashrc</code>, <code>.profile</code>, etc.).</p>
+
+<h2>Cuotas de disco</h2>
+
+<pre><code class="lang-bash"># Habilitar en /etc/fstab: añadir usrquota,grpquota
+sudo quotacheck -avug
+sudo quotaon -av
+sudo edquota -u ana                        # editar cuotas
+quota -u ana                               # ver</code></pre>
+
+<h2>Buenas prácticas</h2>
+
+<ol>
+  <li><strong>Nunca compartir cuentas</strong>. Cada humano = un usuario</li>
+  <li><strong>Deshabilitar root login por SSH</strong>: <code>PermitRootLogin no</code> en <code>/etc/ssh/sshd_config</code></li>
+  <li><strong>Usar <code>sudo</code></strong>, no <code>su -</code>, para auditoría</li>
+  <li><strong>Política de contraseñas</strong>: instalar <code>libpam-pwquality</code> y configurar <code>/etc/security/pwquality.conf</code></li>
+  <li><strong>Bloquear cuentas inactivas</strong>: <code>chage -E</code> para expiración</li>
+</ol>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Crear usuario <code>desarrollador</code> con home, shell <code>/bin/bash</code>, en grupo <code>devs</code></li>
+  <li>Verificar su entrada en <code>/etc/passwd</code> y <code>/etc/shadow</code></li>
+  <li>Forzar que cambie la contraseña en el próximo login</li>
+  <li>Configurar sudo sin contraseña para un comando específico (ej: <code>systemctl restart nginx</code>)</li>
+  <li>Ver los últimos 10 logins con <code>last</code> y los fallidos con <code>lastb</code></li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-05-procesos/lecture.html">← Anterior: Procesos</a>
+  <a href="../modulo-07-paquetes/lecture.html">Siguiente: Gestión de Paquetes →</a>
+</nav>
+
+</div>
+</body>
+</html>

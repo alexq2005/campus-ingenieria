@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 22 — Pipeline CI/CD · Campus CS-FE</title>
+<meta name="description" content="Automatizá test → build → deploy con GitHub Actions: cada push se valida y publica solo. Integración y entrega continua (M27).">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-05-ingenieria-de-software/m27-devops-y-cicd/lecture.html">🎓 M27 CI/CD</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 22</span>
+  <span class="badge nivel-inter">Intermedio</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">GitHub Actions</span>
+</div>
+
+<article>
+
+<h1>🔁 Pipeline CI/CD</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> que cada vez que hagas <code>git push</code>, una máquina corra tus tests, construya la app y —si todo pasa— la publique automáticamente. Eso es <strong>CI/CD</strong>: integración continua (validar siempre) + entrega continua (desplegar sin intervención manual). Adiós al "deploy a mano los viernes".
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-05-ingenieria-de-software/m27-devops-y-cicd/lecture.html">M27 DevOps y CI/CD</a> (pipelines),
+  <a href="../../Curso%20ingenieria%20sistemas/area-05-ingenieria-de-software/m26-testing-y-qa/lecture.html">M26 Testing</a> (la base de CI),
+  <a href="../Curso-Linux/modulo-09-bash-scripting/lecture.html">Bash</a> (los pasos del pipeline) y
+  <a href="../Curso-React/m12-performance-y-testing/lecture.html">Testing en React</a>.
+</div>
+
+<h2>Cómo funciona — el pipeline gatillado por push</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 130" role="img" aria-label="Push dispara: checkout, tests, build, y si todo pasa, deploy">
+  <defs>
+    <marker id="ac" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <rect x="10" y="45" width="95" height="42" rx="6" fill="#1f2638" stroke="#fb7185" stroke-width="2"/>
+  <text x="57" y="63" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">git push</text>
+  <text x="57" y="78" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">gatillo</text>
+  <line x1="105" y1="66" x2="138" y2="66" stroke="#f0883e" stroke-width="2" marker-end="url(#ac)"/>
+  <rect x="143" y="45" width="95" height="42" rx="6" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="190" y="63" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">📥 Checkout</text>
+  <text x="190" y="78" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">+ deps</text>
+  <line x1="238" y1="66" x2="271" y2="66" stroke="#f0883e" stroke-width="2" marker-end="url(#ac)"/>
+  <rect x="276" y="45" width="95" height="42" rx="6" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="323" y="63" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">🧪 Tests</text>
+  <text x="323" y="78" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">lint + unit</text>
+  <line x1="371" y1="66" x2="404" y2="66" stroke="#f0883e" stroke-width="2" marker-end="url(#ac)"/>
+  <rect x="409" y="45" width="95" height="42" rx="6" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="456" y="63" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">🔨 Build</text>
+  <text x="456" y="78" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">imagen/bundle</text>
+  <line x1="504" y1="66" x2="537" y2="66" stroke="#3fb950" stroke-width="2" marker-end="url(#ac)"/>
+  <text x="540" y="40" fill="#3fb950" font-size="10" font-family="system-ui">si todo ✓</text>
+  <rect x="542" y="45" width="100" height="42" rx="6" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="592" y="63" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">🚀 Deploy</text>
+  <text x="592" y="78" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">automático</text>
+  <!-- fallo -->
+  <text x="323" y="112" text-anchor="middle" fill="#fb7185" font-size="11" font-family="system-ui">si un test falla → el pipeline corta acá y NO se despliega ✗</text>
+</svg>
+<figcaption>Cada push dispara la cadena. Si los tests fallan, el pipeline se detiene y nada llega a producción. El "merge a main" deja de dar miedo porque está blindado por la automatización.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Qué es un <strong>runner</strong> y cómo se define un workflow (YAML declarativo).</li>
+  <li>Disparadores: <strong>on push / pull_request</strong>, jobs, steps, matrices.</li>
+  <li>Correr <strong>tests automáticos</strong> en cada cambio (M26) — el corazón de CI.</li>
+  <li>Construir artefactos: bundle, imagen Docker (conecta con P21).</li>
+  <li><strong>Secrets</strong> del repo para credenciales de deploy (sin exponerlas).</li>
+  <li>Gates: solo desplegar desde <code>main</code> y si todo pasó.</li>
+</ul>
+
+<h2>Stack</h2>
+<p><strong>GitHub Actions</strong> (gratis para repos públicos) · tu proyecto con tests (pytest / Vitest) · destino de deploy: GitHub Pages, un VPS por SSH, o un registry de imágenes. Aplicable también a GitLab CI con sintaxis similar.</p>
+
+<h2>Código clave (.github/workflows/ci.yml)</h2>
+
+<pre><code class="lang-yaml">name: CI/CD
+on:
+  push:
+    branches: [main]          # gatillo: push a main
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest    # un runner Linux efímero
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - run: npm ci            # instalar exacto (lockfile)
+      - run: npm run lint
+      - run: npm test          # 🧪 si falla, el job corta acá (M26)
+      - run: npm run build
+
+      - name: Deploy            # solo se llega si todo lo anterior pasó
+        run: ./scripts/deploy.sh
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}   # secreto del repo</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El pipeline es un <strong>script de bash glorificado</strong> (Linux M09) que corre en un servidor limpio cada vez — por eso atrapa el "en mi máquina funciona". Y <code>npm test</code> como gate es la razón por la que M26 Testing importa: sin tests, CI no valida nada. Los <code>secrets</code> evitan poner claves en el código (M31).
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> un workflow mínimo que corra en cada push e imprima "hola". Entendé el ciclo runner/job/step.</div>
+<div class="fase"><strong>Fase 2:</strong> CI real: instalar deps + lint + tests. Hacé fallar un test a propósito y mirá el pipeline rojo.</div>
+<div class="fase"><strong>Fase 3:</strong> build del artefacto (bundle o imagen Docker, P21).</div>
+<div class="fase"><strong>Fase 4:</strong> CD: deploy automático a GitHub Pages o por SSH, usando secrets.</div>
+<div class="fase"><strong>Fase 5:</strong> badge de estado en el README, matriz de versiones, y bloqueo de merge si CI falla.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Cada push corre tests automáticamente y muestra ✓/✗ en GitHub.</li>
+    <li>Un test que falla DETIENE el deploy (el gate funciona).</li>
+    <li>El deploy es 100% automático: no tocás nada a mano.</li>
+    <li>Las credenciales viven en secrets, no en el repo.</li>
+    <li>El README muestra el badge de estado del pipeline.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Matriz: testear en varias versiones de Node/Python a la vez.</li>
+  <li>Entornos: deploy automático a staging, manual a producción (con aprobación).</li>
+  <li>Construir y publicar la imagen Docker del stack de P21 en un registry.</li>
+  <li>Caché de dependencias para acelerar el pipeline.</li>
+  <li>Notificar a Slack/Discord cuando el deploy termina o falla.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./21-stack-docker.html">← Stack Docker</a>
+  <a href="./23-api-rest-sql.html">Siguiente: API REST con SQL →</a>
+</nav>
+
+</div>
+</body>
+</html>

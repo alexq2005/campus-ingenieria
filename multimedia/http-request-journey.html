@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP Request Journey — de URL a píxel</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0; padding: 1.5rem;
+      background: linear-gradient(135deg, #0f172a, #1e1b4b);
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 { margin-top: 0; color: #38bdf8; font-size: 1.6rem; }
+    .sub { color: #94a3b8; font-size: 0.95em; margin-bottom: 1rem; }
+
+    .scene {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem;
+      backdrop-filter: blur(8px);
+    }
+
+    svg { width: 100%; height: auto; display: block; max-height: 420px; }
+
+    /* Nodos del diagrama */
+    .node { cursor: pointer; transition: filter 0.2s; }
+    .node:hover { filter: brightness(1.2); }
+    .node.active circle,
+    .node.active rect { stroke-width: 4; }
+
+    .node-label {
+      fill: #e2e8f0;
+      font-size: 13px;
+      text-anchor: middle;
+      font-weight: 600;
+      font-family: system-ui, sans-serif;
+    }
+    .node-sub {
+      fill: #94a3b8;
+      font-size: 10px;
+      text-anchor: middle;
+      font-family: system-ui, sans-serif;
+    }
+
+    .packet {
+      fill: #fbbf24;
+      stroke: #f59e0b;
+      stroke-width: 2;
+      filter: drop-shadow(0 0 6px #fbbf24);
+    }
+    .response-packet {
+      fill: #34d399;
+      stroke: #10b981;
+      stroke-width: 2;
+      filter: drop-shadow(0 0 6px #34d399);
+    }
+
+    .wire {
+      stroke: #475569;
+      stroke-width: 2;
+      fill: none;
+    }
+    .wire.active {
+      stroke: #38bdf8;
+      stroke-dasharray: 5 3;
+      animation: dash 0.8s linear infinite;
+    }
+    @keyframes dash { to { stroke-dashoffset: -16; } }
+
+    /* Panel de info */
+    .info {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    @media (max-width: 720px) { .info { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .panel h2 {
+      margin: 0 0 0.5rem; font-size: 0.8em;
+      text-transform: uppercase; letter-spacing: 0.1em;
+      color: #94a3b8;
+    }
+    .step-num {
+      display: inline-block;
+      background: #38bdf8; color: #0f172a;
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      text-align: center; line-height: 28px;
+      font-weight: bold; margin-right: 0.5rem;
+    }
+
+    .log {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 0.7rem;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .log > div {
+      padding: 2px 0;
+      animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(-5px); } to { opacity: 1; } }
+    .log .ok { color: #34d399; }
+    .log .warn { color: #fbbf24; }
+    .log .info { color: #7dd3fc; }
+    .log .stage { color: #a78bfa; font-weight: bold; margin-top: 0.4rem; }
+
+    .controls {
+      display: flex; gap: 0.4rem; margin-top: 1rem;
+      flex-wrap: wrap; align-items: center;
+    }
+    button {
+      background: #38bdf8; color: #0f172a;
+      border: 0; padding: 0.6rem 1.2rem;
+      border-radius: 6px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s, transform 0.1s;
+    }
+    button:hover:not(:disabled) { background: #0ea5e9; transform: translateY(-1px); }
+    button.secondary { background: #334155; color: #e2e8f0; }
+    button.danger { background: #ef4444; color: white; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    input[type=text] {
+      background: #0f172a; color: #e2e8f0;
+      border: 1px solid #334155; padding: 0.55rem 0.8rem;
+      border-radius: 6px; font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9em; min-width: 240px;
+    }
+
+    .progress {
+      margin-top: 0.8rem; height: 6px;
+      background: #334155; border-radius: 3px; overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #38bdf8, #a78bfa);
+      transition: width 0.3s;
+      width: 0%;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🌍 HTTP Request Journey</h1>
+    <p class="sub">De <code>Enter</code> en la barra del navegador a píxel en pantalla — los 13 pasos que el ciclo recorre en ~500ms.</p>
+
+    <div class="scene">
+      <div class="controls" style="margin-bottom: 1rem;">
+        <input type="text" id="url" value="https://ejemplo.com/sobre" aria-label="URL">
+        <button id="go">🚀 Lanzar request</button>
+        <button id="reset" class="danger">↺ Reset</button>
+      </div>
+
+      <svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" aria-label="Diagrama del viaje de un request HTTP">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+          </marker>
+          <linearGradient id="browserGrad" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stop-color="#38bdf8"/>
+            <stop offset="100%" stop-color="#0ea5e9"/>
+          </linearGradient>
+          <linearGradient id="serverGrad" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stop-color="#a78bfa"/>
+            <stop offset="100%" stop-color="#7c3aed"/>
+          </linearGradient>
+        </defs>
+
+        <!-- Wires (cables entre nodos) -->
+        <path id="wire-dns" class="wire" d="M 170 110 Q 280 70 390 110" marker-end="url(#arr)"/>
+        <path id="wire-tcp" class="wire" d="M 170 140 Q 350 240 580 180" marker-end="url(#arr)"/>
+        <path id="wire-tls" class="wire" d="M 170 170 Q 380 290 580 210" marker-end="url(#arr)"/>
+        <path id="wire-req" class="wire" d="M 170 200 Q 380 330 580 240" marker-end="url(#arr)"/>
+        <path id="wire-resp" class="wire" d="M 580 280 Q 380 360 170 280" marker-end="url(#arr)" stroke-dasharray="3 3"/>
+
+        <!-- Browser -->
+        <g class="node" id="node-browser" data-step="0">
+          <rect x="30" y="80" width="140" height="220" rx="12" fill="url(#browserGrad)" stroke="#38bdf8" stroke-width="2"/>
+          <text x="100" y="110" class="node-label" fill="white">🌐 NAVEGADOR</text>
+          <text x="100" y="130" class="node-sub" fill="#e0f2fe">(Cliente)</text>
+          <line x1="50" y1="145" x2="150" y2="145" stroke="#e0f2fe" stroke-width="1" opacity="0.4"/>
+          <text x="100" y="170" class="node-sub" fill="#e0f2fe">📄 HTML parser</text>
+          <text x="100" y="195" class="node-sub" fill="#e0f2fe">🎨 CSS engine</text>
+          <text x="100" y="220" class="node-sub" fill="#e0f2fe">⚙️ JS VM</text>
+          <text x="100" y="245" class="node-sub" fill="#e0f2fe">🖼️ Layout</text>
+          <text x="100" y="270" class="node-sub" fill="#e0f2fe">🎨 Paint</text>
+          <text x="100" y="290" class="node-sub" fill="#e0f2fe">🪟 Composite</text>
+        </g>
+
+        <!-- DNS -->
+        <g class="node" id="node-dns" data-step="1">
+          <circle cx="430" cy="70" r="50" fill="#1e293b" stroke="#facc15" stroke-width="2"/>
+          <text x="430" y="68" class="node-label">📡 DNS</text>
+          <text x="430" y="86" class="node-sub">resolver</text>
+        </g>
+
+        <!-- Server -->
+        <g class="node" id="node-server" data-step="2">
+          <rect x="580" y="140" width="240" height="140" rx="12" fill="url(#serverGrad)" stroke="#a78bfa" stroke-width="2"/>
+          <text x="700" y="170" class="node-label" fill="white">🖥️ SERVIDOR</text>
+          <text x="700" y="188" class="node-sub" fill="#ede9fe">ejemplo.com</text>
+          <line x1="600" y1="200" x2="800" y2="200" stroke="#ede9fe" stroke-width="1" opacity="0.4"/>
+          <text x="700" y="222" class="node-sub" fill="#ede9fe">🔐 TLS handshake</text>
+          <text x="700" y="244" class="node-sub" fill="#ede9fe">🗃️ Routing</text>
+          <text x="700" y="266" class="node-sub" fill="#ede9fe">💾 Database</text>
+        </g>
+
+        <!-- Paquete animado -->
+        <circle class="packet" id="packet" r="8" cx="-20" cy="-20" opacity="0"/>
+      </svg>
+
+      <div class="progress"><div class="progress-bar" id="progress"></div></div>
+    </div>
+
+    <div class="info">
+      <div class="panel">
+        <h2>Paso actual</h2>
+        <div id="stepInfo">
+          <div><span class="step-num">0</span><strong>Esperando...</strong></div>
+          <p style="color:#94a3b8; font-size: 0.9em; margin-top: 0.5rem;">
+            Ingresá una URL y presioná "Lanzar request".
+          </p>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>📜 Log técnico</h2>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  // ═══════════════════════════════════════════════
+  // Los 13 pasos del ciclo URL → píxel
+  // ═══════════════════════════════════════════════
+  const STEPS = [
+    {
+      title: "Parse URL",
+      desc: "Descomponer la URL en protocolo, host, path, query, hash.",
+      focus: 'browser',
+      log: [
+        { cls: 'info', text: '🔍 URL = "https://ejemplo.com/sobre"' },
+        { cls: 'ok',   text: '  protocolo=https, host=ejemplo.com, path=/sobre' }
+      ],
+    },
+    {
+      title: "Verificar caché HSTS / HTTP cache",
+      desc: "¿Ya visité este dominio? ¿Hay recursos cacheados?",
+      focus: 'browser',
+      log: [{ cls: 'info', text: '🗄️  Cache lookup... (miss)' }],
+    },
+    {
+      title: "DNS lookup",
+      desc: "Convertir 'ejemplo.com' en una IP. Consulta al resolver (suele ser tu ISP o 1.1.1.1).",
+      focus: 'dns',
+      animate: 'to-dns',
+      log: [
+        { cls: 'info', text: '📡 DNS query: ejemplo.com?' },
+        { cls: 'ok',   text: '  ← 93.184.216.34 (A record)' }
+      ],
+    },
+    {
+      title: "TCP handshake",
+      desc: "3-way handshake: SYN → SYN-ACK → ACK. Abre un canal confiable con el servidor.",
+      focus: 'server',
+      animate: 'to-server',
+      log: [
+        { cls: 'stage', text: '━━ TCP ━━' },
+        { cls: 'info', text: '→ SYN (seq=0)' },
+        { cls: 'info', text: '← SYN-ACK (seq=0, ack=1)' },
+        { cls: 'ok',   text: '→ ACK (ack=1) · conexión establecida' }
+      ],
+    },
+    {
+      title: "TLS handshake",
+      desc: "Intercambio de claves, verificación del certificado. Habilita HTTPS (cifrado).",
+      focus: 'server',
+      log: [
+        { cls: 'stage', text: '━━ TLS 1.3 ━━' },
+        { cls: 'info', text: '→ ClientHello (cipher suites, SNI)' },
+        { cls: 'info', text: '← ServerHello + Certificate' },
+        { cls: 'ok',   text: '🔒 Sesión cifrada negociada' }
+      ],
+    },
+    {
+      title: "HTTP Request",
+      desc: "Envía la petición: método, path, headers, cookies, body si hay.",
+      focus: 'server',
+      animate: 'request',
+      log: [
+        { cls: 'stage', text: '━━ HTTP ━━' },
+        { cls: 'info', text: '→ GET /sobre HTTP/2' },
+        { cls: 'info', text: '→ Host: ejemplo.com' },
+        { cls: 'info', text: '→ Accept: text/html' },
+      ],
+    },
+    {
+      title: "Server processing",
+      desc: "La app ejecuta: routing, lectura DB, render de template.",
+      focus: 'server',
+      log: [
+        { cls: 'warn', text: '⚙️  Matching route /sobre...' },
+        { cls: 'warn', text: '💾 SELECT * FROM pages WHERE slug=\'sobre\'' },
+        { cls: 'ok',   text: '  HTML generado (1547 bytes)' }
+      ],
+    },
+    {
+      title: "HTTP Response",
+      desc: "Vuelve el documento con status, headers y body.",
+      focus: 'browser',
+      animate: 'response',
+      log: [
+        { cls: 'ok',   text: '← HTTP/2 200 OK' },
+        { cls: 'info', text: '← Content-Type: text/html; charset=utf-8' },
+        { cls: 'info', text: '← Content-Length: 1547' },
+        { cls: 'info', text: '← Cache-Control: max-age=3600' },
+      ],
+    },
+    {
+      title: "Parse HTML → DOM",
+      desc: "El parser construye el árbol de nodos.",
+      focus: 'browser',
+      log: [{ cls: 'ok', text: '📄 DOM construido (42 nodos)' }],
+    },
+    {
+      title: "Parse CSS → CSSOM",
+      desc: "El motor CSS construye el árbol de reglas computadas.",
+      focus: 'browser',
+      log: [
+        { cls: 'info', text: '🎨 Descargando style.css (24 KB)' },
+        { cls: 'ok',   text: '  CSSOM construido (128 reglas)' }
+      ],
+    },
+    {
+      title: "Ejecutar JavaScript",
+      desc: "Si hay scripts, se ejecutan (pueden modificar DOM/CSSOM).",
+      focus: 'browser',
+      log: [
+        { cls: 'warn', text: '⚙️  Descargando app.js (diferido con defer)' },
+        { cls: 'ok',   text: '  JS ejecutado sin errores' }
+      ],
+    },
+    {
+      title: "Layout + Paint",
+      desc: "Calcula posiciones, tamaños, y llena píxeles en capas.",
+      focus: 'browser',
+      log: [
+        { cls: 'stage', text: '━━ Render pipeline ━━' },
+        { cls: 'info', text: '📐 Layout: 42 nodos → 38 cajas' },
+        { cls: 'info', text: '🎨 Paint: 4 capas' }
+      ],
+    },
+    {
+      title: "Composite → píxeles",
+      desc: "La GPU combina las capas y muestra el frame en pantalla.",
+      focus: 'browser',
+      log: [
+        { cls: 'info', text: '🖥️  Composite en GPU (1 frame)' },
+        { cls: 'ok',   text: '✅ First Contentful Paint @ 480ms' },
+        { cls: 'ok',   text: '✅ Largest Contentful Paint @ 520ms' }
+      ],
+    },
+  ];
+
+  // ═══════════════════════════════════════════════
+  // Animación y control
+  // ═══════════════════════════════════════════════
+  const $ = (id) => document.getElementById(id);
+  let running = false;
+  let packetAnim;
+
+  function resetScene() {
+    $('log').innerHTML = '';
+    $('progress').style.width = '0%';
+    $('packet').setAttribute('cx', -20);
+    $('packet').setAttribute('cy', -20);
+    $('packet').setAttribute('opacity', 0);
+    $('packet').setAttribute('class', 'packet');
+    document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.wire').forEach(w => w.classList.remove('active'));
+    $('stepInfo').innerHTML = `<div><span class="step-num">0</span><strong>Esperando...</strong></div>
+      <p style="color:#94a3b8; font-size: 0.9em; margin-top: 0.5rem;">Ingresá una URL y presioná "Lanzar request".</p>`;
+  }
+
+  function highlightNode(id) {
+    document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
+    if (id) $(`node-${id}`).classList.add('active');
+  }
+
+  // Mueve el paquete a lo largo de un path
+  function animatePacket(pathId, duration = 1000, asResponse = false) {
+    return new Promise(resolve => {
+      const path = document.getElementById(pathId);
+      if (!path) return resolve();
+
+      const packet = $('packet');
+      packet.setAttribute('class', asResponse ? 'packet response-packet' : 'packet');
+      packet.setAttribute('opacity', 1);
+      path.classList.add('active');
+
+      const len = path.getTotalLength();
+      const start = performance.now();
+
+      function frame(now) {
+        const t = Math.min((now - start) / duration, 1);
+        const pt = path.getPointAtLength(len * t);
+        packet.setAttribute('cx', pt.x);
+        packet.setAttribute('cy', pt.y);
+        if (t < 1) {
+          packetAnim = requestAnimationFrame(frame);
+        } else {
+          path.classList.remove('active');
+          packet.setAttribute('opacity', 0);
+          resolve();
+        }
+      }
+      packetAnim = requestAnimationFrame(frame);
+    });
+  }
+
+  function addLogs(logs) {
+    logs.forEach(l => {
+      const el = document.createElement('div');
+      el.className = l.cls;
+      el.textContent = l.text;
+      $('log').appendChild(el);
+    });
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+
+  async function runStep(i) {
+    const s = STEPS[i];
+    $('stepInfo').innerHTML = `
+      <div style="display:flex; align-items:center;">
+        <span class="step-num">${i + 1}</span>
+        <strong>${s.title}</strong>
+      </div>
+      <p style="color:#cbd5e1; margin-top: 0.5rem; font-size: 0.9em; line-height: 1.5;">${s.desc}</p>
+    `;
+    highlightNode(s.focus);
+    $('progress').style.width = `${((i + 1) / STEPS.length) * 100}%`;
+    addLogs(s.log);
+
+    if (s.animate === 'to-dns')    await animatePacket('wire-dns', 800);
+    if (s.animate === 'to-server') await animatePacket('wire-tcp', 900);
+    if (s.animate === 'request')   await animatePacket('wire-req', 900);
+    if (s.animate === 'response')  await animatePacket('wire-resp', 1000, true);
+  }
+
+  async function runAll() {
+    if (running) return;
+    running = true;
+    $('go').disabled = true;
+    resetScene();
+    for (let i = 0; i < STEPS.length; i++) {
+      if (!running) break;
+      await runStep(i);
+      await new Promise(r => setTimeout(r, 550));
+    }
+    running = false;
+    $('go').disabled = false;
+  }
+
+  $('go').addEventListener('click', runAll);
+  $('reset').addEventListener('click', () => {
+    running = false;
+    cancelAnimationFrame(packetAnim);
+    resetScene();
+    $('go').disabled = false;
+  });
+  </script>
+</body>
+</html>

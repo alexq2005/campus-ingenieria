@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 17 — Chatbot con RAG · Campus CS-FE</title>
+<meta name="description" content="Un chatbot que responde sobre TUS documentos usando RAG: embeddings + búsqueda vectorial + LLM. NLP (M41) aplicado.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m41-procesamiento-lenguaje-natural/lecture.html">🎓 M41 NLP</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 17</span>
+  <span class="badge nivel-avan">Avanzado</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">Python + LLM</span>
+</div>
+
+<article>
+
+<h1>💬 Chatbot con RAG</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un chatbot que responde preguntas sobre <strong>tus propios documentos</strong> (apuntes, manuales, un PDF) sin inventar. La técnica es <strong>RAG</strong> (Retrieval-Augmented Generation): buscás los fragmentos relevantes y se los das al LLM como contexto, para que responda con datos reales en vez de alucinar.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m41-procesamiento-lenguaje-natural/lecture.html">M41 NLP</a> (embeddings, tokenización),
+  <a href="../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m43-data-engineering/lecture.html">M43 Data Engineering</a> (pipeline de ingesta),
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m21-nosql-y-newsql/lecture.html">M21 NoSQL</a> (base vectorial) y
+  <a href="../Curso-Python/modulo-08-archivos-io/lecture.html">Python</a> (leer/parsear documentos).
+</div>
+
+<h2>Cómo funciona — el pipeline RAG</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 210" role="img" aria-label="Pipeline RAG: pregunta, embedding, búsqueda vectorial, contexto, LLM, respuesta">
+  <defs>
+    <marker id="aq" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- ingesta (arriba) -->
+  <text x="150" y="22" text-anchor="middle" fill="#3fb950" font-size="12" font-family="system-ui" font-weight="700">INGESTA (una vez)</text>
+  <rect x="20" y="32" width="110" height="42" rx="6" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="75" y="50" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">📄 Documentos</text>
+  <text x="75" y="65" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">trozos (chunks)</text>
+  <line x1="130" y1="53" x2="165" y2="53" stroke="#f0883e" stroke-width="2" marker-end="url(#aq)"/>
+  <rect x="170" y="32" width="110" height="42" rx="6" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="225" y="50" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">Embeddings</text>
+  <text x="225" y="65" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">texto → vector</text>
+  <line x1="280" y1="53" x2="315" y2="53" stroke="#f0883e" stroke-width="2" marker-end="url(#aq)"/>
+  <rect x="320" y="32" width="120" height="42" rx="6" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="380" y="50" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">🗄️ Vector DB</text>
+  <text x="380" y="65" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">índice de vectores</text>
+
+  <!-- consulta (abajo) -->
+  <text x="150" y="120" text-anchor="middle" fill="#fb7185" font-size="12" font-family="system-ui" font-weight="700">CONSULTA (cada pregunta)</text>
+  <rect x="20" y="130" width="110" height="42" rx="6" fill="#1f2638" stroke="#fb7185" stroke-width="2"/>
+  <text x="75" y="156" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">❓ Pregunta</text>
+  <line x1="130" y1="151" x2="320" y2="80" stroke="#58a6ff" stroke-width="2" marker-end="url(#aq)"/>
+  <text x="215" y="120" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">embed + buscar similares</text>
+  <!-- contexto -->
+  <line x1="440" y1="60" x2="500" y2="140" stroke="#f0883e" stroke-width="2" marker-end="url(#aq)"/>
+  <rect x="470" y="130" width="120" height="42" rx="6" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="530" y="148" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">Pregunta +</text>
+  <text x="530" y="163" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">contexto</text>
+  <line x1="590" y1="151" x2="625" y2="151" stroke="#f0883e" stroke-width="2" marker-end="url(#aq)"/>
+  <rect x="630" y="130" width="110" height="42" rx="6" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="685" y="148" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">🤖 LLM</text>
+  <text x="685" y="163" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">respuesta citada</text>
+</svg>
+<figcaption>RAG en dos tiempos: primero indexás tus documentos como vectores; después, cada pregunta recupera los trozos más parecidos y se los pasás al LLM como contexto. El modelo responde con TUS datos, no con lo que "recuerda".</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Qué es un <strong>embedding</strong>: convertir texto en un vector que captura significado (M41).</li>
+  <li><strong>Chunking</strong>: cómo partir documentos para que la búsqueda funcione bien.</li>
+  <li>Búsqueda por <strong>similitud de coseno</strong> en una base vectorial.</li>
+  <li><strong>Prompt engineering</strong>: armar el contexto para que el LLM no alucine.</li>
+  <li>Por qué RAG reduce alucinaciones y permite citar fuentes.</li>
+  <li>Medir calidad: ¿responde bien? ¿cita el fragmento correcto?</li>
+</ul>
+
+<h2>Stack</h2>
+<p>Python · librería de embeddings (sentence-transformers, local y gratis, o la API de OpenAI) · vector DB: <strong>ChromaDB</strong> o FAISS (locales) · un LLM (Ollama local con Llama/Mistral, o una API). Frontend opcional con Streamlit o React.</p>
+
+<h2>Código clave (recuperar + generar)</h2>
+
+<pre><code class="lang-python">from sentence_transformers import SentenceTransformer
+import chromadb
+
+embed = SentenceTransformer("all-MiniLM-L6-v2")
+db = chromadb.Client().create_collection("docs")
+
+# INGESTA: indexar chunks
+for i, chunk in enumerate(chunks):
+    db.add(ids=[str(i)], embeddings=[embed.encode(chunk).tolist()],
+           documents=[chunk])
+
+# CONSULTA
+def responder(pregunta):
+    q_vec = embed.encode(pregunta).tolist()
+    hits = db.query(query_embeddings=[q_vec], n_results=3)
+    contexto = "\n".join(hits["documents"][0])     # trozos relevantes
+    prompt = f"""Respondé SOLO con este contexto. Si no está, decí "no sé".
+Contexto:\n{contexto}\n\nPregunta: {pregunta}"""
+    return llm(prompt)                              # llamar al LLM</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <code>embed.encode()</code> convierte texto en un punto en un espacio de cientos de dimensiones donde "cercano = parecido en significado" (M41). Buscar es geometría: el vecino más cercano al vector de la pregunta. La instrucción <em>"si no está, decí no sé"</em> es lo que frena la alucinación.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> tomá un texto (un PDF, tus apuntes), partilo en chunks, generá embeddings y guardalos.</div>
+<div class="fase"><strong>Fase 2:</strong> dada una pregunta, recuperá los 3 chunks más similares. Verificá que sean relevantes.</div>
+<div class="fase"><strong>Fase 3:</strong> conectá un LLM (Ollama local es gratis). Armá el prompt con el contexto y obtené respuestas.</div>
+<div class="fase"><strong>Fase 4:</strong> citá fuentes: mostrá de qué fragmento salió la respuesta. Manejá "no sé".</div>
+<div class="fase"><strong>Fase 5:</strong> interfaz de chat con historial y un set de preguntas de prueba para medir calidad.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Responde correctamente preguntas cuya respuesta está en tus documentos.</li>
+    <li>Dice "no sé" cuando la respuesta NO está (no inventa).</li>
+    <li>Cita el fragmento de origen de cada respuesta.</li>
+    <li>Funciona con un LLM local (no dependés de una API paga).</li>
+    <li>Entendés por qué el chunking y el tamaño del contexto afectan la calidad.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>RAG sobre el propio campus: que responda dudas de los lectures.</li>
+  <li>Re-ranking de los resultados para mejorar la precisión.</li>
+  <li>Memoria de conversación (preguntas de seguimiento).</li>
+  <li>Evaluación automática con un set de QA y métricas (groundedness).</li>
+  <li>Deploy como API (conecta con P23) + frontend React.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./16-clasificador-imagenes.html">← Clasificador de Imágenes</a>
+  <a href="./18-analisis-datos-eda.html">Siguiente: Análisis Exploratorio de Datos →</a>
+</nav>
+
+</div>
+</body>
+</html>

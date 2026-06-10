@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 08 — Custom Hooks · Curso de React</title>
+<meta name="description" content="Extraer lógica reutilizable en hooks propios. Patrones populares.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M03, M06, M07</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Custom Hooks</h1>
+
+<blockquote>El verdadero superpoder de React: <strong>extraer lógica reutilizable en funciones propias</strong>. Custom hooks son lo que diferencia a un junior de un mid-level.</blockquote>
+
+<h2>1. ¿Qué es un custom hook?</h2>
+<figure class="foto">
+  <img src="../assets/img/m08-crochet.jpg" alt="Tejido a crochet hecho a mano">
+  <figcaption>Crochet hecho a mano: un custom hook es lógica reutilizable que vos tejés combinando los hooks básicos. Foto: Stilfehler, vía <a href="https://commons.wikimedia.org/wiki/File:Crochet_Cross_Stitch_%28Rounds%29.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+
+<div class="concept">Un custom hook es <strong>una función JavaScript</strong> cuyo nombre empieza con <code>use</code> y que internamente llama a otros hooks de React. Encapsula lógica que querés reutilizar entre componentes.</div>
+
+<div class="rule">
+Las dos reglas:
+<ul>
+  <li>El nombre debe empezar con <code>use</code> (<code>useFoo</code>, <code>useAuth</code>). Sin esa convención, ESLint no detecta que es hook y no aplica las reglas.</li>
+  <li>Puede usar cualquier hook adentro (useState, useEffect, otros customs).</li>
+</ul>
+</div>
+
+<h2>2. Antes y después: extraer lógica repetida</h2>
+
+<h3>Antes (lógica duplicada en 2 componentes)</h3>
+
+<pre><code class="lang-jsx">function UserList() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    fetch('/api/users')
+      .then(r =&gt; r.json())
+      .then(d =&gt; !cancelled && setData(d))
+      .catch(e =&gt; !cancelled && setError(e))
+      .finally(() =&gt; !cancelled && setLoading(false));
+    return () =&gt; { cancelled = true; };
+  }, []);
+
+  // ...render
+}
+
+function PostList() {
+  // EL MISMO CÓDIGO DUPLICADO pero con /api/posts...
+}</code></pre>
+
+<h3>Después (extraído en custom hook)</h3>
+
+<pre><code class="lang-jsx">// hooks/useFetch.js
+import { useState, useEffect } from 'react';
+
+export function useFetch(url) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    setLoading(true);
+    fetch(url)
+      .then(r =&gt; r.json())
+      .then(d =&gt; !cancelled && setData(d))
+      .catch(e =&gt; !cancelled && setError(e))
+      .finally(() =&gt; !cancelled && setLoading(false));
+    return () =&gt; { cancelled = true; };
+  }, [url]);
+
+  return { data, loading, error };
+}
+
+// Uso:
+function UserList() {
+  const { data: users, loading, error } = useFetch('/api/users');
+  // ...
+}
+
+function PostList() {
+  const { data: posts, loading, error } = useFetch('/api/posts');
+  // ...
+}</code></pre>
+
+<div class="tip">El hook NO comparte ESTADO entre los dos componentes — cada uso crea su propia instancia. Lo que comparte es la LÓGICA.</div>
+
+<h2>3. Custom hooks populares</h2>
+
+<h3>useLocalStorage — persistir en localStorage</h3>
+
+<pre><code class="lang-jsx">function useLocalStorage(key, defaultValue) {
+  const [value, setValue] = useState(() =&gt; {
+    const stored = localStorage.getItem(key);
+    return stored ? JSON.parse(stored) : defaultValue;
+  });
+
+  useEffect(() =&gt; {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
+// Uso
+function Theme() {
+  const [theme, setTheme] = useLocalStorage('theme', 'light');
+  return &lt;button onClick={() =&gt; setTheme(t =&gt; t === 'light' ? 'dark' : 'light')}&gt;
+    Theme: {theme}
+  &lt;/button&gt;;
+}</code></pre>
+
+<h3>useDebounce — esperar antes de actuar</h3>
+
+<pre><code class="lang-jsx">function useDebounce(value, delay = 500) {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() =&gt; {
+    const t = setTimeout(() =&gt; setDebounced(value), delay);
+    return () =&gt; clearTimeout(t);
+  }, [value, delay]);
+
+  return debounced;
+}
+
+// Uso: buscador que no llama API en cada tecla
+function Buscador() {
+  const [input, setInput] = useState('');
+  const debouncedInput = useDebounce(input, 400);
+
+  useEffect(() =&gt; {
+    if (debouncedInput) {
+      fetch(`/api/search?q=${debouncedInput}`);
+    }
+  }, [debouncedInput]);
+
+  return &lt;input value={input} onChange={(e) =&gt; setInput(e.target.value)} /&gt;;
+}</code></pre>
+
+<h3>useToggle — boolean simple</h3>
+
+<pre><code class="lang-jsx">function useToggle(initial = false) {
+  const [value, setValue] = useState(initial);
+  const toggle = useCallback(() =&gt; setValue(v =&gt; !v), []);
+  return [value, toggle];
+}
+
+// Uso
+function Modal() {
+  const [isOpen, toggleModal] = useToggle();
+  return (
+    &lt;&gt;
+      &lt;button onClick={toggleModal}&gt;Abrir&lt;/button&gt;
+      {isOpen && &lt;dialog open&gt;Modal content&lt;/dialog&gt;}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h3>useWindowSize — viewport reactivo</h3>
+
+<pre><code class="lang-jsx">function useWindowSize() {
+  const [size, setSize] = useState({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
+
+  useEffect(() =&gt; {
+    function handler() {
+      setSize({ width: window.innerWidth, height: window.innerHeight });
+    }
+    window.addEventListener('resize', handler);
+    return () =&gt; window.removeEventListener('resize', handler);
+  }, []);
+
+  return size;
+}</code></pre>
+
+<h3>usePrevious — recordar valor anterior</h3>
+
+<pre><code class="lang-jsx">function usePrevious(value) {
+  const ref = useRef();
+  useEffect(() =&gt; {
+    ref.current = value;
+  }, [value]);
+  return ref.current;
+}
+
+// Uso: detectar cambios de prop
+function Counter({ count }) {
+  const prev = usePrevious(count);
+  return &lt;p&gt;Ahora: {count}, antes: {prev}&lt;/p&gt;;
+}</code></pre>
+
+<h3>useOnlineStatus</h3>
+
+<pre><code class="lang-jsx">function useOnlineStatus() {
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  useEffect(() =&gt; {
+    function on() { setIsOnline(true); }
+    function off() { setIsOnline(false); }
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () =&gt; {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, []);
+
+  return isOnline;
+}</code></pre>
+
+<h2>4. Custom hooks que componen otros custom hooks</h2>
+
+<pre><code class="lang-jsx">function useAuth() {
+  const [user, setUser] = useLocalStorage('user', null);
+
+  const login = useCallback(async (email, pwd) =&gt; {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, pwd })
+    });
+    const u = await res.json();
+    setUser(u);
+  }, [setUser]);
+
+  const logout = useCallback(() =&gt; setUser(null), [setUser]);
+
+  return { user, login, logout, isLoggedIn: !!user };
+}
+
+// Uso
+function Header() {
+  const { user, logout } = useAuth();
+  return user
+    ? &lt;p&gt;Hola {user.name} &lt;button onClick={logout}&gt;Salir&lt;/button&gt;&lt;/p&gt;
+    : &lt;p&gt;No logueado&lt;/p&gt;;
+}</code></pre>
+
+<h2>5. Convención de nombres y firma</h2>
+
+<table>
+<thead><tr><th>Patrón</th><th>Devuelve</th></tr></thead>
+<tbody>
+<tr><td>useToggle, useLocalStorage</td><td>Array <code>[valor, setter]</code> (como useState)</td></tr>
+<tr><td>useFetch, useAuth</td><td>Objeto <code>{ data, loading, error }</code></td></tr>
+<tr><td>useDebounce, usePrevious</td><td>Valor único</td></tr>
+<tr><td>useHover, useOnScreen</td><td>Tupla <code>[ref, isActive]</code></td></tr>
+</tbody>
+</table>
+
+<div class="tip">Devolvé array si hay 2 cosas paralelas. Objeto si hay más de 2 o si querés nombres claros. No hay regla dura — consistencia dentro de tu proyecto es lo importante.</div>
+
+<h2>6. Cuándo NO crear custom hook</h2>
+
+<div class="warn">
+Custom hooks tienen costo cognitivo. NO crear si:
+<ul>
+  <li>La "lógica" es 2-3 líneas usadas en 1 lugar.</li>
+  <li>Solo lo usa 1 componente.</li>
+  <li>El nombre cuesta encontrar — síntoma de que la abstracción no es buena.</li>
+  <li>La lógica es realmente del componente (form-specific, etc).</li>
+</ul>
+Espera a tener 2-3 usos REALES antes de extraer.
+</div>
+
+<h2>7. Tests de custom hooks</h2>
+
+<pre><code class="lang-jsx">// useCounter.test.js
+import { renderHook, act } from '@testing-library/react';
+import { useCounter } from './useCounter';
+
+test('increment funciona', () =&gt; {
+  const { result } = renderHook(() =&gt; useCounter(0));
+
+  expect(result.current.count).toBe(0);
+
+  act(() =&gt; result.current.increment());
+
+  expect(result.current.count).toBe(1);
+});</code></pre>
+
+<div class="info">Para testear hooks aislados, usá <code>renderHook</code> de Testing Library. Wraps el hook en un componente de prueba.</div>
+
+<h2>8. Errores típicos</h2>
+
+<div class="mistake"><strong>Olvidar el prefijo <code>use</code></strong>: <code>function fetchData()</code> que llama useEffect adentro. ESLint no lo va a chequear → bugs sutiles.</div>
+
+<div class="mistake"><strong>Pretender que custom hook comparte estado</strong>: cada componente que usa <code>useCounter()</code> tiene SU PROPIO contador. Si necesitás estado compartido, usá context o store global.</div>
+
+<div class="mistake"><strong>Hooks anidados condicionalmente</strong>: aplican las mismas reglas — siempre top-level.</div>
+
+<div class="mistake"><strong>Custom hook con efectos secundarios al "primer call"</strong>: si tu hook hace fetch automáticamente con cada llamada y se usa en 5 componentes, son 5 fetches. Para data fetching real → TanStack Query (M10).</div>
+
+<div class="mistake"><strong>Devolver objeto nuevo cada vez sin memo</strong>: si retornás <code>{ data, loading }</code>, cada render es nueva referencia. Si el padre lo pasa a un memo, no funciona. Para hooks complejos, considerá memoizar el return.</div>
+
+<h2>9. Ejercicios</h2>
+
+<ol>
+  <li>Implementar <code>useToggle</code> y usar en un dropdown.</li>
+  <li>Implementar <code>useLocalStorage</code> y persistir un setting.</li>
+  <li>Implementar <code>useDebounce</code> y aplicarlo a un buscador.</li>
+  <li>Implementar <code>useFetch</code> con cancelación.</li>
+  <li>Implementar <code>useCopyToClipboard</code> que copia texto y devuelve <code>{ copy, copied }</code>.</li>
+  <li>Componer <code>useAuth</code> con useLocalStorage + funciones login/logout.</li>
+</ol>
+
+<h2>10. Recursos</h2>
+
+<ul>
+  <li><a href="https://usehooks.com" target="_blank">usehooks.com</a> — colección de custom hooks listos</li>
+  <li><a href="https://github.com/streamich/react-use" target="_blank">react-use</a> — librería de 100+ hooks</li>
+  <li><a href="https://www.joshwcomeau.com/react/the-importance-of-cleanup/" target="_blank">Josh Comeau: cleanup</a></li>
+</ul>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Qué hace especial a un custom hook?</summary>
+<p>Es una función cuyo nombre empieza con <code>use</code> y que usa otros hooks adentro. Permite extraer lógica con estado/efectos para reutilizarla en múltiples componentes sin duplicación.</p></details>
+
+<details><summary>2. ¿Custom hooks comparten estado entre componentes que los usan?</summary>
+<p>NO. Cada llamada a <code>useFoo()</code> crea su propia instancia. Comparten la LÓGICA, no el ESTADO. Si necesitás estado compartido, usá context o estado global (Zustand).</p></details>
+
+<details><summary>3. ¿Por qué importa que el nombre empiece con <code>use</code>?</summary>
+<p>Es una convención que React/ESLint usan para reconocer que es hook y aplicar las reglas (no llamar condicionalmente, etc). Sin el prefijo, te perdés esa validación.</p></details>
+
+<details><summary>4. ¿Cuándo NO crear un custom hook?</summary>
+<p>Cuando la lógica es trivial (2-3 líneas), solo se usa 1 vez, o cuando el nombre cuesta encontrar (síntoma de mala abstracción). Esperá a tener 2-3 usos reales antes de extraer.</p></details>
+
+<details><summary>5. ¿Cómo testear un custom hook?</summary>
+<p>Con <code>renderHook</code> de <code>@testing-library/react</code>. Devuelve un objeto <code>{ result }</code> con el valor actual. Usá <code>act</code> al disparar updates de estado.</p></details>
+
+<details><summary>6. ¿Es mejor que un custom hook devuelva array u objeto?</summary>
+<p>Array si tiene 2 cosas paralelas y querés renombrar fácil (<code>const [x, setX] = useFoo()</code>). Objeto si tiene 3+ propiedades o querés que el orden no importe. Lo importante es consistencia en tu proyecto.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m07-hooks-avanzados/lecture.html">← Anterior: Hooks Avanzados</a>
+  <a href="../m09-react-router/lecture.html">Siguiente: React Router →</a>
+</nav>
+
+</div>
+</body>
+</html>

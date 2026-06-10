@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Impacto · Riego Inteligente de Subsistencia · Campus CS-FE</title>
+<meta name="description" content="Riego por goteo controlado por humedad del suelo: cada gota de agua cuenta. Más cosecha con menos agua para pequeños agricultores en zonas áridas.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/e08-control/lecture.html">⚡ E08 Control</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Impacto · Alimentos</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2-3 semanas</span>
+  <span class="badge">Control + Solar</span>
+</div>
+
+<article>
+
+<h1>🌾 Riego Inteligente de Subsistencia</h1>
+
+<div class="impacto">
+  <strong>🌍 El problema:</strong> la agricultura usa el <strong>70% del agua dulce</strong> del planeta, y gran parte se desperdicia regando de más o en el momento equivocado. Para un pequeño agricultor en zona árida, el agua es escasa y cada cosecha define el año. <strong>A quién ayuda:</strong> familias de agricultura de subsistencia y huertas comunitarias — regar la cantidad justa en el momento justo significa más comida con menos agua.
+</div>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un sistema de <strong>riego por goteo automático</strong> que riega según la <strong>humedad real del suelo</strong> (no por un reloj), funciona con <strong>energía solar</strong> y es lo bastante barato y robusto para el campo. Maximiza la cosecha por litro de agua.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../Curso-Computacion-Fisica/e08-control/lecture.html">E08 Control</a> (lazo cerrado, histéresis),
+  <a href="../Curso-Computacion-Fisica/e05-sensores-actuadores/lecture.html">E05</a> (sensor de suelo, válvula/bomba),
+  <a href="../Curso-Computacion-Fisica/e00-fundamentos-electricos/lecture.html">E00</a> (energía solar, baterías) y el
+  <a href="./15-invernadero-automatizado.html">P15 Invernadero</a> (hermano de este proyecto).
+</div>
+
+<h2>Por qué regar por humedad y no por reloj</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 180" role="img" aria-label="Riego por reloj desperdicia agua; riego por humedad mantiene el suelo en su rango óptimo">
+  <line x1="40" y1="140" x2="730" y2="140" stroke="#2a3247" stroke-width="1"/>
+  <text x="40" y="22" fill="#e8edf4" font-size="12" font-family="system-ui">humedad del suelo en el tiempo</text>
+  <!-- zona óptima -->
+  <rect x="40" y="60" width="690" height="35" fill="rgba(16,185,129,0.12)"/>
+  <text x="700" y="80" text-anchor="end" fill="#3fb950" font-size="9" font-family="system-ui">zona óptima</text>
+  <!-- por reloj: sube de más, baja de más -->
+  <path d="M40,120 L100,120 L100,45 L160,110 L160,40 L220,120 L220,45 L280,118 L280,42 L340,120"
+        fill="none" stroke="#fb7185" stroke-width="2"/>
+  <text x="190" y="35" text-anchor="middle" fill="#fb7185" font-size="10" font-family="system-ui">por RELOJ: riega aunque ya esté húmedo → desperdicio</text>
+  <!-- por humedad: se mantiene en banda -->
+  <path d="M400,90 L440,95 L450,68 L500,88 L510,68 L560,90 L570,67 L620,88 L630,68 L690,86"
+        fill="none" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="560" y="120" text-anchor="middle" fill="#3fb950" font-size="10" font-family="system-ui">por HUMEDAD: solo riega al secarse → ahorra agua</text>
+</svg>
+<figcaption>El riego por reloj ignora la lluvia y la humedad real: riega de más o de menos. El riego por humedad mantiene el suelo en su banda óptima con la mínima agua — es control de lazo cerrado (E08) aplicado a la tierra.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Control por <strong>histéresis</strong> sobre la humedad del suelo (E08).</li>
+  <li>Sensores de humedad <strong>capacitivos</strong> (los resistivos se corroen) (E05).</li>
+  <li>Accionar una <strong>válvula/bomba</strong> de bajo consumo (E05/E00).</li>
+  <li>Diseño <strong>solar + batería</strong> para autonomía total en el campo (E00).</li>
+  <li>Robustez: que funcione meses al sol, la lluvia y el polvo sin mantenimiento.</li>
+  <li>Medir el ahorro de agua real vs riego manual.</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>ESP32/Arduino (deep sleep) + sensor de humedad <strong>capacitivo</strong> + electroválvula 12V o bomba + relé/MOSFET · panel solar pequeño + batería + cargador solar · manguera de goteo. Bajo costo y reparable con piezas comunes.</p>
+
+<h2>Código clave (riego por histéresis + ahorro de energía)</h2>
+
+<pre><code class="lang-cpp">const int SECO   = 40;   // % humedad: por debajo → regar
+const int HUMEDO = 60;   // % humedad: por encima → cortar
+bool regando = false;
+
+void cicloRiego() {
+  int h = leerHumedadSuelo();          // capacitivo (E05)
+
+  if (!regando &amp;&amp; h &lt; SECO) {
+    abrirValvula(); regando = true;     // empezar a regar
+  } else if (regando &amp;&amp; h &gt; HUMEDO) {
+    cerrarValvula(); regando = false;   // suelo ya húmedo → cortar (ahorro)
+  }
+
+  // Dormir entre chequeos: el suelo cambia lento, no hace falta vigilar siempre
+  esp_sleep_enable_timer_wakeup(15 * 60 * 1000000ULL);  // cada 15 min (E03)
+  esp_deep_sleep_start();               // batería dura semanas con poco panel
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> Es el <strong>mismo lazo de histéresis</strong> del Invernadero (P15) y de E08, pero optimizado para el campo: el <strong>deep sleep</strong> (E03) hace que un panel solar chico alcance, porque el suelo cambia lento y no hace falta medir cada segundo. Ahorro de agua + ahorro de energía, los dos por diseño.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> calibrá el sensor capacitivo (seco al aire vs sumergido). Mapealo a 0-100%.</div>
+<div class="fase"><strong>Fase 2:</strong> control por histéresis abriendo/cerrando la válvula con una maceta de prueba.</div>
+<div class="fase"><strong>Fase 3:</strong> alimentación solar + batería. Medí cuánto dura y ajustá el deep sleep.</div>
+<div class="fase"><strong>Fase 4:</strong> robustez de campo: proteger electrónica del agua/sol, válvula confiable, fail-safe (si falla, no inundar ni dejar secar).</div>
+<div class="fase"><strong>Fase 5:</strong> medí el ahorro: litros usados vs riego manual, para la misma planta.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El sistema mantiene la humedad del suelo en su banda sin intervención por días.</li>
+    <li>Funciona solo con energía solar (autónomo en el campo).</li>
+    <li>Demostrás un ahorro de agua medible frente al riego manual/por reloj.</li>
+    <li>La electrónica sobrevive a la intemperie y tiene un comportamiento seguro ante fallas.</li>
+    <li>Es barato y reparable con piezas accesibles.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Varias zonas con cultivos distintos, cada una con su umbral.</li>
+  <li>Integrar pronóstico de lluvia: no regar si va a llover (API + WiFi/LoRa).</li>
+  <li>Telemetría a un panel para una cooperativa de agricultores (P14 MQTT).</li>
+  <li>Recolección de agua de lluvia con medición de tanque.</li>
+  <li>Modelo que aprende la curva de cada cultivo (M39).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./impacto-06-potabilidad-agua.html">← Potabilidad del Agua</a>
+  <a href="./impacto-08-lengua-senas.html">Siguiente: Traductor de Lengua de Señas →</a>
+</nav>
+
+</div>
+</body>
+</html>

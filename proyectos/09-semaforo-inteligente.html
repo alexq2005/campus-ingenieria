@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 09 — Semáforo Inteligente · Campus CS-FE</title>
+<meta name="description" content="Una máquina de estados en hardware: la FSM de la teoría hecha circuito físico.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 09</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">ESP32/Arduino + C</span>
+</div>
+
+<article>
+
+<h1>🚦 Semáforo Inteligente</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> construir un semáforo real (3 LEDs) controlado por un microcontrolador, con botón peatonal y temporización. Es el proyecto perfecto para ver una <strong>máquina de estados finitos (FSM) hecha hardware</strong> — el mismo concepto que estudiaste en teoría, ahora con luces que parpadean de verdad.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>El concepto que une todo:</strong> una FSM aparece TRES veces en el campus —
+  <a href="../../Curso ingenieria sistemas/area-01-matematicas-y-teoria/m01-matematica-discreta/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M01</a> (autómatas, teoría),
+  <a href="../track-senior/modulo-02-state-machines/lecture.html">track-senior</a> (state machines en software), y
+  <a href="../Curso-Computacion-Fisica/e02-electronica-digital/lecture.html">E02</a> (FSM en silicio). Este proyecto las junta: vas a escribir la FSM en C y verla controlar voltajes reales.
+</div>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Implementar una <strong>FSM</strong> en C (estados + transiciones).</li>
+  <li>Controlar <strong>GPIO de salida</strong> (encender LEDs).</li>
+  <li>Leer <strong>GPIO de entrada</strong> (botón) con pull-up/pull-down.</li>
+  <li>Manejar <strong>tiempo sin bloquear</strong> (<code>millis()</code> en vez de <code>delay()</code>).</li>
+  <li><strong>Debounce</strong> de un botón físico (rebote mecánico).</li>
+  <li>Diseñar el circuito: resistencias para los LEDs (Ley de Ohm).</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>ESP32 o Arduino · 3 LEDs (rojo, amarillo, verde) · 3 resistencias 220-470Ω · 1 pulsador · 1 resistencia 10kΩ (pull-down) · protoboard · cables. <strong>Todo simulable en <a href="https://wokwi.com">Wokwi</a> sin comprar nada.</strong></p>
+
+<h2>El circuito (Ley de Ohm en acción)</h2>
+
+<pre><code>Cada LED necesita su resistencia en serie:
+  R = (Vcc - V_led) / I = (3.3V - 2V) / 0.01A ≈ 130Ω → usar 220Ω (seguro)
+
+ESP32 ──[GPIO 25]──[220Ω]──►|──┐ (LED rojo)
+       ──[GPIO 26]──[220Ω]──►|──┤ (LED amarillo)    todos a GND
+       ──[GPIO 27]──[220Ω]──►|──┘ (LED verde)
+       ──[GPIO 14]──── botón ──── 3.3V (con pull-down 10kΩ a GND)</code></pre>
+
+<h2>La FSM</h2>
+
+<pre><code>Estados:  ROJO → VERDE → AMARILLO → ROJO ...
+                                    ↑
+          botón peatonal: si está en VERDE, acelera el cambio a AMARILLO</code></pre>
+
+<h2>Código (C / Arduino)</h2>
+
+<pre><code>enum Estado { ROJO, VERDE, AMARILLO };
+Estado estado = ROJO;
+unsigned long ultimoCambio = 0;
+bool peatonPidio = false;
+
+const int LED_R = 25, LED_A = 26, LED_V = 27, BOTON = 14;
+
+// Duración de cada estado en ms
+unsigned long duracion(Estado e) {
+  switch (e) {
+    case ROJO:     return 5000;
+    case VERDE:    return peatonPidio ? 1500 : 5000;  // acelera si hay peatón
+    case AMARILLO: return 1500;
+  }
+  return 5000;
+}
+
+void setEstado(Estado e) {
+  digitalWrite(LED_R, e == ROJO);
+  digitalWrite(LED_A, e == AMARILLO);
+  digitalWrite(LED_V, e == VERDE);
+  estado = e;
+  ultimoCambio = millis();
+}
+
+void setup() {
+  pinMode(LED_R, OUTPUT); pinMode(LED_A, OUTPUT); pinMode(LED_V, OUTPUT);
+  pinMode(BOTON, INPUT);          // con pull-down externo
+  setEstado(ROJO);
+}
+
+void loop() {
+  // Leer botón (sin bloquear)
+  if (digitalRead(BOTON) == HIGH && estado == VERDE) {
+    peatonPidio = true;
+  }
+
+  // Transición por tiempo (sin delay — usa millis)
+  if (millis() - ultimoCambio >= duracion(estado)) {
+    switch (estado) {
+      case ROJO:     setEstado(VERDE); break;
+      case VERDE:    setEstado(AMARILLO); break;
+      case AMARILLO: setEstado(ROJO); peatonPidio = false; break;
+    }
+  }
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Por qué <code>millis()</code> y no <code>delay()</code>:</strong> <code>delay(5000)</code> congela el chip 5 segundos — no podría leer el botón mientras tanto. Usar <code>millis()</code> es el patrón "non-blocking" que en software conocés como no bloquear el event loop (<a href="../Curso-React/m06-useeffect/lecture.html">M06</a>) o el scheduler cooperativo (<a href="../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m14-sistemas-operativos/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M14</a>). Mismo principio, otro dominio.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> armá el circuito en Wokwi. 3 LEDs que prenden de a uno en secuencia con <code>delay()</code> (versión simple).</div>
+<div class="fase"><strong>Fase 2:</strong> convertí a FSM con <code>millis()</code> (non-blocking).</div>
+<div class="fase"><strong>Fase 3:</strong> agregá el botón peatonal con debounce.</div>
+<div class="fase"><strong>Fase 4:</strong> sumá un segundo semáforo (cruce) que esté sincronizado al revés.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El semáforo cicla rojo→verde→amarillo→rojo con tiempos correctos.</li>
+    <li>El botón peatonal funciona y acelera el cambio (sin congelar el sistema).</li>
+    <li>El código usa una FSM clara (enum + switch), no spaghetti de delays.</li>
+    <li>Cada LED tiene su resistencia calculada con Ley de Ohm.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Cruce completo: 2 semáforos peatonales + 2 vehiculares sincronizados.</li>
+  <li>Modo nocturno: amarillo titilante después de cierta hora (RTC).</li>
+  <li>Sensor de tráfico: un sensor que detecta autos y ajusta los tiempos.</li>
+  <li>Control remoto vía WiFi/MQTT (conecta con la estación meteo y M37 IoT).</li>
+  <li>Display con cuenta regresiva (pantalla de 7 segmentos o OLED).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./06-url-shortener.html">← URL Shortener</a>
+  <a href="./10-robot-obstaculos.html">Siguiente: Robot Evita-Obstáculos →</a>
+</nav>
+
+</div>
+</body>
+</html>

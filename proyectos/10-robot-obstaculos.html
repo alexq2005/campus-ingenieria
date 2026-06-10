@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 10 — Robot Evita-Obstáculos · Campus CS-FE</title>
+<meta name="description" content="Robot autónomo: sensor ultrasónico, motores, lógica de decisión. Intro a la robótica.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 10</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">ESP32 + sensores + motores</span>
+</div>
+
+<article>
+
+<h1>🤖 Robot Evita-Obstáculos</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un robot que se mueve solo y esquiva obstáculos. Mide la distancia con un sensor ultrasónico, decide hacia dónde ir, y controla dos motores. Es el ciclo <strong>sensar → decidir → actuar</strong> — la esencia de la robótica y de todo sistema autónomo.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>El loop sensar-decidir-actuar:</strong> es el mismo de la IA (percepción → modelo → acción de <a href="../../Curso ingenieria sistemas/area-08-inteligencia-y-datos/m39-machine-learning-clasico/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M39</a>), del game loop (<a href="../../Curso ingenieria sistemas/area-07-desarrollo-aplicado/m35-game-development/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M35</a>: input → update → render), y del control (E08). Acá lo ves físico: el robot literalmente percibe el mundo y reacciona.
+</div>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Leer un <strong>sensor ultrasónico</strong> (HC-SR04): medir distancia por tiempo de eco.</li>
+  <li>Controlar <strong>motores DC</strong> con un driver (L298N / L9110) — los pines del MCU NO pueden alimentar motores directo.</li>
+  <li><strong>PWM</strong> para controlar la velocidad de los motores.</li>
+  <li>Lógica de decisión (la "inteligencia" del robot).</li>
+  <li>Manejo de <strong>energía</strong>: batería, consumo, por qué los motores necesitan fuente aparte.</li>
+  <li>Introducción al <strong>control</strong>: reaccionar proporcionalmente a la distancia.</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>ESP32 · sensor ultrasónico HC-SR04 · 2 motores DC + ruedas · driver de motor L298N · chasis · porta-pilas (4×AA o batería LiPo) · protoboard · cables. Simulable en <a href="https://wokwi.com">Wokwi</a> (con limitaciones de motores).</p>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Lección de E00 que SALVA tu chip:</strong> un pin del ESP32 da ~20mA; un motor DC pide cientos de mA. Conectar el motor directo al pin lo <strong>quema</strong>. Por eso va un <strong>driver</strong> (L298N) que usa una fuente aparte para los motores y solo recibe la señal de control del MCU. Esto es exactamente por qué E00 (potencia, corriente) importa antes de tocar actuadores.
+</div>
+
+<h2>El sensor ultrasónico (cómo mide distancia)</h2>
+
+<pre><code>Emite un pulso de ultrasonido → rebota en el obstáculo → mide el tiempo del eco.
+distancia = (tiempo_eco × velocidad_sonido) / 2
+         = (tiempo_µs × 0.0343 cm/µs) / 2
+
+// En código:
+long medirDistancia() {
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10); digitalWrite(TRIG, LOW);
+  long us = pulseIn(ECHO, HIGH);     // mide el tiempo del eco
+  return us * 0.0343 / 2;            // cm
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Esto es un ADC temporal:</strong> convertir un fenómeno físico (distancia) en un número usando tiempo, como el ADC de <a href="../Curso-Computacion-Fisica/e03-microcontroladores-1/lecture.html">E03</a> convierte voltaje en número. Todo sensor hace lo mismo: traduce el mundo analógico a un número que tu código puede procesar.
+</div>
+
+<h2>La lógica de decisión</h2>
+
+<pre><code>void loop() {
+  long dist = medirDistancia();   // SENSAR
+
+  if (dist > 30) {                // DECIDIR
+    avanzar();                    // camino libre
+  } else {
+    detener();
+    retroceder(300);              // alejarse un poco
+    girarDerecha(400);            // buscar otra dirección
+  }
+}
+
+// ACTUAR — controlar los motores vía el driver
+void avanzar() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);   // motor izq adelante
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);   // motor der adelante
+  analogWrite(ENA, 200); analogWrite(ENB, 200);      // PWM velocidad
+}</code></pre>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> hacé andar los motores solos (adelante, atrás, girar). Verificá la fuente de poder separada.</div>
+<div class="fase"><strong>Fase 2:</strong> leé el sensor ultrasónico e imprimí la distancia por serial.</div>
+<div class="fase"><strong>Fase 3:</strong> uní ambos: el robot avanza y frena al detectar obstáculo cercano.</div>
+<div class="fase"><strong>Fase 4:</strong> lógica de esquive (retroceder + girar) y ajuste de velocidad según distancia (control proporcional simple).</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El robot avanza solo en línea recta.</li>
+    <li>Detecta obstáculos a &lt;30cm y los esquiva sin chocar.</li>
+    <li>Los motores andan desde una fuente separada (no quemaste el ESP32).</li>
+    <li>El código tiene el ciclo claro sensar→decidir→actuar.</li>
+    <li>Grabaste un video del robot andando (va al portfolio).</li>
+  </ul>
+</div>
+
+<h2>Variantes (hacia robótica seria)</h2>
+<ol>
+  <li><strong>Control PID</strong>: en vez de "frenar/girar", ajustá velocidad proporcionalmente a la distancia (suaviza el movimiento). Conecta con E08 Control.</li>
+  <li><strong>Seguidor de línea</strong>: sensores infrarrojos que siguen una línea negra en el piso.</li>
+  <li><strong>Control remoto</strong>: manejarlo desde el celular vía WiFi/Bluetooth (M37 IoT).</li>
+  <li><strong>Mapeo</strong>: que recuerde por dónde anduvo y arme un mapa simple.</li>
+  <li><strong>Visión</strong>: agregar una ESP32-CAM y que siga objetos por color (conecta con M42 Visión).</li>
+  <li><strong>ML en el edge</strong>: clasificar obstáculos con un modelo TinyML en el chip (M39+M40).</li>
+</ol>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Este es el capstone de la complementariedad:</strong> empezás con electrónica pura (motores, sensor, energía), agregás lógica de software (decisión), y las variantes te llevan a control (E08), visión (M42), IoT (M37) y ML (M39). Un robot es el sistema ciber-físico por excelencia: ningún mundo funciona sin el otro.
+</div>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./09-semaforo-inteligente.html">← Semáforo Inteligente</a>
+  <a href="./index.html">🏠 Galería de Proyectos</a>
+</nav>
+
+</div>
+</body>
+</html>

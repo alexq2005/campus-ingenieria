@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 21 — Stack Docker Multi-servicio · Campus CS-FE</title>
+<meta name="description" content="Levantá una app real (web + API + base de datos + reverse proxy) con un solo docker-compose up. Contenedores y DevOps (M27) en la práctica.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-05-ingenieria-de-software/m27-devops-y-cicd/lecture.html">🎓 M27 DevOps</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 21</span>
+  <span class="badge nivel-avan">Avanzado</span>
+  <span class="badge">⏱ ~1-2 semanas</span>
+  <span class="badge">Docker + Compose</span>
+</div>
+
+<article>
+
+<h1>🐳 Stack Docker Multi-servicio</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> empaquetar una aplicación real completa —frontend, API, base de datos y un reverse proxy— en contenedores que arrancan con <strong>un solo comando</strong>. Vas a resolver de raíz el "en mi máquina funciona": el stack corre igual en tu laptop, en la de un compañero y en un servidor.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-05-ingenieria-de-software/m27-devops-y-cicd/lecture.html">M27 DevOps</a> (contenedores, orquestación),
+  <a href="../Curso-Linux/modulo-08-redes/lecture.html">Linux redes</a> (puertos, networking),
+  <a href="../Curso-Linux/modulo-05-procesos/lecture.html">Linux procesos</a> (aislamiento) y
+  <a href="../../Curso%20ingenieria%20sistemas/area-07-desarrollo-aplicado/m38-cloud-computing/lecture.html">M38 Cloud</a> (deploy).
+</div>
+
+<h2>Cómo funciona — un stack, una red interna</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 200" role="img" aria-label="Reverse proxy nginx enruta a frontend y API; la API habla con la base de datos en una red interna">
+  <defs>
+    <marker id="ak" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- usuario -->
+  <text x="55" y="100" text-anchor="middle" fill="#e8edf4" font-size="13" font-family="system-ui">🌐 :80</text>
+  <text x="55" y="118" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">usuario</text>
+  <line x1="90" y1="100" x2="135" y2="100" stroke="#f0883e" stroke-width="2" marker-end="url(#ak)"/>
+  <!-- caja: red docker -->
+  <rect x="140" y="20" width="600" height="165" rx="10" fill="none" stroke="#2a3247" stroke-width="2" stroke-dasharray="6,4"/>
+  <text x="230" y="40" fill="#8b95a8" font-size="11" font-family="system-ui">red interna de Docker</text>
+  <!-- nginx -->
+  <rect x="155" y="75" width="120" height="50" rx="8" fill="#1f2638" stroke="#f0883e" stroke-width="2"/>
+  <text x="215" y="97" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">nginx</text>
+  <text x="215" y="113" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">reverse proxy</text>
+  <line x1="275" y1="90" x2="320" y2="62" stroke="#58a6ff" stroke-width="2" marker-end="url(#ak)"/>
+  <line x1="275" y1="110" x2="320" y2="135" stroke="#58a6ff" stroke-width="2" marker-end="url(#ak)"/>
+  <!-- frontend -->
+  <rect x="325" y="38" width="120" height="48" rx="8" fill="#1f2638" stroke="#61dafb" stroke-width="2"/>
+  <text x="385" y="60" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">⚛️ Frontend</text>
+  <text x="385" y="76" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">React</text>
+  <!-- api -->
+  <rect x="325" y="112" width="120" height="48" rx="8" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="385" y="134" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">⚙️ API</text>
+  <text x="385" y="150" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">Node/FastAPI</text>
+  <line x1="445" y1="136" x2="500" y2="136" stroke="#f0883e" stroke-width="2" marker-end="url(#ak)"/>
+  <!-- db -->
+  <rect x="505" y="112" width="120" height="48" rx="8" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="565" y="134" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">🗄️ PostgreSQL</text>
+  <text x="565" y="150" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">volumen persistente</text>
+  <!-- volumen -->
+  <rect x="650" y="112" width="75" height="48" rx="8" fill="#1f2638" stroke="#8b95a8" stroke-width="2"/>
+  <text x="687" y="140" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">💾 datos</text>
+  <line x1="625" y1="136" x2="648" y2="136" stroke="#8b95a8" stroke-width="2" marker-end="url(#ak)"/>
+</svg>
+<figcaption>Solo el puerto 80 (nginx) se expone afuera. La API y la base hablan por la red interna de Docker, invisibles desde fuera. El volumen mantiene los datos aunque el contenedor se reinicie.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Diferencia entre <strong>imagen</strong> y <strong>contenedor</strong>, y por qué aíslan procesos (Linux).</li>
+  <li>Escribir un <strong>Dockerfile</strong> eficiente (capas, multi-stage build).</li>
+  <li>Orquestar varios servicios con <strong>docker-compose</strong>.</li>
+  <li><strong>Redes</strong> entre contenedores y qué exponer al exterior (seguridad).</li>
+  <li><strong>Volúmenes</strong>: persistir datos fuera del ciclo de vida del contenedor.</li>
+  <li>Variables de entorno y secretos (no hardcodear credenciales).</li>
+</ul>
+
+<h2>Stack</h2>
+<p><strong>Docker</strong> + <strong>docker-compose</strong> · una API (FastAPI/Express) · frontend (React build servido por nginx) · PostgreSQL · nginx como reverse proxy. Todo en Linux (nativo o WSL2).</p>
+
+<h2>Código clave (docker-compose.yml)</h2>
+
+<pre><code class="lang-yaml">services:
+  proxy:
+    image: nginx:alpine
+    ports: ["80:80"]              # ÚNICO puerto expuesto al exterior
+    depends_on: [api, web]
+    volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+
+  web:
+    build: ./frontend            # tu React
+    expose: ["3000"]             # solo visible en la red interna
+
+  api:
+    build: ./backend
+    expose: ["8000"]
+    environment:
+      DATABASE_URL: postgres://app:${DB_PASS}@db:5432/app
+    depends_on: [db]
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASS}
+    volumes: ["pgdata:/var/lib/postgresql/data"]   # datos persistentes
+
+volumes:
+  pgdata:</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> Fijate que <code>api</code> conecta a <code>db</code> por su <strong>nombre de servicio</strong> (<code>db:5432</code>), no por IP — Docker resuelve eso con DNS interno (M15 Redes). Y <code>expose</code> vs <code>ports</code>: <code>ports</code> abre al mundo, <code>expose</code> solo a la red interna. Esa distinción es seguridad (M30): minimizás la superficie expuesta.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> dockerizá UN servicio (la API). Escribí su Dockerfile y corré <code>docker build/run</code>.</div>
+<div class="fase"><strong>Fase 2:</strong> sumá PostgreSQL como segundo servicio en compose. La API se conecta a la base.</div>
+<div class="fase"><strong>Fase 3:</strong> agregá el frontend y nginx como reverse proxy. Una sola URL para todo.</div>
+<div class="fase"><strong>Fase 4:</strong> volúmenes para persistir la base, variables de entorno para secretos, healthchecks.</div>
+<div class="fase"><strong>Fase 5:</strong> optimizá imágenes (multi-stage, alpine) y documentá el <code>up</code>/<code>down</code>.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li><code>docker compose up</code> levanta toda la app y funciona end-to-end.</li>
+    <li>Solo el proxy está expuesto; la base NO es accesible desde afuera.</li>
+    <li>Los datos sobreviven a <code>docker compose down &amp;&amp; up</code> (volumen).</li>
+    <li>No hay credenciales hardcodeadas (usás variables de entorno).</li>
+    <li>Otra persona clona el repo y levanta todo sin instalar dependencias a mano.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Agregá Redis como caché (conecta con P24).</li>
+  <li>HTTPS con certificados (Let's Encrypt / Caddy) — cripto en tránsito (M29).</li>
+  <li>Healthchecks y reinicio automático de servicios caídos.</li>
+  <li>Pipeline CI/CD que construye y publica las imágenes (P22).</li>
+  <li>Deploy en un VPS real o en Kubernetes (M38 Cloud).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./20-escaner-puertos.html">← Escáner de Puertos</a>
+  <a href="./22-pipeline-cicd.html">Siguiente: Pipeline CI/CD →</a>
+</nav>
+
+</div>
+</body>
+</html>

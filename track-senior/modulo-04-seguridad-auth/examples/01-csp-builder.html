@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>CSP Builder — interactivo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0a0e1a; color: #e2e8f0;
+      min-height: 100vh; padding: 1.5rem;
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 {
+      background: linear-gradient(135deg, #ef4444, #f59e0b);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      font-size: 1.8rem; margin-bottom: 0.3rem;
+    }
+    .sub { color: #94a3b8; margin-bottom: 1.5rem; }
+    a { color: #ef4444; text-decoration: none; }
+    .back { color: #94a3b8; font-size: 0.9em; display: inline-block; margin-bottom: 1rem; }
+
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.2rem;
+    }
+    .panel h2 {
+      font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #94a3b8; margin-bottom: 0.7rem;
+    }
+
+    /* Directives */
+    .directive {
+      margin-bottom: 1rem;
+    }
+    .directive label {
+      display: block; font-weight: 600; margin-bottom: 0.3rem;
+      color: #fbbf24; font-family: monospace;
+    }
+    .directive .opts {
+      display: flex; gap: 0.3rem; flex-wrap: wrap;
+    }
+    .directive .opts label {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      background: #0f172a;
+      padding: 0.3rem 0.6rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78em;
+      color: #cbd5e1;
+      cursor: pointer;
+      font-weight: normal;
+    }
+    .directive .opts label:has(input:checked) {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+    }
+    .directive .opts input { accent-color: #ef4444; }
+
+    /* Output CSP */
+    .csp-output {
+      background: #0f172a;
+      padding: 1rem;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      color: #fbbf24;
+      line-height: 1.6;
+      word-break: break-all;
+      margin-bottom: 1rem;
+    }
+    .copy-csp {
+      background: #ef4444; color: white;
+      border: 0; padding: 0.5rem 0.8rem;
+      border-radius: 5px; cursor: pointer;
+      font-size: 0.85em; font-weight: 600;
+    }
+    .copy-csp:hover { background: #dc2626; }
+
+    /* Test simulator */
+    .scenario {
+      padding: 0.7rem 1rem;
+      border-radius: 6px;
+      margin-bottom: 0.5rem;
+      background: #0f172a;
+      border-left: 3px solid #334155;
+    }
+    .scenario .desc { font-size: 0.85em; margin-bottom: 0.3rem; }
+    .scenario .code {
+      font-family: monospace;
+      font-size: 0.78em;
+      color: #cbd5e1;
+      background: #1e293b;
+      padding: 4px 8px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .scenario .verdict {
+      margin-top: 0.4rem;
+      font-size: 0.82em;
+      font-weight: 600;
+    }
+    .scenario.allow { border-left-color: #34d399; }
+    .scenario.allow .verdict { color: #6ee7b7; }
+    .scenario.block { border-left-color: #ef4444; }
+    .scenario.block .verdict { color: #fca5a5; }
+
+    .grade {
+      padding: 1rem; border-radius: 8px;
+      font-weight: 700; text-align: center;
+      margin-top: 1rem;
+    }
+    .grade.a { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+    .grade.b { background: rgba(251,191,36,0.15); color: #fde047; }
+    .grade.c { background: rgba(249,115,22,0.15); color: #fdba74; }
+    .grade.f { background: rgba(220,38,38,0.15); color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a href="../lecture.html" class="back">← Volver al lecture</a>
+    <h1>🛡 CSP Builder</h1>
+    <p class="sub">Configurá tu Content-Security-Policy y ve qué requests permite/bloquea. Modo "playground" para entender el impacto.</p>
+
+    <div class="layout">
+      <div class="panel">
+        <h2>Configuración</h2>
+        <div id="directives"></div>
+      </div>
+
+      <div>
+        <div class="panel">
+          <h2>CSP generado</h2>
+          <div class="csp-output" id="cspOutput"></div>
+          <button class="copy-csp" onclick="copyCsp()">Copiar header</button>
+          <div class="grade" id="grade"></div>
+        </div>
+
+        <div class="panel" style="margin-top: 1rem;">
+          <h2>Simulación de scenarios</h2>
+          <div id="scenarios"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const DIRECTIVES = [
+    {
+      key: 'default-src',
+      label: 'default-src',
+      desc: 'Default para todo lo que no esté especificado',
+      options: [
+        { val: "'self'", recommended: true },
+        { val: "'none'", strict: true },
+        { val: "*", insecure: true },
+      ],
+      default: ["'self'"],
+    },
+    {
+      key: 'script-src',
+      label: 'script-src',
+      desc: 'De dónde puede cargar scripts',
+      options: [
+        { val: "'self'", recommended: true },
+        { val: "'unsafe-inline'", insecure: true },
+        { val: "'unsafe-eval'", insecure: true },
+        { val: "'nonce-RANDOM'", strict: true },
+        { val: 'https://cdn.jsdelivr.net' },
+        { val: 'https://unpkg.com' },
+      ],
+      default: ["'self'"],
+    },
+    {
+      key: 'style-src',
+      label: 'style-src',
+      desc: 'De dónde puede cargar CSS',
+      options: [
+        { val: "'self'", recommended: true },
+        { val: "'unsafe-inline'", insecure: true },
+        { val: 'https://fonts.googleapis.com' },
+      ],
+      default: ["'self'"],
+    },
+    {
+      key: 'img-src',
+      label: 'img-src',
+      desc: 'De dónde pueden venir imágenes',
+      options: [
+        { val: "'self'", recommended: true },
+        { val: 'data:', neutral: true },
+        { val: 'https:', neutral: true },
+        { val: 'blob:' },
+      ],
+      default: ["'self'", 'data:', 'https:'],
+    },
+    {
+      key: 'connect-src',
+      label: 'connect-src',
+      desc: 'A dónde puede hacer fetch / XHR / WebSocket',
+      options: [
+        { val: "'self'", recommended: true },
+        { val: 'https://api.miapp.com' },
+        { val: '*', insecure: true },
+      ],
+      default: ["'self'"],
+    },
+    {
+      key: 'frame-ancestors',
+      label: 'frame-ancestors',
+      desc: 'Quién puede embeber tu sitio en un iframe',
+      options: [
+        { val: "'none'", recommended: true },
+        { val: "'self'" },
+        { val: '*', insecure: true },
+      ],
+      default: ["'none'"],
+    },
+    {
+      key: 'object-src',
+      label: 'object-src',
+      desc: 'Plugins (Flash, etc.) — siempre none',
+      options: [
+        { val: "'none'", recommended: true },
+        { val: "'self'" },
+      ],
+      default: ["'none'"],
+    },
+  ];
+
+  const state = {};
+  DIRECTIVES.forEach(d => { state[d.key] = new Set(d.default); });
+
+  function render() {
+    document.getElementById('directives').innerHTML = DIRECTIVES.map(d => `
+      <div class="directive">
+        <label>${d.label} <small style="color:#94a3b8; font-weight:normal;">— ${d.desc}</small></label>
+        <div class="opts">
+          ${d.options.map(o => {
+            const checked = state[d.key].has(o.val);
+            const tag = o.recommended ? '✓' : o.insecure ? '⚠️' : o.strict ? '🔒' : '';
+            return `
+              <label>
+                <input type="checkbox" data-key="${d.key}" data-val='${o.val}' ${checked ? 'checked' : ''}>
+                ${tag} ${o.val}
+              </label>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    `).join('');
+
+    document.querySelectorAll('input[data-key]').forEach(cb => {
+      cb.addEventListener('change', (e) => {
+        const k = e.target.dataset.key;
+        const v = e.target.dataset.val;
+        if (e.target.checked) state[k].add(v);
+        else state[k].delete(v);
+        update();
+      });
+    });
+  }
+
+  function buildCsp() {
+    return DIRECTIVES
+      .map(d => {
+        const vals = [...state[d.key]];
+        return vals.length ? `${d.key} ${vals.join(' ')}` : null;
+      })
+      .filter(Boolean)
+      .join('; ');
+  }
+
+  function gradeCsp() {
+    let score = 0;
+    const csp = buildCsp();
+    // Reglas de scoring
+    if (csp.includes("default-src 'self'") || csp.includes("default-src 'none'")) score += 20;
+    if (csp.includes("script-src") && !csp.includes("'unsafe-inline'")) score += 25;
+    if (csp.includes("script-src") && !csp.includes("'unsafe-eval'")) score += 15;
+    if (csp.includes("frame-ancestors 'none'")) score += 15;
+    if (csp.includes("object-src 'none'")) score += 10;
+    if (!csp.includes(' *')) score += 15;  // sin wildcards permisivos
+
+    let grade = 'F', cls = 'f', msg = '';
+    if (score >= 90) { grade = 'A+'; cls = 'a'; msg = 'CSP excelente. Defensa robusta contra XSS.'; }
+    else if (score >= 75) { grade = 'A'; cls = 'a'; msg = 'CSP bueno, podés afinar más.'; }
+    else if (score >= 60) { grade = 'B'; cls = 'b'; msg = 'OK pero hay mejoras importantes.'; }
+    else if (score >= 40) { grade = 'C'; cls = 'c'; msg = 'Permisivo. Endurecer recomendado.'; }
+    else { msg = '⚠️ CSP muy débil. Vulnerable a XSS.'; }
+    return `<div>Grade: <strong style="font-size:1.5rem;">${grade}</strong> (${score}/100)</div><div style="font-size:0.85em; margin-top:4px;">${msg}</div>`;
+  }
+
+  const SCENARIOS = [
+    { type: 'script', desc: 'Cargar marked.js desde jsDelivr', code: '<script src="https://cdn.jsdelivr.net/npm/marked@13.0.0/marked.min.js"></script>',
+      check: (csp) => csp.includes('script-src') && csp.match(/script-src[^;]*(jsdelivr|\*)/) },
+    { type: 'inline-script', desc: 'Inline script: <code>&lt;script&gt;alert(1)&lt;/script&gt;</code>', code: '<script>alert(1)</script>',
+      check: (csp) => csp.includes("'unsafe-inline'") || csp.includes('nonce') },
+    { type: 'eval', desc: 'eval() o Function() constructor', code: 'eval("alert(1)")',
+      check: (csp) => csp.includes("'unsafe-eval'") },
+    { type: 'image', desc: 'Imagen externa de cualquier HTTPS', code: '<img src="https://example.com/foto.jpg">',
+      check: (csp) => /img-src[^;]*(https:|\*)/.test(csp) || !csp.includes('img-src') },
+    { type: 'fetch', desc: 'Fetch a tu API: api.miapp.com', code: 'fetch("https://api.miapp.com/users")',
+      check: (csp) => /connect-src[^;]*(api\.miapp\.com|\*)/.test(csp) },
+    { type: 'iframe-self', desc: 'Otro sitio embebe TU app en un iframe', code: '<iframe src="https://miapp.com">',
+      check: (csp) => !csp.includes("frame-ancestors 'none'") && !csp.includes("frame-ancestors 'self'") },
+  ];
+
+  function renderScenarios() {
+    const csp = buildCsp();
+    document.getElementById('scenarios').innerHTML = SCENARIOS.map(s => {
+      const allowed = s.check(csp);
+      return `
+        <div class="scenario ${allowed ? 'allow' : 'block'}">
+          <div class="desc">${s.desc}</div>
+          <div class="code">${s.code.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+          <div class="verdict">${allowed ? '✅ Permitido por tu CSP' : '🚫 Bloqueado por tu CSP'}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function update() {
+    document.getElementById('cspOutput').textContent = buildCsp();
+    document.getElementById('grade').className = 'grade ' + (gradeCsp().includes('A') ? 'a' : gradeCsp().includes('B') ? 'b' : gradeCsp().includes('C') ? 'c' : 'f');
+    document.getElementById('grade').innerHTML = gradeCsp();
+    renderScenarios();
+  }
+
+  async function copyCsp() {
+    await navigator.clipboard.writeText('Content-Security-Policy: ' + buildCsp());
+    const btn = document.querySelector('.copy-csp');
+    btn.textContent = '✓ copiado';
+    setTimeout(() => btn.textContent = 'Copiar header', 1500);
+  }
+
+  render();
+  update();
+  </script>
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>backup.sh · Curso de Linux</title>
+  <meta name="description" content="Script bash de backup con timestamp, rotación y cleanup.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+  <style>
+    .script-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }
+    .btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9em;
+      font-family: inherit;
+      text-decoration: none;
+      transition: all 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .btn.copied { background: var(--success); color: var(--bg); border-color: var(--success); }
+    article pre { max-height: 600px; overflow-y: auto; }
+    .hljs { background: var(--code-bg) !important; padding: 1.2rem !important; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../../index.html">← Curso de Linux</a>
+  <a href="../lecture.html">← Módulo 09</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">📜 backup.sh</span>
+  <span class="badge">Bash</span>
+  <span class="badge">~50 líneas</span>
+  <span class="badge">Módulo 09</span>
+</div>
+
+<article>
+
+<h1>backup.sh — Backup con timestamp y rotación</h1>
+
+<p>Script bash que comprime un directorio en <code>.tar.gz</code> con timestamp, valida argumentos, hace cleanup ante interrupción y rota backups viejos manteniendo solo los últimos 7.</p>
+
+<h2>¿Qué hace?</h2>
+
+<ul>
+  <li>Valida que reciba al menos 1 argumento (directorio origen).</li>
+  <li>Acepta destino opcional (default <code>~/backups</code>).</li>
+  <li>Genera nombre con timestamp <code>YYYYMMDD-HHMMSS</code>.</li>
+  <li>Usa <code>trap</code> para limpiar archivo parcial si lo interrumpís con Ctrl+C.</li>
+  <li>Rota: borra backups más viejos que los 7 más recientes con el mismo prefijo.</li>
+</ul>
+
+<h2>Cómo ejecutar</h2>
+
+<pre><code class="language-bash"># 1) Hacerlo ejecutable
+chmod +x backup.sh
+
+# 2) Backup a destino default (~/backups)
+./backup.sh /home/ana/proyectos
+
+# 3) Backup con destino custom
+./backup.sh /var/www /mnt/backups
+
+# 4) Probar con un directorio chico primero
+mkdir -p /tmp/prueba &amp;&amp; echo "hola" &gt; /tmp/prueba/test.txt
+./backup.sh /tmp/prueba /tmp/backups</code></pre>
+
+<div class="tip">Para automatizarlo: crear un timer systemd o entrada de cron diaria que llame a este script. Ver Módulos 10 y 12.</div>
+
+<h2>Código fuente</h2>
+
+<div class="script-actions">
+  <button class="btn" id="copyBtn">📋 Copiar código</button>
+  <a class="btn" href="./backup.sh" download>⬇ Descargar .sh</a>
+</div>
+
+<pre><code class="language-bash" id="code">#!/usr/bin/env bash
+# Backup script — comprime un directorio con timestamp.
+# Uso: ./backup.sh &lt;directorio_origen&gt; [destino]
+
+set -euo pipefail
+
+# --- Validación de argumentos ---
+if [[ $# -lt 1 ]]; then
+    echo "Uso: $0 &lt;directorio_origen&gt; [destino]" &gt;&amp;2
+    exit 1
+fi
+
+ORIGEN="${1%/}"   # quita barra final si la hay
+DESTINO="${2:-$HOME/backups}"
+
+if [[ ! -d "$ORIGEN" ]]; then
+    echo "Error: '$ORIGEN' no es un directorio válido" &gt;&amp;2
+    exit 1
+fi
+
+# --- Preparación ---
+mkdir -p "$DESTINO"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+NOMBRE=$(basename "$ORIGEN")
+ARCHIVO="$DESTINO/${NOMBRE}-${TIMESTAMP}.tar.gz"
+
+# --- Cleanup en caso de interrupción ---
+limpiar() {
+    if [[ -f "$ARCHIVO" &amp;&amp; ! -s "$ARCHIVO" ]]; then
+        echo "Backup interrumpido, eliminando archivo parcial..." &gt;&amp;2
+        rm -f "$ARCHIVO"
+    fi
+}
+trap limpiar INT TERM
+
+# --- Backup ---
+echo "📦 Comprimiendo '$ORIGEN' → '$ARCHIVO'"
+tar -czf "$ARCHIVO" -C "$(dirname "$ORIGEN")" "$NOMBRE"
+
+# --- Reporte ---
+TAMANO=$(du -h "$ARCHIVO" | cut -f1)
+echo "✅ Backup creado: $ARCHIVO ($TAMANO)"
+
+# --- Rotación: mantener últimos 7 ---
+cd "$DESTINO"
+mapfile -t VIEJOS &lt; &lt;(ls -1t "${NOMBRE}-"*.tar.gz 2&gt;/dev/null | tail -n +8)
+for f in "${VIEJOS[@]}"; do
+    echo "🗑️  Eliminando viejo: $f"
+    rm -f "$f"
+done
+</code></pre>
+
+<h2>Conceptos clave del script</h2>
+
+<ul>
+  <li><code>${1%/}</code> — Parameter expansion: quita el último <code>/</code> si existe.</li>
+  <li><code>${2:-$HOME/backups}</code> — Default value si <code>$2</code> está vacío.</li>
+  <li><code>trap limpiar INT TERM</code> — Ejecuta función al recibir Ctrl+C (INT) o TERM.</li>
+  <li><code>tar -czf ARCHIVO -C dir nombre</code> — <code>-C</code> cambia directorio antes de tar; evita rutas absolutas en el archivo.</li>
+  <li><code>mapfile -t VIEJOS &lt; &lt;(comando)</code> — Process substitution: lee output de un comando en un array línea por línea.</li>
+  <li><code>ls -1t | tail -n +8</code> — Lista por fecha desc; <code>tail -n +8</code> deja todo desde la línea 8 en adelante (los "viejos").</li>
+</ul>
+
+<h2>Ejercicios para extenderlo</h2>
+
+<ol>
+  <li>Agregar opción <code>--exclude PATRON</code> para pasar a <code>tar --exclude</code>.</li>
+  <li>Verificar integridad después de crear: <code>tar -tzf ARCHIVO &gt; /dev/null</code>.</li>
+  <li>Sumar SHA-256 al lado: <code>sha256sum ARCHIVO &gt; ARCHIVO.sha256</code>.</li>
+  <li>Soportar destino remoto vía <code>rsync</code> o <code>scp</code>.</li>
+  <li>Hacer la cantidad de backups a mantener configurable con env var <code>BACKUP_KEEP</code>.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../lecture.html">← Volver al Módulo 09</a>
+  <a href="../../modulo-13-proyectos/scripts/sys-report.html">Ver sys-report.sh →</a>
+</nav>
+
+</div>
+
+<script>
+  hljs.highlightAll();
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const code = document.getElementById('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      const btn = document.getElementById('copyBtn');
+      const original = btn.textContent;
+      btn.textContent = '✓ Copiado';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 2000);
+    } catch (err) {
+      alert('No se pudo copiar. Seleccioná el código manualmente.');
+    }
+  });
+</script>
+
+</body>
+</html>

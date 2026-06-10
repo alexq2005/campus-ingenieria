@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 11 — Estado Global · Curso de React</title>
+<meta name="description" content="Zustand, Context API, Redux Toolkit, Jotai. Cuándo usar cada uno.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 11</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M03, M07</span>
+</div>
+
+<article>
+
+<h1>Módulo 11 — Estado Global</h1>
+
+<blockquote>Cuando muchos componentes necesitan los mismos datos, levantar estado pierde sentido. Necesitás un "store global". En 2026 hay varias opciones — saber cuál usar es la clave.</blockquote>
+
+<h2>1. Decisión jerárquica de estado</h2>
+<figure class="foto">
+  <img src="../assets/img/m11-globo.jpg" alt="Globo terráqueo antiguo">
+  <figcaption>Un globo terráqueo: el estado global (Context, Zustand) comparte datos entre toda la app sin pasarlos nivel por nivel. Foto: Myrabella, vía <a href="https://commons.wikimedia.org/wiki/File:Coronelli_globe_terrestre.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 3.0).</figcaption>
+</figure>
+
+
+<div class="rule">
+Antes de "estado global", probá en este orden:
+<ol>
+  <li><strong>useState local</strong>: si solo lo usa 1 componente.</li>
+  <li><strong>Lifting state</strong>: si 2-3 hermanos lo comparten.</li>
+  <li><strong>Composición / children</strong>: si querés evitar pasarlo manualmente.</li>
+  <li><strong>useContext</strong>: si lo necesita un subárbol (theme, locale, user actual).</li>
+  <li><strong>Zustand / Redux</strong>: si MUCHAS partes lo necesitan y cambia con frecuencia.</li>
+  <li><strong>URL params</strong>: si es estado de navegación (filtro, página).</li>
+  <li><strong>TanStack Query</strong>: si es server state.</li>
+</ol>
+</div>
+
+<h2>2. Context API — la solución built-in</h2>
+
+<pre><code class="lang-jsx">// stores/AuthContext.jsx
+import { createContext, useContext, useState } from 'react';
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+
+  const login = async (email, pwd) =&gt; { /* ... */ };
+  const logout = () =&gt; setUser(null);
+
+  return (
+    &lt;AuthContext.Provider value={{ user, login, logout }}&gt;
+      {children}
+    &lt;/AuthContext.Provider&gt;
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth fuera de AuthProvider');
+  return ctx;
+}
+
+// Uso
+&lt;AuthProvider&gt;
+  &lt;App /&gt;
+&lt;/AuthProvider&gt;
+
+function Header() {
+  const { user, logout } = useAuth();
+  // ...
+}</code></pre>
+
+<div class="warn">Context API tiene un problema: TODO el subárbol bajo el Provider re-renderiza si cambia el value (objeto nuevo). Para apps grandes con updates frecuentes, prefiero Zustand.</div>
+
+<h2>3. Zustand — el estándar moderno 2026</h2>
+
+<pre><code class="lang-bash">npm install zustand</code></pre>
+
+<pre><code class="lang-jsx">// stores/useCounterStore.js
+import { create } from 'zustand';
+
+export const useCounterStore = create((set) =&gt; ({
+  count: 0,
+  increment: () =&gt; set((state) =&gt; ({ count: state.count + 1 })),
+  decrement: () =&gt; set((state) =&gt; ({ count: state.count - 1 })),
+  reset: () =&gt; set({ count: 0 }),
+}));</code></pre>
+
+<pre><code class="lang-jsx">// Uso desde cualquier componente — sin Provider, sin nada
+function Counter() {
+  const { count, increment } = useCounterStore();
+  return (
+    &lt;&gt;
+      &lt;p&gt;{count}&lt;/p&gt;
+      &lt;button onClick={increment}&gt;+1&lt;/button&gt;
+    &lt;/&gt;
+  );
+}
+
+function CounterDisplay() {
+  // Solo se suscribe a `count` — no re-renderiza si cambia OTRO field
+  const count = useCounterStore((state) =&gt; state.count);
+  return &lt;h1&gt;{count}&lt;/h1&gt;;
+}</code></pre>
+
+<div class="tip">Zustand brilla por su simplicidad: no necesita Provider, selectors granulares evitan re-renders innecesarios, API mínima. Para 2026 es la opción por defecto cuando context no alcanza.</div>
+
+<h2>4. Zustand con persistencia</h2>
+
+<pre><code class="lang-jsx">import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+export const useThemeStore = create(
+  persist(
+    (set) =&gt; ({
+      theme: 'light',
+      toggle: () =&gt; set((s) =&gt; ({ theme: s.theme === 'light' ? 'dark' : 'light' })),
+    }),
+    { name: 'theme-storage' }  // guardado en localStorage
+  )
+);</code></pre>
+
+<h2>5. Zustand "slices" — store grande dividido</h2>
+
+<pre><code class="lang-jsx">// Cada slice maneja un dominio
+const createAuthSlice = (set) =&gt; ({
+  user: null,
+  login: (u) =&gt; set({ user: u }),
+  logout: () =&gt; set({ user: null }),
+});
+
+const createCartSlice = (set) =&gt; ({
+  items: [],
+  addItem: (item) =&gt; set((s) =&gt; ({ items: [...s.items, item] })),
+});
+
+// Combinar
+export const useStore = create((set) =&gt; ({
+  ...createAuthSlice(set),
+  ...createCartSlice(set),
+}));</code></pre>
+
+<h2>6. Redux Toolkit — el "viejo confiable"</h2>
+
+<p>Redux sigue siendo común en proyectos enterprise. La librería moderna se llama <strong>Redux Toolkit (RTK)</strong>:</p>
+
+<pre><code class="lang-bash">npm install @reduxjs/toolkit react-redux</code></pre>
+
+<pre><code class="lang-jsx">// store/counterSlice.js
+import { createSlice } from '@reduxjs/toolkit';
+
+const counterSlice = createSlice({
+  name: 'counter',
+  initialState: { value: 0 },
+  reducers: {
+    increment: (state) =&gt; { state.value++; },  // Immer permite mutar
+    decrement: (state) =&gt; { state.value--; },
+  },
+});
+
+export const { increment, decrement } = counterSlice.actions;
+export default counterSlice.reducer;</code></pre>
+
+<pre><code class="lang-jsx">// store/index.js
+import { configureStore } from '@reduxjs/toolkit';
+import counterReducer from './counterSlice';
+
+export const store = configureStore({
+  reducer: { counter: counterReducer },
+});
+
+// Uso
+function Counter() {
+  const count = useSelector((s) =&gt; s.counter.value);
+  const dispatch = useDispatch();
+
+  return (
+    &lt;&gt;
+      &lt;p&gt;{count}&lt;/p&gt;
+      &lt;button onClick={() =&gt; dispatch(increment())}&gt;+1&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="info">RTK incluye RTK Query (alternativa a TanStack Query) y maneja bien apps grandes. Tiene MÁS boilerplate que Zustand pero más patrones consolidados para equipos grandes.</div>
+
+<h2>7. Jotai — atomic state</h2>
+
+<pre><code class="lang-jsx">import { atom, useAtom } from 'jotai';
+
+const countAtom = atom(0);
+
+function Counter() {
+  const [count, setCount] = useAtom(countAtom);
+  return &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;{count}&lt;/button&gt;;
+}</code></pre>
+
+<p>Jotai es "Recoil-like": estado en átomos pequeños, componibles. Bueno cuando tu estado es muy granular.</p>
+
+<h2>8. Comparativa en 2026</h2>
+
+<table>
+<thead><tr><th>Lib</th><th>Bundle</th><th>Boilerplate</th><th>Curva aprendizaje</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><strong>useState + lifting</strong></td><td>0 KB</td><td>Cero</td><td>Cero</td><td>Default para todo</td></tr>
+<tr><td><strong>Context</strong></td><td>0 KB (built-in)</td><td>Bajo</td><td>Bajo</td><td>Subárboles (theme, locale, user)</td></tr>
+<tr><td><strong>Zustand</strong></td><td>~3 KB</td><td>Bajo</td><td>Bajo</td><td>⭐ Default 2026 cuando context no alcanza</td></tr>
+<tr><td><strong>Jotai</strong></td><td>~5 KB</td><td>Bajo</td><td>Medio</td><td>Estado granular, derivado, async</td></tr>
+<tr><td><strong>Redux Toolkit</strong></td><td>~15 KB</td><td>Alto</td><td>Alto</td><td>Equipos grandes, devtools potentes</td></tr>
+<tr><td><strong>MobX</strong></td><td>~16 KB</td><td>Medio</td><td>Medio</td><td>Fans de reactividad observable</td></tr>
+</tbody>
+</table>
+
+<h2>9. Cuándo necesitás estado global de verdad</h2>
+
+<ul>
+  <li>Usuario logueado (auth) — accesible en todo el árbol.</li>
+  <li>Carrito de compras — visible en navbar + checkout + detalle.</li>
+  <li>Notificaciones / toasts — disparables desde cualquier lugar.</li>
+  <li>Tema / preferencias UI — afectan todo.</li>
+  <li>Filtros globales que afectan múltiples componentes.</li>
+</ul>
+
+<div class="warn">Si solo lo usás en 1-2 componentes, NO es estado global. Mantenelo local. El estado global "por las dudas" agrega complejidad y dificulta razonar sobre la app.</div>
+
+<h2>10. Patrón: combinar Zustand + TanStack Query</h2>
+
+<table>
+<thead><tr><th>Tipo de estado</th><th>Dónde va</th></tr></thead>
+<tbody>
+<tr><td>Server state (posts del backend)</td><td>TanStack Query</td></tr>
+<tr><td>UI state local (modal abierto)</td><td>useState</td></tr>
+<tr><td>UI state global (theme, sidebar abierto)</td><td>Zustand</td></tr>
+<tr><td>Estado de form mientras se escribe</td><td>useState o React Hook Form</td></tr>
+<tr><td>Filtros que vienen de URL</td><td>useSearchParams</td></tr>
+</tbody>
+</table>
+
+<div class="rule">Esta separación es CRUCIAL. Mezclar server y client state en el mismo store es bug factory.</div>
+
+<h2>11. Mini-ejemplo: store de carrito con Zustand</h2>
+
+<pre><code class="lang-jsx">// stores/useCartStore.js
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+export const useCartStore = create(
+  persist(
+    (set, get) =&gt; ({
+      items: [],
+
+      addItem: (product) =&gt; set((state) =&gt; {
+        const existing = state.items.find(i =&gt; i.id === product.id);
+        if (existing) {
+          return {
+            items: state.items.map(i =&gt;
+              i.id === product.id ? { ...i, qty: i.qty + 1 } : i
+            )
+          };
+        }
+        return { items: [...state.items, { ...product, qty: 1 }] };
+      }),
+
+      removeItem: (id) =&gt; set((state) =&gt; ({
+        items: state.items.filter(i =&gt; i.id !== id)
+      })),
+
+      clear: () =&gt; set({ items: [] }),
+
+      total: () =&gt; get().items.reduce((sum, i) =&gt; sum + i.precio * i.qty, 0),
+    }),
+    { name: 'cart-storage' }
+  )
+);
+
+// Uso
+function NavBar() {
+  const count = useCartStore((s) =&gt; s.items.length);
+  return &lt;span&gt;🛒 {count}&lt;/span&gt;;
+}
+
+function ProductCard({ product }) {
+  const addItem = useCartStore((s) =&gt; s.addItem);
+  return &lt;button onClick={() =&gt; addItem(product)}&gt;Agregar&lt;/button&gt;;
+}</code></pre>
+
+<h2>12. Errores típicos</h2>
+
+<div class="mistake"><strong>Empezar con Redux desde el día 1</strong>: la mayoría de apps no lo necesitan. Empezá local, escalá a Zustand si duele.</div>
+
+<div class="mistake"><strong>Server state en Zustand</strong>: <code>set({ posts: await fetch(...) })</code>. No tenés cache automático, ni refetch, ni dedup. Usá TanStack Query.</div>
+
+<div class="mistake"><strong>Context con value inline</strong>: <code>&lt;Ctx.Provider value={{ x, y }}&gt;</code>. Objeto nuevo cada render → todo el subárbol re-renderiza. Memoizar el value.</div>
+
+<div class="mistake"><strong>Zustand sin selectors</strong>: <code>const store = useStore()</code> trae todo el store → re-render cuando CUALQUIER campo cambia. Usar selectors: <code>useStore(s =&gt; s.count)</code>.</div>
+
+<div class="mistake"><strong>Reescribir todo en Redux por "buen patrón"</strong>: no es 2018. Apps modernas usan menos Redux. Zustand + TanStack Query cubre el 90%.</div>
+
+<h2>13. Ejercicios</h2>
+
+<ol>
+  <li>AuthContext con login/logout/user.</li>
+  <li>Theme store con Zustand + persist.</li>
+  <li>Cart store con add/remove/clear y total derivado.</li>
+  <li>Toast system: cualquier componente puede disparar un toast vía store.</li>
+  <li>Comparar useState lifted, Context y Zustand para el mismo caso de uso.</li>
+  <li>Migrar un Context con muchos re-renders a Zustand.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Cuándo necesitás "estado global"?</summary>
+<p>Cuando múltiples componentes en distintas partes del árbol necesitan el mismo dato Y este cambia con cierta frecuencia. Ejemplos: auth, carrito, tema, notificaciones. Si solo 2-3 hermanos lo usan, lift state al padre — no es global.</p></details>
+
+<details><summary>2. ¿Diferencia entre Context y Zustand?</summary>
+<p>Context es built-in pero causa re-render de todo el subárbol cuando el value cambia. Zustand es externo (~3KB), permite selectors granulares, no requiere Provider y tiene mejor performance en stores grandes.</p></details>
+
+<details><summary>3. ¿Cuándo elegir Redux Toolkit sobre Zustand?</summary>
+<p>Equipos grandes con patrones rígidos consolidados, devtools de Redux que querés mantener, ya tenés código RTK en producción, o necesitás middleware complejo (saga, observables).</p></details>
+
+<details><summary>4. ¿Server state vs client state?</summary>
+<p>Server state = datos del backend (posts, users). Necesita cache, refetch, dedup → TanStack Query / SWR. Client state = UI local (modal abierto, tema) → useState o Zustand. MEZCLAR los dos en el mismo store es antipatrón.</p></details>
+
+<details><summary>5. ¿Qué problema resuelven los selectors de Zustand?</summary>
+<p>Permiten suscribirse SOLO a una parte del store. <code>useStore(s =&gt; s.count)</code> hace que el componente re-renderice solo si <code>count</code> cambia, ignorando cambios en otros fields del store.</p></details>
+
+<details><summary>6. ¿Qué es Jotai?</summary>
+<p>Librería de estado "atómico": cada pieza es un "atom" pequeño y componible. Bueno cuando tu estado es muy granular o necesitás derivar valores async. Inspirado en Recoil pero más simple.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m10-data-fetching/lecture.html">← Anterior: Data Fetching</a>
+  <a href="../m12-performance-y-testing/lecture.html">Siguiente: Performance y Testing →</a>
+</nav>
+
+</div>
+</body>
+</html>

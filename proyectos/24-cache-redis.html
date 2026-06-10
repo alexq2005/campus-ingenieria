@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 24 — Caché con Redis · Campus CS-FE</title>
+<meta name="description" content="Acelerá una API metiendo Redis como caché (patrón cache-aside): de cientos de ms a sub-milisegundo. NoSQL en memoria (M21).">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m21-nosql-y-newsql/lecture.html">🎓 M21 NoSQL</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 24</span>
+  <span class="badge nivel-inter">Intermedio</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">Redis + API</span>
+</div>
+
+<article>
+
+<h1>⚡ Caché con Redis</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> tomar una API con una query costosa y ponerle <strong>Redis</strong> como caché en memoria con el patrón <strong>cache-aside</strong>. La primera vez consultás la base; las siguientes, respondés desde RAM en sub-milisegundo. Vas a entender el trade-off central de los sistemas: <strong>velocidad vs frescura de los datos</strong>.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m21-nosql-y-newsql/lecture.html">M21 NoSQL/NewSQL</a> (key-value en memoria),
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m20-motores-y-tuning/lecture.html">M20 Tuning</a> (cuándo cachear),
+  <a href="../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m13-arquitectura-computadoras/lecture.html">M13 Arquitectura</a> (jerarquía de memoria) y el
+  <a href="./23-api-rest-sql.html">Proyecto 23 (API+SQL)</a>.
+</div>
+
+<h2>Cómo funciona — cache-aside (hit vs miss)</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 200" role="img" aria-label="La app consulta Redis: si hay hit responde rápido; si hay miss va a la base, guarda en Redis y responde">
+  <defs>
+    <marker id="ax" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- app -->
+  <rect x="20" y="80" width="110" height="50" rx="8" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="75" y="102" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">⚙️ API</text>
+  <text x="75" y="119" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">1. ¿está en caché?</text>
+  <line x1="130" y1="105" x2="185" y2="105" stroke="#f0883e" stroke-width="2" marker-end="url(#ax)"/>
+  <!-- redis -->
+  <rect x="190" y="80" width="120" height="50" rx="8" fill="#1f2638" stroke="#fb7185" stroke-width="2.5"/>
+  <text x="250" y="102" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">⚡ Redis</text>
+  <text x="250" y="119" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">RAM, key-value</text>
+  <!-- HIT -->
+  <path d="M250,80 Q250,40 130,55" fill="none" stroke="#3fb950" stroke-width="2" marker-end="url(#ax)"/>
+  <text x="180" y="40" text-anchor="middle" fill="#3fb950" font-size="11" font-family="system-ui">HIT → responde &lt;1ms ✓</text>
+  <!-- MISS -->
+  <line x1="310" y1="105" x2="365" y2="105" stroke="#fbbf24" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#ax)"/>
+  <text x="337" y="96" text-anchor="middle" fill="#fbbf24" font-size="10" font-family="system-ui">MISS</text>
+  <!-- db -->
+  <rect x="370" y="80" width="120" height="50" rx="8" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="430" y="102" text-anchor="middle" fill="#e8edf4" font-size="12" font-family="system-ui">🗄️ PostgreSQL</text>
+  <text x="430" y="119" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">2. query lenta</text>
+  <!-- guardar en redis -->
+  <path d="M430,130 Q430,175 250,165 Q200,160 200,132" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#ax)"/>
+  <text x="370" y="180" text-anchor="middle" fill="#58a6ff" font-size="11" font-family="system-ui">3. guarda en Redis con TTL para la próxima</text>
+</svg>
+<figcaption>Cache-aside: la app pregunta primero a Redis. <strong>Hit</strong> = responde de RAM al instante. <strong>Miss</strong> = va a Postgres, guarda el resultado en Redis con un TTL, y responde. La 2ª petición igual ya es instantánea.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>El patrón <strong>cache-aside</strong> (lazy loading) y cuándo conviene.</li>
+  <li>Redis como <strong>key-value en memoria</strong> y por qué es tan rápido (M21, M13 jerarquía de memoria).</li>
+  <li><strong>TTL</strong> y expiración: balancear frescura vs carga a la base.</li>
+  <li><strong>Invalidación</strong> de caché — "uno de los dos problemas difíciles de CS".</li>
+  <li>Medir <strong>hit ratio</strong> y latencia p50/p99 antes y después.</li>
+  <li>Riesgos: datos rancios, stampede, qué NO cachear.</li>
+</ul>
+
+<h2>Stack</h2>
+<p><strong>Redis</strong> (Docker, P21) · la API del Proyecto 23 (o cualquier endpoint con una query cara) · cliente Redis (redis-py / ioredis) · una herramienta de carga (<code>ab</code>, <code>wrk</code>, k6) para medir.</p>
+
+<h2>Código clave (cache-aside con TTL)</h2>
+
+<pre><code class="lang-python">import json, redis
+r = redis.Redis()
+
+def get_pedidos(cliente_id):
+    key = f"pedidos:{cliente_id}"
+
+    cached = r.get(key)              # 1) ¿hit?
+    if cached:
+        return json.loads(cached)   # responde desde RAM (&lt;1ms)
+
+    datos = db_query(cliente_id)     # 2) miss → base (lento)
+    r.setex(key, 60, json.dumps(datos))   # 3) guardar 60s (TTL)
+    return datos
+
+def crear_pedido(cliente_id, pedido):
+    db_insert(pedido)
+    r.delete(f"pedidos:{cliente_id}")     # invalidar: el dato cambió</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <code>setex</code> con TTL es el corazón del trade-off: 60s de caché = hasta 60s de datos potencialmente rancios, a cambio de muchísima menos carga en la base. Y el <code>delete</code> al escribir es la <strong>invalidación</strong> — si te la olvidás, servís datos viejos. Esto conecta con la jerarquía de memoria de M13: caché rápida y chica delante de almacenamiento lento y grande, la misma idea que L1/L2/RAM/disco.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> levantá Redis (Docker) y jugá con <code>SET/GET/EXPIRE</code> desde el CLI. Entendé key-value.</div>
+<div class="fase"><strong>Fase 2:</strong> medí la latencia de tu endpoint lento SIN caché (p50/p99). Anotá los números.</div>
+<div class="fase"><strong>Fase 3:</strong> implementá cache-aside con TTL. Volvé a medir: el speedup debería ser dramático.</div>
+<div class="fase"><strong>Fase 4:</strong> invalidación al escribir. Verificá que NO servís datos rancios tras un cambio.</div>
+<div class="fase"><strong>Fase 5:</strong> medí el hit ratio bajo carga. Ajustá el TTL según frescura vs carga.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Mostrás con números el antes/después de latencia (p99) con y sin caché.</li>
+    <li>El hit ratio es alto bajo carga repetida.</li>
+    <li>Tras escribir, la siguiente lectura refleja el dato nuevo (invalidación correcta).</li>
+    <li>Definiste un TTL razonable y podés justificarlo.</li>
+    <li>Sabés explicar qué NO cachearías y por qué (datos sensibles, muy volátiles).</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Rate limiting con Redis (contador con TTL) — protección de la API (M30).</li>
+  <li>Redis como cola de trabajos (jobs en background).</li>
+  <li>Pub/Sub de Redis para notificaciones en vivo (conecta con el Chat real-time, P08).</li>
+  <li>Sesiones de usuario en Redis en vez de en la base.</li>
+  <li>Estrategia write-through vs cache-aside: compará trade-offs.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./23-api-rest-sql.html">← API REST con SQL</a>
+  <a href="./index.html">Volver a la Galería →</a>
+</nav>
+
+</div>
+</body>
+</html>

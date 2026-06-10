@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 20 — Escáner de Puertos · Campus CS-FE</title>
+<meta name="description" content="Un escáner de puertos concurrente que mapea servicios en una red. Sockets, concurrencia y seguridad de redes (M30) — solo en TU red.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-06-seguridad/m30-seguridad-de-redes/lecture.html">🎓 M30 Seguridad de Redes</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 20</span>
+  <span class="badge nivel-inter">Intermedio</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">Sockets + Concurrencia</span>
+</div>
+
+<article>
+
+<h1>🛰️ Escáner de Puertos</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> una herramienta que descubre qué <strong>puertos están abiertos</strong> en un host y qué <strong>servicio</strong> corre en cada uno. Vas a entender cómo funcionan los sockets TCP por dentro, por qué la concurrencia lo hace 100× más rápido, y cómo un atacante (y un defensor) ve tu red.
+</div>
+
+<div class="danger">
+  ⚠️ <strong>Solo escaneá redes/hosts que te pertenezcan o tengas permiso explícito de escanear.</strong> Escanear sistemas ajenos es ilegal en muchos países. Practicá contra <code>localhost</code>, tu propio router, o laboratorios diseñados para eso (Metasploitable, TryHackMe).
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-06-seguridad/m30-seguridad-de-redes/lecture.html">M30 Seguridad de Redes</a> (puertos, servicios, defensa),
+  <a href="../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m15-redes-de-computadoras/lecture.html">M15 Redes</a> (TCP, three-way handshake),
+  <a href="../Curso-Python/modulo-11-concurrencia/lecture.html">Python concurrencia</a> (threads, async) y
+  <a href="../Curso-Linux/modulo-08-redes/lecture.html">Linux redes</a> (ss, netstat).
+</div>
+
+<h2>Cómo funciona — el handshake que delata el puerto</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 160" role="img" aria-label="Three-way handshake TCP: SYN, SYN-ACK indica puerto abierto, RST indica cerrado">
+  <text x="120" y="22" text-anchor="middle" fill="#58a6ff" font-size="12" font-family="system-ui" font-weight="700">TU escáner</text>
+  <text x="640" y="22" text-anchor="middle" fill="#3fb950" font-size="12" font-family="system-ui" font-weight="700">Host objetivo</text>
+  <line x1="120" y1="30" x2="120" y2="150" stroke="#2a3247" stroke-width="2"/>
+  <line x1="640" y1="30" x2="640" y2="150" stroke="#2a3247" stroke-width="2"/>
+  <!-- SYN -->
+  <line x1="120" y1="55" x2="640" y2="70" stroke="#f0883e" stroke-width="2" marker-end="url(#ap)"/>
+  <text x="380" y="52" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">SYN → "¿puerto 80 abierto?"</text>
+  <defs><marker id="ap" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker></defs>
+  <!-- SYN-ACK abierto -->
+  <line x1="640" y1="90" x2="120" y2="105" stroke="#3fb950" stroke-width="2" marker-end="url(#ap)"/>
+  <text x="380" y="88" text-anchor="middle" fill="#3fb950" font-size="11" font-family="system-ui">SYN-ACK → ABIERTO ✓ (hay servicio)</text>
+  <!-- RST cerrado -->
+  <line x1="640" y1="128" x2="120" y2="138" stroke="#fb7185" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#ap)"/>
+  <text x="380" y="126" text-anchor="middle" fill="#fb7185" font-size="11" font-family="system-ui">RST → CERRADO ✗ (o sin respuesta = filtrado)</text>
+</svg>
+<figcaption>Escanear es iniciar el handshake TCP (M15): si el puerto responde SYN-ACK, está abierto; si responde RST, cerrado; si no responde, hay un firewall filtrando. Eso es todo el "secreto".</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Cómo funciona un <strong>socket TCP</strong> y el <strong>three-way handshake</strong> (M15).</li>
+  <li>Qué revela un puerto abierto: el <strong>servicio</strong> y a veces su versión (banner grabbing).</li>
+  <li>Por qué la <strong>concurrencia</strong> (threads/async) es clave: 65.535 puertos en serie es eternо.</li>
+  <li>Diferencia entre puerto <strong>cerrado</strong> y <strong>filtrado</strong> (firewall).</li>
+  <li>La perspectiva <strong>defensiva</strong>: cerrar puertos, fail2ban, mínima superficie (M30).</li>
+  <li>Timeouts y manejo de errores de red robusto.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>Python · módulo <code>socket</code> (estándar) · <code>concurrent.futures</code> o <code>asyncio</code> para concurrencia · comparalo con <code>nmap</code> real. Practicá contra <code>127.0.0.1</code> y tu router.</p>
+
+<h2>Código clave (escaneo concurrente)</h2>
+
+<pre><code class="lang-python">import socket
+from concurrent.futures import ThreadPoolExecutor
+
+def escanear_puerto(host, puerto, timeout=1.0):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        if s.connect_ex((host, puerto)) == 0:    # 0 = handshake OK = abierto
+            try:
+                banner = s.recv(1024).decode(errors="ignore").strip()
+            except Exception:
+                banner = ""
+            return puerto, banner
+    return None
+
+def escanear(host, puertos):
+    # Concurrencia (M Python 11): cientos de puertos a la vez, no en fila
+    with ThreadPoolExecutor(max_workers=200) as pool:
+        resultados = pool.map(lambda p: escanear_puerto(host, p), puertos)
+    return [r for r in resultados if r]           # solo los abiertos</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> <code>connect_ex</code> hace el handshake de M15 y devuelve 0 si el puerto acepta. El <code>ThreadPoolExecutor</code> es concurrencia de Python (M11): como escanear es I/O-bound (esperás respuesta de red), los threads se solapan y el escaneo pasa de minutos a segundos. La elección threads vs async es la misma discusión de M11.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> escaneá UN puerto de localhost. Entendé <code>connect_ex</code> y los timeouts.</div>
+<div class="fase"><strong>Fase 2:</strong> escaneá un rango (1-1024) en serie. Cronometralo — vas a sufrir la lentitud.</div>
+<div class="fase"><strong>Fase 3:</strong> agregá concurrencia. Medí el speedup (debería ser enorme).</div>
+<div class="fase"><strong>Fase 4:</strong> banner grabbing: identificá el servicio (SSH, HTTP) y su versión.</div>
+<div class="fase"><strong>Fase 5:</strong> reporte claro (puerto / servicio / estado) y compará tus resultados con <code>nmap</code>.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Escaneás los 1024 puertos bien conocidos de localhost en segundos.</li>
+    <li>Identificás al menos un servicio por su banner.</li>
+    <li>Distinguís cerrado de filtrado y manejás timeouts sin crashear.</li>
+    <li>Tus resultados coinciden con <code>nmap</code> en el mismo host.</li>
+    <li>Entendés y podés explicar el lado defensivo (qué cerrarías y por qué).</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Versión <strong>async</strong> con <code>asyncio</code> y compará con threads (M11).</li>
+  <li>Descubrimiento de hosts en la LAN (ping sweep) antes de escanear.</li>
+  <li>Detección de servicios vulnerables conocidos (cruzar versión con CVEs).</li>
+  <li>Modo defensivo: un mini-IDS que detecta cuando ALGUIEN te escanea (conecta con análisis de logs).</li>
+  <li>Exportá a JSON e integralo con un dashboard (P18 / P23).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./19-gestor-contrasenas.html">← Gestor de Contraseñas</a>
+  <a href="./21-stack-docker.html">Siguiente: Stack Docker →</a>
+</nav>
+
+</div>
+</body>
+</html>

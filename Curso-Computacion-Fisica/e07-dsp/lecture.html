@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E07 — DSP y Procesamiento · Computación Física</title>
+<meta name="description" content="FFT, filtros digitales FIR/IIR, audio y convolución: limpiar y entender señales en código.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E07</span>
+  <span class="badge">⏱ ~85 min</span>
+  <span class="badge">🎯 Pre-req: E06 Señales</span>
+  <span class="badge">Fase 3</span>
+</div>
+
+<article>
+
+<h1>E07 — DSP y Procesamiento Digital de Señales</h1>
+
+<blockquote class="author">"DSP es donde la matemática de las señales se vuelve código que limpia tu llamada, reconoce tu voz y alimenta a la IA." — la disciplina invisible que está en todo</blockquote>
+
+<blockquote>Si E06 fue la teoría (qué es una señal, Fourier, Nyquist), E07 es la práctica en software: cómo PROCESAR señales digitales con algoritmos. La FFT, los filtros digitales y la convolución son las herramientas que alimentan al audio, las comunicaciones y al Deep Learning.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El puente directo a la IA:</strong> el DSP es el preprocesamiento que ocurre ANTES de que los datos lleguen a un modelo. Antes de que <a href="../../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m42-vision-por-computadora/lecture.html">M42 Visión</a> clasifique una imagen o <a href="../../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html">M40 Deep Learning</a> reconozca tu voz, el DSP limpia, normaliza y transforma la señal. Sin DSP, la IA recibiría ruido.
+</div>
+
+<h2>1. ¿Qué es DSP?</h2>
+
+<div class="concept"><strong>DSP</strong> (Digital Signal Processing) es procesar señales ya digitalizadas (muestreadas por el ADC de E03) con algoritmos: filtrar ruido, detectar patrones, comprimir, transformar. Vive en CPUs, chips DSP dedicados, y en tu MCU.</div>
+
+<h2>2. La FFT — Fourier en código</h2>
+
+<div class="concept">La <strong>FFT</strong> (Fast Fourier Transform) es el algoritmo que calcula la Transformada de Fourier de E06 de forma rápida: pasa una señal del tiempo a la frecuencia en <strong>O(n log n)</strong> en vez de O(n²).</div>
+
+<pre><code class="lang-py">import numpy as np
+
+# Señal: 440 Hz (La) + 880 Hz, muestreada a 8000 Hz
+fs = 8000
+t = np.linspace(0, 1, fs)
+senal = np.sin(2*np.pi*440*t) + 0.5*np.sin(2*np.pi*880*t)
+
+# FFT — pasar al dominio frecuencia
+espectro = np.abs(np.fft.rfft(senal))
+frecuencias = np.fft.rfftfreq(len(senal), 1/fs)
+
+# Picos en 440 y 880 Hz → la FFT "encontró" las notas
+pico = frecuencias[np.argmax(espectro)]
+print(f"Frecuencia dominante: {pico:.0f} Hz")  # ~440</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Por qué O(n log n) cambió el mundo (M12):</strong> la FFT (Cooley-Tukey, 1965) bajó el costo de O(n²) a O(n log n). Para n=1 millón de muestras, eso es la diferencia entre 10¹² y 2×10⁷ operaciones — de imposible a instantáneo. El análisis de complejidad de <a href="../../../Curso%20ingenieria%20sistemas/area-02-programacion-fundamentos/m12-complejidad-y-correctitud/lecture.html">M12</a> explica por qué este algoritmo, y no otro, hizo posible el audio digital, el JPEG y el WiFi.
+</div>
+
+<figure class="foto">
+  <img src="../assets/img/espectrograma.jpg" alt="Espectrograma de un acorde musical: frecuencia en vertical, tiempo en horizontal, intensidad en color">
+  <figcaption>Espectrograma de un acorde: la FFT aplicada a lo largo del tiempo. El eje vertical es frecuencia, el horizontal es tiempo, el color es intensidad. Las líneas horizontales son las notas del acorde (la "analogía del piano" de E06, hecha imagen). Foto: Poolpeggy, vía <a href="https://commons.wikimedia.org/wiki/File:Spectrogram_of_Chord.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 3.0).</figcaption>
+</figure>
+
+<h2>3. Filtros digitales</h2>
+
+<div class="concept">Un filtro digital procesa la señal muestra por muestra para dejar pasar o atenuar ciertas frecuencias (los filtros de E06, ahora en código). Dos familias:</div>
+
+<table>
+<thead><tr><th>Tipo</th><th>Cómo</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>FIR</strong> (Finite Impulse Response)</td><td>Promedio ponderado de N muestras pasadas</td><td>Estable, fase lineal, pero más cómputo</td></tr>
+<tr><td><strong>IIR</strong> (Infinite Impulse Response)</td><td>Usa también salidas pasadas (feedback)</td><td>Eficiente, pero puede ser inestable</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-py"># Filtro FIR pasa-bajos simple: promedio de las últimas 5 muestras
+def filtro_fir(senal, N=5):
+    salida = []
+    for i in range(len(senal)):
+        ventana = senal[max(0, i-N+1):i+1]
+        salida.append(sum(ventana) / len(ventana))
+    return salida
+# Atenúa cambios bruscos (alta frecuencia = ruido), deja la tendencia</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El filtro de media móvil de E05/E06 es el FIR más simple (todos los pesos iguales). Acá lo generalizás: eligiendo los pesos, diseñás QUÉ frecuencias atenuar. Es el mismo salto que de "promedio simple" a "promedio ponderado" en estadística (M04).
+</div>
+
+<h2>4. Convolución — la operación universal</h2>
+
+<div class="concept">La <strong>convolución</strong> desliza un "kernel" (ventana de pesos) sobre la señal, multiplicando y sumando. Es CÓMO se aplica un filtro FIR, y la operación central del procesamiento de señales e imágenes.</div>
+
+<pre><code>señal:   [1, 2, 3, 4, 5]
+kernel:  [0.5, 0.5]   (promedio de a 2)
+conv:    [1.5, 2.5, 3.5, 4.5]   ← cada salida = combinación local</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Esta ES la operación de las CNN:</strong> cuando una red convolucional de <a href="../../../Curso%20ingenieria%20sistemas/area-08-inteligencia-y-datos/m42-vision-por-computadora/lecture.html">M42 Visión</a> detecta bordes, desliza un kernel 3×3 sobre la imagen — convolución 2D. La diferencia con DSP clásico: en DSP vos DISEÑÁS el kernel; en Deep Learning la red APRENDE el kernel óptimo. Misma operación, kernel fijo vs aprendido. Este es el bucle más profundo del campus.
+</div>
+
+<h2>5. Casos de uso del DSP</h2>
+
+<table>
+<thead><tr><th>Aplicación</th><th>DSP que usa</th></tr></thead>
+<tbody>
+<tr><td>Cancelación de ruido (auriculares)</td><td>Filtros adaptativos + anti-fase</td></tr>
+<tr><td>Reconocimiento de voz (Alexa)</td><td>FFT → MFCC → modelo ML</td></tr>
+<tr><td>Compresión MP3/JPEG</td><td>Transformada (DCT) + descartar frecuencias imperceptibles</td></tr>
+<tr><td>WiFi / 5G</td><td>OFDM (multiplexación por frecuencia)</td></tr>
+<tr><td>ECG / monitoreo médico</td><td>Filtro notch (quitar 50Hz) + detección de picos</td></tr>
+<tr><td>Shazam (identificar canción)</td><td>FFT → huella espectral → match</td></tr>
+</tbody>
+</table>
+
+<h2>6. DSP en el MCU (edge)</h2>
+
+<div class="concept">Procesar la señal EN el dispositivo (no en la nube) se llama <strong>edge DSP</strong>. Ahorra ancho de banda, latencia y privacidad. Los MCU modernos (ESP32, ARM Cortex-M con DSP) corren FFT y filtros en tiempo real.</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>TinyML = DSP + IA en el chip:</strong> "detección de palabra clave" ("Hey Siri") corre en el dispositivo: el micrófono (E05) → ADC (E03) → FFT/MFCC (E07) → modelo TinyML (M40) → todo en µW. Es la convergencia total: hardware + señales + IA en un chip que cabe en un reloj. El capstone de la complementariedad.
+</div>
+
+<h2>7. Práctica</h2>
+<ul>
+  <li>Python + <code>numpy</code>/<code>scipy.signal</code>: cargá un WAV, sacá su FFT, aplicá un filtro, escuchá la diferencia.</li>
+  <li><a href="https://jackschaedler.github.io/circles-sines-signals/" target="_blank">Circles, Sines and Signals</a> — DSP visual interactivo.</li>
+  <li>Reto: grabá audio con ruido de 50Hz (zumbido) y eliminálo con un filtro notch.</li>
+</ul>
+
+<h2>8. Errores típicos</h2>
+<div class="mistake"><strong>FFT sin ventana (windowing)</strong>: bordes abruptos generan "spectral leakage" — frecuencias falsas. Aplicá una ventana (Hann, Hamming).</div>
+<div class="mistake"><strong>Filtro IIR mal diseñado</strong>: el feedback puede volverse inestable (la salida explota). FIR es más seguro para empezar.</div>
+<div class="mistake"><strong>Procesar sin respetar Nyquist (E06)</strong>: si la señal tiene frecuencias sobre fs/2, el DSP procesa basura aliaseada.</div>
+<div class="mistake"><strong>Confundir convolución con multiplicación</strong>: convolución es deslizar-multiplicar-sumar, no multiplicar punto a punto.</div>
+
+<h2>9. Recursos</h2>
+<ul>
+  <li><a href="https://www.dspguide.com/" target="_blank">The Scientist and Engineer's Guide to DSP</a> (Smith, gratis)</li>
+  <li><a href="https://www.youtube.com/watch?v=nmgFG7PUHfo" target="_blank">3Blue1Brown — Convolution</a></li>
+  <li><code>scipy.signal</code> docs — filtros listos para usar</li>
+</ul>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Qué hace la FFT y por qué importa su complejidad?</summary>
+<p>Calcula la Transformada de Fourier (tiempo → frecuencia) en O(n log n) en vez de O(n²). Esa mejora (M12) hizo viable el audio digital, JPEG y WiFi — para n grande, la diferencia es entre imposible e instantáneo.</p></details>
+
+<details><summary>2. ¿Diferencia entre filtro FIR e IIR?</summary>
+<p>FIR usa solo muestras de entrada pasadas (estable, fase lineal, más cómputo). IIR usa también salidas pasadas vía feedback (eficiente pero puede ser inestable). FIR es más seguro para empezar.</p></details>
+
+<details><summary>3. ¿Qué es la convolución y cómo conecta con Deep Learning?</summary>
+<p>Deslizar un kernel de pesos sobre la señal, multiplicando y sumando. Es la operación central del DSP y de las CNN (M42). Diferencia: en DSP vos diseñás el kernel; en Deep Learning la red lo aprende. Misma operación.</p></details>
+
+<details><summary>4. ¿Qué es edge DSP / TinyML?</summary>
+<p>Procesar señales y correr modelos ML en el propio dispositivo (no la nube). Ahorra latencia, ancho de banda y privacidad. Ejemplo: "Hey Siri" = micrófono → ADC → FFT → modelo TinyML, todo en el chip a µW.</p></details>
+
+<details><summary>5. ¿Por qué hay que aplicar una ventana antes de la FFT?</summary>
+<p>Porque los bordes abruptos de un segmento finito generan "spectral leakage" (frecuencias falsas). Una ventana (Hann, Hamming) suaviza los bordes y da un espectro limpio.</p></details>
+
+<details><summary>6. ¿Cómo se relaciona el DSP con la IA del campus?</summary>
+<p>El DSP es el preprocesamiento ANTES del modelo: limpia, normaliza y transforma la señal (FFT, filtros, MFCC). M42 Visión y M40 Deep Learning reciben datos ya procesados por DSP. Sin DSP, la IA recibiría ruido crudo.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e06-senales-sistemas/lecture.html">← E06 Señales y Sistemas</a>
+  <a href="../e08-control/lecture.html">Siguiente: E08 Sistemas de Control →</a>
+</nav>
+
+</div>
+</body>
+</html>

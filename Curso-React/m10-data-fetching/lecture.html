@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 10 — Data Fetching · Curso de React</title>
+<meta name="description" content="TanStack Query 5 para fetching, cache, mutations, optimistic updates.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 10</span>
+  <span class="badge">⏱ ~60 min</span>
+  <span class="badge">🎯 Pre-req: M06, M08</span>
+</div>
+
+<article>
+
+<h1>Módulo 10 — Data Fetching con TanStack Query</h1>
+
+<blockquote>Hacer fetch a mano con useEffect funciona para hello world. En producción no escala: no hay cache, no hay deduplicación, no hay retry, no hay refetch al volver al tab. <strong>TanStack Query</strong> resuelve TODO esto.</blockquote>
+
+<h2>1. El problema de useEffect + fetch</h2>
+<figure class="foto">
+  <img src="../assets/img/m10-balde.jpg" alt="Balde en un pozo de agua">
+  <figcaption>Un balde de pozo: 'fetch' es traer datos del servidor hacia tu componente, como sacar agua del pozo. Foto: Zserghei, vía <a href="https://commons.wikimedia.org/wiki/File:Bucket_well.jpg" target="_blank">Wikimedia Commons</a> (Public domain).</figcaption>
+</figure>
+
+
+<div class="warn">
+Si codeás todo el data fetching con useEffect manualmente:
+<ul>
+  <li>3 componentes piden los mismos datos → 3 fetches al backend.</li>
+  <li>Cliente vuelve al tab tras 5 min → datos viejos.</li>
+  <li>Network blip → fallo sin retry.</li>
+  <li>Sin loading/error/success states consistentes.</li>
+  <li>Cache manual = bug factory.</li>
+</ul>
+</div>
+
+<h2>2. ¿Qué es TanStack Query?</h2>
+
+<div class="concept">Librería para manejar "server state" (datos del backend) en React. Maneja cache, deduplicación, retry, refetch, mutations — todo con una API declarativa.</div>
+
+<p>Antes se llamaba "React Query". En 2026 se llama TanStack Query y soporta Vue, Solid, Svelte también.</p>
+
+<h2>3. Instalación y setup</h2>
+
+<pre><code class="lang-bash">npm install @tanstack/react-query
+npm install @tanstack/react-query-devtools  # opcional pero recomendado</code></pre>
+
+<pre><code class="lang-jsx">// src/main.jsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,        // 1 minuto antes de marcar como "stale"
+      refetchOnWindowFocus: false, // opcional: desactivar si molesta
+    },
+  },
+});
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  &lt;QueryClientProvider client={queryClient}&gt;
+    &lt;App /&gt;
+    &lt;ReactQueryDevtools /&gt;
+  &lt;/QueryClientProvider&gt;
+);</code></pre>
+
+<h2>4. Tu primer useQuery</h2>
+
+<pre><code class="lang-jsx">import { useQuery } from '@tanstack/react-query';
+
+function Posts() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['posts'],
+    queryFn: async () =&gt; {
+      const res = await fetch('/api/posts');
+      if (!res.ok) throw new Error('Falló');
+      return res.json();
+    },
+  });
+
+  if (isLoading) return &lt;p&gt;Cargando...&lt;/p&gt;;
+  if (error) return &lt;p&gt;Error: {error.message}&lt;/p&gt;;
+
+  return (
+    &lt;ul&gt;
+      {data.map(p =&gt; &lt;li key={p.id}&gt;{p.title}&lt;/li&gt;)}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="step"><strong>Qué hace TanStack Query automáticamente</strong>:</div>
+<ul>
+  <li>Llama <code>queryFn</code> al montar.</li>
+  <li>Cachea el resultado bajo <code>queryKey</code> (<code>['posts']</code>).</li>
+  <li>Si otro componente hace <code>useQuery({ queryKey: ['posts'] })</code>, REUTILIZA el cache — no hace 2 fetches.</li>
+  <li>Si los datos se vuelven "stale" (pasó <code>staleTime</code>), refetch en background al refocus, al reconectar, al remount.</li>
+  <li>Retry automático en errores transitorios.</li>
+</ul>
+
+<h2>5. Query keys con argumentos</h2>
+
+<pre><code class="lang-jsx">function Post({ id }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['post', id],
+    queryFn: () =&gt; fetch(`/api/posts/${id}`).then(r =&gt; r.json()),
+  });
+
+  if (isLoading) return &lt;p&gt;...&lt;/p&gt;;
+  return &lt;h1&gt;{data.title}&lt;/h1&gt;;
+}</code></pre>
+
+<div class="rule">Las queryKeys son arrays. Cada combinación distinta es una entrada de cache diferente. <code>['post', 1]</code> y <code>['post', 2]</code> se cachean por separado.</div>
+
+<h2>6. Query dependiente (esperar otra query)</h2>
+
+<pre><code class="lang-jsx">function UserPosts() {
+  const { data: user } = useQuery({
+    queryKey: ['user'],
+    queryFn: fetchCurrentUser,
+  });
+
+  // Solo se ejecuta cuando user.id existe
+  const { data: posts } = useQuery({
+    queryKey: ['posts', user?.id],
+    queryFn: () =&gt; fetchPosts(user.id),
+    enabled: !!user?.id,  // ⭐ clave
+  });
+
+  return ...;
+}</code></pre>
+
+<h2>7. Mutations (POST/PUT/DELETE)</h2>
+
+<pre><code class="lang-jsx">import { useMutation, useQueryClient } from '@tanstack/react-query';
+
+function CreatePost() {
+  const queryClient = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: async (newPost) =&gt; {
+      const res = await fetch('/api/posts', {
+        method: 'POST',
+        body: JSON.stringify(newPost),
+      });
+      return res.json();
+    },
+    onSuccess: () =&gt; {
+      // Invalida la lista de posts → refetch automático
+      queryClient.invalidateQueries({ queryKey: ['posts'] });
+    },
+  });
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    const title = e.target.title.value;
+    mutation.mutate({ title });
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;input name="title" /&gt;
+      &lt;button disabled={mutation.isPending}&gt;
+        {mutation.isPending ? 'Creando...' : 'Crear'}
+      &lt;/button&gt;
+      {mutation.isError && &lt;p&gt;Error: {mutation.error.message}&lt;/p&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<h2>8. Optimistic updates</h2>
+
+<p>Cambiá la UI ANTES de que el servidor confirme. Si falla, rollback:</p>
+
+<pre><code class="lang-jsx">const mutation = useMutation({
+  mutationFn: deletePost,
+  onMutate: async (postId) =&gt; {
+    // Cancela queries en curso
+    await queryClient.cancelQueries({ queryKey: ['posts'] });
+
+    // Snapshot del estado previo
+    const previous = queryClient.getQueryData(['posts']);
+
+    // Optimistic update
+    queryClient.setQueryData(['posts'], (old) =&gt;
+      old.filter(p =&gt; p.id !== postId)
+    );
+
+    // Return context para rollback
+    return { previous };
+  },
+  onError: (err, postId, context) =&gt; {
+    queryClient.setQueryData(['posts'], context.previous);
+  },
+  onSettled: () =&gt; {
+    queryClient.invalidateQueries({ queryKey: ['posts'] });
+  },
+});</code></pre>
+
+<h2>9. Cómo afecta el cache la UX</h2>
+
+<table>
+<thead><tr><th>Estado del cache</th><th>Qué hace TanStack Query</th></tr></thead>
+<tbody>
+<tr><td>Sin datos</td><td>Fetch + muestra <code>isLoading</code></td></tr>
+<tr><td>Datos fresh (<code>&lt; staleTime</code>)</td><td>Devuelve cache, NO fetch</td></tr>
+<tr><td>Datos stale (<code>&gt; staleTime</code>)</td><td>Devuelve cache + fetch en background (UI no parpadea)</td></tr>
+<tr><td>Datos stale + window refocus</td><td>Refetch automático</td></tr>
+<tr><td>Componente desmontado</td><td>Datos siguen en cache (<code>cacheTime</code> default 5 min) → próxima vez es instant</td></tr>
+</tbody>
+</table>
+
+<h2>10. Pagination e Infinite Queries</h2>
+
+<pre><code class="lang-jsx">// Pagination simple
+const { data } = useQuery({
+  queryKey: ['posts', page],
+  queryFn: () =&gt; fetchPosts(page),
+  placeholderData: (prev) =&gt; prev,  // mantener data anterior mientras carga nueva (no flicker)
+});
+
+// Infinite scroll
+import { useInfiniteQuery } from '@tanstack/react-query';
+
+const { data, fetchNextPage, hasNextPage } = useInfiniteQuery({
+  queryKey: ['posts-infinite'],
+  queryFn: ({ pageParam = 0 }) =&gt; fetchPosts(pageParam),
+  initialPageParam: 0,
+  getNextPageParam: (lastPage, allPages) =&gt; lastPage.nextCursor,
+});</code></pre>
+
+<h2>11. SWR — la alternativa</h2>
+
+<p>SWR (de Vercel) es similar a TanStack Query, más simple, más liviana:</p>
+
+<pre><code class="lang-jsx">import useSWR from 'swr';
+
+function Posts() {
+  const { data, error, isLoading } = useSWR('/api/posts', fetcher);
+  // ...
+}</code></pre>
+
+<table>
+<thead><tr><th>Feature</th><th>TanStack Query</th><th>SWR</th></tr></thead>
+<tbody>
+<tr><td>Mutations</td><td>🟢 Robustas</td><td>🟡 Manual</td></tr>
+<tr><td>Devtools</td><td>🟢 Excelentes</td><td>🟡 Básicas</td></tr>
+<tr><td>Bundle</td><td>Más grande</td><td>Más chica</td></tr>
+<tr><td>API</td><td>Object</td><td>Función directa</td></tr>
+</tbody>
+</table>
+
+<div class="tip">2026 default: TanStack Query para apps medianas+. SWR para apps chicas o cuando ya usás Next.js (Vercel-friendly).</div>
+
+<h2>12. ¿Y los Server Components?</h2>
+
+<p>En Next.js 15 con RSC (M13), el data fetching pasa al servidor:</p>
+
+<pre><code class="lang-jsx">// Server Component (sin 'use client')
+async function Posts() {
+  const posts = await fetch('/api/posts').then(r =&gt; r.json());  // ⭐ await directo
+  return &lt;ul&gt;{posts.map(p =&gt; &lt;li key={p.id}&gt;{p.title}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<p>No necesitás TanStack Query del lado server. PERO si tu componente es Client, sí. Lo profundizamos en M13.</p>
+
+<h2>13. Errores típicos</h2>
+
+<div class="mistake"><strong>QueryKeys inconsistentes</strong>: <code>['post', 1]</code> en un componente y <code>['posts', 1]</code> (plural) en otro. Cache no se comparte porque las keys son distintas.</div>
+
+<div class="mistake"><strong>QueryFn que no tira error en !res.ok</strong>: si fetch devuelve 404, response.ok es false PERO no tira. TanStack Query no sabe que falló. Hay que tirar manualmente <code>throw new Error</code>.</div>
+
+<div class="mistake"><strong>No invalidar queries tras mutation</strong>: hacés POST exitoso pero la lista no se actualiza. Llamá <code>queryClient.invalidateQueries</code> en onSuccess.</div>
+
+<div class="mistake"><strong>useEffect + fetch en proyectos serios</strong>: 90% de los problemas que vas a tener (cache stale, refetch, loading) ya están resueltos. No reinventes la rueda.</div>
+
+<div class="mistake"><strong>Usar TanStack Query para client-only state</strong>: TanStack Query es para SERVER state (datos del backend). Para estado UI local (modal abierto, theme), useState o Zustand.</div>
+
+<h2>14. Ejercicios</h2>
+
+<ol>
+  <li>Setup de QueryClient + DevTools.</li>
+  <li>Cargar lista de posts con useQuery.</li>
+  <li>Detalle con <code>useQuery</code> usando query key con id.</li>
+  <li>Mutation para crear post + invalidación de lista.</li>
+  <li>Optimistic update para "like" de post.</li>
+  <li>Infinite scroll de posts con useInfiniteQuery.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Qué problemas resuelve TanStack Query que useEffect+fetch no?</summary>
+<p>Cache compartido entre componentes, deduplicación de requests, retry automático, refetch al window focus / reconnect, loading/error/success states consistentes, devtools, optimistic updates. TODO el "boilerplate" de server state se elimina.</p></details>
+
+<details><summary>2. ¿Qué es el queryKey y por qué importa?</summary>
+<p>Es el identificador de la entrada de cache. Si 2 componentes usan la MISMA queryKey, comparten cache (no doble fetch). Si cambia un elemento del array, se trata como query nueva (útil para params: <code>['post', id]</code>).</p></details>
+
+<details><summary>3. ¿Diferencia entre <code>isLoading</code> y <code>isFetching</code>?</summary>
+<p><code>isLoading</code> es true SOLO el primer fetch (no hay data aún). <code>isFetching</code> es true CUALQUIER fetch (primero o refetch en background). Para spinner inicial: isLoading. Para indicador discreto de "actualizando": isFetching.</p></details>
+
+<details><summary>4. ¿Qué hace <code>invalidateQueries</code>?</summary>
+<p>Marca queries como stale → TanStack Query las refetch al próximo render que las use. Patrón común: tras una mutación POST exitosa, invalidás la lista para que se refetch.</p></details>
+
+<details><summary>5. ¿Qué es un optimistic update?</summary>
+<p>Actualizar la UI ANTES de que el servidor confirme. Si falla, rollback. UX percibida como instantánea. Se implementa con <code>onMutate</code> (snapshot + cambio), <code>onError</code> (rollback), <code>onSettled</code> (invalidate).</p></details>
+
+<details><summary>6. ¿Cuándo usar Zustand en lugar de TanStack Query?</summary>
+<p>Para client state (UI local): modal abierto, theme, items seleccionados, formularios complejos. TanStack Query es ESPECÍFICAMENTE para server state (datos que vienen del backend y tienen que mantenerse sincronizados).</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m09-react-router/lecture.html">← Anterior: React Router</a>
+  <a href="../m11-estado-global/lecture.html">Siguiente: Estado Global →</a>
+</nav>
+
+</div>
+</body>
+</html>

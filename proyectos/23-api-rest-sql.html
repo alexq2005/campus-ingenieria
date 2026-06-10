@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 23 — API REST con SQL e Índices · Campus CS-FE</title>
+<meta name="description" content="Construí una API REST sobre PostgreSQL: modelado, queries, índices y EXPLAIN. El backend que sostiene todo lo demás. Bases de datos (M19/M20).">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m19-modelado-y-sql/lecture.html">🎓 M19 Modelado y SQL</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 23</span>
+  <span class="badge nivel-avan">Avanzado</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">API + PostgreSQL</span>
+</div>
+
+<article>
+
+<h1>🗃️ API REST con SQL e Índices</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> construir una API REST que persiste datos en <strong>PostgreSQL</strong>, con un modelo de datos bien diseñado, queries eficientes e <strong>índices</strong> que hacen la diferencia entre 5 ms y 5 segundos. Es el backend que sostiene casi cualquier app — y donde una mala decisión de esquema se paga durante años.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m19-modelado-y-sql/lecture.html">M19 Modelado y SQL</a> (esquema, joins, normalización),
+  <a href="../../Curso%20ingenieria%20sistemas/area-04-bases-de-datos/m20-motores-y-tuning/lecture.html">M20 Tuning</a> (índices, EXPLAIN),
+  <a href="../../Curso%20ingenieria%20sistemas/area-07-desarrollo-aplicado/m33-desarrollo-web-fullstack/lecture.html">M33 Fullstack</a> y
+  <a href="../Curso-Python/modulo-06-poo/lecture.html">Python POO</a> (modelos).
+</div>
+
+<h2>Cómo funciona — el índice que cambia todo</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 175" role="img" aria-label="Sin índice se recorre toda la tabla; con índice se salta directo a la fila">
+  <!-- sin indice -->
+  <text x="190" y="22" text-anchor="middle" fill="#fb7185" font-size="13" font-family="system-ui" font-weight="700">SIN índice — Seq Scan</text>
+  <g>
+    <rect x="60" y="35" width="40" height="18" fill="#2a3247" stroke="#454f63"/>
+    <rect x="105" y="35" width="40" height="18" fill="#2a3247" stroke="#454f63"/>
+    <rect x="150" y="35" width="40" height="18" fill="#2a3247" stroke="#454f63"/>
+    <rect x="195" y="35" width="40" height="18" fill="#3fb950" stroke="#454f63"/>
+    <rect x="240" y="35" width="40" height="18" fill="#2a3247" stroke="#454f63"/>
+    <rect x="285" y="35" width="40" height="18" fill="#2a3247" stroke="#454f63"/>
+  </g>
+  <path d="M80,62 L100,62 M125,62 L145,62 M170,62 L190,62 M215,62 L215,62" stroke="#fb7185" stroke-width="2"/>
+  <text x="190" y="85" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">revisa fila por fila hasta encontrarla → O(n)</text>
+
+  <!-- con indice -->
+  <text x="565" y="22" text-anchor="middle" fill="#3fb950" font-size="13" font-family="system-ui" font-weight="700">CON índice — Index Scan</text>
+  <circle cx="565" cy="50" r="16" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="565" y="55" text-anchor="middle" fill="#fbbf24" font-size="11" font-family="system-ui">B-tree</text>
+  <line x1="565" y1="66" x2="490" y2="110" stroke="#8b95a8" stroke-width="1.5"/>
+  <line x1="565" y1="66" x2="640" y2="110" stroke="#8b95a8" stroke-width="1.5"/>
+  <line x1="490" y1="120" x2="455" y2="120" stroke="#8b95a8" stroke-width="1.5"/>
+  <rect x="600" y="112" width="60" height="20" fill="#3fb950" stroke="#454f63"/>
+  <text x="565" y="160" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">baja por el árbol directo a la fila → O(log n)</text>
+</svg>
+<figcaption>Sin índice, la base recorre toda la tabla (Seq Scan). Con un índice B-tree, "baja por el árbol" y salta directo. En millones de filas, eso es la diferencia entre milisegundos y segundos. <code>EXPLAIN</code> te muestra cuál usa.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Diseñar un <strong>esquema relacional</strong>: tablas, claves, relaciones, normalización (M19).</li>
+  <li>CRUD vía SQL parametrizado (sin <strong>inyección SQL</strong> — M31 seguridad).</li>
+  <li>Diseñar endpoints <strong>REST</strong> con verbos y códigos de estado correctos.</li>
+  <li><strong>Índices</strong>: cuándo crearlos, qué cuesta, y leer <code>EXPLAIN ANALYZE</code> (M20).</li>
+  <li>Joins, paginación y evitar el problema <strong>N+1</strong>.</li>
+  <li>Migraciones de esquema versionadas.</li>
+</ul>
+
+<h2>Stack</h2>
+<p>API: <strong>FastAPI</strong> (Python) o <strong>Express</strong> (Node) · <strong>PostgreSQL</strong> · un cliente SQL/ORM (psycopg, Drizzle, SQLAlchemy) · <code>EXPLAIN ANALYZE</code> para medir. Levantá Postgres con Docker (P21).</p>
+
+<h2>Código clave (query parametrizada + índice)</h2>
+
+<pre><code class="lang-sql">-- Esquema (M19)
+CREATE TABLE pedidos (
+  id        SERIAL PRIMARY KEY,
+  cliente_id INT NOT NULL REFERENCES clientes(id),
+  estado    TEXT NOT NULL,
+  creado    TIMESTAMPTZ DEFAULT now()
+);
+
+-- Esta consulta se hace MUCHO → merece índice (M20)
+-- EXPLAIN ANALYZE SELECT * FROM pedidos WHERE cliente_id = 42 AND estado = 'abierto';
+CREATE INDEX idx_pedidos_cliente_estado ON pedidos (cliente_id, estado);
+</code></pre>
+
+<pre><code class="lang-python"># API — NUNCA concatenar strings en SQL (inyección, M31)
+@app.get("/clientes/{cid}/pedidos")
+def pedidos_de(cid: int, estado: str = "abierto"):
+    return db.execute(
+        "SELECT * FROM pedidos WHERE cliente_id = %s AND estado = %s",
+        (cid, estado),          # parámetros: la base los escapa por vos
+    ).fetchall()</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> Dos lecciones que se cruzan: el <strong>índice compuesto</strong> <code>(cliente_id, estado)</code> acelera justo esa query (M20), y los <strong>parámetros</strong> <code>%s</code> previenen inyección SQL (M31). Concatenar la entrada del usuario en el SQL es el bug de seguridad #1 de la historia web — no lo hagas nunca.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> diseñá el esquema (3-4 tablas con relaciones). Justificá claves y tipos.</div>
+<div class="fase"><strong>Fase 2:</strong> API con CRUD completo, SQL parametrizado, códigos de estado correctos (200/201/404/422).</div>
+<div class="fase"><strong>Fase 3:</strong> cargá ~100k filas de prueba. Encontrá una query lenta con <code>EXPLAIN ANALYZE</code>.</div>
+<div class="fase"><strong>Fase 4:</strong> creá el índice adecuado. Volvé a medir: documentá el antes/después (ms).</div>
+<div class="fase"><strong>Fase 5:</strong> paginación, manejo de errores, y migraciones versionadas del esquema.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>La API hace CRUD completo y devuelve códigos de estado correctos.</li>
+    <li>Toda query usa parámetros (cero concatenación de strings).</li>
+    <li>Mostrás con <code>EXPLAIN ANALYZE</code> un Seq Scan que convertís en Index Scan, con los ms.</li>
+    <li>La paginación funciona y no hay N+1 en las listas.</li>
+    <li>El esquema tiene migraciones versionadas, no cambios a mano.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Caché con Redis delante de las queries calientes (P24).</li>
+  <li>Autenticación con JWT y autorización por rol (M31).</li>
+  <li>Full-text search en Postgres (o comparar con un índice GIN).</li>
+  <li>Dockerizar la API + base (P21) y CI/CD (P22).</li>
+  <li>Frontend React que consuma la API (Dashboard, P07).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./22-pipeline-cicd.html">← Pipeline CI/CD</a>
+  <a href="./24-cache-redis.html">Siguiente: Caché con Redis →</a>
+</nav>
+
+</div>
+</body>
+</html>

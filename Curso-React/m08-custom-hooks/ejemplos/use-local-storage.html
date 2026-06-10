@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>use-local-storage.jsx · Curso de React</title>
+<meta name="description" content="Custom hook que persiste estado en localStorage. Reusado en 3 componentes.">
+<link rel="stylesheet" href="../../assets/lecture.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
+<style>
+  .script-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }
+  .btn { background: var(--surface); border: 1px solid var(--border); color: var(--accent); padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-size: 0.9em; font-family: inherit; text-decoration: none; transition: all 0.15s; display: inline-flex; align-items: center; gap: 0.4rem; }
+  .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .btn.copied { background: var(--success); color: var(--bg); border-color: var(--success); }
+  article pre { max-height: 600px; overflow-y: auto; }
+  .hljs { background: var(--code-bg) !important; padding: 1.2rem !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../../index.html">← Curso de React</a>
+  <a href="../lecture.html">← Módulo 08</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">⚛️ use-local-storage.jsx</span>
+  <span class="badge">Custom Hook</span>
+  <span class="badge">~120 líneas</span>
+  <span class="badge">Módulo 08</span>
+</div>
+
+<article>
+
+<h1>use-local-storage.jsx — Custom hook reusable</h1>
+
+<p>Un custom hook <code>useLocalStorage(key, defaultValue)</code> que se comporta como <code>useState</code> pero persiste a localStorage. Reusado en 3 componentes distintos.</p>
+
+<h2>¿Qué demuestra?</h2>
+
+<ul>
+  <li><strong>Custom hook</strong>: una función con prefijo <code>use</code> que usa otros hooks adentro.</li>
+  <li><strong>Misma firma que useState</strong>: <code>const [v, setV] = useLocalStorage(...)</code>.</li>
+  <li><strong>Lazy init</strong>: lectura de localStorage SOLO al montar.</li>
+  <li><strong>Sync con useEffect</strong>: cada cambio en valor → escribe a localStorage.</li>
+  <li><strong>Error handling</strong>: try/catch en getItem y setItem (quota exceeded, JSON parse error).</li>
+  <li><strong>3 componentes reusan el mismo hook</strong> con tipos distintos (string, number, object).</li>
+</ul>
+
+<h2>Cómo ejecutarlo</h2>
+
+<pre><code class="language-bash">npm run dev
+# Reemplazá src/App.jsx
+# Cambiá valores, recargá la página (F5), persisten</code></pre>
+
+<h2>El hook (lo importante)</h2>
+
+<div class="script-actions">
+  <button class="btn" id="copyBtn">📋 Copiar todo</button>
+  <a class="btn" href="./use-local-storage.jsx" download>⬇ Descargar .jsx</a>
+  <a class="btn" href="./use-local-storage.jsx" target="_blank">🔗 Ver crudo</a>
+</div>
+
+<pre><code class="language-javascript" id="code">import { useState, useEffect } from 'react';
+
+// Devuelve [valor, setter] como useState, pero persiste en localStorage.
+function useLocalStorage(key, defaultValue) {
+  const [value, setValue] = useState(() =&gt; {
+    // Lazy init: solo se ejecuta al montar
+    try {
+      const stored = localStorage.getItem(key);
+      return stored !== null ? JSON.parse(stored) : defaultValue;
+    } catch {
+      return defaultValue;
+    }
+  });
+
+  // Sync a localStorage cada vez que cambia value
+  useEffect(() =&gt; {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      console.error('Error guardando en localStorage:', err);
+    }
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
+// ─── 3 usos del mismo hook ───
+
+function ThemeToggle() {
+  const [theme, setTheme] = useLocalStorage('theme', 'dark');
+  return (
+    &lt;button onClick={() =&gt; setTheme(t =&gt; t === 'dark' ? 'light' : 'dark')}&gt;
+      {theme === 'dark' ? '🌙 Dark' : '☀️ Light'}
+    &lt;/button&gt;
+  );
+}
+
+function Counter() {
+  const [count, setCount] = useLocalStorage('counter', 0);
+  return (
+    &lt;&gt;
+      &lt;p&gt;Count: {count}&lt;/p&gt;
+      &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;+1&lt;/button&gt;
+    &lt;/&gt;
+  );
+}
+
+function UserProfile() {
+  const [user, setUser] = useLocalStorage('user', { nombre: '', email: '' });
+  return (
+    &lt;&gt;
+      &lt;input
+        value={user.nombre}
+        onChange={(e) =&gt; setUser({ ...user, nombre: e.target.value })}
+      /&gt;
+      &lt;input
+        value={user.email}
+        onChange={(e) =&gt; setUser({ ...user, email: e.target.value })}
+      /&gt;
+    &lt;/&gt;
+  );
+}
+</code></pre>
+
+<h2>Lecciones clave</h2>
+
+<ul>
+  <li><strong>Misma firma que useState</strong>: facilita reemplazar uno por otro sin cambiar el sitio que lo usa.</li>
+  <li><strong>NO comparte estado entre componentes</strong>: cada <code>useLocalStorage('x')</code> es independiente. Comparten la LÓGICA, no los datos. Si dos componentes usan la MISMA <code>key</code>, hay sync vía localStorage pero no instantáneo (se actualizan al re-renderizar).</li>
+  <li><strong>El nombre TIENE que empezar con <code>use</code></strong>: sin esto, ESLint no aplica las reglas de hooks.</li>
+  <li><strong>Lazy init</strong>: <code>useState(() =&gt; readFromStorage())</code> evita leer localStorage en cada render.</li>
+  <li><strong>Try/catch</strong>: localStorage puede tirar (quota exceeded, JSON malformado, modo privado de Safari).</li>
+</ul>
+
+<h2>Otros custom hooks útiles para implementar</h2>
+
+<ol>
+  <li><code>useDebounce(value, delay)</code> — diferir un valor.</li>
+  <li><code>useToggle(initial)</code> — boolean + función toggle.</li>
+  <li><code>useFetch(url)</code> — <code>{ data, loading, error }</code>.</li>
+  <li><code>usePrevious(value)</code> — recordar valor anterior.</li>
+  <li><code>useWindowSize()</code> — viewport reactivo.</li>
+  <li><code>useCopyToClipboard()</code> — <code>{ copy, copied }</code> con flash visual.</li>
+  <li><code>useHover(ref)</code> — boolean true si el mouse está encima.</li>
+  <li><code>useOnScreen(ref)</code> — boolean si el elemento es visible (IntersectionObserver).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../../m06-useeffect/ejemplos/clock.html">← clock.jsx</a>
+  <a href="../../index.html">🏠 Volver al curso</a>
+</nav>
+
+</div>
+
+<script>
+  hljs.highlightAll();
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const code = document.getElementById('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      const btn = document.getElementById('copyBtn');
+      const o = btn.textContent;
+      btn.textContent = '✓ Copiado';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = o; btn.classList.remove('copied'); }, 2000);
+    } catch (e) {}
+  });
+</script>
+
+</body>
+</html>

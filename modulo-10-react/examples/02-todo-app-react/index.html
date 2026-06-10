@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TODO — React con custom hook</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 1rem; background: #f1f5f9; }
+    .app { background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    h1 { margin-top: 0; }
+    form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    input[type=text] { flex: 1; padding: 0.6rem; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 1rem; }
+    button { padding: 0.6rem 1rem; background: #0ea5e9; color: white; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #0284c7; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem; border-bottom: 1px solid #e2e8f0; }
+    li:last-child { border-bottom: 0; }
+    li.done span { text-decoration: line-through; color: #94a3b8; }
+    li span { flex: 1; }
+    .del { background: #fee2e2; color: #b91c1c; font-size: 0.8em; padding: 0.3rem 0.6rem; }
+    .del:hover { background: #fecaca; }
+    .filters { display: flex; gap: 0.3rem; margin: 0.8rem 0; }
+    .filters button { background: transparent; color: #475569; padding: 0.3rem 0.7rem; }
+    .filters button.on { background: #0ea5e9; color: white; }
+    .stats { font-size: 0.85em; color: #64748b; margin-top: 1rem; }
+    .empty { text-align: center; color: #94a3b8; padding: 2rem; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    // ── Custom hook: useLocalStorage ──
+    function useLocalStorage(key, initial) {
+      const [value, setValue] = useState(() => {
+        const s = localStorage.getItem(key);
+        return s ? JSON.parse(s) : initial;
+      });
+      useEffect(() => {
+        localStorage.setItem(key, JSON.stringify(value));
+      }, [key, value]);
+      return [value, setValue];
+    }
+
+    // ── Componentes ──
+    function TodoItem({ todo, onToggle, onDelete }) {
+      return (
+        <li className={todo.done ? 'done' : ''}>
+          <input type="checkbox" checked={todo.done} onChange={() => onToggle(todo.id)} />
+          <span>{todo.texto}</span>
+          <button className="del" onClick={() => onDelete(todo.id)}>Borrar</button>
+        </li>
+      );
+    }
+
+    function Filtros({ filtro, setFiltro }) {
+      const opts = ['todos', 'pendientes', 'completados'];
+      return (
+        <div className="filters">
+          {opts.map(f => (
+            <button key={f} className={filtro === f ? 'on' : ''} onClick={() => setFiltro(f)}>
+              {f}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    function App() {
+      const [todos, setTodos] = useLocalStorage('todos_react_v1', []);
+      const [texto, setTexto] = useState('');
+      const [filtro, setFiltro] = useState('todos');
+
+      const visibles = useMemo(() => {
+        if (filtro === 'pendientes') return todos.filter(t => !t.done);
+        if (filtro === 'completados') return todos.filter(t => t.done);
+        return todos;
+      }, [todos, filtro]);
+
+      const pendientes = useMemo(() => todos.filter(t => !t.done).length, [todos]);
+
+      function add(e) {
+        e.preventDefault();
+        const t = texto.trim();
+        if (!t) return;
+        setTodos([{ id: Date.now(), texto: t, done: false }, ...todos]);
+        setTexto('');
+      }
+      const toggle = (id) => setTodos(todos.map(t => t.id === id ? { ...t, done: !t.done } : t));
+      const remove = (id) => setTodos(todos.filter(t => t.id !== id));
+      const limpiar = () => setTodos(todos.filter(t => !t.done));
+
+      return (
+        <div className="app">
+          <h1>TODOs React</h1>
+          <form onSubmit={add}>
+            <input type="text" value={texto} onChange={e => setTexto(e.target.value)}
+                   placeholder="¿Qué tenés que hacer?" maxLength={120} autoFocus />
+            <button>Agregar</button>
+          </form>
+
+          <Filtros filtro={filtro} setFiltro={setFiltro} />
+
+          {visibles.length === 0
+            ? <p className="empty">Sin tareas</p>
+            : <ul>{visibles.map(t => <TodoItem key={t.id} todo={t} onToggle={toggle} onDelete={remove} />)}</ul>
+          }
+
+          <div className="stats" style={{display:'flex', justifyContent:'space-between'}}>
+            <span>{pendientes} pendiente{pendientes !== 1 ? 's' : ''} de {todos.length}</span>
+            <button className="del" onClick={limpiar}>Borrar completados</button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

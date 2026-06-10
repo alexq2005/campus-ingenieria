@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DOM Tree Explorer — interactivo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0; padding: 1.5rem;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 {
+      margin-top: 0;
+      background: linear-gradient(135deg, #a78bfa, #ec4899);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .sub { color: #94a3b8; margin-bottom: 1.5rem; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1rem;
+      min-height: 300px;
+    }
+    .panel h2 {
+      font-size: 0.78em;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #94a3b8;
+      margin: 0 0 0.7rem;
+    }
+
+    /* ═══ Tree ═══ */
+    .tree {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88em;
+      line-height: 1.5;
+    }
+    .node {
+      padding: 3px 6px;
+      border-radius: 4px;
+      margin: 2px 0;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      border-left: 3px solid transparent;
+    }
+    .node:hover {
+      background: rgba(167, 139, 250, 0.12);
+      border-left-color: #a78bfa;
+    }
+    .node.selected {
+      background: rgba(167, 139, 250, 0.2);
+      border-left-color: #a78bfa;
+      font-weight: bold;
+    }
+    .node.path {
+      background: rgba(251, 191, 36, 0.1);
+      border-left-color: #fbbf24;
+    }
+    .tag { color: #ec4899; }
+    .attr { color: #fbbf24; }
+    .val { color: #34d399; }
+    .text { color: #cbd5e1; font-style: italic; }
+    .children {
+      margin-left: 18px;
+      padding-left: 10px;
+      border-left: 1px dashed #334155;
+    }
+
+    /* ═══ Details panel ═══ */
+    .details {
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 0.8rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      line-height: 1.6;
+    }
+    .details .label {
+      color: #94a3b8;
+      font-size: 0.78em;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 2px;
+    }
+    .details .value {
+      color: #e2e8f0;
+      margin-bottom: 0.7rem;
+      word-break: break-all;
+    }
+    .details code {
+      background: #1e293b;
+      padding: 2px 6px;
+      border-radius: 3px;
+      color: #a78bfa;
+    }
+
+    .empty {
+      color: #64748b;
+      font-style: italic;
+      padding: 1rem;
+      text-align: center;
+    }
+
+    /* ═══ Editor ═══ */
+    .editor {
+      background: #0f172a;
+      border-radius: 6px;
+      padding: 0.7rem;
+      margin-bottom: 1rem;
+    }
+    textarea {
+      width: 100%;
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      padding: 0.5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82em;
+      min-height: 180px;
+      resize: vertical;
+    }
+    textarea:focus { outline: 2px solid #a78bfa; }
+
+    .controls {
+      display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem;
+    }
+    button {
+      background: #a78bfa; color: #0f172a;
+      border: 0; padding: 0.4rem 0.9rem;
+      border-radius: 5px; font-weight: 600;
+      cursor: pointer; font-size: 0.85em;
+    }
+    button:hover { background: #8b5cf6; }
+    button.secondary { background: #334155; color: #e2e8f0; }
+    button.secondary:hover { background: #475569; }
+
+    /* Preset selector */
+    select {
+      background: #0f172a; color: #e2e8f0;
+      border: 1px solid #334155; padding: 0.4rem 0.6rem;
+      border-radius: 5px; font-family: inherit;
+      margin-top: 0.5rem;
+      width: 100%;
+    }
+
+    .info-row {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    .stat {
+      background: #0f172a;
+      padding: 0.5rem;
+      border-radius: 5px;
+      text-align: center;
+    }
+    .stat-num {
+      font-size: 1.4rem;
+      font-weight: bold;
+      color: #a78bfa;
+      font-family: monospace;
+    }
+    .stat-label {
+      font-size: 0.7em;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🌳 DOM Tree Explorer</h1>
+    <p class="sub">Escribí HTML, mirá el árbol, cliqueá cualquier nodo para ver sus propiedades y su "path" hasta el root.</p>
+
+    <div class="layout">
+      <!-- IZQUIERDA: HTML editor + árbol -->
+      <div class="panel">
+        <h2>✍️ HTML</h2>
+        <select id="preset">
+          <option value="0">Blog simple (default)</option>
+          <option value="1">Form con inputs</option>
+          <option value="2">Card con data attributes</option>
+          <option value="3">Lista anidada</option>
+        </select>
+        <textarea id="html" style="margin-top: 0.5rem;"></textarea>
+        <div class="controls">
+          <button id="parse">▶ Parsear</button>
+          <button id="reset" class="secondary">↺ Reset</button>
+        </div>
+
+        <h2 style="margin-top: 1rem;">🌳 Árbol DOM</h2>
+        <div class="info-row">
+          <div class="stat"><div class="stat-num" id="totalNodes">0</div><div class="stat-label">elementos</div></div>
+          <div class="stat"><div class="stat-num" id="totalText">0</div><div class="stat-label">nodos texto</div></div>
+        </div>
+        <div class="tree" id="tree" style="margin-top: 0.8rem;"></div>
+      </div>
+
+      <!-- DERECHA: details + API exploration -->
+      <div class="panel">
+        <h2>🔍 Detalles del nodo seleccionado</h2>
+        <div class="details" id="details">
+          <div class="empty">Cliqueá un nodo en el árbol ←</div>
+        </div>
+
+        <h2 style="margin-top: 1rem;">🛤 Path hasta el root</h2>
+        <div class="details" id="path">
+          <div class="empty">—</div>
+        </div>
+
+        <h2 style="margin-top: 1rem;">🧭 JS para seleccionarlo</h2>
+        <div class="details" id="selector"><div class="empty">—</div></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top: 1rem;">
+      <h2>💡 Claves del DOM</h2>
+      <div style="font-size: 0.9em; color: #cbd5e1; line-height: 1.7;">
+        · <strong>DOM ≠ HTML</strong>. HTML es texto; DOM es el árbol de objetos que el browser construye a partir de él.<br>
+        · Cada nodo tiene: <code>nodeName</code>, <code>nodeType</code>, <code>childNodes</code>, <code>parentNode</code>, <code>attributes</code>.<br>
+        · <code>nodeType</code>: 1 = Element, 3 = Text, 8 = Comment, 9 = Document.<br>
+        · <code>childNodes</code> incluye text nodes (espacios, saltos de línea). <code>children</code> solo elementos.
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const PRESETS = [
+`<article class="post" id="article-1">
+  <header>
+    <h1>Título del post</h1>
+    <time datetime="2026-04-24">24 abr 2026</time>
+  </header>
+  <p class="intro">Primer párrafo del artículo.</p>
+  <section>
+    <h2>Subtítulo</h2>
+    <p>Contenido de la sección.</p>
+  </section>
+</article>`,
+
+`<form id="registro" action="/api/users" method="POST">
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required>
+  <label for="pwd">Contraseña</label>
+  <input type="password" id="pwd" name="pwd" minlength="8">
+  <button type="submit">Registrar</button>
+</form>`,
+
+`<article class="card" data-id="42" data-category="tech">
+  <img src="/hero.jpg" alt="Hero image" loading="lazy">
+  <div class="card-body">
+    <h3>Título</h3>
+    <p>Descripción de la tarjeta.</p>
+    <button data-action="like" aria-label="Me gusta">❤</button>
+  </div>
+</article>`,
+
+`<nav aria-label="Principal">
+  <ul>
+    <li><a href="/">Inicio</a></li>
+    <li>
+      <a href="/productos">Productos</a>
+      <ul>
+        <li><a href="/productos/ropa">Ropa</a></li>
+        <li><a href="/productos/zapatos">Zapatos</a></li>
+      </ul>
+    </li>
+    <li><a href="/contacto">Contacto</a></li>
+  </ul>
+</nav>`,
+  ];
+
+  const $ = (id) => document.getElementById(id);
+
+  let selected = null;
+
+  // Parser: convierte HTML string → tree renderable
+  function parseHTML(html) {
+    const sandbox = document.createElement('div');
+    sandbox.innerHTML = html.trim();
+    return sandbox;
+  }
+
+  // Render recursivo
+  function renderNode(node, depth = 0) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent.trim();
+      if (!text) return '';
+      const div = document.createElement('div');
+      div.className = 'node';
+      div.dataset.node = 'text';
+      div.innerHTML = `<span class="text">"${escape(text.slice(0, 40))}${text.length > 40 ? '…' : ''}"</span>`;
+      div._ref = node;
+      div.addEventListener('click', (e) => { e.stopPropagation(); selectNode(div, node); });
+      return div;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+    const attrs = [...node.attributes].map(a => ` <span class="attr">${a.name}</span>=<span class="val">"${escape(a.value)}"</span>`).join('');
+    const el = document.createElement('div');
+    el.className = 'node';
+    el.innerHTML = `&lt;<span class="tag">${node.tagName.toLowerCase()}</span>${attrs}&gt;`;
+    el._ref = node;
+    el.addEventListener('click', (e) => { e.stopPropagation(); selectNode(el, node); });
+
+    if (node.childNodes.length > 0) {
+      const ch = document.createElement('div');
+      ch.className = 'children';
+      for (const child of node.childNodes) {
+        const c = renderNode(child, depth + 1);
+        if (c) ch.appendChild(c);
+      }
+      el.appendChild(ch);
+    }
+    return el;
+  }
+
+  function escape(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function selectNode(domNodeInTree, realNode) {
+    // Quitar selección previa
+    document.querySelectorAll('.node.selected, .node.path').forEach(n => {
+      n.classList.remove('selected');
+      n.classList.remove('path');
+    });
+    domNodeInTree.classList.add('selected');
+    selected = realNode;
+
+    // Marcar path de ancestros
+    let p = domNodeInTree.parentElement?.closest('.node');
+    while (p) {
+      p.classList.add('path');
+      p = p.parentElement?.closest('.node');
+    }
+
+    renderDetails(realNode);
+    renderPath(realNode);
+    renderSelector(realNode);
+  }
+
+  function renderDetails(node) {
+    const panel = $('details');
+    if (node.nodeType === Node.TEXT_NODE) {
+      panel.innerHTML = `
+        <div class="label">nodeType</div>
+        <div class="value">3 (Text)</div>
+        <div class="label">textContent</div>
+        <div class="value">"${escape(node.textContent.trim())}"</div>
+        <div class="label">length</div>
+        <div class="value">${node.textContent.length}</div>
+      `;
+      return;
+    }
+    const attrs = [...node.attributes];
+    const children = [...node.children];
+    panel.innerHTML = `
+      <div class="label">tagName</div>
+      <div class="value">&lt;${node.tagName.toLowerCase()}&gt;</div>
+
+      <div class="label">nodeType</div>
+      <div class="value">1 (Element)</div>
+
+      <div class="label">attributes (${attrs.length})</div>
+      <div class="value">${attrs.length ? attrs.map(a => `<code>${a.name}="${escape(a.value)}"</code>`).join(' ') : '<em>ninguno</em>'}</div>
+
+      <div class="label">id / className</div>
+      <div class="value">id=<code>${escape(node.id || '—')}</code> · class=<code>${escape(node.className || '—')}</code></div>
+
+      <div class="label">children (elements) / childNodes (con text)</div>
+      <div class="value">${children.length} / ${node.childNodes.length}</div>
+
+      <div class="label">textContent</div>
+      <div class="value">"${escape((node.textContent || '').trim().slice(0, 80))}${(node.textContent||'').trim().length > 80 ? '…' : ''}"</div>
+    `;
+  }
+
+  function renderPath(node) {
+    const panel = $('path');
+    const path = [];
+    let n = node;
+    while (n && n.nodeType !== Node.DOCUMENT_FRAGMENT_NODE && n.parentNode) {
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        let s = n.tagName.toLowerCase();
+        if (n.id) s += `#${n.id}`;
+        else if (n.className) s += `.${String(n.className).trim().split(/\s+/).join('.')}`;
+        path.unshift(s);
+      } else if (n.nodeType === Node.TEXT_NODE) {
+        path.unshift('#text');
+      }
+      n = n.parentNode;
+    }
+    panel.innerHTML = path.length
+      ? path.map((s, i) => `<span style="color:${i === path.length-1 ? '#a78bfa' : '#94a3b8'}">${escape(s)}</span>`).join(' <span style="color:#64748b;">→</span> ')
+      : '<div class="empty">—</div>';
+  }
+
+  function renderSelector(node) {
+    const panel = $('selector');
+    if (node.nodeType === Node.TEXT_NODE) {
+      panel.innerHTML = `<div class="empty">text nodes no son seleccionables con querySelector</div>`;
+      return;
+    }
+    let sel;
+    if (node.id) sel = `#${node.id}`;
+    else {
+      const tag = node.tagName.toLowerCase();
+      const cls = node.className ? '.' + String(node.className).trim().split(/\s+/).join('.') : '';
+      sel = tag + cls;
+    }
+    panel.innerHTML = `
+      <div class="label">Selector sugerido</div>
+      <div class="value"><code>${escape(sel)}</code></div>
+
+      <div class="label">Para obtenerlo</div>
+      <div class="value">
+<code>const el = document.querySelector('${escape(sel)}');</code>
+      </div>
+
+      <div class="label">Propiedades útiles</div>
+      <div class="value" style="font-size: 0.8em;">
+        <code>el.textContent</code> · <code>el.innerHTML</code> · <code>el.classList</code> · <code>el.dataset</code><br>
+        <code>el.closest('selector')</code> · <code>el.parentElement</code> · <code>el.children</code>
+      </div>
+    `;
+  }
+
+  function render() {
+    const html = $('html').value;
+    const tree = parseHTML(html);
+
+    // Stats
+    const allElements = tree.querySelectorAll('*');
+    $('totalNodes').textContent = allElements.length;
+
+    let textCount = 0;
+    function countText(n) {
+      for (const c of n.childNodes) {
+        if (c.nodeType === Node.TEXT_NODE && c.textContent.trim()) textCount++;
+        countText(c);
+      }
+    }
+    countText(tree);
+    $('totalText').textContent = textCount;
+
+    // Render del árbol
+    const treeEl = $('tree');
+    treeEl.innerHTML = '';
+    for (const child of tree.childNodes) {
+      const c = renderNode(child);
+      if (c) treeEl.appendChild(c);
+    }
+
+    // Reset detail panels
+    $('details').innerHTML = '<div class="empty">Cliqueá un nodo en el árbol ←</div>';
+    $('path').innerHTML = '<div class="empty">—</div>';
+    $('selector').innerHTML = '<div class="empty">—</div>';
+  }
+
+  // Eventos
+  $('preset').addEventListener('change', (e) => {
+    $('html').value = PRESETS[Number(e.target.value)];
+    render();
+  });
+  $('parse').addEventListener('click', render);
+  $('reset').addEventListener('click', () => {
+    $('preset').value = '0';
+    $('html').value = PRESETS[0];
+    render();
+  });
+
+  // Init
+  $('html').value = PRESETS[0];
+  render();
+  </script>
+</body>
+</html>

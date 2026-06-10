@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — Manejo de Errores · Curso de Python</title>
+  <meta name="description" content="try/except/finally, raise, excepciones custom, context managers, EAFP.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Python</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~75 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 06</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — Manejo de Errores</h1>
+
+<h2>Excepciones</h2>
+<figure class="foto">
+  <img src="../assets/img/07-bug.jpg" alt="El primer bug informático, una polilla de 1947">
+  <figcaption>El primer 'bug' real (1947): una polilla atrapada en un relé del Harvard Mark II. De ahí viene la palabra debugging. Foto: Naval Surface Warfare Center, vía <a href="https://commons.wikimedia.org/wiki/File:First_Computer_Bug%2C_1947.jpg" target="_blank">Wikimedia Commons</a> (Public domain).</figcaption>
+</figure>
+
+
+
+<p>Cuando algo falla, Python <strong>lanza una excepción</strong>. Si no la capturás, el programa termina con traceback.</p>
+
+<pre><code class="lang-python">&gt;&gt;&gt; 10 / 0
+ZeroDivisionError: division by zero
+
+&gt;&gt;&gt; int("abc")
+ValueError: invalid literal for int() with base 10: 'abc'
+
+&gt;&gt;&gt; abrir_archivo("inexistente.txt")
+FileNotFoundError: [Errno 2] No such file or directory</code></pre>
+
+<h2>try / except</h2>
+
+<pre><code class="lang-python">try:
+    numero = int(input("Número: "))
+    resultado = 100 / numero
+    print(resultado)
+except ValueError:
+    print("No es un número válido")
+except ZeroDivisionError:
+    print("No se puede dividir por cero")</code></pre>
+
+<h3>Capturar varias excepciones a la vez</h3>
+
+<pre><code class="lang-python">try:
+    ...
+except (ValueError, TypeError) as e:
+    print(f"Error: {e}")</code></pre>
+
+<h3>Capturar todas (úsalo poco)</h3>
+
+<pre><code class="lang-python">try:
+    ...
+except Exception as e:    # captura casi todo
+    log(e)
+    raise                  # re-lanza para no ocultar bugs
+
+except:                    # ⚠️ ANTI-PATRÓN: captura hasta KeyboardInterrupt
+    pass</code></pre>
+
+<div class="rule"><strong>Regla</strong>: <code>except Exception</code> está bien si re-lanzás. <code>except:</code> (bare) <strong>es un bug esperando</strong>.</div>
+
+<h2>else y finally</h2>
+
+<pre><code class="lang-python">try:
+    archivo = open("datos.txt")
+except FileNotFoundError:
+    print("No existe")
+else:
+    # solo si no hubo excepción
+    procesar(archivo)
+finally:
+    # SIEMPRE se ejecuta (haya o no excepción)
+    archivo.close()</code></pre>
+
+<h2>Lanzar excepciones — <code>raise</code></h2>
+
+<pre><code class="lang-python">def dividir(a, b):
+    if b == 0:
+        raise ValueError("El divisor no puede ser cero")
+    return a / b</code></pre>
+
+<h3>Re-lanzar con contexto</h3>
+
+<pre><code class="lang-python">try:
+    proceso_complejo()
+except ValueError as e:
+    raise RuntimeError("Falló el proceso") from e</code></pre>
+
+<h2>Excepciones personalizadas</h2>
+
+<pre><code class="lang-python">class SaldoInsuficienteError(Exception):
+    def __init__(self, saldo, monto):
+        super().__init__(f"Saldo {saldo} &lt; monto {monto}")
+        self.saldo = saldo
+        self.monto = monto
+
+class Cuenta:
+    def __init__(self, saldo):
+        self.saldo = saldo
+
+    def retirar(self, monto):
+        if monto &gt; self.saldo:
+            raise SaldoInsuficienteError(self.saldo, monto)
+        self.saldo -= monto</code></pre>
+
+<h3>Jerarquía recomendada</h3>
+
+<pre><code class="lang-python">class MiAppError(Exception):
+    """Base de todas las excepciones de la app."""
+
+class ValidationError(MiAppError): pass
+class NotFoundError(MiAppError): pass
+class PermissionError(MiAppError): pass</code></pre>
+
+<p>Permite capturar todas tus excepciones con <code>except MiAppError</code>.</p>
+
+<h2>Jerarquía built-in</h2>
+
+<pre><code>BaseException
+ ├── KeyboardInterrupt
+ ├── SystemExit
+ └── Exception
+      ├── ArithmeticError
+      │    ├── ZeroDivisionError
+      │    └── OverflowError
+      ├── LookupError
+      │    ├── KeyError
+      │    └── IndexError
+      ├── ValueError
+      ├── TypeError
+      ├── OSError
+      │    ├── FileNotFoundError
+      │    ├── PermissionError
+      │    └── ConnectionError
+      └── RuntimeError</code></pre>
+
+<blockquote>Capturá la <strong>más específica posible</strong>. Capturar <code>Exception</code> cuando solo te importa <code>KeyError</code> oculta otros bugs.</blockquote>
+
+<h2>Context managers (<code>with</code>)</h2>
+
+<p>Garantizan limpieza incluso si hay excepción:</p>
+
+<pre><code class="lang-python">with open("datos.txt") as archivo:
+    contenido = archivo.read()
+# archivo se cierra automáticamente al salir del with</code></pre>
+
+<h3>Crear tu propio context manager</h3>
+
+<h4>Con clase</h4>
+
+<pre><code class="lang-python">class Cronometro:
+    def __enter__(self):
+        import time
+        self.inicio = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, tb):
+        import time
+        print(f"Tomó {time.time() - self.inicio:.4f}s")
+        return False   # False = no suprime excepciones
+
+with Cronometro():
+    sum(range(10**6))</code></pre>
+
+<h4>Con <code>contextlib</code></h4>
+
+<pre><code class="lang-python">from contextlib import contextmanager
+
+@contextmanager
+def cronometro():
+    import time
+    inicio = time.time()
+    try:
+        yield
+    finally:
+        print(f"Tomó {time.time() - inicio:.4f}s")
+
+with cronometro():
+    sum(range(10**6))</code></pre>
+
+<h2>Assertions</h2>
+
+<p>Para invariantes que <strong>nunca deberían fallar</strong> (no para validar input de usuario):</p>
+
+<pre><code class="lang-python">def media(numeros):
+    assert len(numeros) &gt; 0, "Lista vacía"
+    return sum(numeros) / len(numeros)</code></pre>
+
+<div class="warn">⚠️ Las assertions se <strong>desactivan con <code>python -O</code></strong>. No las uses para seguridad ni validación crítica.</div>
+
+<h2>EAFP vs LBYL</h2>
+
+<p>Dos filosofías:</p>
+
+<ul>
+  <li><strong>LBYL</strong> (Look Before You Leap): chequear antes de actuar</li>
+  <li><strong>EAFP</strong> (Easier to Ask Forgiveness than Permission): intentar y manejar el error</li>
+</ul>
+
+<p>Python prefiere <strong>EAFP</strong>:</p>
+
+<pre><code class="lang-python"># LBYL — más lento, race conditions posibles
+if "clave" in diccionario:
+    valor = diccionario["clave"]
+
+# EAFP — más pythónico
+try:
+    valor = diccionario["clave"]
+except KeyError:
+    valor = "default"
+
+# Mejor aún (para este caso)
+valor = diccionario.get("clave", "default")</code></pre>
+
+<h2>Logging vs print</h2>
+
+<p>Para producción, usá <code>logging</code>:</p>
+
+<pre><code class="lang-python">import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+try:
+    resultado = operacion_riesgosa()
+except Exception:
+    log.exception("Falló la operación")    # incluye traceback automáticamente</code></pre>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Función <code>parse_int_seguro(s)</code> que devuelve <code>None</code> si no se puede parsear (sin try/except a la vista del caller)</li>
+  <li>Excepción <code>EmailInvalidoError</code> y función que la lance ante email mal formado</li>
+  <li>Context manager que abre y cierra una conexión a DB simulada (logueando ambos eventos)</li>
+  <li>Wrapper <code>reintentar(fn, n)</code> que ejecute <code>fn</code> hasta <code>n</code> veces si lanza excepciones</li>
+  <li>Refactorizar un código LBYL a EAFP con <code>dict.get()</code> o try/except</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-06-poo/lecture.html">← Anterior: POO</a>
+  <a href="../modulo-08-archivos-io/lecture.html">Siguiente: Archivos e I/O →</a>
+</nav>
+
+</div>
+</body>
+</html>

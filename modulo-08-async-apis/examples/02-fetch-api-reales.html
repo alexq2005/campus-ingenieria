@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fetch contra APIs reales</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 1rem; background: #f8fafc; }
+    section { background: white; padding: 1.5rem; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 1.5rem; }
+    button { background: #0ea5e9; color: white; border: 0; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer; font-weight: 600; margin-right: 0.3rem; }
+    button:hover { background: #0284c7; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input { padding: 0.5rem; border: 1px solid #cbd5e1; border-radius: 5px; margin-right: 0.3rem; }
+    pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 5px; overflow: auto; max-height: 300px; font-size: 0.85em; }
+    .pokemon { display: flex; gap: 1rem; align-items: center; padding: 1rem; background: #f1f5f9; border-radius: 8px; }
+    .pokemon img { width: 100px; height: 100px; }
+    .loader { color: #64748b; font-style: italic; }
+    .error { color: #dc2626; }
+    .success { color: #16a34a; }
+  </style>
+</head>
+<body>
+
+  <h1>Fetch contra APIs reales</h1>
+  <p>Estos ejemplos consumen APIs públicas. Requieren conexión.</p>
+
+  <section>
+    <h2>1. GET a JSONPlaceholder (posts)</h2>
+    <button onclick="cargarPosts()">Cargar posts</button>
+    <button onclick="cargarPostsConError()">Forzar 404</button>
+    <div id="posts-out" class="loader">—</div>
+  </section>
+
+  <section>
+    <h2>2. PokéAPI — buscador</h2>
+    <input id="poke-input" placeholder="nombre o id (ej: pikachu, 25)" value="pikachu">
+    <button onclick="buscarPokemon()">Buscar</button>
+    <button onclick="buscarRandom()">Random</button>
+    <div id="poke-out" class="loader" style="margin-top: 1rem;">—</div>
+  </section>
+
+  <section>
+    <h2>3. Paralelo vs secuencial</h2>
+    <p>Hacemos 3 fetches. Comparamos tiempo:</p>
+    <button onclick="medirParalelo()">Paralelo (Promise.all)</button>
+    <button onclick="medirSecuencial()">Secuencial (uno por uno)</button>
+    <pre id="medida-out">—</pre>
+  </section>
+
+  <section>
+    <h2>4. AbortController (cancelar)</h2>
+    <button onclick="startLargo()">Iniciar fetch lento</button>
+    <button onclick="cancelarLargo()">Cancelar</button>
+    <div id="largo-out" class="loader">—</div>
+  </section>
+
+  <script>
+    // 1. Posts
+    async function cargarPosts() {
+      const out = document.getElementById('posts-out');
+      out.textContent = 'Cargando...';
+      try {
+        const r = await fetch('https://jsonplaceholder.typicode.com/posts?_limit=5');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const posts = await r.json();
+        out.innerHTML = '<pre>' + JSON.stringify(posts, null, 2) + '</pre>';
+      } catch (e) {
+        out.innerHTML = `<span class="error">Error: ${e.message}</span>`;
+      }
+    }
+
+    async function cargarPostsConError() {
+      const out = document.getElementById('posts-out');
+      out.textContent = 'Cargando URL inválida...';
+      try {
+        const r = await fetch('https://jsonplaceholder.typicode.com/inexistente-404');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        out.textContent = await r.text();
+      } catch (e) {
+        out.innerHTML = `<span class="error">Capturé el error: ${e.message}</span>`;
+      }
+    }
+
+    // 2. PokéAPI
+    async function buscarPokemon() {
+      const q = document.getElementById('poke-input').value.trim().toLowerCase();
+      const out = document.getElementById('poke-out');
+      if (!q) return;
+      out.textContent = 'Buscando...';
+      try {
+        const r = await fetch(`https://pokeapi.co/api/v2/pokemon/${q}`);
+        if (!r.ok) throw new Error(`No encontrado (${r.status})`);
+        const p = await r.json();
+        out.innerHTML = `
+          <div class="pokemon">
+            <img src="${p.sprites.other['official-artwork'].front_default || p.sprites.front_default}" alt="${p.name}">
+            <div>
+              <h3 style="text-transform:capitalize;margin:0;">${p.name} <small>#${p.id}</small></h3>
+              <p>Altura: ${p.height/10}m · Peso: ${p.weight/10}kg</p>
+              <p>Tipos: ${p.types.map(t => t.type.name).join(', ')}</p>
+            </div>
+          </div>`;
+      } catch (e) {
+        out.innerHTML = `<span class="error">${e.message}</span>`;
+      }
+    }
+    function buscarRandom() {
+      document.getElementById('poke-input').value = Math.floor(Math.random() * 151) + 1;
+      buscarPokemon();
+    }
+
+    // 3. Paralelo vs secuencial
+    async function medirParalelo() {
+      const out = document.getElementById('medida-out');
+      const ini = performance.now();
+      const [a, b, c] = await Promise.all([
+        fetch('https://pokeapi.co/api/v2/pokemon/1').then(r => r.json()),
+        fetch('https://pokeapi.co/api/v2/pokemon/4').then(r => r.json()),
+        fetch('https://pokeapi.co/api/v2/pokemon/7').then(r => r.json()),
+      ]);
+      const ms = (performance.now() - ini).toFixed(0);
+      out.textContent = `Paralelo: ${ms}ms — ${a.name}, ${b.name}, ${c.name}`;
+    }
+    async function medirSecuencial() {
+      const out = document.getElementById('medida-out');
+      const ini = performance.now();
+      const a = await (await fetch('https://pokeapi.co/api/v2/pokemon/1')).json();
+      const b = await (await fetch('https://pokeapi.co/api/v2/pokemon/4')).json();
+      const c = await (await fetch('https://pokeapi.co/api/v2/pokemon/7')).json();
+      const ms = (performance.now() - ini).toFixed(0);
+      out.textContent = `Secuencial: ${ms}ms — ${a.name}, ${b.name}, ${c.name}`;
+    }
+
+    // 4. AbortController
+    let abortCtrl = null;
+    async function startLargo() {
+      const out = document.getElementById('largo-out');
+      abortCtrl = new AbortController();
+      out.textContent = 'Pidiendo pokemon con red simulada lenta... (presioná cancelar en <3s)';
+      try {
+        // PokeAPI es rápida; esta URL de httpbin espera 5 segundos
+        const r = await fetch('https://httpbin.org/delay/5', { signal: abortCtrl.signal });
+        const data = await r.json();
+        out.innerHTML = `<span class="success">Llegó ${data.url}</span>`;
+      } catch (e) {
+        if (e.name === 'AbortError') out.innerHTML = '<span class="error">Cancelado por el usuario ✓</span>';
+        else out.innerHTML = `<span class="error">Error: ${e.message}</span>`;
+      }
+    }
+    function cancelarLargo() {
+      abortCtrl?.abort();
+    }
+  </script>
+</body>
+</html>

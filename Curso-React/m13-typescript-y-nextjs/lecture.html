@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 13 — TypeScript + Next.js 15 · Curso de React</title>
+<meta name="description" content="React con TypeScript, Next.js App Router, Server Components, Server Actions.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 13</span>
+  <span class="badge">⏱ ~80 min</span>
+  <span class="badge">🎯 Pre-req: Todo el curso anterior</span>
+</div>
+
+<article>
+
+<h1>Módulo 13 — TypeScript + Next.js 15</h1>
+
+<blockquote>En 2026, el stack profesional de React es <strong>TypeScript + Next.js 15 con App Router</strong>. Si vas a buscar trabajo o construir algo serio, esto es lo que se espera.</blockquote>
+
+<h2>Parte 1 — TypeScript con React</h2>
+<figure class="foto">
+  <img src="../assets/img/m13-red.jpg" alt="Red de seguridad de circo">
+  <figcaption>Una red de seguridad: TypeScript es la red que atrapa errores de tipos antes de que lleguen a producción. Foto: Georgios Liakopoulos, vía <a href="https://commons.wikimedia.org/wiki/File:Wow%2C_No_Safety_Net%21_%28L%27Homme_Cirque_-_David_Dimitri%29.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 2.0).</figcaption>
+</figure>
+
+
+<h2>1. ¿Por qué TypeScript?</h2>
+
+<div class="concept">TS te avisa de bugs ANTES de runtime: usás una prop que no existe, le pasás un string a un componente que espera number, llamás un método inexistente. Más confianza al refactorizar grandes apps.</div>
+
+<div class="rule">En 2026 NO es opcional para apps profesionales. Las ofertas de trabajo casi todas requieren TS. Aprenderlo es no-negociable.</div>
+
+<h2>2. Setup desde cero</h2>
+
+<pre><code class="lang-bash">npm create vite@latest mi-app -- --template react-ts</code></pre>
+
+<p>Archivos: <code>*.tsx</code> en lugar de <code>*.jsx</code>, <code>tsconfig.json</code> en raíz, <code>vite.config.ts</code>.</p>
+
+<h2>3. Tipar props</h2>
+
+<pre><code class="lang-tsx">type SaludoProps = {
+  nombre: string;
+  edad?: number;             // opcional
+  hobbies: string[];
+  onClick: (id: number) =&gt; void;
+  user: { id: number; email: string };
+};
+
+function Saludo({ nombre, edad = 0, hobbies, onClick, user }: SaludoProps) {
+  return (
+    &lt;&gt;
+      &lt;h1&gt;Hola {nombre}&lt;/h1&gt;
+      &lt;p&gt;Edad: {edad}&lt;/p&gt;
+      &lt;p&gt;Hobbies: {hobbies.join(', ')}&lt;/p&gt;
+      &lt;p&gt;Email: {user.email}&lt;/p&gt;
+      &lt;button onClick={() =&gt; onClick(user.id)}&gt;Click&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h2>4. Tipar children</h2>
+
+<pre><code class="lang-tsx">import { ReactNode } from 'react';
+
+type CardProps = {
+  title: string;
+  children: ReactNode;       // cualquier JSX
+};
+
+function Card({ title, children }: CardProps) {
+  return &lt;div&gt;&lt;h2&gt;{title}&lt;/h2&gt;{children}&lt;/div&gt;;
+}</code></pre>
+
+<h2>5. Tipar useState</h2>
+
+<pre><code class="lang-tsx">// Inferencia automática
+const [count, setCount] = useState(0);         // number
+const [user, setUser] = useState<User | null>(null);   // explícito
+const [items, setItems] = useState&lt;Item[]&gt;([]);</code></pre>
+
+<h2>6. Tipar event handlers</h2>
+
+<pre><code class="lang-tsx">function Form() {
+  function handleChange(e: React.ChangeEvent&lt;HTMLInputElement&gt;) {
+    console.log(e.target.value);
+  }
+
+  function handleSubmit(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+    e.preventDefault();
+  }
+
+  function handleClick(e: React.MouseEvent&lt;HTMLButtonElement&gt;) {
+    console.log(e.currentTarget);
+  }
+
+  return ...;
+}</code></pre>
+
+<h2>7. Tipar custom hooks</h2>
+
+<pre><code class="lang-tsx">function useLocalStorage&lt;T&gt;(key: string, initial: T): [T, (v: T) =&gt; void] {
+  const [value, setValue] = useState&lt;T&gt;(() =&gt; {
+    const stored = localStorage.getItem(key);
+    return stored ? JSON.parse(stored) : initial;
+  });
+
+  useEffect(() =&gt; {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue];
+}
+
+// Uso — T se infiere
+const [theme, setTheme] = useLocalStorage('theme', 'light');         // T = string
+const [count, setCount] = useLocalStorage('count', 0);               // T = number
+const [user, setUser] = useLocalStorage&lt;User | null&gt;('user', null);  // T explícito</code></pre>
+
+<h2>Parte 2 — Next.js 15</h2>
+
+<h2>8. ¿Qué es Next.js?</h2>
+
+<div class="concept">Framework fullstack sobre React. Resuelve: routing (file-based), SSR/SSG, API routes, Server Components, optimización de imágenes, fonts, deploy en Vercel con 1 click.</div>
+
+<h2>9. Crear app con App Router</h2>
+
+<pre><code class="lang-bash">npx create-next-app@latest mi-app
+# Choices: TypeScript yes, App Router yes, Tailwind opcional</code></pre>
+
+<h2>10. Estructura App Router</h2>
+
+<pre><code>app/
+├── layout.tsx          # layout raíz (envuelve todo)
+├── page.tsx            # ruta "/"
+├── about/
+│   └── page.tsx        # ruta "/about"
+├── blog/
+│   ├── page.tsx        # ruta "/blog"
+│   └── [slug]/
+│       └── page.tsx    # ruta "/blog/:slug"
+└── api/
+    └── posts/
+        └── route.ts    # endpoint API GET/POST /api/posts</code></pre>
+
+<h2>11. Server Components — el cambio fundamental</h2>
+
+<p>Por DEFAULT, los componentes en App Router corren EN EL SERVIDOR. Pueden hacer DB queries directamente, leer archivos, usar secrets:</p>
+
+<pre><code class="lang-tsx">// app/posts/page.tsx — Server Component (no 'use client')
+import { db } from '@/lib/db';
+
+export default async function PostsPage() {
+  const posts = await db.posts.findMany();   // ⭐ query directa a la DB
+
+  return (
+    &lt;ul&gt;
+      {posts.map(p =&gt; &lt;li key={p.id}&gt;{p.title}&lt;/li&gt;)}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="tip">El JS de Server Components NUNCA llega al browser. Cero hidration cost para ese componente. La response es HTML directo.</div>
+
+<h2>12. Client Components — cuando necesitás interactividad</h2>
+
+<pre><code class="lang-tsx">// app/components/Counter.tsx
+'use client';   // ⭐ directiva al inicio del archivo
+
+import { useState } from 'react';
+
+export default function Counter() {
+  const [count, setCount] = useState(0);
+  return &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;{count}&lt;/button&gt;;
+}</code></pre>
+
+<div class="rule">
+<strong>¿Cuándo Client vs Server?</strong>
+<ul>
+  <li>Usás <code>useState</code>, <code>useEffect</code>, eventos onClick → <strong>Client</strong>.</li>
+  <li>Solo renderizás HTML estático con data del backend → <strong>Server</strong>.</li>
+  <li>Por default, mantené Server. Marcá Client solo donde hace falta.</li>
+</ul>
+</div>
+
+<h2>13. Server Actions</h2>
+
+<p>Funciones marcadas <code>'use server'</code> que corren en el servidor pero se llaman desde el cliente:</p>
+
+<pre><code class="lang-tsx">// app/actions.ts
+'use server';
+
+import { db } from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+
+export async function createPost(formData: FormData) {
+  const title = formData.get('title') as string;
+  await db.posts.create({ data: { title } });
+  revalidatePath('/posts');  // invalida cache de esta ruta
+}
+
+// app/posts/new/page.tsx
+import { createPost } from '@/app/actions';
+
+export default function NewPostPage() {
+  return (
+    &lt;form action={createPost}&gt;
+      &lt;input name="title" /&gt;
+      &lt;button&gt;Crear&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="info">El form se envía sin escribir fetch ni endpoint. La función <code>createPost</code> corre en el servidor. Es como un RPC pero más simple.</div>
+
+<h2>14. Layouts anidados</h2>
+
+<pre><code class="lang-tsx">// app/layout.tsx — layout raíz
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    &lt;html&gt;
+      &lt;body&gt;
+        &lt;Header /&gt;
+        {children}
+        &lt;Footer /&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  );
+}
+
+// app/dashboard/layout.tsx — layout para /dashboard/*
+export default function DashboardLayout({ children }) {
+  return (
+    &lt;div className="dashboard"&gt;
+      &lt;Sidebar /&gt;
+      &lt;main&gt;{children}&lt;/main&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h2>15. Loading y error UI por convención</h2>
+
+<pre><code>app/posts/
+├── page.tsx
+├── loading.tsx       # se muestra mientras page.tsx carga
+└── error.tsx         # se muestra si page.tsx tira error</code></pre>
+
+<pre><code class="lang-tsx">// app/posts/loading.tsx
+export default function Loading() {
+  return &lt;div className="spinner" /&gt;;
+}
+
+// app/posts/error.tsx
+'use client';
+export default function Error({ error, reset }: {
+  error: Error;
+  reset: () =&gt; void;
+}) {
+  return (
+    &lt;&gt;
+      &lt;p&gt;Error: {error.message}&lt;/p&gt;
+      &lt;button onClick={reset}&gt;Reintentar&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h2>16. Optimizaciones built-in</h2>
+
+<pre><code class="lang-tsx">// next/image — optimización automática (resize, formato, lazy)
+import Image from 'next/image';
+
+&lt;Image src="/foto.jpg" alt="..." width={500} height={300} /&gt;
+
+// next/font — Google Fonts sin CLS
+import { Inter } from 'next/font/google';
+const inter = Inter({ subsets: ['latin'] });
+
+&lt;body className={inter.className}&gt;...&lt;/body&gt;
+
+// next/link — prefetch automático en hover
+import Link from 'next/link';
+
+&lt;Link href="/about"&gt;About&lt;/Link&gt;</code></pre>
+
+<h2>17. Deploy a Vercel</h2>
+
+<pre><code class="lang-bash">npm i -g vercel
+vercel</code></pre>
+
+<p>O conectar el repo en vercel.com → cada push a main = deploy nuevo. Cada PR = preview deploy con URL única.</p>
+
+<h2>18. Cuándo Next.js vs Vite</h2>
+
+<table>
+<thead><tr><th>Caso</th><th>Mejor</th></tr></thead>
+<tbody>
+<tr><td>SaaS/dashboard con login (SPA)</td><td>Vite + React Router</td></tr>
+<tr><td>App de marketing con SEO</td><td>Next.js (SSG/SSR)</td></tr>
+<tr><td>App fullstack con DB</td><td>Next.js (Server Actions)</td></tr>
+<tr><td>E-commerce</td><td>Next.js</td></tr>
+<tr><td>Blog</td><td>Next.js o Astro</td></tr>
+<tr><td>Extensión Chrome / Electron</td><td>Vite</td></tr>
+</tbody>
+</table>
+
+<h2>19. Errores típicos</h2>
+
+<div class="mistake"><strong>Usar hooks en Server Components</strong>: error. Hooks solo en Client. Si necesitás useState, marca el archivo con 'use client'.</div>
+
+<div class="mistake"><strong>Importar Client en Server sin marcar</strong>: si Server Component renderiza Client Component, marcá el Client con 'use client' arriba.</div>
+
+<div class="mistake"><strong>Cliente "use client" arriba pero usa fetch del server</strong>: si pasaste a Client, ya no podés hacer DB queries directas. Usás fetch a una API route.</div>
+
+<div class="mistake"><strong>Tipos <code>any</code> regados</strong>: derrota el propósito de TS. Si TS se queja, RESOLVÉ el tipo, no escapes con any.</div>
+
+<div class="mistake"><strong>tsconfig sin <code>strict: true</code></strong>: TS sin strict atrapa la mitad de bugs. Activá siempre.</div>
+
+<div class="mistake"><strong>Bundle con todo en Client</strong>: si todo es 'use client', perdés la ventaja de RSC (bundle chico, no hidration). Default Server, Client solo donde hace falta.</div>
+
+<h2>20. Ejercicios</h2>
+
+<ol>
+  <li>Convertir el contador del M03 a TypeScript con tipos correctos.</li>
+  <li>Tipar un custom hook genérico con <code>&lt;T&gt;</code>.</li>
+  <li>Crear app Next.js con páginas /, /about, /blog.</li>
+  <li>Server Component que lee posts mock (array) y los renderiza.</li>
+  <li>Form con Server Action que agrega item a una lista.</li>
+  <li>Implementar layout + loading.tsx + error.tsx en una ruta.</li>
+  <li>Deploy de tu app a Vercel.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Por qué TypeScript en React?</summary>
+<p>Atrapa bugs en compile-time (props mal pasadas, métodos inexistentes, refactors rotos). Mejora autocomplete del IDE. En 2026, requisito casi universal en ofertas profesionales.</p></details>
+
+<details><summary>2. ¿Diferencia entre Server y Client Components en Next.js 15?</summary>
+<p>Server (default): corren solo en servidor, pueden hacer DB queries directo, NO usan hooks. Su JS no llega al browser. Client (marcado con 'use client'): corren en browser, usan hooks, manejan interactividad.</p></details>
+
+<details><summary>3. ¿Cómo funciona Server Actions?</summary>
+<p>Función marcada con 'use server' que corre en el servidor. Se llama desde el cliente vía form action o programáticamente. Sin necesidad de escribir API route ni fetch. Next.js hace el RPC por vos.</p></details>
+
+<details><summary>4. ¿Cuándo Next.js vs Vite + React Router?</summary>
+<p>Next.js: cuando necesitás SEO (SSR/SSG), fullstack con DB, o vas a deployar en Vercel. Vite + RR: SPA pura sin SSR, extensión, Electron, o cuando querés más control.</p></details>
+
+<details><summary>5. ¿Qué hace <code>revalidatePath</code>?</summary>
+<p>Invalida la cache de Next.js para una ruta específica. Después de una mutation (Server Action), llamás revalidatePath para que la próxima visita reflje el nuevo dato sin esperar TTL.</p></details>
+
+<details><summary>6. ¿Cuál es la regla de oro de Server vs Client?</summary>
+<p>Por default mantené Server. Pasá a Client SOLO cuando necesitás useState/useEffect/eventos. Marcá Client en componentes hoja, no en el padre. Así maximizás los beneficios de RSC (menos JS, menos hidration).</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m12-performance-y-testing/lecture.html">← Anterior: Performance y Testing</a>
+  <a href="../m14-proyectos/lecture.html">Siguiente: Proyecto Integrador →</a>
+</nav>
+
+</div>
+</body>
+</html>

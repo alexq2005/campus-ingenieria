@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Testing Pyramid Explorer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0a0e1a; color: #e2e8f0;
+      min-height: 100vh; padding: 1.5rem;
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 {
+      background: linear-gradient(135deg, #34d399, #06b6d4);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      font-size: 1.8rem; margin-bottom: 0.3rem;
+    }
+    .sub { color: #94a3b8; margin-bottom: 1.5rem; }
+    a { color: #34d399; }
+    .back { color: #94a3b8; font-size: 0.9em; display: inline-block; margin-bottom: 1rem; text-decoration: none; }
+
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .panel h2 {
+      font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #94a3b8; margin-bottom: 1rem;
+    }
+
+    /* Pyramid */
+    .pyramid {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      margin-bottom: 2rem;
+    }
+    .layer {
+      padding: 0.8rem 1rem;
+      border-radius: 8px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-weight: 600;
+      border: 2px solid;
+    }
+    .layer:hover { transform: scale(1.03); }
+    .layer.selected {
+      box-shadow: 0 0 25px currentColor;
+    }
+    .layer[data-layer="e2e"]    { width: 50%; background: rgba(239,68,68,0.15); border-color: #ef4444; color: #fca5a5; }
+    .layer[data-layer="integ"]  { width: 70%; background: rgba(167,139,250,0.15); border-color: #a78bfa; color: #c4b5fd; }
+    .layer[data-layer="unit"]   { width: 85%; background: rgba(52,211,153,0.15); border-color: #34d399; color: #6ee7b7; }
+    .layer[data-layer="static"] { width: 100%; background: rgba(56,189,248,0.15); border-color: #38bdf8; color: #7dd3fc; }
+    .layer .meta { font-size: 0.78em; color: #94a3b8; margin-top: 4px; }
+
+    .layer-detail {
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-top: 1rem;
+      font-size: 0.9em;
+    }
+    .layer-detail h3 { color: #34d399; margin-bottom: 0.5rem; }
+    .layer-detail .meta-row {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 0.5rem; margin-bottom: 0.7rem;
+      font-size: 0.85em;
+    }
+    .layer-detail .meta-row > div { background: #1e293b; padding: 0.4rem 0.7rem; border-radius: 4px; }
+    .layer-detail .meta-row .label { color: #94a3b8; font-size: 0.78em; text-transform: uppercase; }
+
+    .layer-detail pre {
+      background: #1e293b;
+      padding: 0.7rem;
+      border-radius: 5px;
+      overflow-x: auto;
+      font-size: 0.78em;
+      line-height: 1.5;
+      margin-top: 0.5rem;
+    }
+    .layer-detail code { color: #cbd5e1; font-family: 'JetBrains Mono', monospace; }
+
+    /* Quiz: situaciones */
+    .quiz h3 { color: #fbbf24; margin-bottom: 0.7rem; font-size: 1rem; }
+    .situation {
+      background: #0f172a;
+      padding: 0.8rem 1rem;
+      border-radius: 6px;
+      margin-bottom: 0.5rem;
+      cursor: pointer;
+      transition: all 0.15s;
+      border-left: 3px solid #334155;
+    }
+    .situation:hover { border-left-color: #fbbf24; }
+    .situation.answered { opacity: 0.7; }
+    .situation .question { font-size: 0.9em; }
+    .situation .options {
+      display: flex; gap: 0.3rem; margin-top: 0.5rem; flex-wrap: wrap;
+    }
+    .situation .options button {
+      background: #1e293b; color: #cbd5e1;
+      border: 1px solid #334155;
+      padding: 0.3rem 0.6rem;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.78em;
+    }
+    .situation .options button:hover:not(:disabled) { background: #334155; }
+    .situation .options button.correct { background: #10b981; color: white; }
+    .situation .options button.wrong { background: #dc2626; color: white; }
+    .situation .feedback {
+      margin-top: 0.5rem;
+      padding: 0.5rem;
+      border-radius: 4px;
+      font-size: 0.82em;
+      display: none;
+    }
+    .situation.answered .feedback { display: block; }
+    .situation .feedback.ok { background: rgba(16,185,129,0.1); color: #6ee7b7; border-left: 2px solid #10b981; }
+    .situation .feedback.fail { background: rgba(220,38,38,0.1); color: #fca5a5; border-left: 2px solid #dc2626; }
+
+    .score {
+      margin-top: 1rem; text-align: center;
+      font-size: 1.1rem; font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a href="../lecture.html" class="back">← Volver al lecture</a>
+    <h1>🏆 Testing Trophy Explorer</h1>
+    <p class="sub">Cliqueá una capa para ver detalles. Después, el quiz: ¿qué nivel de test elegirías para cada situación?</p>
+
+    <div class="layout">
+      <div class="panel">
+        <h2>La pirámide moderna (Testing Trophy)</h2>
+        <div class="pyramid">
+          <div class="layer" data-layer="e2e">E2E<div class="meta">5-10% · más caro</div></div>
+          <div class="layer" data-layer="integ">Integration<div class="meta">50-60% · ★ inversión clave</div></div>
+          <div class="layer" data-layer="unit">Unit<div class="meta">30-40%</div></div>
+          <div class="layer" data-layer="static">Static (TS + ESLint)<div class="meta">gratis · primera línea</div></div>
+        </div>
+
+        <div class="layer-detail" id="detail">
+          <p style="color: #94a3b8;">👈 Cliqueá una capa para ver detalles</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Quiz: ¿qué nivel de test usarías?</h2>
+        <div class="quiz" id="quiz"></div>
+        <div class="score" id="score"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  const LAYERS = {
+    static: {
+      title: '⚡ Static analysis',
+      what: 'TypeScript, ESLint, Prettier. Encuentra errores SIN ejecutar el código.',
+      cost: 'Gratis',
+      speed: 'Instantáneo',
+      example: `function total(items: Item[]): number {
+  return items.reduce((t, i) => t + i.price, 0);
+}
+// TS detecta: i.price puede ser undefined → bug en compile time`,
+      bestFor: 'Tipos correctos, imports válidos, async sin await, etc.',
+    },
+    unit: {
+      title: '🧪 Unit tests',
+      what: 'Una función pura, una clase, sin DOM ni red.',
+      cost: 'Bajo (correr toma ms)',
+      speed: 'Muy rápido',
+      example: `test('cart.add agrega item nuevo', () => {
+  const c = cart.add({ items: [] }, { id: 'p1' });
+  expect(c.items).toHaveLength(1);
+});`,
+      bestFor: 'Lógica matemática, validaciones, transformaciones, reducers.',
+    },
+    integ: {
+      title: '🔗 Integration tests',
+      what: 'Componentes interactuando con sus dependencias mockeadas mínimamente.',
+      cost: 'Medio',
+      speed: 'Rápido (cientos por segundo)',
+      example: `test('login válido llama onLogin', async () => {
+  const onLogin = vi.fn();
+  render(<Login onLogin={onLogin} />);
+  await user.type(screen.getByLabelText(/email/i), 'a@b.com');
+  await user.click(screen.getByRole('button'));
+  expect(onLogin).toHaveBeenCalled();
+});`,
+      bestFor: 'Comportamiento de componentes, formularios, hooks complejos.',
+    },
+    e2e: {
+      title: '🌐 E2E tests (Playwright)',
+      what: 'Browser real, app real, flow completo desde la UI.',
+      cost: 'Alto (segundos por test)',
+      speed: 'Lento',
+      example: `test('checkout completo', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /comprar/i }).click();
+  await page.fill('#card', '4242...');
+  await expect(page.getByText(/orden #/)).toBeVisible();
+});`,
+      bestFor: 'Flujos críticos: signup, payment, primary CTA. NO para todo.',
+    },
+  };
+
+  function selectLayer(key) {
+    document.querySelectorAll('.layer').forEach(l => {
+      l.classList.toggle('selected', l.dataset.layer === key);
+    });
+    const d = LAYERS[key];
+    document.getElementById('detail').innerHTML = `
+      <h3>${d.title}</h3>
+      <p>${d.what}</p>
+      <div class="meta-row">
+        <div><div class="label">Costo</div><strong>${d.cost}</strong></div>
+        <div><div class="label">Velocidad</div><strong>${d.speed}</strong></div>
+      </div>
+      <p style="font-size: 0.85em; color: #cbd5e1;"><strong>Mejor para:</strong> ${d.bestFor}</p>
+      <pre><code>${d.example}</code></pre>
+    `;
+  }
+
+  document.querySelectorAll('.layer').forEach(l => {
+    l.addEventListener('click', () => selectLayer(l.dataset.layer));
+  });
+  selectLayer('integ');
+
+  // Quiz
+  const QUIZ = [
+    {
+      q: 'La función <code>formatPrice(1234.56)</code> debe devolver <code>"$1,234.56"</code>. ¿Qué test escribís?',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E', static: 'Static' },
+      correct: 'unit',
+      reason: 'Función pura sin DOM. Unit test es perfecto: rápido y aislado.',
+    },
+    {
+      q: 'El form de login debe validar email mientras escribís y mostrar error en rojo.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E' },
+      correct: 'integ',
+      reason: 'Necesitás render + user typing + verificar el DOM. Integration con React Testing Library.',
+    },
+    {
+      q: 'El usuario debe poder completar checkout: seleccionar producto, agregar al carrito, pagar y ver confirmación.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E' },
+      correct: 'e2e',
+      reason: 'Flow crítico de negocio que cruza múltiples páginas y backend. E2E con Playwright.',
+    },
+    {
+      q: 'Detectar que <code>const total = items.reduce(...)</code> no rompa si <code>items</code> está vacío.',
+      options: { unit: 'Unit', integ: 'Integration', static: 'Static (TS)' },
+      correct: 'static',
+      reason: 'TypeScript con strict mode + noUncheckedIndexedAccess detecta esto en compile time. Sin tests adicionales.',
+    },
+    {
+      q: 'El componente <code>&lt;Avatar src name /&gt;</code> que renderiza una imagen con fallback a iniciales.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E', skip: 'No testear (presentación pura)' },
+      correct: 'skip',
+      reason: 'Componente puro de presentación sin lógica. Visual regression con Storybook + Chromatic captura cambios visuales mejor.',
+    },
+    {
+      q: 'El reducer del carrito que maneja add, remove, updateQty, clear.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E' },
+      correct: 'unit',
+      reason: 'Función pura (state, action) → newState. Unit tests cubren todas las transiciones rápido.',
+    },
+    {
+      q: 'Verificar que cuando el server devuelve 500, el componente muestra el mensaje de error correcto.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E' },
+      correct: 'integ',
+      reason: 'Necesitás render + mock de fetch (con MSW) + verificar el DOM. Integration es ideal.',
+    },
+    {
+      q: 'Asegurar que el campo password siempre tiene <code>type="password"</code> y no es leíble con screen reader como número.',
+      options: { unit: 'Unit', integ: 'Integration', e2e: 'E2E', a11y: 'Accessibility test' },
+      correct: 'a11y',
+      reason: 'Accessibility test (axe-core en integration o playwright-axe). No es unit ni puro E2E — es una preocupación específica.',
+    },
+  ];
+
+  let score = 0;
+  let answered = 0;
+
+  function renderQuiz() {
+    document.getElementById('quiz').innerHTML = QUIZ.map((item, i) => `
+      <div class="situation" data-idx="${i}">
+        <div class="question">${i+1}. ${item.q}</div>
+        <div class="options">
+          ${Object.entries(item.options).map(([k, label]) => `
+            <button data-opt="${k}">${label}</button>
+          `).join('')}
+        </div>
+        <div class="feedback"></div>
+      </div>
+    `).join('');
+
+    document.querySelectorAll('.situation').forEach(s => {
+      const idx = +s.dataset.idx;
+      s.querySelectorAll('button').forEach(btn => {
+        btn.addEventListener('click', () => answerQuestion(idx, btn.dataset.opt, s, btn));
+      });
+    });
+  }
+
+  function answerQuestion(idx, opt, situation, btn) {
+    if (situation.classList.contains('answered')) return;
+    situation.classList.add('answered');
+    answered++;
+
+    const item = QUIZ[idx];
+    const isCorrect = opt === item.correct;
+    if (isCorrect) {
+      btn.classList.add('correct');
+      score++;
+    } else {
+      btn.classList.add('wrong');
+      // Marcar la correcta también
+      situation.querySelectorAll('button').forEach(b => {
+        if (b.dataset.opt === item.correct) b.classList.add('correct');
+      });
+    }
+    // Disable all buttons
+    situation.querySelectorAll('button').forEach(b => b.disabled = true);
+
+    const feedback = situation.querySelector('.feedback');
+    feedback.className = 'feedback ' + (isCorrect ? 'ok' : 'fail');
+    feedback.innerHTML = (isCorrect ? '✅ ' : '❌ ') + item.reason;
+
+    updateScore();
+  }
+
+  function updateScore() {
+    const el = document.getElementById('score');
+    if (answered === QUIZ.length) {
+      const pct = Math.round((score / QUIZ.length) * 100);
+      el.innerHTML = `🎯 ${score}/${QUIZ.length} correctas (${pct}%)`;
+      el.style.color = pct >= 75 ? '#34d399' : pct >= 50 ? '#fbbf24' : '#f87171';
+    } else {
+      el.innerHTML = `Progreso: ${answered}/${QUIZ.length}`;
+    }
+  }
+
+  renderQuiz();
+  </script>
+</body>
+</html>
