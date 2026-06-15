@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⭕ Tic-Tac-Toe — App real (MVP) · Campus CS-FE</title>
+<meta name="description" content="MVP funcionando del Proyecto 01: Ta-Te-Ti jugable de a dos o contra una IA imbatible (minimax). Marcador persistente. Corre 100% en el navegador, sin servidor.">
+<style>
+  :root{--bg:#0f172a;--surface:#1e293b;--surface-2:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--accent-2:#8b5cf6;--success:#10b981;--danger:#fb7185;--border:#334155}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+  .topbar{display:flex;align-items:center;gap:.8rem;padding:.6rem 1rem;border-bottom:1px solid var(--border);background:var(--surface);flex-wrap:wrap}
+  .topbar a{color:var(--accent);text-decoration:none;font-size:.85em}
+  .topbar .marca{font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent-2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .demo-tag{font-size:.7em;background:rgba(16,185,129,.18);color:var(--success);padding:2px 8px;border-radius:999px;font-weight:700}
+  .game{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:2rem 1rem;gap:1.2rem}
+  .modos{display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center}
+  .modo{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:.45rem 1rem;border-radius:999px;cursor:pointer;font-family:inherit;font-size:.85em;transition:all .15s}
+  .modo.activo{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:700}
+  .estado{font-size:1.15rem;font-weight:600;min-height:1.6em}
+  .tablero{display:grid;grid-template-columns:repeat(3,90px);grid-template-rows:repeat(3,90px);gap:8px}
+  .celda{background:var(--surface);border:1px solid var(--border);border-radius:12px;font-size:2.6rem;font-weight:800;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .12s}
+  .celda:hover:not(.ocupada){background:var(--surface-2)}
+  .celda.x{color:var(--accent)} .celda.o{color:var(--danger)}
+  .celda.win{background:rgba(16,185,129,.2);border-color:var(--success)}
+  .acciones{display:flex;gap:.6rem}
+  .btn{background:var(--accent);color:var(--bg);border:none;border-radius:8px;padding:.55rem 1.1rem;font-weight:700;cursor:pointer;font-family:inherit}
+  .btn.sec{background:var(--surface);color:var(--text);border:1px solid var(--border)}
+  .marcador{display:flex;gap:1.5rem;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:.7rem 1.4rem;font-size:.9em}
+  .marcador b{display:block;font-size:1.4rem;text-align:center}
+  .mX b{color:var(--accent)} .mO b{color:var(--danger)} .mE b{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="marca">⭕ Tic-Tac-Toe</span>
+  <span class="demo-tag">MVP REAL · corre sin servidor</span>
+  <span style="flex:1"></span>
+  <a href="../01-tic-tac-toe.html">← Ver la guía del proyecto</a>
+  <a href="../index.html">🛠️ Galería</a>
+</div>
+
+<div class="game">
+  <div class="modos">
+    <button class="modo activo" data-modo="2p">👥 2 jugadores</button>
+    <button class="modo" data-modo="ia-facil">🤖 vs IA (fácil)</button>
+    <button class="modo" data-modo="ia">🧠 vs IA (imbatible)</button>
+  </div>
+  <div class="estado" id="estado">Turno de X</div>
+  <div class="tablero" id="tablero"></div>
+  <div class="acciones">
+    <button class="btn" id="reiniciar">Nueva partida</button>
+    <button class="btn sec" id="borrar">Borrar marcador</button>
+  </div>
+  <div class="marcador">
+    <div class="mX">X<b id="sX">0</b></div>
+    <div class="mE">Empates<b id="sE">0</b></div>
+    <div class="mO">O<b id="sO">0</b></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var LINEAS = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+  var KEY = 'ttt-score-v1';
+  var tablero = Array(9).fill(null);
+  var turnoX = true;       // X siempre arranca (humano en modo IA)
+  var fin = false;
+  var modo = '2p';
+  var score = { X: 0, O: 0, E: 0 };
+  try { score = Object.assign(score, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) {}
+
+  var $t = document.getElementById('tablero');
+  var $estado = document.getElementById('estado');
+
+  // ---- Lógica del juego ----
+  function ganador(b) {
+    for (var i = 0; i < LINEAS.length; i++) {
+      var L = LINEAS[i];
+      if (b[L[0]] && b[L[0]] === b[L[1]] && b[L[0]] === b[L[2]]) return { jugador: b[L[0]], linea: L };
+    }
+    return b.every(Boolean) ? { jugador: 'E' } : null;
+  }
+
+  // ---- IA: minimax (imbatible) ----
+  function minimax(b, esO) {
+    var w = ganador(b);
+    if (w) { if (w.jugador === 'O') return { score: 10 }; if (w.jugador === 'X') return { score: -10 }; return { score: 0 }; }
+    var mejor = esO ? { score: -Infinity } : { score: Infinity };
+    for (var i = 0; i < 9; i++) {
+      if (b[i]) continue;
+      b[i] = esO ? 'O' : 'X';
+      var r = minimax(b, !esO).score;
+      b[i] = null;
+      if (esO ? r > mejor.score : r < mejor.score) mejor = { score: r, mov: i };
+    }
+    return mejor;
+  }
+  function jugadaIA() {
+    var libres = tablero.map(function (v, i) { return v ? null : i; }).filter(function (v) { return v !== null; });
+    if (modo === 'ia-facil' && Math.random() < 0.55) return libres[Math.floor(Math.random() * libres.length)];
+    return minimax(tablero.slice(), true).mov;
+  }
+
+  // ---- Render ----
+  function render(win) {
+    $t.innerHTML = '';
+    tablero.forEach(function (v, i) {
+      var c = document.createElement('div');
+      c.className = 'celda' + (v ? ' ocupada ' + v.toLowerCase() : '');
+      if (win && win.linea && win.linea.indexOf(i) !== -1) c.className += ' win';
+      c.textContent = v || '';
+      c.onclick = function () { jugar(i); };
+      $t.appendChild(c);
+    });
+  }
+  function pintarScore() {
+    document.getElementById('sX').textContent = score.X;
+    document.getElementById('sO').textContent = score.O;
+    document.getElementById('sE').textContent = score.E;
+  }
+
+  function jugar(i) {
+    if (fin || tablero[i]) return;
+    if (modo !== '2p' && !turnoX) return;           // en modo IA el humano es X
+    tablero[i] = turnoX ? 'X' : 'O';
+    turnoX = !turnoX;
+    avanzar();
+    // turno de la IA
+    if (!fin && modo !== '2p' && !turnoX) {
+      $estado.textContent = 'La IA piensa…';
+      setTimeout(function () {
+        var m = jugadaIA();
+        if (m != null) { tablero[m] = 'O'; turnoX = true; avanzar(); }
+      }, 280);
+    }
+  }
+  function avanzar() {
+    var w = ganador(tablero);
+    if (w) {
+      fin = true;
+      if (w.jugador === 'E') { $estado.textContent = '🤝 ¡Empate!'; score.E++; }
+      else { $estado.textContent = '🎉 ¡Gana ' + w.jugador + '!'; score[w.jugador]++; }
+      try { localStorage.setItem(KEY, JSON.stringify(score)); } catch (e) {}
+      pintarScore();
+      render(w);
+    } else {
+      $estado.textContent = 'Turno de ' + (turnoX ? 'X' : 'O');
+      render();
+    }
+  }
+  function reiniciar() {
+    tablero = Array(9).fill(null); turnoX = true; fin = false;
+    $estado.textContent = 'Turno de X'; render();
+  }
+
+  // ---- Controles ----
+  document.querySelectorAll('.modo').forEach(function (b) {
+    b.onclick = function () {
+      document.querySelectorAll('.modo').forEach(function (x) { x.classList.remove('activo'); });
+      b.classList.add('activo'); modo = b.getAttribute('data-modo'); reiniciar();
+    };
+  });
+  document.getElementById('reiniciar').onclick = reiniciar;
+  document.getElementById('borrar').onclick = function () {
+    score = { X: 0, O: 0, E: 0 };
+    try { localStorage.removeItem(KEY); } catch (e) {}
+    pintarScore();
+  };
+
+  pintarScore();
+  reiniciar();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 12 — Proyectos Integradores · Curso de Rust</title>
+  <meta name="description" content="Cuatro proyectos para integrar todo Rust: una CLI, una mini librería con tests, un procesador concurrente y Rust embebido en el ESP32.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 12</span>
+  <span class="badge">🎓 Capstone</span>
+  <span class="badge">🎯 Pre-req: todo el curso</span>
+</div>
+
+<article>
+
+<h1>Módulo 12 — Proyectos Integradores</h1>
+
+<p>Llegaste al final. Ya tenés todo Rust en la cabeza: ownership y borrowing, structs y enums, <code>Option</code> y <code>Result</code> con el operador <code>?</code>, genéricos, traits, iteradores, concurrencia, y Cargo con tests. Lo que falta no es <em>más teoría</em> — es <strong>integrarlo en proyectos reales</strong>, donde las piezas dejan de estar aisladas y empiezan a trabajar juntas.</p>
+
+<div class="info">
+  <strong>Esta guía es distinta a los módulos anteriores.</strong> Menos explicación, más estructura. Te presento <strong>4 proyectos</strong>, cada uno con su objetivo, los módulos del curso que aplica, las fases para construirlo, y un criterio claro de "✅ terminado cuando…". No te doy el código resuelto — esa es justamente la parte que tenés que escribir vos.
+</div>
+
+<div class="concept">
+  <strong>💡 Por qué proyectos y no más lecciones.</strong> Saber cada concepto por separado no es lo mismo que <em>combinarlos</em>. Un proyecto real te obliga a decidir: ¿esto es un <code>struct</code> o un <code>enum</code>? ¿devuelvo <code>Result</code> o hago <code>panic!</code>? ¿clono o presto una referencia? Ahí es donde Rust deja de ser teoría y se vuelve tuyo.
+</div>
+
+<hr>
+
+<h2>🛠️ Proyecto 1 — Una CLI rápida</h2>
+
+<p><strong>Objetivo:</strong> construir una herramienta de terminal que reciba argumentos y procese texto. Una buena primera elección es un <strong>contador de palabras</strong> (estilo <code>wc</code>) o un <strong>mini-grep</strong> que busque un patrón en un archivo. Es el proyecto perfecto para entrar: poco vistoso, pero te hace tocar argumentos, archivos y manejo de errores de una.</p>
+
+<table>
+<thead><tr><th>Módulo del curso</th><th>Cómo lo aplicás acá</th></tr></thead>
+<tbody>
+<tr><td>M04 — Structs &amp; Enums</td><td>Modelar la configuración (patrón a buscar, ruta del archivo) en un <code>struct</code></td></tr>
+<tr><td>M06 — Manejo de errores</td><td><code>Result</code> + el operador <code>?</code> para propagar fallos de lectura del archivo</td></tr>
+<tr><td>M07 — Iteradores</td><td><code>lines()</code>, <code>filter()</code>, <code>split_whitespace()</code>, <code>count()</code> sobre el contenido</td></tr>
+<tr><td>std / crate <code>clap</code></td><td>Leer argumentos con <code>std::env::args</code> (a mano) o con el crate <code>clap</code> (declarativo)</td></tr>
+</tbody>
+</table>
+
+<p>La forma mínima, sin dependencias, arranca leyendo argumentos del entorno:</p>
+
+<pre><code class="lang-rust">use std::env;
+use std::fs;
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let args: Vec&lt;String&gt; = env::args().collect();
+    let patron = &amp;args[1];
+    let ruta = &amp;args[2];
+
+    let contenido = fs::read_to_string(ruta)?;   // el ? propaga el error de I/O
+
+    for linea in contenido.lines() {
+        if linea.contains(patron) {
+            println!("{}", linea);
+        }
+    }
+    Ok(())
+}</code></pre>
+
+<div class="tip">
+  <strong>Subí el nivel con <code>clap</code>.</strong> Cuando quieras flags reales (<code>--ignore-case</code>, <code>--count</code>), agregá el crate <code>clap</code> con <code>cargo add clap --features derive</code> y describí los argumentos con un <code>struct</code> anotado. Es la forma idiomática de las CLIs serias en Rust.
+</div>
+
+<p><strong>Fases para construirlo:</strong></p>
+
+<ol>
+  <li>Crear el proyecto con <code>cargo new mi-grep</code> y correrlo vacío.</li>
+  <li>Leer los argumentos con <code>std::env::args</code> e imprimirlos para ver que llegan bien.</li>
+  <li>Leer el archivo con <code>fs::read_to_string</code> y devolver <code>Result</code> con <code>?</code>.</li>
+  <li>Iterar las líneas y filtrar las que contienen el patrón.</li>
+  <li>Manejar los errores feos: ¿qué pasa si faltan argumentos? ¿si el archivo no existe?</li>
+  <li><em>(Opcional)</em> Migrar a <code>clap</code> y agregar un flag <code>--count</code> que muestre cuántas coincidencias hubo.</li>
+</ol>
+
+<div class="rule">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>Corre con <code>cargo run -- patron archivo.txt</code> y muestra las líneas que coinciden.</li>
+    <li>Si el archivo no existe, falla con un mensaje claro (no con un <code>panic</code> críptico).</li>
+    <li>Si faltan argumentos, avisa cómo usar el programa.</li>
+    <li>No hay ningún <code>.unwrap()</code> en el camino feliz: usás <code>?</code> y <code>Result</code>.</li>
+  </ul>
+</div>
+
+<hr>
+
+<h2>📚 Proyecto 2 — Mini librería con tests</h2>
+
+<p><strong>Objetivo:</strong> escribir un <em>crate</em> (una librería) con una API limpia y bien testeada. La mejor elección es una <strong>estructura de datos pequeña</strong>: una <strong>pila</strong> (stack, LIFO) o una <strong>cola</strong> (queue, FIFO). Es chico, pero te obliga a pensar en la <em>interfaz pública</em> y en los casos borde (¿qué pasa al sacar de una pila vacía?).</p>
+
+<table>
+<thead><tr><th>Módulo del curso</th><th>Cómo lo aplicás acá</th></tr></thead>
+<tbody>
+<tr><td>M07 — Genéricos</td><td>Una <code>Pila&lt;T&gt;</code> que funcione para cualquier tipo, no solo enteros</td></tr>
+<tr><td>M08 — Traits</td><td>Implementar <code>Default</code>, o derivar <code>Debug</code> y <code>Clone</code> para la API</td></tr>
+<tr><td>M04 — <code>Option</code></td><td><code>pop()</code> devuelve <code>Option&lt;T&gt;</code>: <code>Some</code> si hay, <code>None</code> si está vacía</td></tr>
+<tr><td>M11 — Tests</td><td><code>#[test]</code> para cubrir push, pop, vacía, y el orden LIFO</td></tr>
+</tbody>
+</table>
+
+<p>El esqueleto de una pila genérica se ve así:</p>
+
+<pre><code class="lang-rust">pub struct Pila&lt;T&gt; {
+    elementos: Vec&lt;T&gt;,
+}
+
+impl&lt;T&gt; Pila&lt;T&gt; {
+    pub fn nueva() -&gt; Self {
+        Pila { elementos: Vec::new() }
+    }
+
+    pub fn push(&amp;mut self, item: T) {
+        self.elementos.push(item);
+    }
+
+    pub fn pop(&amp;mut self) -&gt; Option&lt;T&gt; {
+        self.elementos.pop()      // devuelve None si está vacía
+    }
+
+    pub fn esta_vacia(&amp;self) -&gt; bool {
+        self.elementos.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pop_respeta_lifo() {
+        let mut p = Pila::nueva();
+        p.push(1);
+        p.push(2);
+        assert_eq!(p.pop(), Some(2));   // el último que entró, sale primero
+        assert_eq!(p.pop(), Some(1));
+        assert_eq!(p.pop(), None);      // vacía → None
+    }
+}</code></pre>
+
+<div class="analogy">
+  <strong>Una pila es una pila de platos.</strong> Apilás platos arriba (<code>push</code>) y solo podés sacar el de más arriba (<code>pop</code>) — el último que pusiste. LIFO: <em>Last In, First Out</em>. Una cola, en cambio, es la fila del banco: el primero que llega es el primero que se atiende (FIFO).
+</div>
+
+<p><strong>Fases para construirlo:</strong></p>
+
+<ol>
+  <li><code>cargo new mi-pila --lib</code> (el flag <code>--lib</code> crea una librería, no un binario).</li>
+  <li>Definir <code>Pila&lt;T&gt;</code> con un <code>Vec&lt;T&gt;</code> adentro.</li>
+  <li>Implementar <code>nueva</code>, <code>push</code> y <code>pop</code> (que devuelve <code>Option&lt;T&gt;</code>).</li>
+  <li>Agregar <code>esta_vacia</code> y <code>len</code>.</li>
+  <li>Escribir tests con <code>#[test]</code>: el orden LIFO, sacar de vacía, push/pop alternados.</li>
+  <li>Correr <code>cargo test</code> y que todo pase en verde.</li>
+</ol>
+
+<div class="rule">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>La pila es genérica: <code>Pila&lt;i32&gt;</code> y <code>Pila&lt;String&gt;</code> compilan sin tocar el código.</li>
+    <li><code>pop()</code> sobre una pila vacía devuelve <code>None</code>, nunca hace <code>panic</code>.</li>
+    <li>Tenés al menos 3 tests con <code>#[test]</code> y <code>cargo test</code> pasa todo.</li>
+    <li>La API pública (<code>pub</code>) es mínima y clara — nada interno expuesto de más.</li>
+  </ul>
+</div>
+
+<hr>
+
+<h2>⚡ Proyecto 3 — Procesador concurrente</h2>
+
+<p><strong>Objetivo:</strong> usar varios <em>threads</em> para procesar trabajo en paralelo y juntar los resultados de forma segura. Una idea concreta: <strong>contar palabras en muchos archivos a la vez</strong>, un thread por archivo, sumando todo a un total compartido. Acá Rust brilla: el compilador te garantiza que no hay <em>data races</em>.</p>
+
+<table>
+<thead><tr><th>Módulo del curso</th><th>Cómo lo aplicás acá</th></tr></thead>
+<tbody>
+<tr><td>M10 — Concurrencia</td><td><code>thread::spawn</code> para lanzar trabajo en paralelo</td></tr>
+<tr><td>M10 — <code>Arc</code> + <code>Mutex</code></td><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code> para compartir un total entre threads de forma segura</td></tr>
+<tr><td>M10 — Channels</td><td>Alternativa: <code>mpsc</code> para que cada thread <em>envíe</em> su resultado al hilo principal</td></tr>
+<tr><td>M06 — Errores</td><td>Manejar archivos que no existen sin que se caiga todo el programa</td></tr>
+</tbody>
+</table>
+
+<p>El patrón <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> — un contador compartido entre threads:</p>
+
+<pre><code class="lang-rust">use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let total = Arc::new(Mutex::new(0));
+    let mut handles = vec![];
+
+    for n in 0..4 {
+        let total = Arc::clone(&amp;total);   // cada thread comparte el mismo contador
+        let h = thread::spawn(move || {
+            let palabras = n * 10;        // acá iría: leer archivo y contar
+            let mut suma = total.lock().unwrap();
+            *suma += palabras;            // sección crítica, protegida por el Mutex
+        });
+        handles.push(h);
+    }
+
+    for h in handles {
+        h.join().unwrap();                // esperar a que todos terminen
+    }
+
+    println!("Total: {}", *total.lock().unwrap());
+}</code></pre>
+
+<p>La alternativa con <strong>channels</strong> (<code>mpsc</code> = <em>multiple producer, single consumer</em>) evita el lock: cada thread manda su número por el canal y el principal los suma a medida que llegan.</p>
+
+<pre><code class="lang-rust">use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+
+    for n in 0..4 {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            tx.send(n * 10).unwrap();     // cada thread envía su resultado
+        });
+    }
+    drop(tx);                             // cerrar el emisor original
+
+    let total: i32 = rx.iter().sum();     // el principal recibe y suma
+    println!("Total: {}", total);
+}</code></pre>
+
+<div class="warn">
+  <strong>Cuidado con olvidar <code>join</code>.</strong> Si el hilo principal termina antes que los threads que lanzaste, esos threads se matan a la mitad. Siempre guardá los <em>handles</em> y hacé <code>join()</code> sobre todos, o usá un channel que mantenga vivo el flujo hasta que todos envíen.
+</div>
+
+<p><strong>Fases para construirlo:</strong></p>
+
+<ol>
+  <li>Primero la versión <em>secuencial</em>: contar palabras de una lista de archivos en un bucle normal. Que funcione.</li>
+  <li>Decidir el modelo: ¿<code>Arc&lt;Mutex&gt;</code> compartido o channel <code>mpsc</code>? Empezá con el que te resulte más claro.</li>
+  <li>Lanzar un <code>thread::spawn</code> por archivo, moviendo lo necesario con <code>move</code>.</li>
+  <li>Juntar resultados: lock + suma, o recibir por el canal.</li>
+  <li>Hacer <code>join()</code> de todos los handles antes de imprimir el total.</li>
+  <li>Comparar: ¿el total concurrente coincide con el secuencial? Tiene que dar igual.</li>
+</ol>
+
+<div class="tip">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>El total concurrente es <em>idéntico</em> al de la versión secuencial (si no, hay un bug de sincronización).</li>
+    <li>No hay <code>data races</code>: el código compila — en Rust, si compila con threads, no hay carrera de datos.</li>
+    <li>Todos los threads se esperan con <code>join()</code>; nada queda colgado.</li>
+    <li>Un archivo inexistente no tira abajo el programa entero.</li>
+  </ul>
+</div>
+
+<hr>
+
+<h2>🦀 Proyecto 4 — Rust embebido en el ESP32</h2>
+
+<p><strong>Objetivo:</strong> el puente con <strong>Computación Física</strong>. Hacer que Rust corra <em>directo sobre el microcontrolador</em> — sin sistema operativo debajo — para parpadear un LED o leer un sensor en el ESP32. Es Rust en su hábitat original: programación de sistemas, cerca del metal.</p>
+
+<div class="concept">
+  <strong>💡 ¿Qué es <code>no_std</code>?</strong> Hasta ahora todos tus programas usaban la <em>standard library</em> de Rust (<code>std</code>): <code>Vec</code>, <code>String</code>, archivos, threads… Todo eso asume que hay un <strong>sistema operativo</strong> que da memoria dinámica, archivos y demás. Un microcontrolador <strong>no tiene OS</strong>. Por eso se compila con <code>#![no_std]</code>: Rust sin la librería estándar, usando solo el <em>core</em> del lenguaje. Tenés tipos, control de flujo y <code>Option</code>/<code>Result</code>, pero <strong>no</strong> hay <code>Vec</code> ni <code>String</code> "gratis" — la memoria es un recurso que administrás vos.
+</div>
+
+<table>
+<thead><tr><th>Concepto del curso</th><th>Cómo cambia en embebido</th></tr></thead>
+<tbody>
+<tr><td>M00 — Cargo</td><td>Seguís usando Cargo, pero compilás para otra arquitectura (<em>cross-compile</em>) y flasheás al chip</td></tr>
+<tr><td>std completa</td><td>Reemplazada por <code>#![no_std]</code> + el crate <code>esp-hal</code> (la capa que habla con el hardware del ESP32)</td></tr>
+<tr><td>M06 — Errores</td><td><code>Result</code> y <code>Option</code> siguen — son del <em>core</em>, no de <code>std</code></td></tr>
+<tr><td>Computación Física</td><td>Aplicás GPIO, PWM y sensores que viste en ese curso, pero con la seguridad de Rust</td></tr>
+</tbody>
+</table>
+
+<p>Un "blink" mínimo con <code>esp-hal</code> tiene esta forma (el detalle exacto depende de la versión del crate):</p>
+
+<pre><code class="lang-rust">#![no_std]
+#![no_main]
+
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{Level, Output};
+use esp_backtrace as _;
+
+#[esp_hal::main]
+fn main() -&gt; ! {
+    let p = esp_hal::init(Default::default());
+
+    let mut led = Output::new(p.GPIO2, Level::Low);
+    let delay = Delay::new();
+
+    loop {
+        led.toggle();        // prende / apaga
+        delay.delay_millis(500);
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo que delata que es embebido:</strong> <code>#![no_std]</code> (sin librería estándar), <code>#![no_main]</code> (el arranque lo maneja el chip, no el <code>main</code> normal), el tipo de retorno <strong><code>-&gt; !</code></strong> (el programa <em>nunca</em> termina — corre para siempre en el micro), y el <code>loop {}</code> infinito. No hay <code>return</code> ni "fin del programa": un microcontrolador siempre está haciendo algo.
+</div>
+
+<p><strong>Fases para construirlo:</strong></p>
+
+<ol>
+  <li>Instalar el toolchain del ESP32 (<code>espup</code> instala el target de Rust para Espressif).</li>
+  <li>Generar el proyecto base con la plantilla oficial (<code>esp-generate</code> / <code>cargo generate</code>).</li>
+  <li>Identificar a qué pin GPIO está conectado el LED de tu placa (suele ser el GPIO2).</li>
+  <li>Escribir el <code>loop</code> con <code>toggle()</code> + <code>delay</code> para parpadear.</li>
+  <li>Flashear con <code>cargo run</code> (que usa <code>espflash</code> por detrás) y ver el LED parpadear.</li>
+  <li><em>(Siguiente paso)</em> Leer un sensor por una entrada analógica (ADC) e imprimir el valor por el puerto serie.</li>
+</ol>
+
+<div class="step">
+  <strong>🔌 El puente con Computación Física.</strong> Todo lo que aprendiste sobre electrónica — GPIO, PWM, ADC, pull-ups, el ESP32 — aplica acá, pero ahora con la red de seguridad de Rust en vez de C. Repasá los fundamentos de hardware en el <a href="../../Curso-Computacion-Fisica/index.html">⚡ Curso de Computación Física</a> y volvé a implementarlos en Rust.
+</div>
+
+<div class="danger">
+  <strong>Embebido es el proyecto más difícil — y está bien.</strong> Necesitás hardware real (un ESP32), drivers y un toolchain de cross-compilación. Si todavía no tenés la placa, leé y entendé el concepto de <code>no_std</code> igual: es el "para qué existe Rust" en estado puro. Cuando consigas el chip, este es el proyecto que te va a hacer sentir que sos programador de sistemas.
+</div>
+
+<hr>
+
+<h2>🎓 Cierre del curso — ¿qué sigue?</h2>
+
+<p>Terminaste el Curso de Rust. Sabés escribir programas seguros, rápidos e idiomáticos. Pero Rust es enorme y hay caminos para seguir creciendo:</p>
+
+<table>
+<thead><tr><th>Tema</th><th>Qué es</th><th>Por dónde empezar</th></tr></thead>
+<tbody>
+<tr><td><strong>async / await</strong></td><td>Concurrencia sin bloquear hilos — miles de tareas en pocos threads. La base de servidores web modernos.</td><td>El runtime <code>tokio</code></td></tr>
+<tr><td><strong>WebAssembly</strong></td><td>Compilar Rust a <em>Wasm</em> y correrlo en el navegador a velocidad casi nativa.</td><td><code>wasm-bindgen</code>, <code>wasm-pack</code></td></tr>
+<tr><td><strong>Macros</strong></td><td>Generar código en compilación. Lo que hace <code>println!</code> y <code>#[derive(...)]</code> por dentro.</td><td>Macros declarativas (<code>macro_rules!</code>) primero</td></tr>
+<tr><td><strong>El libro oficial</strong></td><td>"The Rust Programming Language" — la referencia definitiva, gratis y online.</td><td><a href="https://doc.rust-lang.org/book/" target="_blank">doc.rust-lang.org/book</a></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>El consejo final:</strong> no leas más Rust — <em>escribí</em> más Rust. Cada uno de los 4 proyectos de arriba te enseña algo que ninguna lección puede: cómo se siente combinar las piezas cuando el compilador te discute cada decisión. Empezá por la CLI, que es la más accesible, y subí desde ahí.
+</div>
+
+<h3>Checkpoint — repaso del curso</h3>
+
+<details><summary>¿Por qué <code>pop()</code> de una pila debería devolver <code>Option&lt;T&gt;</code> y no <code>T</code>?</summary>
+<p>Porque la pila puede estar vacía. Si devolviera <code>T</code>, no habría forma de representar "no hay nada que sacar" sin hacer <code>panic</code>. <code>Option&lt;T&gt;</code> obliga a quien llama a manejar el caso <code>None</code> — es la forma segura, sin <code>null</code>, que Rust impone (M04).</p></details>
+
+<details><summary>¿Qué garantiza Rust cuando un programa con threads <em>compila</em>?</summary>
+<p>Que no hay <em>data races</em>: nunca dos threads acceden a la misma memoria de forma conflictiva sin sincronización. El compilador lo verifica con ownership y los traits <code>Send</code>/<code>Sync</code>. Por eso compartís estado con <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> o channels <code>mpsc</code> (M10): el tipo te fuerza a hacerlo bien.</p></details>
+
+<details><summary>¿Qué significa <code>#![no_std]</code> y por qué hace falta en el ESP32?</summary>
+<p>Significa compilar sin la librería estándar de Rust, usando solo el <em>core</em> del lenguaje. Hace falta en un microcontrolador porque <code>std</code> asume un sistema operativo (memoria dinámica, archivos, threads del OS) que el ESP32 no tiene. Seguís teniendo tipos, control de flujo y <code>Option</code>/<code>Result</code>, pero administrás la memoria vos.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Elegí <strong>uno</strong> de los 4 proyectos y construilo siguiendo sus fases hasta cumplir el "✅ terminado cuando…".</li>
+  <li>En el Proyecto 1 (CLI), agregá un flag <code>--count</code> que en vez de imprimir las líneas muestre cuántas coincidieron.</li>
+  <li>En el Proyecto 2 (librería), agregá un método <code>peek()</code> que devuelva una referencia al tope sin sacarlo (pista: <code>Option&lt;&amp;T&gt;</code>).</li>
+  <li>En el Proyecto 3, implementá la versión con <code>Arc&lt;Mutex&gt;</code> <strong>y</strong> la versión con <code>mpsc</code>, y comprobá que dan el mismo total.</li>
+  <li>Leé el primer capítulo del libro oficial "The Rust Programming Language" y compará su "guessing game" con lo que ya sabés.</li>
+</ol>
+
+<section class="quiz" id="quizRs12">
+  <style>
+    #quizRs12{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs12 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs12 .q{margin-bottom:1.5rem}
+    #quizRs12 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs12 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs12 .opt:hover{border-color:var(--accent)}
+    #quizRs12 .opt:disabled{cursor:default}
+    #quizRs12 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs12 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs12 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs12 .exp.show{display:block}
+    #quizRs12 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación — repaso del curso</h3>
+
+  <div class="q" data-c="2">
+    <p>1. En la CLI, ¿qué te permite el operador <code>?</code> al leer un archivo con <code>fs::read_to_string(ruta)?</code>?</p>
+    <button class="opt">Ignorar el error y seguir con un string vacío</button>
+    <button class="opt">Convertir el resultado en <code>None</code> automáticamente</button>
+    <button class="opt">Propagar el error hacia arriba si la lectura falla, devolviendo el valor si tuvo éxito</button>
+    <div class="exp">El <code>?</code> desempaca el <code>Ok</code> si todo salió bien, o retorna temprano el <code>Err</code> hacia quien llamó (M06). Por eso la función devuelve <code>Result</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. En el procesador concurrente, ¿qué usás para compartir un contador entre varios threads de forma segura?</p>
+    <button class="opt"><code>Arc&lt;Mutex&lt;T&gt;&gt;</code> o un channel <code>mpsc</code></button>
+    <button class="opt">Una variable global <code>static mut</code> sin protección</button>
+    <button class="opt">Un <code>Vec&lt;T&gt;</code> común y corriente</button>
+    <div class="exp"><code>Arc</code> permite múltiples dueños del dato y <code>Mutex</code> serializa el acceso; alternativamente, los channels <code>mpsc</code> envían resultados sin estado compartido (M10). El compilador rechaza lo inseguro.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. ¿Por qué un programa para el ESP32 usa <code>#![no_std]</code>?</p>
+    <button class="opt">Porque Rust no funciona en microcontroladores</button>
+    <button class="opt">Porque el micro no tiene sistema operativo, y <code>std</code> asume que sí lo hay</button>
+    <button class="opt">Porque <code>no_std</code> hace el programa más rápido en la PC</button>
+    <div class="exp">La librería estándar (<code>std</code>) depende de un OS (memoria dinámica, archivos, threads). En un microcontrolador sin OS se compila con <code>#![no_std]</code> y se usa el <em>core</em> del lenguaje más un crate como <code>esp-hal</code>.</div>
+  </div>
+
+  <div class="score" id="scoreRs12"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs12');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs12').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el Curso de Rust.' : '  — repasá las que fallaste; ya casi sos rustacean.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m11-cargo-crates-testing/lecture.html">← M11: Cargo &amp; Testing</a>
+  <a href="../index.html">Volver al syllabus →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 12 — Proyectos Integradores · Curso de Go</title>
+  <meta name="description" content="Cierre del curso: 4 proyectos que integran HTTP, concurrencia, interfaces, errores y tests. Acortador de URLs, CLI, worker concurrente y paquete reutilizable.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 12</span>
+  <span class="badge">🎓 Capstone</span>
+  <span class="badge">🎯 Pre-req: todo el curso</span>
+</div>
+
+<article>
+
+<h1>Módulo 12 — Proyectos Integradores</h1>
+
+<p>Llegaste al final. Ya tenés <strong>todo Go</strong>: sintaxis, structs, punteros, interfaces, errores como valores, goroutines, channels, paquetes, tests y un servidor HTTP. Lo que falta no es aprender más teoría — es <strong>integrar</strong> esas piezas en proyectos reales que podrías mostrar en un portfolio o usar en producción.</p>
+
+<div class="concept">
+  <strong>💡 Esta guía es distinta a los módulos anteriores.</strong> Menos explicación, más estructura. Para cada proyecto te doy: el objetivo, qué módulos del curso aplica, las fases (en orden) y un criterio claro de "terminado". El código lo escribís vos — esa es la parte donde realmente se fija lo aprendido.
+</div>
+
+<div class="info">
+  <strong>Elegí uno y terminalo de punta a punta</strong> antes de saltar al siguiente. Un proyecto chico y completo enseña más que cuatro a medio hacer. Si tenés que ordenar la dificultad: CLI → Acortador → Worker → Paquete.
+</div>
+
+<h2>🔗 Proyecto 1 — Acortador de URLs en Go</h2>
+
+<p><strong>Objetivo:</strong> un servidor HTTP que recibe una URL larga, le asigna un código corto y lo guarda en memoria. Después, cuando alguien visita <code>/{code}</code>, lo redirige a la URL original. Es la versión backend del proyecto <a href="../../proyectos/06-url-shortener.html">P06 del campus</a> — ahí lo viste en el navegador; acá construís el servidor de verdad.</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>Módulo del curso</th></tr></thead>
+<tbody>
+<tr><td>Servidor HTTP, handlers, JSON</td><td>M11 — HTTP &amp; API</td></tr>
+<tr><td>Guardar pares código→URL en un <code>map</code></td><td>M04 — Estructuras de datos</td></tr>
+<tr><td>Proteger el map con <code>sync.Mutex</code> (varias requests a la vez)</td><td>M09 — Concurrencia avanzada</td></tr>
+<tr><td>Devolver errores como valores (<code>if err != nil</code>)</td><td>M07 — Errores</td></tr>
+</tbody>
+</table>
+
+<p>Los dos endpoints:</p>
+
+<pre><code class="lang-go">// POST /shorten   body: {"url":"https://ejemplo.com/algo/muy/largo"}
+//                 resp: {"code":"a3f9","short":"http://localhost:8080/a3f9"}
+// GET  /{code}    -&gt; HTTP 302 redirect a la URL original</code></pre>
+
+<p>El esqueleto del almacén protegido con Mutex (lo completás vos):</p>
+
+<pre><code class="lang-go">type Store struct {
+    mu   sync.Mutex
+    urls map[string]string // code -&gt; url larga
+}
+
+func (s *Store) Save(code, url string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.urls[code] = url
+}
+
+func (s *Store) Get(code string) (string, bool) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    url, ok := s.urls[code]
+    return url, ok
+}</code></pre>
+
+<div class="mistake">
+  <strong>Sin el Mutex tenés un bug silencioso.</strong> Un <code>map</code> de Go NO es seguro para acceso concurrente: si dos requests escriben a la vez, el programa puede crashear con <code>fatal error: concurrent map writes</code>. Corré <code>go run -race .</code> para detectarlo.
+</div>
+
+<ol>
+  <li><strong>Servidor base:</strong> levantá un <code>http.ServeMux</code> que responda "ok" en <code>/</code> (repaso de M11).</li>
+  <li><strong>POST /shorten:</strong> leé el JSON del body, generá un código corto (random o contador), guardalo en el <code>Store</code> y devolvé el JSON con el código.</li>
+  <li><strong>GET /{code}:</strong> buscá el código en el <code>Store</code>; si existe, <code>http.Redirect(w, r, url, http.StatusFound)</code>; si no, <code>404</code>.</li>
+  <li><strong>Concurrencia:</strong> protegé el map con <code>sync.Mutex</code> y verificá con <code>-race</code>.</li>
+  <li><strong>Errores:</strong> validá que la URL no esté vacía y devolvé un <code>400</code> con un mensaje claro si lo está.</li>
+</ol>
+
+<div class="rule">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li><code>POST /shorten</code> con una URL devuelve un código y lo persiste.</li>
+    <li><code>GET /{code}</code> redirige a la URL original; un código inexistente devuelve <code>404</code>.</li>
+    <li><code>go run -race .</code> no reporta data races con varias requests simultáneas.</li>
+    <li>Una URL vacía o body inválido devuelve <code>400</code>, no un panic.</li>
+  </ul>
+</div>
+
+<h2>🛠️ Proyecto 2 — Herramienta de línea de comandos (CLI)</h2>
+
+<p><strong>Objetivo:</strong> una herramienta de terminal que recibe argumentos y hace algo útil. Dos ideas concretas: un <strong>conversor de unidades</strong> (<code>convertir 100 km millas</code>) o un <strong>TODO por terminal</strong> (<code>todo add "comprar pan"</code>, <code>todo list</code>). Las CLIs son donde Go brilla: un solo binario, sin runtime, lo copiás y corre.</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>Módulo del curso</th></tr></thead>
+<tbody>
+<tr><td>Leer argumentos (<code>os.Args</code> o el paquete <code>flag</code>)</td><td>M00 / M10 — toolchain y paquetes</td></tr>
+<tr><td>Modelar el dato con un <code>struct</code></td><td>M04 / M05 — structs y punteros</td></tr>
+<tr><td>Manejo de errores (input inválido, archivo que no abre)</td><td>M07 — Errores</td></tr>
+</tbody>
+</table>
+
+<p>Las dos formas de leer argumentos:</p>
+
+<pre><code class="lang-go">// 1) Crudo: os.Args[0] es el nombre del programa, [1:] son los argumentos
+args := os.Args[1:]
+if len(args) &lt; 1 {
+    fmt.Println("uso: convertir &lt;valor&gt; &lt;de&gt; &lt;a&gt;")
+    os.Exit(1)
+}
+
+// 2) Con flags: --from km --to millas --valor 100
+from := flag.String("from", "km", "unidad de origen")
+to   := flag.String("to", "millas", "unidad de destino")
+flag.Parse()</code></pre>
+
+<div class="tip">
+  Para un TODO real, guardá las tareas en un archivo JSON (<code>tasks.json</code>) con <code>encoding/json</code> — así sobreviven entre ejecuciones. Repasá <code>os.ReadFile</code> / <code>os.WriteFile</code> y el marshaling de M11.
+</div>
+
+<ol>
+  <li><strong>Parseo:</strong> leé los argumentos y validá que estén completos; si no, mostrá el uso y <code>os.Exit(1)</code>.</li>
+  <li><strong>Modelo:</strong> definí el <code>struct</code> que representa el dato (una <code>Task</code> con texto y estado, o un par valor+unidad).</li>
+  <li><strong>Lógica:</strong> hacé la conversión o el alta/listado de tareas.</li>
+  <li><strong>Errores:</strong> devolvé errores claros para unidades desconocidas o archivos que no se pueden leer.</li>
+  <li><strong>Compilá:</strong> <code>go build</code> y probá el binario directamente desde la terminal.</li>
+</ol>
+
+<div class="rule">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El binario corre desde la terminal y procesa los argumentos correctamente.</li>
+    <li>Un argumento faltante o inválido muestra un mensaje de uso útil y sale con código ≠ 0.</li>
+    <li>(TODO) las tareas persisten en <code>tasks.json</code> entre ejecuciones.</li>
+    <li><code>go build</code> genera un único ejecutable que copiás y corre sin dependencias.</li>
+  </ul>
+</div>
+
+<h2>⚡ Proyecto 3 — Worker concurrente</h2>
+
+<p><strong>Objetivo:</strong> procesar N tareas en paralelo con goroutines, repartirlas por un channel y esperar a que todas terminen con un <code>WaitGroup</code>. El ejemplo clásico: <strong>chequear el estado HTTP de muchas URLs a la vez</strong>. Hacerlo secuencial tarda N×latencia; en paralelo tarda casi lo que la más lenta.</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>Módulo del curso</th></tr></thead>
+<tbody>
+<tr><td>Lanzar trabajo en paralelo con <code>go</code></td><td>M08 — Goroutines &amp; channels</td></tr>
+<tr><td>Repartir tareas y recoger resultados por channels</td><td>M08 — Goroutines &amp; channels</td></tr>
+<tr><td>Esperar a que todas terminen con <code>sync.WaitGroup</code></td><td>M09 — Concurrencia avanzada</td></tr>
+<tr><td>El cliente HTTP (<code>http.Get</code>)</td><td>M11 — HTTP &amp; API</td></tr>
+</tbody>
+</table>
+
+<p>El patrón worker pool en miniatura (lo completás vos):</p>
+
+<pre><code class="lang-go">func main() {
+    urls := []string{"https://go.dev", "https://example.com", "https://httpbin.org/status/200"}
+    var wg sync.WaitGroup
+    results := make(chan string)
+
+    for _, u := range urls {
+        wg.Add(1)
+        go func(url string) {
+            defer wg.Done()
+            resp, err := http.Get(url)
+            if err != nil {
+                results &lt;- url + " -&gt; ERROR: " + err.Error()
+                return
+            }
+            defer resp.Body.Close()
+            results &lt;- fmt.Sprintf("%s -&gt; %d", url, resp.StatusCode)
+        }(u)
+    }
+
+    // cerrar el channel cuando todas las goroutines terminen
+    go func() { wg.Wait(); close(results) }()
+
+    for r := range results {
+        fmt.Println(r)
+    }
+}</code></pre>
+
+<div class="warn">
+  <strong>Ojo con la variable del bucle.</strong> En Go anterior a 1.22, capturar <code>u</code> directamente en la goroutine daba un bug clásico (todas veían el último valor). Por eso lo pasamos como argumento: <code>go func(url string){...}(u)</code>. En Go 1.22+ ya está arreglado, pero pasarlo explícito sigue siendo lo más claro.
+</div>
+
+<div class="analogy">
+  <strong>El WaitGroup es como un contador de mochilas en una excursión.</strong> Sumás uno por cada persona que sale (<code>Add</code>), cada una avisa cuando vuelve (<code>Done</code>), y el guía no cierra el portón (<code>Wait</code>) hasta que el contador llega a cero. Sin él, cerrás el channel antes de que vuelvan todos.
+</div>
+
+<ol>
+  <li><strong>Secuencial primero:</strong> chequeá las URLs una por una en un <code>for</code>. Cronometralo con <code>time.Since</code>.</li>
+  <li><strong>Paralelizá:</strong> lanzá una goroutine por URL, sumando al <code>WaitGroup</code>.</li>
+  <li><strong>Recolectá:</strong> mandá cada resultado por un channel y leelos en el <code>main</code>.</li>
+  <li><strong>Cerrá bien:</strong> usá una goroutine con <code>wg.Wait(); close(results)</code> para terminar el <code>range</code>.</li>
+  <li><strong>Compará:</strong> medí el tiempo paralelo vs el secuencial y mirá la diferencia.</li>
+</ol>
+
+<div class="tip">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Las N URLs se chequean en paralelo y se imprime el status de cada una.</li>
+    <li>El programa termina limpio (no se cuelga esperando un channel que nunca cierra).</li>
+    <li>Una URL caída no rompe el programa: se reporta como error y las demás siguen.</li>
+    <li>El tiempo paralelo es notablemente menor que el secuencial.</li>
+  </ul>
+</div>
+
+<h2>📦 Proyecto 4 — Paquete reutilizable con tests</h2>
+
+<p><strong>Objetivo:</strong> diseñar un paquete con una API limpia, basada en una <strong>interfaz</strong>, y cubrirlo con <strong>tests table-driven</strong>. Es el proyecto menos vistoso pero el más "senior": acá practicás diseño de software, no solo escribir código que corre. Ejemplos: un validador, una calculadora de impuestos, un cache simple, un formateador.</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>Módulo del curso</th></tr></thead>
+<tbody>
+<tr><td>Definir el contrato con una <code>interface</code></td><td>M06 — Interfaces</td></tr>
+<tr><td>Organizar el código en un paquete propio</td><td>M10 — Paquetes &amp; testing</td></tr>
+<tr><td>Tests table-driven con <code>testing</code></td><td>M10 — Paquetes &amp; testing</td></tr>
+<tr><td>Errores como valores en la API pública</td><td>M07 — Errores</td></tr>
+</tbody>
+</table>
+
+<p>La API basada en interfaz (define <em>qué hace</em>, no <em>cómo</em>):</p>
+
+<pre><code class="lang-go">package validador
+
+// Regla es el contrato: cualquier validación implementa esto.
+type Regla interface {
+    Validar(valor string) error
+}
+
+// Distintas implementaciones cumplen la misma interfaz.
+type NoVacio struct{}
+
+func (NoVacio) Validar(v string) error {
+    if v == "" {
+        return errors.New("el valor no puede estar vacío")
+    }
+    return nil
+}</code></pre>
+
+<p>El test table-driven (un caso por fila, un solo bloque de lógica):</p>
+
+<pre><code class="lang-go">func TestNoVacio(t *testing.T) {
+    casos := []struct {
+        nombre  string
+        entrada string
+        quiereErr bool
+    }{
+        {"vacío da error", "", true},
+        {"con texto ok", "hola", false},
+    }
+    for _, c := range casos {
+        t.Run(c.nombre, func(t *testing.T) {
+            err := NoVacio{}.Validar(c.entrada)
+            if (err != nil) != c.quiereErr {
+                t.Errorf("Validar(%q): err=%v, quiereErr=%v", c.entrada, err, c.quiereErr)
+            }
+        })
+    }
+}</code></pre>
+
+<div class="info">
+  El nombre del archivo de test debe terminar en <code>_test.go</code> y cada test ser <code>func TestXxx(t *testing.T)</code>. Corrés todo con <code>go test ./...</code> y ves la cobertura con <code>go test -cover</code>.
+</div>
+
+<ol>
+  <li><strong>Diseñá la interfaz primero:</strong> ¿cuál es el contrato mínimo? Una o dos firmas, no más.</li>
+  <li><strong>Implementá:</strong> al menos dos tipos que cumplan esa interfaz.</li>
+  <li><strong>Tests table-driven:</strong> una tabla de casos (positivos y negativos) recorrida con <code>t.Run</code>.</li>
+  <li><strong>API pública limpia:</strong> exportá solo lo necesario (mayúscula inicial); el resto, privado.</li>
+  <li><strong>Documentá:</strong> un comentario arriba de cada función exportada (estilo godoc).</li>
+</ol>
+
+<div class="rule">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>El paquete expone una API basada en interfaz, con al menos dos implementaciones.</li>
+    <li><code>go test ./...</code> pasa con casos positivos <em>y</em> negativos.</li>
+    <li>Otro paquete (un <code>main</code> de ejemplo) puede importarlo y usarlo sin tocar internals.</li>
+    <li>Las funciones exportadas tienen comentario godoc.</li>
+  </ul>
+</div>
+
+<h2>🎓 Cierre del curso — ¿qué sigue?</h2>
+
+<p>Con estos cuatro proyectos cubriste el corazón de Go en producción: HTTP, concurrencia, diseño con interfaces y testing. Desde acá, el camino se abre en cuatro direcciones muy demandadas:</p>
+
+<ul>
+  <li><strong>Frameworks web</strong> — <a href="https://gin-gonic.com/" target="_blank">Gin</a>, <a href="https://echo.labstack.com/" target="_blank">Echo</a> o <a href="https://github.com/go-chi/chi" target="_blank">Chi</a> te dan routing, middleware y manejo de params encima del <code>net/http</code> que ya conocés. Tu acortador de URLs es el lugar ideal para migrar a uno de ellos.</li>
+  <li><strong>Bases de datos</strong> — el paquete estándar <code>database/sql</code> (con un driver de Postgres o SQLite) reemplaza el <code>map</code> en memoria por persistencia real.</li>
+  <li><strong>gRPC</strong> — para comunicación entre servicios con contratos fuertes (protobuf). Es donde Go domina en arquitecturas de microservicios.</li>
+  <li><strong>Docker</strong> — el superpoder de Go: como compila a un único binario estático, podés meterlo en una imagen <code>scratch</code> o <code>distroless</code> de pocos MB. Tu CLI o tu API entran en un contenedor diminuto que arranca al instante.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 El binario único es la ventaja que se nota al deployar.</strong> Un <code>Dockerfile</code> multi-stage compila el binario y lo copia a una imagen <code>FROM scratch</code>: el resultado pesa megabytes, no gigabytes, no trae runtime ni sistema operativo de más, y arranca en milisegundos. Esa es la razón concreta por la que la nube eligió Go.
+</div>
+
+<h3>Checkpoint — repaso final</h3>
+
+<details><summary>¿Por qué hay que proteger un <code>map</code> con Mutex en el acortador de URLs?</summary>
+<p>Porque un <code>map</code> de Go no es seguro para acceso concurrente. Un servidor HTTP atiende muchas requests en goroutines distintas a la vez; si dos escriben el map simultáneamente, el runtime aborta con <code>fatal error: concurrent map writes</code>. El <code>sync.Mutex</code> garantiza que solo una goroutine toque el map por vez. Se detecta con <code>go run -race</code>.</p></details>
+
+<details><summary>En el worker concurrente, ¿para qué sirve el <code>WaitGroup</code> y por qué se cierra el channel en una goroutine aparte?</summary>
+<p>El <code>WaitGroup</code> cuenta cuántas goroutines lanzaste (<code>Add</code>) y cuántas terminaron (<code>Done</code>), y <code>Wait</code> bloquea hasta que todas acaben. Cerramos el channel en <code>go func(){ wg.Wait(); close(results) }()</code> porque el <code>range</code> sobre el channel en el <code>main</code> necesita que el channel se cierre para terminar — y solo podemos cerrarlo cuando sabemos que ninguna goroutine va a escribir más, es decir, después del <code>Wait</code>.</p></details>
+
+<details><summary>¿Por qué diseñar el paquete alrededor de una interfaz en vez de funciones sueltas?</summary>
+<p>La interfaz define el contrato (<em>qué</em> hace) separado de la implementación (<em>cómo</em>). Eso permite tener varias implementaciones intercambiables, escribir tests con implementaciones falsas (mocks/stubs) sin tocar la real, y que quien usa el paquete dependa del contrato y no de los detalles internos. Es la base del código desacoplado y testeable.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Elegí UNO de los cuatro proyectos y completalo de punta a punta siguiendo sus fases.</li>
+  <li>En el que elijas, corré la verificación de su callout "✅ Terminado cuando..." punto por punto.</li>
+  <li>Al acortador o al worker, pasale <code>go run -race .</code> y confirmá que no hay data races.</li>
+  <li>Tomá tu CLI o tu API y escribí un <code>Dockerfile</code> multi-stage que compile el binario y lo copie a una imagen <code>scratch</code>. Mirá cuántos MB pesa la imagen final.</li>
+  <li>Subí el proyecto terminado a un repo: es la mejor carta de presentación de que sabés Go.</li>
+</ol>
+
+<section class="quiz" id="quizGo12">
+  <style>
+    #quizGo12{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo12 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo12 .q{margin-bottom:1.5rem}
+    #quizGo12 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo12 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo12 .opt:hover{border-color:var(--accent)}
+    #quizGo12 .opt:disabled{cursor:default}
+    #quizGo12 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo12 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo12 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo12 .exp.show{display:block}
+    #quizGo12 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación — repaso del curso</h3>
+
+  <div class="q" data-c="1">
+    <p>1. En el acortador de URLs, varias requests escriben el mismo <code>map</code> a la vez. ¿Qué necesitás para que no crashee?</p>
+    <button class="opt">Nada, los maps de Go son seguros para concurrencia</button>
+    <button class="opt">Proteger el acceso con un <code>sync.Mutex</code> (Lock/Unlock)</button>
+    <button class="opt">Usar <code>try/catch</code> alrededor de la escritura</button>
+    <div class="exp">Los maps de Go NO son concurrent-safe: dos escrituras simultáneas abortan con <code>fatal error: concurrent map writes</code>. El <code>sync.Mutex</code> serializa el acceso. Go ni siquiera tiene <code>try/catch</code> — los errores son valores (M07).</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. En el worker concurrente, ¿para qué se usa el <code>sync.WaitGroup</code>?</p>
+    <button class="opt">Para hacer el código más rápido automáticamente</button>
+    <button class="opt">Para convertir goroutines en funciones normales</button>
+    <button class="opt">Para esperar a que TODAS las goroutines terminen antes de seguir</button>
+    <div class="exp">El <code>WaitGroup</code> cuenta goroutines con <code>Add</code>/<code>Done</code>, y <code>Wait</code> bloquea hasta que el contador llega a cero. Así sabés cuándo cerrar el channel de resultados sin perder ninguno.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Por qué Go es tan cómodo para deployar en Docker (su "superpoder")?</p>
+    <button class="opt">Compila a un único binario estático que entra en una imagen mínima (scratch/distroless)</button>
+    <button class="opt">Porque se interpreta y no necesita compilarse</button>
+    <button class="opt">Porque incluye su propio sistema operativo en el binario</button>
+    <div class="exp">Go compila a un binario nativo sin dependencias externas, así que una imagen <code>FROM scratch</code> con solo ese binario pesa megabytes y arranca al instante. No es interpretado (es compilado) ni trae un SO adentro.</div>
+  </div>
+
+  <div class="score" id="scoreGo12"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo12');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo12').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el Curso de Go. A construir.' : '  — repasá las que fallaste; ya sabés dónde buscar.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m11-http-api/lecture.html">← M11: API REST</a>
+  <a href="../index.html">Volver al syllabus →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 30 — Red Neuronal desde Cero · Campus CS-FE</title>
+<meta name="description" content="Construí una red neuronal (MLP) desde cero, sin librerías: forward, backpropagation y descenso de gradiente escritos a mano. Mirala razonar XOR, círculos y espirales en vivo.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../../Curso ingenieria sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">🧠 M40 Deep Learning</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 30</span>
+  <span class="badge nivel-avan">🟠 Avanzado</span>
+  <span class="badge">⏱ ~1 semana</span>
+  <span class="badge">JS puro / sin librerías</span>
+</div>
+
+<article>
+
+<h1>🧠 Red Neuronal desde Cero</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> construir una red neuronal <strong>desde cero, sin TensorFlow ni PyTorch</strong> — solo arrays y matemática. Vas a escribir el <em>forward pass</em>, la <strong>backpropagation</strong> y el descenso de gradiente a mano, y vas a <em>ver</em> a la red <strong>razonar</strong> un patrón: ajustar sus pesos hasta doblar una frontera de decisión que separa dos clases. Es el proyecto que destapa la caja negra: después de esto, ningún framework de IA te va a parecer magia.
+</div>
+
+<p style="text-align:center;margin:1.2rem 0">
+  <a href="./demos/red-neuronal-app.html" style="display:inline-block;background:linear-gradient(135deg,var(--accent),var(--accent-2,#8b5cf6));color:#0f172a;font-weight:700;text-decoration:none;padding:.7rem 1.4rem;border-radius:10px">▶ Entrenar la red REAL en vivo</a>
+  <br><span style="color:var(--muted);font-size:.85em">No es una maqueta — es una red <code>2→oculta→1</code> con backprop escrito a mano. Cambiá el dataset, el learning rate y las neuronas, y mirá la frontera formarse píxel a píxel.</span>
+</p>
+
+<h2>Cómo funciona — forward, error, backprop, repetir</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 230" role="img" aria-label="MLP: dos entradas, capa oculta con tanh, salida con sigmoide; el error vuelve por backpropagation ajustando los pesos">
+  <defs>
+    <marker id="fw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#58a6ff"/></marker>
+    <marker id="bw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#fb7185"/></marker>
+  </defs>
+  <!-- capas -->
+  <text x="70"  y="26" text-anchor="middle" fill="#3fb950" font-size="11" font-family="system-ui" font-weight="700">entrada (x, y)</text>
+  <text x="370" y="26" text-anchor="middle" fill="#58a6ff" font-size="11" font-family="system-ui" font-weight="700">capa oculta · tanh</text>
+  <text x="690" y="26" text-anchor="middle" fill="#fbbf24" font-size="11" font-family="system-ui" font-weight="700">salida · sigmoide</text>
+  <!-- nodos entrada -->
+  <circle cx="70" cy="90" r="20" fill="#1f2638" stroke="#3fb950" stroke-width="2"/><text x="70" y="95" text-anchor="middle" fill="#e8edf4" font-size="13">x</text>
+  <circle cx="70" cy="150" r="20" fill="#1f2638" stroke="#3fb950" stroke-width="2"/><text x="70" y="155" text-anchor="middle" fill="#e8edf4" font-size="13">y</text>
+  <!-- nodos ocultos -->
+  <circle cx="370" cy="60"  r="17" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <circle cx="370" cy="110" r="17" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <circle cx="370" cy="160" r="17" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <circle cx="370" cy="200" r="17" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <!-- nodo salida -->
+  <circle cx="690" cy="120" r="20" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/><text x="690" y="125" text-anchor="middle" fill="#e8edf4" font-size="12">ŷ</text>
+  <!-- conexiones entrada->oculta -->
+  <g stroke="#58a6ff" stroke-width="1" opacity=".5">
+    <line x1="90" y1="90" x2="353" y2="60"/><line x1="90" y1="90" x2="353" y2="110"/><line x1="90" y1="90" x2="353" y2="160"/><line x1="90" y1="90" x2="353" y2="200"/>
+    <line x1="90" y1="150" x2="353" y2="60"/><line x1="90" y1="150" x2="353" y2="110"/><line x1="90" y1="150" x2="353" y2="160"/><line x1="90" y1="150" x2="353" y2="200"/>
+  </g>
+  <!-- conexiones oculta->salida -->
+  <g stroke="#fbbf24" stroke-width="1" opacity=".55">
+    <line x1="387" y1="60" x2="670" y2="120"/><line x1="387" y1="110" x2="670" y2="120"/><line x1="387" y1="160" x2="670" y2="120"/><line x1="387" y1="200" x2="670" y2="120"/>
+  </g>
+  <!-- forward arrow -->
+  <line x1="120" y1="40" x2="640" y2="40" stroke="#58a6ff" stroke-width="2" marker-end="url(#fw)"/>
+  <text x="380" y="35" text-anchor="middle" fill="#58a6ff" font-size="10" font-family="system-ui">FORWARD: cada peso multiplica y suma → activación</text>
+  <!-- backward arrow -->
+  <line x1="640" y1="218" x2="120" y2="218" stroke="#fb7185" stroke-width="2" marker-end="url(#bw)"/>
+  <text x="380" y="215" text-anchor="middle" fill="#fb7185" font-size="10" font-family="system-ui">BACKPROP: el error (ŷ − y) vuelve y corrige cada peso por su culpa</text>
+</svg>
+<figcaption>Una red es solo <strong>multiplicaciones y sumas</strong> hacia adelante (forward) y una <strong>repartición de la culpa</strong> hacia atrás (backprop). El learning rate decide cuánto corregís en cada paso. Repetir miles de veces = "aprender".</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>Qué es de verdad una <strong>neurona</strong>: <code>activación(Σ wᵢxᵢ + b)</code>.</li>
+  <li>El <strong>forward pass</strong>: cómo fluye un dato de la entrada a la predicción.</li>
+  <li><strong>Backpropagation</strong> con la regla de la cadena — repartir el error a cada peso.</li>
+  <li><strong>Descenso de gradiente</strong>: <code>w ← w − lr · ∂L/∂w</code> (lo de M40, pero en una red entera).</li>
+  <li>Por qué <strong>XOR necesita una capa oculta</strong> (el problema que congeló la IA en los 70).</li>
+  <li><strong>Hiperparámetros</strong>: learning rate, tamaño de la capa, sobreajuste vs generalización.</li>
+</ul>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong> este proyecto materializa
+  <a href="../../Curso ingenieria sistemas/area-08-inteligencia-y-datos/m40-deep-learning/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M40 Deep Learning</a> (forward, backprop, el simulador de gradient descent),
+  <a href="../../Curso ingenieria sistemas/area-01-matematicas-y-teoria/m03-calculo/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M03 Cálculo</a> (derivadas = gradiente) y
+  <a href="../../Curso ingenieria sistemas/area-01-matematicas-y-teoria/m02-algebra-lineal/lecture.html" onclick="this.href=this.href.replace(/ /g,'%20')">M02 Álgebra Lineal</a> (vectores y matrices de pesos) y el
+  <a href="../Curso-Python/modulo-14-numpy/lecture.html">M14 NumPy</a> del Curso de Python (la sintaxis exacta para escribirlo: <code>@</code>, <code>reshape</code>, <code>np.tanh</code>).
+  Es el <strong>paso previo</strong> a usar un framework: una vez que entendés esto, el <a href="./16-clasificador-imagenes.html">P16 Clasificador CNN</a> deja de ser una caja negra.
+</div>
+
+<h2>Stack</h2>
+<p>JavaScript puro + <code>&lt;canvas&gt;</code>. Cero librerías — la idea es escribir vos la matemática. (En "producción" usarías PyTorch/TensorFlow, pero acá el objetivo es <em>entender el motor</em>.)</p>
+
+<h2>Fases</h2>
+
+<div class="fase"><strong>Fase 1 — Una neurona y el forward pass.</strong> Una neurona toma entradas, las pondera, suma un sesgo y pasa todo por una <strong>activación</strong> no-lineal (acá <code>tanh</code> en la capa oculta, <code>sigmoide</code> en la salida para dar una probabilidad 0–1).</div>
+
+<pre><code>// Red: 2 entradas → H neuronas ocultas (tanh) → 1 salida (sigmoide)
+function forward(x0, x1) {
+  const a1 = new Array(H);
+  for (let i = 0; i &lt; H; i++) {
+    const z = W1[i][0]*x0 + W1[i][1]*x1 + b1[i];  // suma ponderada
+    a1[i] = Math.tanh(z);                          // activación no-lineal
+  }
+  let z2 = b2;
+  for (let i = 0; i &lt; H; i++) z2 += W2[i] * a1[i];
+  const out = 1 / (1 + Math.exp(-z2));             // sigmoide → probabilidad
+  return { a1, out };
+}</code></pre>
+
+<div class="fase"><strong>Fase 2 — Medir el error.</strong> Comparás la predicción <code>ŷ</code> con la etiqueta real <code>y</code>. Para clasificación se usa <strong>entropía cruzada binaria</strong> (BCE): castiga fuerte estar seguro y equivocado.</div>
+
+<pre><code>// BCE: -[ y·log(ŷ) + (1-y)·log(1-ŷ) ]   (ε evita log(0))
+loss += -(y * Math.log(out + 1e-7) + (1 - y) * Math.log(1 - out + 1e-7));</code></pre>
+
+<div class="fase"><strong>Fase 3 — Backpropagation (el corazón).</strong> El error vuelve hacia atrás por la <strong>regla de la cadena</strong>, calculando cuánto contribuyó cada peso. Con BCE + sigmoide, el gradiente de la salida se simplifica hermosamente a <code>(ŷ − y)</code>.</div>
+
+<pre><code>const dz2 = out - y;                       // ✨ gradiente de la salida (BCE+sigmoide)
+
+// capa de salida
+for (let i = 0; i &lt; H; i++) W2[i] -= lr * dz2 * a1[i];
+b2 -= lr * dz2;
+
+// capa oculta (derivada de tanh = 1 - a²)
+for (let i = 0; i &lt; H; i++) {
+  const dz1 = dz2 * W2[i] * (1 - a1[i]*a1[i]);
+  W1[i][0] -= lr * dz1 * x0;
+  W1[i][1] -= lr * dz1 * x1;
+  b1[i]    -= lr * dz1;
+}</code></pre>
+
+<blockquote>El <code>-= lr * gradiente</code> ES el descenso de gradiente: movés cada peso un pasito en la dirección que baja el error. Repetir esto por todos los datos, muchas épocas, es <strong>todo</strong> lo que significa "entrenar una red".</blockquote>
+
+<div class="fase"><strong>Fase 4 — Visualizar el razonamiento.</strong> Pintá el <code>&lt;canvas&gt;</code>: para cada píxel corré <code>forward()</code> y coloreá según la clase que la red predice. Encima dibujá los puntos reales. Vas a <em>ver</em> la frontera de decisión doblarse a medida que entrena.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>La red aprende <strong>XOR</strong> con ≥4 neuronas ocultas (y NO lo logra con 1 — comprobalo).</li>
+    <li>La pérdida baja época a época y la precisión sube hacia 100%.</li>
+    <li>Ves la frontera de decisión formarse en el canvas en tiempo real.</li>
+    <li>Subir el learning rate demasiado <strong>desestabiliza</strong> el entrenamiento (lo ves).</li>
+    <li>Resolvés círculo y espiral subiendo las neuronas ocultas.</li>
+  </ul>
+</div>
+
+<h2>Variantes para subir de nivel</h2>
+<ol>
+  <li><strong>Más capas</strong>: agregá una segunda capa oculta (red "profunda") y generalizá el backprop.</li>
+  <li><strong>Otras activaciones</strong>: probá ReLU en vez de tanh y compará la velocidad de aprendizaje.</li>
+  <li><strong>Mini-batch + momentum</strong>: en vez de SGD puro, promediá gradientes y agregá inercia.</li>
+  <li><strong>Regularización</strong>: L2 o dropout para frenar el sobreajuste en la espiral.</li>
+  <li><strong>Dibujar tu propio dataset</strong>: clickear en el canvas para poner puntos de cada clase.</li>
+  <li><strong>Migrar a un framework</strong>: reimplementá lo mismo en PyTorch y verás que hace exactamente esto, pero con autograd. → <a href="./16-clasificador-imagenes.html">P16</a>.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./18-analisis-datos-eda.html">← Análisis de Datos (EDA)</a>
+  <a href="./16-clasificador-imagenes.html">Siguiente: Clasificador CNN (con framework) →</a>
+</nav>
+
+</div>
+</body>
+</html>

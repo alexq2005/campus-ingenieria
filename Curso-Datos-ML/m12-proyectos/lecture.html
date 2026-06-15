@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 12 — Proyectos Integradores · Curso de Datos & ML</title>
+  <meta name="description" content="Cuatro proyectos integradores que cierran el curso: regresión de precios, clasificación, análisis end-to-end y una red neuronal en PyTorch. Pone en práctica todo el pipeline.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 12</span>
+  <span class="badge">🎓 Capstone</span>
+  <span class="badge">🎯 Pre-req: todo el curso</span>
+</div>
+
+<article>
+
+<h1>Módulo 12 — Proyectos Integradores</h1>
+
+<p>Llegaste al final. Recorriste todo el pipeline: <code>cargar → limpiar → explorar → visualizar → modelar → evaluar</code>. Cada módulo te enseñó una pieza por separado. Ahora toca lo más parecido al trabajo real: <strong>integrar todas las piezas en proyectos completos</strong>, de punta a punta, vos solo.</p>
+
+<div class="info">
+  Esta guía no te da más teoría — te da <strong>estructura</strong>. Cuatro proyectos, cada uno con su objetivo, los módulos que aplica, las fases en orden, y un criterio claro de cuándo está terminado. Elegí uno, seguí las fases, y no avances de fase hasta tener la anterior funcionando.
+</div>
+
+<div class="rule">
+  <strong>📌 Regla que vale para los cuatro proyectos:</strong> trabajá en un notebook, separá <strong>train/test desde el principio</strong> (M06), nunca espíes el test antes de tiempo, y documentá tus hallazgos con texto + gráficos. Un proyecto de datos que nadie puede entender no sirve.
+</div>
+
+<h2>🏠 Proyecto 1 — Predecir precios de casas</h2>
+
+<p><strong>Objetivo:</strong> dado un dataset con características de viviendas (metros, habitaciones, ubicación, antigüedad…), entrenar un modelo de <strong>regresión</strong> que prediga el precio. Es el "hola mundo" del ML supervisado con variable continua. Usá un dataset tipo <em>California housing</em> (viene en <code>sklearn.datasets</code>) o cualquier CSV inmobiliario.</p>
+
+<table>
+<thead><tr><th>Pieza del proyecto</th><th>Módulo que aplica</th></tr></thead>
+<tbody>
+<tr><td>Cargar el CSV / dataset</td><td>M02 (pandas)</td></tr>
+<tr><td>Limpiar nulos, tipos, outliers</td><td>M03 (limpieza)</td></tr>
+<tr><td>EDA: correlaciones, distribuciones</td><td>M04 (EDA)</td></tr>
+<tr><td>Gráficos de relación precio vs features</td><td>M05 (visualización)</td></tr>
+<tr><td>Modelo de regresión</td><td>M07 (regresión)</td></tr>
+<tr><td>Validación cruzada + Pipeline</td><td>M09 (validación / Pipeline)</td></tr>
+</tbody>
+</table>
+
+<p>Las fases, en orden:</p>
+
+<ol>
+  <li><strong>Cargar y entender la forma.</strong> <code>df.shape</code>, <code>df.head()</code>, <code>df.describe()</code>. ¿Cuántas filas? ¿Qué columna es el target (precio)?</li>
+  <li><strong>Limpiar.</strong> Tratá nulos, revisá tipos, detectá y decidí qué hacer con outliers de precio.</li>
+  <li><strong>EDA.</strong> ¿Qué features correlacionan más con el precio? Una matriz de correlación y un par de scatter plots te lo dicen.</li>
+  <li><strong>Separar train/test.</strong> <code>train_test_split</code> antes de tocar el modelo.</li>
+  <li><strong>Modelar.</strong> Empezá con <code>LinearRegression</code>; después probá un modelo más fuerte (árbol / random forest).</li>
+  <li><strong>Evaluar.</strong> Reportá métricas en el test (MAE, RMSE, R²) y compará tus modelos.</li>
+  <li><strong>Pipeline.</strong> Envolvé escalado + modelo en un <code>Pipeline</code> de sklearn para que sea reproducible.</li>
+</ol>
+
+<pre><code class="lang-python">from sklearn.datasets import fetch_california_housing
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+
+X, y = fetch_california_housing(return_X_y=True, as_frame=True)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model", LinearRegression()),
+])
+pipe.fit(X_train, y_train)
+pred = pipe.predict(X_test)
+
+print("MAE:", mean_absolute_error(y_test, pred))
+print("R2 :", r2_score(y_test, pred))</code></pre>
+
+<div class="rule">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>Cargaste, limpiaste y exploraste el dataset (con al menos 2 gráficos de EDA).</li>
+    <li>Separaste train/test <em>antes</em> de modelar.</li>
+    <li>Entrenaste al menos 2 modelos y los comparaste con métricas en el test.</li>
+    <li>Tu mejor modelo vive dentro de un <code>Pipeline</code> reproducible.</li>
+    <li>Escribiste 1 párrafo: qué feature pesa más en el precio y cuál fue tu mejor R².</li>
+  </ul>
+</div>
+
+<h2>🌸 Proyecto 2 — Clasificador (Iris o Titanic)</h2>
+
+<p><strong>Objetivo:</strong> predecir una <strong>categoría</strong> en vez de un número. Con <em>Iris</em> clasificás la especie de la flor (3 clases, dataset limpio, ideal para empezar). Con <em>Titanic</em> predecís quién sobrevivió (binario, con datos sucios reales que te obligan a hacer <strong>feature engineering</strong>). Elegí según cuánto desafío quieras.</p>
+
+<table>
+<thead><tr><th>Pieza del proyecto</th><th>Módulo que aplica</th></tr></thead>
+<tbody>
+<tr><td>Carga y exploración</td><td>M02–M04</td></tr>
+<tr><td>Feature engineering (variables nuevas, encoding)</td><td>M03 + M09</td></tr>
+<tr><td>Modelo de clasificación</td><td>M08 (clasificación)</td></tr>
+<tr><td>Métricas: accuracy, precision, recall, F1</td><td>M08</td></tr>
+<tr><td>Matriz de confusión (gráfico)</td><td>M05 + M08</td></tr>
+</tbody>
+</table>
+
+<p>Las fases, en orden:</p>
+
+<ol>
+  <li><strong>Cargar y mirar las clases.</strong> ¿Están balanceadas? <code>df["target"].value_counts()</code>.</li>
+  <li><strong>Feature engineering.</strong> Convertí categóricas a números (one-hot / encoding), creá features útiles (en Titanic: tamaño de familia, título extraído del nombre).</li>
+  <li><strong>Separar train/test</strong> y entrenar un clasificador (<code>LogisticRegression</code> o <code>RandomForestClassifier</code>).</li>
+  <li><strong>Evaluar con las métricas correctas.</strong> Accuracy sola engaña con clases desbalanceadas — mirá precision, recall y F1.</li>
+  <li><strong>Matriz de confusión.</strong> Visualizá dónde se equivoca el modelo (¿confunde clase A con B?).</li>
+</ol>
+
+<pre><code class="lang-python">from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+
+clf.fit(X_train, y_train)
+pred = clf.predict(X_test)
+
+print(classification_report(y_test, pred))   # precision, recall, F1 por clase
+ConfusionMatrixDisplay.from_predictions(y_test, pred)</code></pre>
+
+<div class="mistake"><strong>Reportar solo accuracy.</strong> Si el 90% de los pasajeros no sobrevivió, un modelo que predice "no sobrevivió" siempre tiene 90% accuracy y es inútil. Por eso mirás recall y F1.</div>
+
+<div class="tip">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>Convertiste las variables categóricas a numéricas correctamente.</li>
+    <li>Creaste al menos 1 feature nueva (si elegiste Titanic).</li>
+    <li>Reportaste accuracy, precision, recall y F1 — no solo accuracy.</li>
+    <li>Graficaste la matriz de confusión y explicaste dónde falla el modelo.</li>
+  </ul>
+</div>
+
+<h2>📈 Proyecto 3 — Análisis de un dataset real, de punta a punta</h2>
+
+<p><strong>Objetivo:</strong> este proyecto <em>no modela</em>. El foco es la <strong>ciencia de datos pura</strong>: tomar un dataset real (ventas, clima, deportes, salud, lo que te interese), recorrerlo entero y <strong>comunicar hallazgos</strong>. La habilidad que entrenás acá — sacar una historia de los datos — es la que más se usa en el día a día.</p>
+
+<table>
+<thead><tr><th>Fase</th><th>Módulo que aplica</th></tr></thead>
+<tbody>
+<tr><td>Cargar (CSV / Excel / API)</td><td>M02</td></tr>
+<tr><td>Limpiar (nulos, duplicados, tipos)</td><td>M03</td></tr>
+<tr><td>Explorar (groupby, agregaciones, correlaciones)</td><td>M04</td></tr>
+<tr><td>Visualizar (los gráficos que cuentan la historia)</td><td>M05</td></tr>
+</tbody>
+</table>
+
+<p>Las fases, en orden:</p>
+
+<ol>
+  <li><strong>Elegí un dataset que te interese de verdad.</strong> Vas a mirarlo mucho — que el tema te enganche.</li>
+  <li><strong>Cargá y limpiá.</strong> Dejá los datos en condiciones: tipos correctos, nulos tratados, sin duplicados.</li>
+  <li><strong>Hacé al menos 5 preguntas a los datos.</strong> "¿Qué mes vende más?", "¿hay relación entre X e Y?", "¿qué grupo tiene el valor más alto?". Respondé cada una con <code>groupby</code> / agregaciones.</li>
+  <li><strong>Visualizá cada hallazgo.</strong> Un gráfico por pregunta. Que se entienda sin que vos lo expliques.</li>
+  <li><strong>Escribí las conclusiones.</strong> 3–5 insights en lenguaje claro, como si se lo contaras a alguien que no programa.</li>
+</ol>
+
+<div class="analogy">
+  <strong>🔍 Sos un detective, no un programador.</strong> Los datos son la escena del crimen; tu trabajo es encontrar la historia escondida y contarla. El código es solo la lupa.
+</div>
+
+<div class="rule">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>El dataset está limpio (tipos, nulos, duplicados resueltos).</li>
+    <li>Respondiste al menos 5 preguntas con código (groupby / agregaciones).</li>
+    <li>Cada hallazgo tiene su gráfico claro y bien etiquetado.</li>
+    <li>Escribiste 3–5 insights en lenguaje claro, sin jerga técnica.</li>
+  </ul>
+</div>
+
+<h2>🔢 Proyecto 4 — Red neuronal en PyTorch (dígitos MNIST)</h2>
+
+<p><strong>Objetivo:</strong> dar el salto al <strong>deep learning</strong>. Entrenás una red neuronal que reconoce dígitos escritos a mano (0–9) del clásico dataset <em>MNIST</em>. Es el "hola mundo" de las redes neuronales y conecta directamente con los proyectos del campus <a href="../../proyectos/30-red-neuronal.html">P30 Red Neuronal desde Cero</a> y <a href="../../proyectos/16-clasificador-imagenes.html">P16 Clasificador de Imágenes</a>.</p>
+
+<table>
+<thead><tr><th>Pieza del proyecto</th><th>Módulo que aplica</th></tr></thead>
+<tbody>
+<tr><td>Tensores y carga de datos</td><td>M10 (PyTorch / tensores)</td></tr>
+<tr><td>Definir la red (capas, activaciones)</td><td>M10–M11</td></tr>
+<tr><td>Loop de entrenamiento (loss, optimizer, backprop)</td><td>M11 (entrenar una red)</td></tr>
+<tr><td>Evaluar accuracy en el test set</td><td>M08 + M11</td></tr>
+</tbody>
+</table>
+
+<p>Las fases, en orden:</p>
+
+<ol>
+  <li><strong>Cargar MNIST</strong> con <code>torchvision.datasets.MNIST</code> y armar los <code>DataLoader</code> de train y test.</li>
+  <li><strong>Definir la red.</strong> Una red simple (entrada 784 → capa oculta → salida 10) ya alcanza para empezar.</li>
+  <li><strong>Elegir loss y optimizer.</strong> <code>CrossEntropyLoss</code> + <code>Adam</code> o <code>SGD</code>.</li>
+  <li><strong>Entrenar.</strong> El loop clásico: forward → calcular loss → <code>backward()</code> → <code>optimizer.step()</code>, por varias épocas.</li>
+  <li><strong>Evaluar.</strong> Accuracy sobre el test set. Una red simple bien entrenada pasa el 95% en MNIST.</li>
+</ol>
+
+<pre><code class="lang-python">import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Flatten(),
+    nn.Linear(28 * 28, 128),
+    nn.ReLU(),
+    nn.Linear(128, 10),
+)
+loss_fn = nn.CrossEntropyLoss()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for epoch in range(5):
+    for X, y in train_loader:
+        pred = model(X)            # forward
+        loss = loss_fn(pred, y)    # ¿cuánto se equivoca?
+        opt.zero_grad()
+        loss.backward()            # backprop
+        opt.step()                 # actualizar pesos</code></pre>
+
+<div class="concept">
+  <strong>💡 El loop de entrenamiento es siempre el mismo.</strong> Sea MNIST, texto o lo que sea: <em>forward → loss → backward → step</em>, repetido en épocas. Si entendés este ciclo, entendés el corazón del deep learning.
+</div>
+
+<div class="tip">
+  <strong>✅ Terminado cuando…</strong>
+  <ul>
+    <li>Cargaste MNIST y armaste los DataLoader de train y test.</li>
+    <li>Definiste una red y la entrenaste por varias épocas (la loss baja).</li>
+    <li>Evaluaste accuracy en el test set (apuntá a &gt;95%).</li>
+    <li>Mostraste algunas predicciones junto a la imagen real del dígito.</li>
+  </ul>
+</div>
+
+<h2>🎓 Cierre del curso — ¿qué sigue?</h2>
+
+<p>Terminaste el pipeline completo y lo aplicaste en proyectos reales. Eso es una base sólida. A partir de acá, los caminos para seguir creciendo:</p>
+
+<table>
+<thead><tr><th>Camino</th><th>Qué es</th></tr></thead>
+<tbody>
+<tr><td><strong>MLOps</strong></td><td>Poner modelos en producción: servirlos como API, versionarlos, monitorearlos, reentrenar cuando se degradan.</td></tr>
+<tr><td><strong>Modelos avanzados</strong></td><td><code>XGBoost</code> / gradient boosting (gana competencias con datos tabulares) y <strong>transformers</strong> (la arquitectura detrás de los LLM).</td></tr>
+<tr><td><strong>Competir en Kaggle</strong></td><td>Datasets reales, problemas con leaderboard y soluciones públicas de otros para aprender. La mejor forma de practicar.</td></tr>
+<tr><td><strong>Teoría profunda</strong></td><td>El <a href="../../index.html">área 08 de Ingeniería en Sistemas</a> del campus para los fundamentos matemáticos y de cómputo detrás de todo esto.</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  La ciencia de datos no se aprende leyendo — se aprende <strong>haciendo</strong>. Elegí uno de estos cuatro proyectos hoy, abrí un notebook, y empezá por la fase 1. El resto se construye solo.
+</div>
+
+<h3>Checkpoint — repaso de todo el curso</h3>
+
+<details><summary>¿Cuál es el flujo completo de un proyecto de datos?</summary>
+<p><code>cargar → limpiar → explorar → visualizar → modelar → evaluar</code>. Conseguís los datos, los dejás en condiciones, los entendés, los graficás, entrenás un modelo y verificás si generaliza a datos nuevos.</p></details>
+
+<details><summary>¿Cuándo usás regresión y cuándo clasificación?</summary>
+<p>Regresión cuando predecís un <strong>número continuo</strong> (precio de una casa, temperatura). Clasificación cuando predecís una <strong>categoría</strong> (sobrevivió/no, especie de flor, dígito 0–9). El Proyecto 1 es regresión; el 2 y el 4 son clasificación.</p></details>
+
+<details><summary>¿Por qué un buen análisis no siempre necesita un modelo?</summary>
+<p>Porque mucho valor está en <em>entender y comunicar</em> los datos. El Proyecto 3 no modela nada: limpiar, explorar, visualizar y sacar insights claros ya resuelve problemas reales. Modelar es un paso más, no el único objetivo.</p></details>
+
+<h2>Ejercicio final</h2>
+
+<ol>
+  <li>Elegí <strong>uno</strong> de los cuatro proyectos según lo que más te interese.</li>
+  <li>Abrí un notebook y completá <strong>todas las fases</strong> en orden, sin saltearte ninguna.</li>
+  <li>Separá train/test desde el principio (en los proyectos que modelan).</li>
+  <li>Documentá tus hallazgos con texto + al menos 2 gráficos.</li>
+  <li>Verificá el criterio de "✅ Terminado cuando…" del proyecto que elegiste antes de darlo por cerrado.</li>
+</ol>
+
+<section class="quiz" id="quizDML12">
+  <style>
+    #quizDML12{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML12 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML12 .q{margin-bottom:1.5rem}
+    #quizDML12 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML12 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML12 .opt:hover{border-color:var(--accent)}
+    #quizDML12 .opt:disabled{cursor:default}
+    #quizDML12 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML12 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML12 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML12 .exp.show{display:block}
+    #quizDML12 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación — repaso del curso</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Querés predecir el <strong>precio</strong> de una casa (un número). ¿Qué tipo de problema es?</p>
+    <button class="opt">Clasificación</button>
+    <button class="opt">Regresión</button>
+    <button class="opt">Clustering</button>
+    <div class="exp">El precio es un valor continuo, así que es regresión (Proyecto 1). La clasificación predice categorías; el clustering agrupa sin etiquetas.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu dataset tiene 90% de una clase y 10% de otra. ¿Por qué la accuracy sola no alcanza?</p>
+    <button class="opt">Porque pandas no la calcula bien</button>
+    <button class="opt">Porque la regresión no usa accuracy</button>
+    <button class="opt">Porque un modelo que siempre predice la clase mayoritaria tiene 90% y es inútil — hay que mirar precision, recall y F1</button>
+    <div class="exp">Con clases desbalanceadas la accuracy engaña. Por eso en clasificación reportás también precision, recall y F1, y mirás la matriz de confusión.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cuál es el ciclo correcto del loop de entrenamiento de una red neuronal?</p>
+    <button class="opt">forward → loss → backward → optimizer.step()</button>
+    <button class="opt">backward → forward → step → loss</button>
+    <button class="opt">loss → step → forward → backward</button>
+    <div class="exp">Primero el forward (predecir), después calculás la loss, hacés backward (backprop) y actualizás los pesos con step. Es siempre el mismo ciclo, repetido por épocas.</div>
+  </div>
+
+  <div class="score" id="scoreDML12"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML12');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML12').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Cerraste el curso. Ahora a construir.' : '  — repasá las que fallaste; ya casi.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m11-entrenar-red/lecture.html">← M11: Entrenar una Red</a>
+  <a href="../index.html">Volver al syllabus →</a>
+</nav>
+
+</div>
+</body>
+</html>

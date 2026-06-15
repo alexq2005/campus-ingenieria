@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 11 — API REST con net/http · Curso de Go</title>
+  <meta name="description" content="Servidor HTTP con la librería estándar de Go: handlers, rutas, leer el request, JSON con encoding/json y status codes. Sin frameworks.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 11</span>
+  <span class="badge">⏱ ~60 min</span>
+  <span class="badge">🎯 Pre-req: M06, M07</span>
+</div>
+
+<article>
+
+<h1>Módulo 11 — API REST con net/http</h1>
+
+<p>Una de las cosas más sorprendentes de Go es que <strong>no necesitás un framework para levantar un servidor web</strong>. La librería estándar trae <code>net/http</code>: un servidor HTTP completo, listo para producción, que potencia proyectos reales. En este módulo construís una API REST que recibe y devuelve JSON, leyendo el request y respondiendo con los status codes correctos.</p>
+
+<h2>El servidor está en la stdlib</h2>
+
+<div class="concept">
+  <strong>💡 <code>net/http</code> no es un juguete didáctico.</strong> Es el mismo paquete que usan servicios en producción que atienden millones de requests. Frameworks como Gin o Echo le agregan azúcar (routing más cómodo, middleware), pero por debajo casi todos se apoyan en <code>net/http</code>. Entender la base te da independencia: arrancás sin instalar nada.
+</div>
+
+<p>Un servidor HTTP en Go se reduce a dos ideas: <strong>handlers</strong> (funciones que responden a un request) y un <strong>router</strong> que decide qué handler atiende cada ruta. Eso es todo lo que necesitás para empezar.</p>
+
+<h2>El handler: la pieza central</h2>
+
+<p>Un handler es una función con esta firma exacta:</p>
+
+<pre><code class="lang-go">func(w http.ResponseWriter, r *http.Request)</code></pre>
+
+<div class="rule">
+  <strong>📌 Los dos parámetros:</strong> <code>w</code> (un <code>http.ResponseWriter</code>) es por donde <strong>escribís la respuesta</strong> que recibe el cliente. <code>r</code> (un <code>*http.Request</code>) es el <strong>request entrante</strong>: de ahí leés método, URL, query params, headers y body. Regla mental: <strong>de <code>r</code> se lee, en <code>w</code> se escribe.</strong>
+</div>
+
+<p>El handler más simple posible:</p>
+
+<pre><code class="lang-go">func saludar(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintln(w, "¡Hola desde Go!")
+}</code></pre>
+
+<p><code>fmt.Fprintln</code> escribe en cualquier destino que sea un "writer" — y <code>w</code> lo es. Lo que escribas ahí viaja como cuerpo de la respuesta HTTP.</p>
+
+<h2>Registrar rutas y arrancar</h2>
+
+<p>Con el handler escrito, lo asociás a una ruta y prendés el servidor:</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func saludar(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintln(w, "¡Hola desde Go!")
+}
+
+func main() {
+    http.HandleFunc("/saludo", saludar)
+    fmt.Println("Servidor en http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}</code></pre>
+
+<ul>
+  <li><code>http.HandleFunc("/saludo", saludar)</code> dice: "cuando llegue un request a <code>/saludo</code>, llamá a <code>saludar</code>".</li>
+  <li><code>http.ListenAndServe(":8080", nil)</code> arranca el servidor en el puerto 8080 y se queda escuchando. El <code>nil</code> significa "usá el router por defecto" (donde <code>HandleFunc</code> registró las rutas).</li>
+</ul>
+
+<p>Probalo desde otra terminal:</p>
+
+<pre><code class="lang-bash">go run main.go
+# en otra terminal:
+curl http://localhost:8080/saludo
+# → ¡Hola desde Go!</code></pre>
+
+<div class="info">
+  <strong>Tu propio router con <code>http.ServeMux</code>.</strong> En vez del router global podés crear uno explícito: <code>mux := http.NewServeMux()</code>, registrar con <code>mux.HandleFunc(...)</code> y pasarlo a <code>http.ListenAndServe(":8080", mux)</code>. Es más prolijo en apps grandes (evita el estado global) y facilita los tests, pero la idea es idéntica.
+</div>
+
+<h2>Leer del request</h2>
+
+<p>El <code>*http.Request</code> trae todo lo que mandó el cliente. Lo que más vas a usar:</p>
+
+<table>
+<thead><tr><th>Qué querés</th><th>Cómo</th></tr></thead>
+<tbody>
+<tr><td>Método HTTP</td><td><code>r.Method</code> → <code>"GET"</code>, <code>"POST"</code>, ...</td></tr>
+<tr><td>Path de la URL</td><td><code>r.URL.Path</code> → <code>"/usuarios"</code></td></tr>
+<tr><td>Query param <code>?q=...</code></td><td><code>r.URL.Query().Get("q")</code></td></tr>
+<tr><td>Cuerpo del request</td><td><code>r.Body</code> (un stream que leés/decodificás)</td></tr>
+<tr><td>Un header</td><td><code>r.Header.Get("Authorization")</code></td></tr>
+</tbody>
+</table>
+
+<p>Por ejemplo, ramificar según el método y leer un query param:</p>
+
+<pre><code class="lang-go">func buscar(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "solo GET", http.StatusMethodNotAllowed)
+        return
+    }
+    termino := r.URL.Query().Get("q")   // de /buscar?q=go saca "go"
+    fmt.Fprintf(w, "Buscando: %s\n", termino)
+}</code></pre>
+
+<h2>JSON con encoding/json</h2>
+
+<p>Las APIs REST hablan JSON. Go lo maneja con el paquete <code>encoding/json</code> y unos <strong>struct tags</strong> que mapean campos de Go a claves JSON.</p>
+
+<div class="rule">
+  <strong>📌 Los struct tags.</strong> Un campo de struct debe empezar con mayúscula para que <code>encoding/json</code> pueda verlo (la exportación de M07). El tag <code>`json:"nombre"`</code> entre comillas invertidas le dice qué clave usar en el JSON. Sin tag, la clave sería el nombre del campo tal cual (<code>Nombre</code>, con mayúscula).
+</div>
+
+<pre><code class="lang-go">type Tarea struct {
+    ID      int    `json:"id"`
+    Titulo  string `json:"titulo"`
+    Hecha   bool   `json:"hecha"`
+}</code></pre>
+
+<p><strong>Responder JSON</strong> (codificar un struct y escribirlo en <code>w</code>):</p>
+
+<pre><code class="lang-go">func obtenerTarea(w http.ResponseWriter, r *http.Request) {
+    t := Tarea{ID: 1, Titulo: "Aprender net/http", Hecha: false}
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(t)
+}</code></pre>
+
+<p>Eso produce: <code>{"id":1,"titulo":"Aprender net/http","hecha":false}</code></p>
+
+<p><strong>Leer JSON</strong> del body de un POST (decodificarlo dentro de un struct):</p>
+
+<pre><code class="lang-go">func crearTarea(w http.ResponseWriter, r *http.Request) {
+    var t Tarea
+    if err := json.NewDecoder(r.Body).Decode(&amp;t); err != nil {
+        http.Error(w, "JSON inválido", http.StatusBadRequest)
+        return
+    }
+    // t ya tiene los datos que mandó el cliente
+    fmt.Printf("Nueva tarea: %+v\n", t)
+}</code></pre>
+
+<div class="info">
+  <code>Decode(&amp;t)</code> recibe un <strong>puntero</strong> a <code>t</code> (el <code>&amp;</code> de M06) porque tiene que <em>modificar</em> esa variable rellenando sus campos. <code>NewEncoder(w).Encode(t)</code> escribe directo en <code>w</code> — no arma un string intermedio, hace streaming.
+</div>
+
+<h2>Status codes</h2>
+
+<p>El código de estado HTTP le dice al cliente cómo salió todo. Por defecto Go responde <code>200 OK</code>; para otro código lo seteás vos:</p>
+
+<table>
+<thead><tr><th>Situación</th><th>Código</th><th>Cómo</th></tr></thead>
+<tbody>
+<tr><td>Todo bien (GET)</td><td>200 OK</td><td>(por defecto)</td></tr>
+<tr><td>Recurso creado (POST)</td><td>201 Created</td><td><code>w.WriteHeader(http.StatusCreated)</code></td></tr>
+<tr><td>Datos del cliente mal</td><td>400 Bad Request</td><td><code>http.Error(w, msg, http.StatusBadRequest)</code></td></tr>
+<tr><td>Método no permitido</td><td>405</td><td><code>http.Error(w, msg, http.StatusMethodNotAllowed)</code></td></tr>
+<tr><td>No existe</td><td>404 Not Found</td><td><code>http.Error(w, msg, http.StatusNotFound)</code></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>⚠️ Orden importa:</strong> <code>w.WriteHeader(code)</code> tiene que ir <strong>antes</strong> de escribir el body. Una vez que mandás bytes al cuerpo, el header ya salió y un <code>WriteHeader</code> posterior se ignora (con un warning). Y solo se puede llamar una vez.
+</div>
+
+<h2>Ejemplo completo: API con 2 endpoints</h2>
+
+<p>Un servidor con <code>GET /tarea</code> (devuelve JSON) y <code>POST /tarea</code> (recibe JSON y responde 201):</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+type Tarea struct {
+    ID     int    `json:"id"`
+    Titulo string `json:"titulo"`
+    Hecha  bool   `json:"hecha"`
+}
+
+func manejarTarea(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+
+    switch r.Method {
+    case http.MethodGet:
+        t := Tarea{ID: 1, Titulo: "Aprender net/http", Hecha: false}
+        json.NewEncoder(w).Encode(t)
+
+    case http.MethodPost:
+        var t Tarea
+        if err := json.NewDecoder(r.Body).Decode(&amp;t); err != nil {
+            http.Error(w, "JSON inválido", http.StatusBadRequest)
+            return
+        }
+        t.ID = 42 // simulamos que la "base de datos" asignó un ID
+        w.WriteHeader(http.StatusCreated)
+        json.NewEncoder(w).Encode(t)
+
+    default:
+        http.Error(w, "método no permitido", http.StatusMethodNotAllowed)
+    }
+}
+
+func main() {
+    http.HandleFunc("/tarea", manejarTarea)
+    fmt.Println("Servidor en http://localhost:8080")
+    http.ListenAndServe(":8080", nil)
+}</code></pre>
+
+<p>Probalo con <code>curl</code>:</p>
+
+<pre><code class="lang-bash"># GET → devuelve la tarea
+curl http://localhost:8080/tarea
+
+# POST → manda JSON y recibe 201 con el id asignado
+curl -X POST http://localhost:8080/tarea \
+  -H "Content-Type: application/json" \
+  -d '{"titulo":"Comprar pan","hecha":false}'</code></pre>
+
+<div class="concept">
+  <strong>💡 Esto es la base del proyecto P06 — Acortador de URLs.</strong> Ese proyecto es exactamente esta estructura: un <code>POST /shorten</code> que recibe una URL larga, genera un código corto y lo guarda; y un <code>GET /{code}</code> que busca el código y redirige al original con <code>http.Redirect(w, r, urlLarga, http.StatusFound)</code>. Si entendés este módulo, el proyecto es ensamblar piezas que ya conocés.
+</div>
+
+<h2>Errores típicos al armar la API</h2>
+
+<div class="mistake"><strong>Olvidar <code>Content-Type: application/json</code>.</strong> Si no seteás <code>w.Header().Set("Content-Type", "application/json")</code>, el cliente (o el navegador) puede interpretar tu respuesta como texto plano. Seteá el header <em>antes</em> de escribir el body.</div>
+<div class="mistake"><strong>No chequear <code>r.Method</code>.</strong> Si no filtrás el método, tu endpoint de "crear" responde igual a un GET que a un POST. Validá el método y devolvé <code>405</code> si no corresponde.</div>
+<div class="mistake"><strong>Ignorar el error de <code>Decode</code>.</strong> Si el cliente manda JSON roto y no chequeás <code>if err != nil</code>, seguís adelante con un struct vacío y bugs silenciosos. Siempre validá y respondé <code>400</code> ante un body inválido.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la firma de un handler HTTP en Go y qué hace cada parámetro?</summary>
+<p><code>func(w http.ResponseWriter, r *http.Request)</code>. En <code>w</code> escribís la respuesta (body, headers, status code); de <code>r</code> leés el request (método, URL, query, body, headers). De <code>r</code> se lee, en <code>w</code> se escribe.</p></details>
+
+<details><summary>¿Cómo leés un JSON del body y cómo respondés con JSON?</summary>
+<p>Para leer: <code>json.NewDecoder(r.Body).Decode(&amp;v)</code>, donde <code>v</code> es un struct con tags y pasás un puntero (<code>&amp;v</code>). Para responder: seteás <code>w.Header().Set("Content-Type", "application/json")</code> y usás <code>json.NewEncoder(w).Encode(v)</code>.</p></details>
+
+<details><summary>¿Por qué un campo de struct tiene que empezar con mayúscula para serializarse a JSON?</summary>
+<p>Porque <code>encoding/json</code> está en otro paquete y solo puede acceder a campos <strong>exportados</strong> (mayúscula inicial). Un campo en minúscula es privado y el encoder lo ignora. El tag <code>`json:"..."`</code> controla qué nombre usa la clave en el JSON.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Levantá el servidor del ejemplo y pegale con <code>curl</code> tanto el <code>GET</code> como el <code>POST</code>. Confirmá que el POST devuelve el status <code>201</code> (agregale <code>-i</code> a curl para ver los headers).</li>
+  <li>Agregá un endpoint <code>GET /ping</code> que responda el texto <code>"pong"</code> (sin JSON). Registralo con otro <code>http.HandleFunc</code>.</li>
+  <li>En el handler, leé un query param: hacé que <code>GET /tarea?titulo=algo</code> devuelva una tarea cuyo <code>Titulo</code> sea ese valor.</li>
+  <li>Reemplazá el router global por un <code>http.NewServeMux()</code> explícito y pasáselo a <code>ListenAndServe</code>. Verificá que todo sigue funcionando igual.</li>
+  <li>Probá mandar un body roto al POST (<code>curl ... -d 'esto no es json'</code>) y confirmá que recibís <code>400 Bad Request</code> en vez de que el server crashee.</li>
+</ol>
+
+<section class="quiz" id="quizGo11">
+  <style>
+    #quizGo11{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo11 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo11 .q{margin-bottom:1.5rem}
+    #quizGo11 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo11 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo11 .opt:hover{border-color:var(--accent)}
+    #quizGo11 .opt:disabled{cursor:default}
+    #quizGo11 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo11 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo11 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo11 .exp.show{display:block}
+    #quizGo11 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. En la firma <code>func(w http.ResponseWriter, r *http.Request)</code>, ¿para qué sirve cada parámetro?</p>
+    <button class="opt">En <code>r</code> escribís la respuesta y de <code>w</code> leés el request</button>
+    <button class="opt">En <code>w</code> escribís la respuesta y de <code>r</code> leés el request</button>
+    <button class="opt">Los dos sirven para escribir la respuesta</button>
+    <div class="exp"><code>w</code> (ResponseWriter) es por donde escribís la respuesta; <code>r</code> (*Request) es el request entrante del que leés método, URL y body. De <code>r</code> se lee, en <code>w</code> se escribe.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Cómo decodificás el JSON del body de un POST dentro de un struct <code>t</code>?</p>
+    <button class="opt"><code>json.Marshal(r.Body, t)</code></button>
+    <button class="opt"><code>t = r.Body.JSON()</code></button>
+    <button class="opt"><code>json.NewDecoder(r.Body).Decode(&amp;t)</code></button>
+    <div class="exp">Se usa <code>json.NewDecoder(r.Body).Decode(&amp;t)</code>, pasando un puntero (<code>&amp;t</code>) porque el decoder tiene que modificar la variable rellenando sus campos. Siempre chequeá el error que devuelve.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Antes de escribir el body de la respuesta, ¿qué debés hacer para que el cliente reciba JSON con el status correcto al crear un recurso?</p>
+    <button class="opt">Setear <code>Content-Type: application/json</code> y llamar <code>w.WriteHeader(http.StatusCreated)</code> antes de escribir el body</button>
+    <button class="opt">Llamar <code>w.WriteHeader</code> después de escribir el body</button>
+    <button class="opt">Nada: Go detecta el JSON y el 201 automáticamente</button>
+    <div class="exp">El <code>Content-Type</code> y el <code>WriteHeader(201)</code> van <strong>antes</strong> de escribir el cuerpo: una vez que mandás bytes al body el header ya salió y un <code>WriteHeader</code> posterior se ignora.</div>
+  </div>
+
+  <div class="score" id="scoreGo11"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo11');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo11').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M12.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m10-paquetes-testing/lecture.html">← M10: Paquetes & Testing</a>
+  <a href="../m12-proyectos/lecture.html">M12: Proyectos →</a>
+</nav>
+
+</div>
+</body>
+</html>

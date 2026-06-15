@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 02 — Ownership · Curso de Rust</title>
+  <meta name="description" content="Ownership: el concepto que define a Rust. Un dueño por valor, move, Copy, Clone y cómo elimina bugs de memoria en compilación.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 02</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+</div>
+
+<article>
+
+<h1>Módulo 02 — Ownership</h1>
+
+<p>Llegamos al concepto que <strong>define</strong> a Rust y lo separa de todo lo demás. <em>Ownership</em> (propiedad) es el mecanismo por el cual Rust logra lo imposible: gestionar memoria de forma totalmente segura, sin garbage collector y sin que vos tengas que liberarla a mano. Si entendés ownership, entendés Rust. Si no, vas a pelearte con el compilador sin saber por qué.</p>
+
+<h2>La idea central: cada valor tiene UN dueño</h2>
+
+<div class="concept">
+  <strong>💡 Una sola regla lo gobierna todo.</strong> Cada valor en Rust tiene exactamente <strong>una variable que es su dueña</strong>. Cuando esa variable sale de <em>scope</em> (termina el bloque <code>{ }</code> donde vive), el valor se libera <strong>automáticamente</strong>. A eso se le llama <em>drop</em>. No hay <code>free()</code> manual como en C, ni un GC corriendo en segundo plano como en Java o Python: el compilador inserta la liberación exacta donde corresponde.
+</div>
+
+<p>Mirá este ejemplo. La variable <code>s</code> es la dueña de un <code>String</code>. Cuando el bloque termina, Rust llama a <code>drop</code> y libera la memoria sin que vos hagas nada:</p>
+
+<pre><code class="lang-rust">fn main() {
+    {
+        let s = String::from("hola"); // s es la dueña del String
+        println!("{}", s);            // se usa normalmente
+    } // &lt;- aquí termina el scope: s sale de alcance y el String se libera (drop)
+
+    // println!("{}", s); // ERROR: s ya no existe acá
+}</code></pre>
+
+<div class="info">
+  <strong>¿Por qué importa el scope?</strong> En Rust el <em>scope</em> es la región del código donde una variable es válida. El momento exacto en que una variable sale de scope es el momento exacto en que su valor se libera. No antes (sería use-after-free), no después (sería un leak). El compilador lo calcula por vos.
+</div>
+
+<h2>Move: transferir el ownership</h2>
+
+<p>Acá viene lo que confunde a todos los que llegan de otros lenguajes. ¿Qué pasa cuando asignás un valor a otra variable?</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s1 = String::from("hola");
+    let s2 = s1; // el ownership se MUEVE de s1 a s2
+
+    println!("{}", s1); // ERROR: value used after move
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Esto NO copia el String.</strong> Un <code>String</code> guarda en el stack un puntero al texto que vive en el heap. Si Rust copiara solo el puntero, <strong>dos</strong> variables apuntarían al mismo dato del heap, y al salir de scope ambas intentarían liberarlo → <em>double-free</em>. Para evitarlo, Rust <strong>mueve</strong> el ownership: tras <code>let s2 = s1;</code>, <code>s1</code> queda invalidada. Solo <code>s2</code> es dueña, solo <code>s2</code> liberará el dato. Usar <code>s1</code> después es error de compilación.
+</div>
+
+<p>El compilador te lo dice claramente:</p>
+
+<pre><code class="lang-text">error[E0382]: borrow of moved value: `s1`
+  --&gt; src/main.rs:5:20
+   |
+3  |     let s1 = String::from("hola");
+   |         -- move occurs because `s1` has type `String`,
+   |            which does not implement the `Copy` trait
+4  |     let s2 = s1;
+   |              -- value moved here
+5  |     println!("{}", s1);
+   |                    ^^ value borrowed here after move</code></pre>
+
+<h2>Copy: los tipos simples se copian, no se mueven</h2>
+
+<p>Si todo se moviera, trabajar con números sería un infierno. Por eso los tipos simples que viven enteramente en el <strong>stack</strong> implementan el trait <code>Copy</code>: al asignarlos se hace una copia barata y la variable original <strong>sigue siendo válida</strong>.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let x = 5;
+    let y = x; // x se COPIA en y (i32 es Copy)
+
+    println!("x = {}, y = {}", x, y); // OK: ambas valen 5
+}</code></pre>
+
+<table>
+<thead><tr><th>Implementan <code>Copy</code> (se copian)</th><th>NO implementan <code>Copy</code> (se mueven)</th></tr></thead>
+<tbody>
+<tr><td>Enteros (<code>i32</code>, <code>u64</code>…)</td><td><code>String</code></td></tr>
+<tr><td><code>bool</code></td><td><code>Vec&lt;T&gt;</code></td></tr>
+<tr><td><code>char</code></td><td>Cualquier tipo con datos en el heap</td></tr>
+<tr><td>Flotantes (<code>f64</code>, <code>f32</code>)</td><td>Structs propios (salvo que derives <code>Copy</code>)</td></tr>
+<tr><td>Tuplas de tipos <code>Copy</code></td><td>Tuplas que contienen algo no-<code>Copy</code></td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔗 Pensalo así:</strong> un valor <code>Copy</code> es como pasarle a alguien una <em>fotocopia</em> de un papel — los dos se quedan con el suyo. Un valor que se mueve es como pasarle el <em>papel original</em> — vos te quedás sin él. Por eso un <code>i32</code> se fotocopia (es chiquito y barato) pero un <code>String</code> se entrega (clonar el heap sería caro y silencioso).
+</div>
+
+<h2>Clone: copia profunda explícita</h2>
+
+<p>¿Y si <em>sí</em> querés conservar las dos? Pedís una copia profunda explícita con <code>.clone()</code>. Esto duplica también los datos del heap, así que cada variable es dueña de su propio dato:</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s1 = String::from("hola");
+    let s2 = s1.clone(); // copia PROFUNDA: duplica el dato del heap
+
+    println!("s1 = {}, s2 = {}", s1, s2); // OK: ambas válidas e independientes
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>clone()</code> es explícito a propósito.</strong> Rust nunca copia el heap "por las tuyas" — eso sería un costo oculto. Si ves <code>.clone()</code> en el código, sabés que ahí hay una asignación de memoria real. La claridad sobre el costo es una decisión de diseño del lenguaje.
+</div>
+
+<h2>Ownership y funciones</h2>
+
+<p>Pasar un valor a una función funciona igual que asignarlo a otra variable: si el tipo no es <code>Copy</code>, el ownership <strong>se mueve adentro de la función</strong>. Cuando la función termina, ese valor sale de scope y se libera — salvo que lo devuelvas.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s = String::from("hola");
+    consumir(s);          // el ownership de s se mueve a la función
+
+    // println!("{}", s); // ERROR: s ya fue movida adentro de consumir()
+
+    let n = 5;
+    copiar(n);            // n es i32 (Copy): se copia
+    println!("{}", n);    // OK: n sigue válida
+}
+
+fn consumir(texto: String) {
+    println!("recibí: {}", texto);
+} // &lt;- texto sale de scope acá y el String se libera
+
+fn copiar(numero: i32) {
+    println!("recibí: {}", numero);
+}</code></pre>
+
+<div class="info">
+  <strong>Adelanto del M03:</strong> mover el valor cada vez que llamás una función es incómodo (¿y si la función solo quiere <em>mirar</em> el dato sin quedárselo?). La solución idiomática son las <strong>referencias</strong> (<code>&amp;s</code>): le "prestás" el valor a la función sin transferir el ownership. Lo vemos en detalle en el próximo módulo.
+</div>
+
+<h2>Lo que esto elimina — en compilación</h2>
+
+<div class="rule">
+  <strong>📌 El modelo de ownership erradica tres clases enteras de bugs ANTES de ejecutar:</strong>
+  <ul>
+    <li><strong>use-after-free</strong> — usar memoria ya liberada: imposible, porque la variable invalidada no compila.</li>
+    <li><strong>double-free</strong> — liberar dos veces el mismo dato: imposible, porque solo hay un dueño que libera.</li>
+    <li><strong>memory leaks</strong> — memoria que nunca se libera: el drop automático al salir de scope la previene.</li>
+  </ul>
+  Otros lenguajes atrapan algunos de estos en runtime (con crashes) o nunca (con corrupción silenciosa). Rust los atrapa en <em>compile time</em>: si compila, esos bugs no están.
+</div>
+
+<h2>Errores típicos al empezar</h2>
+
+<div class="mistake"><strong>Usar una variable después de moverla.</strong> El error más común. <code>let s2 = s1;</code> y después tocar <code>s1</code> → <em>value used after move</em>. Recordá: tras un move, la variable original deja de existir.</div>
+<div class="mistake"><strong>Clonar todo para "callar" al compilador.</strong> Cuando el borrow checker se queja, es tentador resolverlo metiendo <code>.clone()</code> en todos lados. Funciona, pero clonás memoria que no hacía falta clonar. Casi siempre la respuesta correcta es una <strong>referencia</strong> (M03), no un clone. <code>clone()</code> es para cuando <em>de verdad</em> querés dos copias independientes.</div>
+
+<h2>Ejemplo completo: el move que falla y cómo arreglarlo</h2>
+
+<p>Este código no compila porque usa <code>s1</code> después de moverla a <code>s2</code>:</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s1 = String::from("Rust");
+    let s2 = s1;                       // ownership movido a s2
+    println!("{} y {}", s1, s2);       // ERROR: s1 ya no es válida
+}</code></pre>
+
+<p><strong>Fix con <code>clone()</code></strong> (cuando realmente necesitás dos Strings independientes):</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s1 = String::from("Rust");
+    let s2 = s1.clone();               // copia profunda: dos dueños, dos datos
+    println!("{} y {}", s1, s2);       // OK
+}</code></pre>
+
+<p><strong>Mejor opción (adelanto del M03): referencia.</strong> Si solo querés <em>leer</em> ambas sin duplicar memoria, prestás el valor con <code>&amp;</code>:</p>
+
+<pre><code class="lang-rust">fn main() {
+    let s1 = String::from("Rust");
+    let s2 = &amp;s1;                      // s2 es una referencia: NO mueve ni copia
+    println!("{} y {}", s1, s2);       // OK: s1 sigue siendo la dueña
+}</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué le pasa a un valor cuando su variable dueña sale de scope?</summary>
+<p>Se libera automáticamente: Rust llama a <code>drop</code> en ese punto exacto. No hay que liberar a mano (como en C) ni esperar a un garbage collector (como en Java/Python). El compilador inserta la liberación donde corresponde.</p></details>
+
+<details><summary>¿Por qué <code>let s2 = s1;</code> invalida a <code>s1</code> si <code>s1</code> es un <code>String</code>?</summary>
+<p>Porque el ownership se <em>mueve</em>. El <code>String</code> apunta a datos en el heap; si <code>s1</code> y <code>s2</code> quedaran ambas válidas, las dos intentarían liberar el mismo dato al salir de scope (double-free). Rust lo evita dejando un solo dueño: <code>s2</code>. Por eso <code>s1</code> deja de ser usable.</p></details>
+
+<details><summary>¿Por qué <code>let y = x;</code> con un <code>i32</code> NO invalida a <code>x</code>?</summary>
+<p>Porque <code>i32</code> implementa el trait <code>Copy</code>: vive enteramente en el stack y copiarlo es barato. Al asignarlo se hace una copia y <code>x</code> sigue válida. Solo los tipos con datos en el heap (como <code>String</code> o <code>Vec</code>) se mueven en vez de copiarse.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí un bloque <code>{ }</code> con un <code>String</code> adentro y, fuera del bloque, intentá usar esa variable. Leé el error y explicá con tus palabras por qué falla.</li>
+  <li>Reproducí el clásico: <code>let s1 = String::from("hola"); let s2 = s1;</code> y después <code>println!("{}", s1);</code>. Mirá el mensaje <em>value used after move</em>.</li>
+  <li>Arreglá el ejercicio anterior de DOS formas distintas: una con <code>.clone()</code> y otra con una referencia (<code>&amp;s1</code>). Compará cuál duplica memoria y cuál no.</li>
+  <li>Probá lo mismo pero con <code>let x = 5; let y = x; println!("{} {}", x, y);</code>. ¿Compila? Explicá por qué un <code>i32</code> se comporta distinto a un <code>String</code>.</li>
+  <li>Escribí una función <code>fn longitud(s: String) -&gt; usize</code> que reciba un <code>String</code> y devuelva su largo. Después de llamarla, intentá usar el <code>String</code> original en <code>main</code> y observá el error de move. (Spoiler: en el M03 lo vas a resolver con referencias.)</li>
+</ol>
+
+<section class="quiz" id="quizRs02">
+  <style>
+    #quizRs02{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs02 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs02 .q{margin-bottom:1.5rem}
+    #quizRs02 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs02 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs02 .opt:hover{border-color:var(--accent)}
+    #quizRs02 .opt:disabled{cursor:default}
+    #quizRs02 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs02 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs02 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs02 .exp.show{display:block}
+    #quizRs02 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tras <code>let s2 = s1;</code> donde <code>s1</code> es un <code>String</code>, ¿qué pasa con <code>s1</code>?</p>
+    <button class="opt">Sigue válida: ambas apuntan al mismo texto</button>
+    <button class="opt">Queda invalidada: el ownership se movió a <code>s2</code></button>
+    <button class="opt">Se copia el texto del heap automáticamente</button>
+    <div class="exp"><code>String</code> no es <code>Copy</code>, así que la asignación mueve el ownership a <code>s2</code>. Usar <code>s1</code> después es error de compilación (<em>value used after move</em>).</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Cuándo se libera la memoria de un valor en Rust?</p>
+    <button class="opt">Cuando el garbage collector decide pasar</button>
+    <button class="opt">Cuando vos llamás manualmente a <code>free()</code></button>
+    <button class="opt">Automáticamente, cuando su variable dueña sale de scope (drop)</button>
+    <div class="exp">No hay GC ni <code>free()</code> manual: el valor se libera (drop) exactamente cuando su dueño sale de scope. El compilador inserta la liberación por vos.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Querés conservar DOS <code>String</code> independientes a partir de uno. ¿Qué usás?</p>
+    <button class="opt"><code>let s2 = s1.clone();</code> — copia profunda explícita</button>
+    <button class="opt"><code>let s2 = s1;</code> — eso ya hace dos copias</button>
+    <button class="opt">No se puede: un String solo puede tener un dueño en todo el programa</button>
+    <div class="exp"><code>.clone()</code> duplica también los datos del heap, dando dos dueños independientes. La asignación simple movería (no copiaría), y un mismo dato puede tener un único dueño a la vez — pero podés crear copias con <code>clone()</code>.</div>
+  </div>
+
+  <div class="score" id="scoreRs02"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs02');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs02').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M03.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m01-sintaxis-tipos/lecture.html">← M01: Sintaxis</a>
+  <a href="../m03-borrowing-referencias/lecture.html">M03: Borrowing →</a>
+</nav>
+
+</div>
+</body>
+</html>

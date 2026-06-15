@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 25 — Macropad / Teclado Custom · Campus CS-FE</title>
+<meta name="description" content="Construí tu propio teclado/macropad: matriz de teclas, debounce, firmware HID por USB. Electrónica digital (E02) + microcontrolador (E03) hechos periférico real.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/e02-electronica-digital/lecture.html">⚡ E02 Digital</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 25</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">Firmware + USB HID</span>
+</div>
+
+<article>
+
+<h1>⌨️ Macropad / Teclado Custom</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> construir tu propio teclado —desde un macropad de 4 teclas hasta uno completo— que la computadora reconoce como un teclado real (USB HID), con cada tecla programable. Vas a entender por dentro algo que usás todos los días: cómo unos cuantos cables y un microcontrolador se convierten en un periférico que el sistema operativo entiende solo.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../Curso-Computacion-Fisica/e02-electronica-digital/lecture.html">E02 Electrónica Digital</a> (matriz, GPIO, lógica),
+  <a href="../Curso-Computacion-Fisica/e03-microcontroladores-1/lecture.html">E03 Microcontrolador</a> (firmware, USB),
+  <a href="../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m14-sistemas-operativos/lecture.html">M14 Sistemas Operativos</a> (drivers, HID) y
+  <a href="../Curso-Linux/modulo-05-procesos/lecture.html">Linux</a> (cómo el SO ve el dispositivo).
+</div>
+
+<h2>Cómo funciona — la matriz y el escaneo</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 200" role="img" aria-label="Las teclas se conectan en una matriz de filas y columnas; el micro escanea fila por fila para detectar qué tecla se apretó, y envía el código por USB HID">
+  <defs>
+    <marker id="k1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- matriz -->
+  <text x="120" y="20" text-anchor="middle" fill="#8b95a8" font-size="10" font-family="system-ui">matriz de teclas (E02)</text>
+  <line x1="40" y1="45" x2="200" y2="45" stroke="#58a6ff" stroke-width="2"/>
+  <line x1="40" y1="85" x2="200" y2="85" stroke="#58a6ff" stroke-width="2"/>
+  <line x1="40" y1="125" x2="200" y2="125" stroke="#58a6ff" stroke-width="2"/>
+  <text x="28" y="48" text-anchor="end" fill="#58a6ff" font-size="9" font-family="system-ui">F1</text>
+  <text x="28" y="88" text-anchor="end" fill="#58a6ff" font-size="9" font-family="system-ui">F2</text>
+  <text x="28" y="128" text-anchor="end" fill="#58a6ff" font-size="9" font-family="system-ui">F3</text>
+  <line x1="70" y1="35" x2="70" y2="140" stroke="#fbbf24" stroke-width="2"/>
+  <line x1="120" y1="35" x2="120" y2="140" stroke="#fbbf24" stroke-width="2"/>
+  <line x1="170" y1="35" x2="170" y2="140" stroke="#fbbf24" stroke-width="2"/>
+  <text x="70" y="158" text-anchor="middle" fill="#fbbf24" font-size="9" font-family="system-ui">C1</text>
+  <text x="120" y="158" text-anchor="middle" fill="#fbbf24" font-size="9" font-family="system-ui">C2</text>
+  <text x="170" y="158" text-anchor="middle" fill="#fbbf24" font-size="9" font-family="system-ui">C3</text>
+  <!-- una tecla marcada -->
+  <circle cx="120" cy="85" r="7" fill="#fb7185"/>
+  <text x="120" y="180" text-anchor="middle" fill="#fb7185" font-size="9" font-family="system-ui">apretada (F2·C2)</text>
+  <!-- micro -->
+  <line x1="200" y1="85" x2="250" y2="85" stroke="#f0883e" stroke-width="2" marker-end="url(#k1)"/>
+  <rect x="255" y="55" width="130" height="60" rx="8" fill="#1f2638" stroke="#f0883e" stroke-width="2.5"/>
+  <text x="320" y="80" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">🧠 micro (E03)</text>
+  <text x="320" y="97" text-anchor="middle" fill="#8b95a8" font-size="8.5" font-family="system-ui">escanea + debounce</text>
+  <line x1="385" y1="85" x2="430" y2="85" stroke="#f0883e" stroke-width="2" marker-end="url(#k1)"/>
+  <rect x="435" y="55" width="135" height="60" rx="8" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="502" y="80" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">USB HID</text>
+  <text x="502" y="97" text-anchor="middle" fill="#8b95a8" font-size="8.5" font-family="system-ui">"tecla K presionada"</text>
+  <line x1="570" y1="85" x2="615" y2="85" stroke="#f0883e" stroke-width="2" marker-end="url(#k1)"/>
+  <rect x="620" y="55" width="125" height="60" rx="8" fill="#1f2638" stroke="#3fb950" stroke-width="2"/>
+  <text x="682" y="80" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">💻 SO (M14)</text>
+  <text x="682" y="97" text-anchor="middle" fill="#8b95a8" font-size="8.5" font-family="system-ui">lo reconoce solo</text>
+</svg>
+<figcaption>Las teclas no tienen un cable cada una: se conectan en una <strong>matriz</strong> de filas × columnas (ahorra pines). El micro <em>escanea</em> fila por fila y detecta el cruce apretado. El <strong>debounce</strong> filtra el rebote mecánico del contacto, y el estándar <strong>USB HID</strong> hace que el SO lo reconozca sin instalar nada.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li><strong>Matriz de teclas</strong>: por qué N×M teclas usan solo N+M pines (E02).</li>
+  <li><strong>Escaneo</strong> fila por fila y detección de cruces (incluido el "ghosting" y los diodos).</li>
+  <li><strong>Debounce</strong>: filtrar el rebote del contacto mecánico (señal real vs ruido).</li>
+  <li><strong>USB HID</strong>: el estándar que hace que cualquier teclado funcione sin drivers (M14).</li>
+  <li>Firmware con <strong>QMK</strong> (o propio): capas, macros, teclas reprogramables.</li>
+  <li>Soldadura básica y armado de un periférico real.</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>Microcontrolador con USB nativo (RP2040 / Pro Micro / ESP32-S3) · switches mecánicos (o pulsadores para empezar) · diodos 1N4148 (anti-ghosting) · cables. Firmware: <strong>QMK</strong>/KMK (open source) o uno propio. Empezá con un macropad de 4 teclas en protoboard.</p>
+
+<h2>Código clave (escaneo + debounce + HID)</h2>
+
+<pre><code class="lang-cpp">// Escanear la matriz: activar una columna, leer las filas (E02/E03)
+for (int c = 0; c &lt; COLS; c++) {
+  digitalWrite(colPin[c], LOW);            // activar columna c
+  for (int f = 0; f &lt; FILAS; f++) {
+    bool pressed = (digitalRead(filaPin[f]) == LOW);
+    // Debounce: solo aceptar si el estado se mantiene N lecturas (no rebote)
+    if (estable(f, c, pressed) &amp;&amp; pressed &amp;&amp; !antes[f][c]) {
+      Keyboard.press(mapa[f][c]);          // envía por USB HID → el SO lo ve
+    }
+    antes[f][c] = pressed;
+  }
+  digitalWrite(colPin[c], HIGH);
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <strong>debounce</strong> es procesamiento de señal aplicado: el contacto mecánico "rebota" milisegundos y generaría decenas de pulsaciones falsas; filtrarlo es la misma idea de limpiar una señal ruidosa de E07. Y la matriz es lógica digital pura (E02): activás una columna, leés las filas, y el cruce te dice qué tecla. Los diodos evitan el "ghosting" (teclas fantasma) cuando apretás varias a la vez.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> 1 tecla → enviar una letra por USB HID. Que el SO la reciba como teclado real.</div>
+<div class="fase"><strong>Fase 2:</strong> matriz de 2×2 con escaneo. Detectá qué tecla se apretó.</div>
+<div class="fase"><strong>Fase 3:</strong> debounce robusto + diodos anti-ghosting (apretá varias juntas).</div>
+<div class="fase"><strong>Fase 4:</strong> firmware con capas/macros: una tecla que escribe un texto, otra que abre una app.</div>
+<div class="fase"><strong>Fase 5:</strong> armado físico: switches, soldadura, una carcasa (impresa 3D o cartón). Tu teclado de verdad.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>La compu lo reconoce como teclado sin instalar drivers.</li>
+    <li>Cada tecla hace lo que programaste; no hay pulsaciones fantasma ni dobles (debounce ok).</li>
+    <li>Funciona apretando varias teclas a la vez (anti-ghosting).</li>
+    <li>Tenés al menos una macro/capa útil para tu flujo de trabajo.</li>
+    <li>Entendés por qué la matriz ahorra pines y cómo el SO lo ve.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Teclado completo (60%) con QMK + keymap propio.</li>
+  <li>Encoder rotativo (volumen) + pantalla OLED de estado.</li>
+  <li>RGB por tecla (WS2812) — conecta con el Vúmetro (P12).</li>
+  <li>Bluetooth (ZMK) en vez de USB — inalámbrico.</li>
+  <li>Macropad de stream/edición con iconos en pantalla (tipo Stream Deck).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./index.html">← Galería</a>
+  <a href="./26-consola-retro.html">Siguiente: Consola Portátil Retro →</a>
+</nav>
+
+</div>
+</body>
+</html>

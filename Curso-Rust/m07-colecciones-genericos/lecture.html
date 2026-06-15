@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — Colecciones &amp; Genéricos · Curso de Rust</title>
+  <meta name="description" content="Vec, String y &str, HashMap, genéricos en funciones y structs, trait bounds e iteradores en Rust.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M04</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — Colecciones &amp; Genéricos</h1>
+
+<p>Hasta acá manejaste valores sueltos. Ahora vas a guardar <strong>muchos</strong> datos juntos con las colecciones del <em>standard library</em>: <code>Vec</code> (listas), <code>String</code> (texto) y <code>HashMap</code> (mapas clave-valor). Y descubrís cómo escribir código que funciona para <strong>cualquier tipo</strong> con <strong>genéricos</strong>, la herramienta que hace que <code>Vec&lt;T&gt;</code> sirva tanto para enteros como para textos.</p>
+
+<h2>Vec&lt;T&gt;: el arreglo dinámico</h2>
+
+<div class="concept">
+  <strong>💡 Un <code>Vec</code> es una lista que crece y se achica.</strong> A diferencia de un arreglo fijo (<code>[i32; 3]</code>), un <code>Vec&lt;T&gt;</code> vive en el heap y puede cambiar de tamaño en runtime. El <code>&lt;T&gt;</code> es el <em>tipo de los elementos</em>: <code>Vec&lt;i32&gt;</code> guarda enteros, <code>Vec&lt;String&gt;</code> guarda textos. Todos los elementos deben ser del mismo tipo.
+</div>
+
+<p>La forma más cómoda de crearlo es con la macro <code>vec!</code>. Después agregás elementos con <code>.push()</code>:</p>
+
+<pre><code class="lang-rust">let mut numeros = vec![1, 2, 3];
+numeros.push(4);
+numeros.push(5);
+// numeros ahora es [1, 2, 3, 4, 5]</code></pre>
+
+<div class="rule">
+  <strong>📌 Para usar <code>.push()</code> el <code>Vec</code> debe ser <code>mut</code>.</strong> Modificar la colección es mutarla, y en Rust mutar exige <code>let mut</code> (igual que cualquier variable).
+</div>
+
+<h3>Dos formas de leer un elemento</h3>
+
+<p>Indexar directo con <code>v[i]</code> es rápido, pero <strong>entra en pánico</strong> (crashea el programa) si el índice no existe. La alternativa segura es <code>.get(i)</code>, que devuelve un <code>Option</code> (lo viste en M04):</p>
+
+<pre><code class="lang-rust">let v = vec![10, 20, 30];
+
+let a = v[0];          // 10  — pánico si el índice no existe
+let b = v.get(1);      // Some(&amp;20)  — nunca crashea
+let c = v.get(99);     // None      — fuera de rango, seguro
+
+match v.get(99) {
+    Some(valor) =&gt; println!("hay: {}", valor),
+    None        =&gt; println!("no existe ese índice"),
+}</code></pre>
+
+<p>Para recorrer todos los elementos, usás <code>for</code>:</p>
+
+<pre><code class="lang-rust">let v = vec![10, 20, 30];
+for n in &amp;v {
+    println!("{}", n);
+}</code></pre>
+
+<div class="info">
+  <strong>¿Por qué <code>&amp;v</code> y no <code>v</code>?</strong> Iterar sobre <code>&amp;v</code> <em>presta</em> el vector (lo lee sin consumirlo), así que después del <code>for</code> seguís pudiendo usar <code>v</code>. Iterar sobre <code>v</code> directo lo <em>mueve</em> y lo consume (ownership, M03).
+</div>
+
+<h2>String vs &amp;str: dos formas de texto</h2>
+
+<p>Rust tiene <strong>dos tipos de texto</strong> y al principio confunde. La distinción es la misma idea de ownership: uno es dueño, el otro presta.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Qué es</th><th>Dueño del dato</th><th>Crece/cambia</th></tr></thead>
+<tbody>
+<tr><td><code>String</code></td><td>Texto UTF-8 en el heap</td><td>Sí (owned)</td><td>Sí, es mutable</td></tr>
+<tr><td><code>&amp;str</code></td><td>Una "vista" (slice) a un texto</td><td>No (prestado)</td><td>No, solo lectura</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔗 Analogía:</strong> <code>String</code> es <em>tu libro</em> — lo tenés, podés escribir en él, agregar páginas. <code>&amp;str</code> es <em>una foto de una página</em> de ese libro — la podés leer, pero no es tuya y no la podés modificar. Los literales que escribís entre comillas (<code>"hola"</code>) son <code>&amp;str</code>.
+</div>
+
+<pre><code class="lang-rust">let saludo: &amp;str = "hola";          // literal → &amp;str
+let mut nombre: String = String::from("Ada");  // owned, mutable
+
+nombre.push_str(" Lovelace");      // String puede crecer
+// nombre ahora es "Ada Lovelace"
+
+// Conversiones entre los dos:
+let s: String = "texto".to_string();   // &amp;str → String
+let r: &amp;str = &amp;nombre;                 // String → &amp;str (lo presta)</code></pre>
+
+<div class="tip">
+  <strong>✅ Regla práctica:</strong> en los <em>parámetros</em> de una función pedí <code>&amp;str</code> (acepta ambos y no te apropiás del dato); cuando necesitás <em>guardar</em> o construir texto, usá <code>String</code>.
+</div>
+
+<h2>HashMap&lt;K, V&gt;: clave → valor</h2>
+
+<div class="concept">
+  <strong>💡 Un <code>HashMap&lt;K, V&gt;</code> asocia claves con valores.</strong> Como un diccionario de Python o un objeto de JS: buscás por la <strong>clave</strong> (<code>K</code>) y obtenés el <strong>valor</strong> (<code>V</code>). Las búsquedas son rapidísimas (tiempo constante promedio) sin importar cuántos elementos haya.
+</div>
+
+<p>No viene en el <em>prelude</em>, así que hay que importarlo. Agregás pares con <code>.insert()</code> y leés con <code>.get()</code>:</p>
+
+<pre><code class="lang-rust">use std::collections::HashMap;
+
+let mut edades: HashMap&lt;String, i32&gt; = HashMap::new();
+edades.insert(String::from("Ada"), 36);
+edades.insert(String::from("Alan"), 41);
+
+// .get(&amp;k) devuelve Option&lt;&amp;V&gt;: Some si existe la clave, None si no
+let e = edades.get("Ada");        // Some(&amp;36)
+let x = edades.get("Grace");      // None
+
+match edades.get("Ada") {
+    Some(edad) =&gt; println!("Ada tiene {}", edad),
+    None        =&gt; println!("no está en el mapa"),
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>.get(&amp;k)</code> siempre devuelve <code>Option&lt;&amp;V&gt;</code>.</strong> El <code>Option</code> te obliga a manejar el caso "la clave no existe" — no podés ignorar que una búsqueda puede fallar. El <code>&amp;V</code> significa que te presta una referencia al valor, no te lo entrega.
+</div>
+
+<h2>Genéricos: código para cualquier tipo</h2>
+
+<p>¿Notaste el <code>&lt;T&gt;</code> en <code>Vec&lt;T&gt;</code>? Eso es un <strong>genérico</strong>: un "hueco" para un tipo que se decide más tarde. Gracias a los genéricos, los autores de la stdlib escribieron <code>Vec</code> <em>una sola vez</em> y vos lo usás con cualquier tipo.</p>
+
+<p>Vos también podés escribir funciones genéricas. Imaginá querer "el mayor de dos valores" para enteros, decimales, textos… sin repetir la función:</p>
+
+<pre><code class="lang-rust">fn mayor&lt;T: PartialOrd&gt;(a: T, b: T) -&gt; T {
+    if a &gt; b { a } else { b }
+}
+
+fn main() {
+    println!("{}", mayor(3, 7));          // funciona con i32 → 7
+    println!("{}", mayor(2.5, 1.1));      // funciona con f64 → 2.5
+    println!("{}", mayor("abc", "xyz"));  // funciona con &amp;str → xyz
+}</code></pre>
+
+<div class="info">
+  <strong>Leelo así:</strong> <code>fn mayor&lt;T: PartialOrd&gt;(a: T, b: T) -&gt; T</code> dice "para algún tipo <code>T</code> que se pueda ordenar, recibí dos <code>T</code> y devolveme un <code>T</code>". El <code>&lt;T&gt;</code> después del nombre <em>declara</em> el tipo genérico.
+</div>
+
+<h3>Structs genéricos</h3>
+
+<p>Los <code>struct</code> (M05) también aceptan genéricos. Un <code>Par&lt;T&gt;</code> guarda dos valores del mismo tipo, sea cual sea:</p>
+
+<pre><code class="lang-rust">struct Par&lt;T&gt; {
+    a: T,
+    b: T,
+}
+
+fn main() {
+    let enteros = Par { a: 1, b: 2 };           // Par&lt;i32&gt;
+    let textos  = Par { a: "hola", b: "chau" }; // Par&lt;&amp;str&gt;
+    println!("{} {}", enteros.a, textos.b);
+}</code></pre>
+
+<h2>Trait bounds: poner condiciones al genérico</h2>
+
+<div class="concept">
+  <strong>💡 Un <em>trait bound</em> restringe qué tipos se permiten.</strong> En <code>&lt;T: PartialOrd&gt;</code>, el <code>: PartialOrd</code> exige que <code>T</code> sea un tipo <em>comparable con <code>&gt;</code> y <code>&lt;</code></em>. Sin ese bound, Rust no te deja escribir <code>a &gt; b</code>: no todos los tipos saben compararse. El bound es una <strong>promesa</strong> que el compilador verifica.
+</div>
+
+<p>Vas a ver bounds comunes como <code>Clone</code> (se puede copiar), <code>Debug</code> (se puede imprimir con <code>{:?}</code>) o <code>PartialOrd</code> (se puede ordenar). Los <strong>traits</strong> se profundizan en el M08 — por ahora alcanza con saber que un bound dice "este genérico tiene que saber hacer X".</p>
+
+<div class="warn">
+  <strong>⚠️ El bound no es opcional cuando usás la capacidad.</strong> Si dentro de la función comparás (<code>&gt;</code>), sumás (<code>+</code>) o clonás (<code>.clone()</code>) un valor genérico <code>T</code>, <strong>tenés</strong> que declarar el bound correspondiente — si no, el código no compila.
+</div>
+
+<h2>Iteradores: recorrer con estilo</h2>
+
+<p>Los <strong>iteradores</strong> son la forma idiomática de transformar colecciones en Rust. En vez de un <code>for</code> con índices, encadenás operaciones declarativas:</p>
+
+<pre><code class="lang-rust">let numeros = vec![1, 2, 3, 4, 5, 6];
+
+let pares_x10: Vec&lt;i32&gt; = numeros
+    .iter()                       // recorre prestando cada elemento
+    .filter(|n| *n % 2 == 0)      // quedate solo con los pares
+    .map(|n| n * 10)              // multiplicá cada uno por 10
+    .collect();                   // junta el resultado en un Vec
+
+// pares_x10 == [20, 40, 60]</code></pre>
+
+<div class="info">
+  <strong>Lazy de verdad:</strong> los iteradores no hacen <em>nada</em> hasta que algo los consume. <code>.filter()</code> y <code>.map()</code> solo describen el plan; recién <code>.collect()</code> (o un <code>for</code>) lo ejecuta. Eso los hace eficientes: no se crean listas intermedias innecesarias.
+</div>
+
+<table>
+<thead><tr><th>Método</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>.iter()</code></td><td>Crea un iterador que presta cada elemento</td></tr>
+<tr><td><code>.map(|x| ...)</code></td><td>Transforma cada elemento</td></tr>
+<tr><td><code>.filter(|x| ...)</code></td><td>Deja pasar solo los que cumplen la condición</td></tr>
+<tr><td><code>.collect()</code></td><td>Junta el resultado en una colección (<code>Vec</code>, <code>String</code>, etc.)</td></tr>
+</tbody>
+</table>
+
+<h2>Errores típicos al empezar</h2>
+
+<div class="mistake"><strong>Indexar un <code>Vec</code> fuera de rango.</strong> <code>v[99]</code> en un vector de 3 elementos hace que el programa entre en <em>pánico</em> y crashee. Si no estás seguro de que el índice existe, usá <code>.get(99)</code>, que devuelve <code>None</code> en vez de explotar.</div>
+<div class="mistake"><strong>Olvidar el trait bound.</strong> Escribir <code>fn mayor&lt;T&gt;(a: T, b: T)</code> y dentro hacer <code>a &gt; b</code> no compila: faltó <code>&lt;T: PartialOrd&gt;</code>. El compilador no asume que cualquier <code>T</code> sabe compararse.</div>
+<div class="mistake"><strong>Mezclar <code>String</code> y <code>&amp;str</code> sin convertir.</strong> Pasar un <code>String</code> donde se espera <code>&amp;str</code> (o viceversa) sin <code>&amp;</code> o <code>.to_string()</code> da error de tipos. Recordá: <code>&amp;mi_string</code> lo convierte a <code>&amp;str</code>; <code>"x".to_string()</code> lo convierte a <code>String</code>.</div>
+
+<div class="danger">
+  <strong>🚨 El pánico por índice no se atrapa con <code>Option</code>.</strong> <code>v[i]</code> y <code>v.get(i)</code> son mundos distintos: el primero aborta, el segundo te da un <code>Option</code> para manejar a mano. En código robusto, preferí siempre <code>.get()</code> sobre la indexación cuando el índice viene de afuera (input del usuario, longitud variable, etc.).
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia entre <code>v[i]</code> y <code>v.get(i)</code> en un <code>Vec</code>?</summary>
+<p><code>v[i]</code> devuelve el valor directo pero entra en <em>pánico</em> (crashea) si el índice no existe. <code>v.get(i)</code> devuelve un <code>Option</code>: <code>Some(&amp;valor)</code> si existe, <code>None</code> si está fuera de rango — nunca crashea.</p></details>
+
+<details><summary>¿Qué devuelve <code>hashmap.get(&amp;clave)</code> y por qué?</summary>
+<p>Devuelve <code>Option&lt;&amp;V&gt;</code>: <code>Some(&amp;valor)</code> si la clave existe, <code>None</code> si no. Es un <code>Option</code> porque la clave podría no estar, y Rust te obliga a manejar ese caso en vez de asumir que siempre está.</p></details>
+
+<details><summary>En <code>fn mayor&lt;T: PartialOrd&gt;(...)</code>, ¿para qué sirve <code>: PartialOrd</code>?</summary>
+<p>Es un <em>trait bound</em>: restringe <code>T</code> a tipos que se pueden ordenar (comparar con <code>&gt;</code> y <code>&lt;</code>). Sin ese bound, el compilador no permite hacer <code>a &gt; b</code> porque no todos los tipos saben compararse.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un <code>let mut v = vec![1, 2, 3];</code>, hacé <code>v.push(4)</code> e imprimí cada elemento con un <code>for n in &amp;v</code>.</li>
+  <li>Usá <code>v.get(10)</code> sobre ese vector y manejá el resultado con un <code>match</code> que imprima "no existe" en el caso <code>None</code>.</li>
+  <li>Creá un <code>HashMap&lt;String, i32&gt;</code> con tres pares (nombre → puntaje). Buscá uno que exista y uno que no, e imprimí el resultado de cada <code>.get()</code>.</li>
+  <li>Escribí una función genérica <code>fn menor&lt;T: PartialOrd&gt;(a: T, b: T) -&gt; T</code> que devuelva el menor de dos valores, y probala con enteros y con <code>&amp;str</code>.</li>
+  <li>Partiendo de <code>vec![1, 2, 3, 4, 5]</code>, usá <code>.iter().filter(...).map(...).collect()</code> para obtener un <code>Vec&lt;i32&gt;</code> con los impares multiplicados por 100.</li>
+</ol>
+
+<section class="quiz" id="quizRs07">
+  <style>
+    #quizRs07{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs07 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs07 .q{margin-bottom:1.5rem}
+    #quizRs07 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs07 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs07 .opt:hover{border-color:var(--accent)}
+    #quizRs07 .opt:disabled{cursor:default}
+    #quizRs07 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs07 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs07 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs07 .exp.show{display:block}
+    #quizRs07 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué pasa si hacés <code>v[99]</code> en un <code>Vec</code> de 3 elementos?</p>
+    <button class="opt">Devuelve <code>None</code> de forma segura</button>
+    <button class="opt">El programa entra en pánico y crashea</button>
+    <button class="opt">Devuelve <code>0</code> por defecto</button>
+    <div class="exp">Indexar fuera de rango con <code>[]</code> produce un pánico. Para evitarlo usá <code>.get(99)</code>, que devuelve <code>None</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Qué devuelve <code>hashmap.get(&amp;clave)</code>?</p>
+    <button class="opt">Siempre el valor directo</button>
+    <button class="opt">Un <code>Result&lt;V, E&gt;</code></button>
+    <button class="opt">Un <code>Option&lt;&amp;V&gt;</code>: <code>Some</code> si existe la clave, <code>None</code> si no</button>
+    <div class="exp"><code>.get()</code> devuelve <code>Option&lt;&amp;V&gt;</code> porque la clave puede no existir; el <code>Option</code> te obliga a manejar ese caso.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. En <code>fn mayor&lt;T: PartialOrd&gt;(a: T, b: T) -&gt; T</code>, ¿qué hace <code>: PartialOrd</code>?</p>
+    <button class="opt">Restringe <code>T</code> a tipos que se pueden comparar/ordenar (trait bound)</button>
+    <button class="opt">Convierte <code>T</code> en un número</button>
+    <button class="opt">Hace que la función sea más rápida</button>
+    <div class="exp">Es un trait bound: limita <code>T</code> a tipos comparables. Sin él, <code>a &gt; b</code> no compila porque no todos los tipos saben ordenarse.</div>
+  </div>
+
+  <div class="score" id="scoreRs07"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs07');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs07').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M08.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m06-manejo-errores/lecture.html">← M06: Manejo de Errores</a>
+  <a href="../m08-traits/lecture.html">M08: Traits →</a>
+</nav>
+
+</div>
+</body>
+</html>

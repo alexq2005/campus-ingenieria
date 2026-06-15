@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🧠 Red Neuronal desde Cero — App real (MVP) · Campus CS-FE</title>
+<meta name="description" content="MVP funcionando: una red neuronal (MLP) escrita desde cero en JavaScript, sin librerías. Entrenala en vivo y mirá cómo backpropagation dobla la frontera de decisión para resolver XOR, círculos y espirales. Corre 100% en el navegador.">
+<style>
+  :root{--bg:#0f172a;--surface:#1e293b;--surface-2:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--accent-2:#8b5cf6;--c0:#38bdf8;--c1:#fb923c;--success:#10b981;--warn:#fbbf24;--danger:#fb7185;--border:#334155}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+  .topbar{display:flex;align-items:center;gap:.8rem;padding:.6rem 1rem;border-bottom:1px solid var(--border);background:var(--surface);flex-wrap:wrap}
+  .topbar a{color:var(--accent);text-decoration:none;font-size:.85em}
+  .topbar .marca{font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent-2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .demo-tag{font-size:.7em;background:rgba(16,185,129,.18);color:var(--success);padding:2px 8px;border-radius:999px;font-weight:700}
+  .app{flex:1;width:100%;max-width:860px;margin:0 auto;padding:1.4rem 1rem;display:flex;flex-direction:column;gap:1.1rem}
+  .grid{display:grid;grid-template-columns:1fr 300px;gap:1.1rem;align-items:start}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1rem 1.1rem}
+  .panel h2{font-size:.9rem;margin-bottom:.7rem;display:flex;align-items:center;gap:.5rem}
+  .lienzo{position:relative;width:100%;aspect-ratio:1/1;background:var(--bg);border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+  .lienzo canvas{position:absolute;inset:0;width:100%;height:100%}
+  .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+  .seg{display:flex;gap:.3rem;flex-wrap:wrap}
+  .chip{background:var(--bg);border:1px solid var(--border);color:var(--muted);padding:.4rem .7rem;border-radius:999px;cursor:pointer;font-family:inherit;font-size:.8rem;transition:all .15s}
+  .chip.on{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:700}
+  .btn{background:var(--accent);color:var(--bg);border:none;border-radius:9px;padding:.5rem 1rem;font-weight:700;cursor:pointer;font-family:inherit;font-size:.88rem}
+  .btn.sec{background:var(--surface-2);color:var(--text)}
+  label.ctl{display:block;font-size:.78rem;color:var(--muted);margin:.7rem 0 .2rem}
+  label.ctl b{color:var(--text);font-variant-numeric:tabular-nums}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.4rem}
+  .stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:.5rem .6rem}
+  .stat .k{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .stat .v{font-size:1.15rem;font-weight:800;font-variant-numeric:tabular-nums}
+  #loss{width:100%;height:64px;display:block;background:var(--bg);border:1px solid var(--border);border-radius:10px;margin-top:.5rem}
+  .leg{display:flex;gap:1rem;justify-content:center;font-size:.76rem;color:var(--muted);margin-top:.5rem}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle;margin-right:.3rem}
+  .nota{font-size:.79rem;color:var(--muted);line-height:1.55;border-left:3px solid var(--accent-2);padding:.5rem .9rem;background:rgba(139,92,246,.07);border-radius:0 8px 8px 0}
+  .nota b{color:var(--text)} code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--surface-2);padding:1px 5px;border-radius:4px;font-size:.85em}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="marca">🧠 Red Neuronal desde Cero</span>
+  <span class="demo-tag">MVP REAL · backprop a mano · sin librerías</span>
+  <span style="flex:1"></span>
+  <a href="../30-red-neuronal.html">← Ver la guía del proyecto</a>
+  <a href="../index.html">🛠️ Galería</a>
+</div>
+
+<div class="app">
+  <div class="grid">
+
+    <!-- LIENZO -->
+    <div class="panel">
+      <h2>🎯 Frontera de decisión <span class="demo-tag" id="estado">detenida</span></h2>
+      <div class="lienzo">
+        <canvas id="bg"></canvas>
+        <canvas id="pts"></canvas>
+      </div>
+      <div class="leg">
+        <span><span class="dot" style="background:var(--c0)"></span>Clase A</span>
+        <span><span class="dot" style="background:var(--c1)"></span>Clase B</span>
+        <span>· el fondo = lo que la red "cree" en cada punto</span>
+      </div>
+    </div>
+
+    <!-- CONTROLES -->
+    <div class="panel">
+      <h2>⚙️ Entrenamiento</h2>
+      <div class="row" style="margin-bottom:.6rem">
+        <button class="btn" id="play">▶ Entrenar</button>
+        <button class="btn sec" id="step">Paso</button>
+        <button class="btn sec" id="reset">↺ Reiniciar</button>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><div class="k">Época</div><div class="v" id="epoca">0</div></div>
+        <div class="stat"><div class="k">Pérdida</div><div class="v" id="perdida">—</div></div>
+        <div class="stat"><div class="k">Precisión</div><div class="v" id="acc">—</div></div>
+        <div class="stat"><div class="k">Neuronas</div><div class="v" id="hv">8</div></div>
+      </div>
+      <canvas id="loss" width="280" height="64"></canvas>
+
+      <label class="ctl">Dataset (el problema a resolver)</label>
+      <div class="seg" id="datasets">
+        <span class="chip on" data-ds="xor">XOR</span>
+        <span class="chip" data-ds="circulo">Círculo</span>
+        <span class="chip" data-ds="grupos">2 Grupos</span>
+        <span class="chip" data-ds="espiral">Espiral</span>
+      </div>
+
+      <label class="ctl">Capa oculta: <b id="hLab">8</b> neuronas</label>
+      <input type="range" id="hidden" min="1" max="24" value="8" step="1">
+
+      <label class="ctl">Learning rate (tamaño del paso): <b id="lrLab">0.10</b></label>
+      <input type="range" id="lr" min="1" max="100" value="10" step="1">
+
+      <label class="ctl">Velocidad: <b id="spLab">3</b> épocas/frame</label>
+      <input type="range" id="speed" min="1" max="20" value="3" step="1">
+    </div>
+  </div>
+
+  <p class="nota"><b>★ Acá no hay magia ni librería.</b> La red es <code>2 → capa oculta (tanh) → 1 (sigmoide)</code>, con <b>forward</b> y <b>backpropagation escritos a mano</b> en JavaScript. Nadie le dice la regla: ajusta sus pesos con el gradiente del error (lo mismo que el simulador de <i>gradient descent</i> de M40, pero en una red entera). Probá <b>XOR</b> con <b>1 sola neurona</b>: no puede — es el problema histórico que demostró que hacían falta <i>capas ocultas</i>. Subila a 4–8 y mirá cómo aparece la frontera curva. Eso es, literalmente, una IA <i>razonando</i> un patrón no-lineal.</p>
+</div>
+
+<script>
+(function () {
+  // ---------- utilidades ----------
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function randn() { return (Math.random() + Math.random() + Math.random() + Math.random() - 2) / 1.46; } // ~normal
+  function shuffle(a) { for (var i = a.length - 1; i > 0; i--) { var j = (Math.random() * (i + 1)) | 0; var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+
+  // ---------- datasets (puntos en [-1,1]^2 con etiqueta 0/1) ----------
+  function genData(tipo, n) {
+    n = n || 160; var d = [];
+    for (var i = 0; i < n; i++) {
+      var x, y, lab;
+      if (tipo === 'xor') {
+        x = rnd(-1, 1); y = rnd(-1, 1); lab = (x * y > 0) ? 1 : 0;           // mismo signo = clase B
+      } else if (tipo === 'circulo') {
+        x = rnd(-1, 1); y = rnd(-1, 1); lab = (x * x + y * y < 0.36) ? 1 : 0; // adentro del círculo
+      } else if (tipo === 'grupos') {
+        var c = i % 2; var cx = c ? 0.5 : -0.5, cy = c ? 0.5 : -0.5;
+        x = cx + randn() * 0.22; y = cy + randn() * 0.22; lab = c;            // linealmente separable
+      } else { // espiral
+        var c2 = i % 2; var t = (i / n) * 3.2 + rnd(-0.05, 0.05);
+        var r = t / 3.4; var ang = t * 2.6 + c2 * Math.PI;
+        x = r * Math.cos(ang); y = r * Math.sin(ang); lab = c2;
+      }
+      d.push({ x: x, y: y, lab: lab });
+    }
+    return d;
+  }
+
+  // ---------- red: 2 -> H (tanh) -> 1 (sigmoide), entrenada por SGD ----------
+  var H = 8, lr = 0.10, datos = genData('xor'), tipo = 'xor';
+  var W1, b1, W2, b2, epoca = 0, hist = [];
+
+  function initNet() {
+    W1 = []; b1 = []; W2 = []; b2 = 0;
+    for (var i = 0; i < H; i++) { W1.push([rnd(-1, 1), rnd(-1, 1)]); b1.push(0); W2.push(rnd(-1, 1)); }
+    epoca = 0; hist = [];
+  }
+
+  function forward(x0, x1) {
+    var a1 = new Array(H), z;
+    for (var i = 0; i < H; i++) { z = W1[i][0] * x0 + W1[i][1] * x1 + b1[i]; a1[i] = Math.tanh(z); }
+    var z2 = b2; for (i = 0; i < H; i++) z2 += W2[i] * a1[i];
+    var out = 1 / (1 + Math.exp(-z2));
+    return { a1: a1, out: out };
+  }
+
+  function epoch() {
+    var orden = shuffle(datos.map(function (_, i) { return i; }));
+    for (var k = 0; k < orden.length; k++) {
+      var p = datos[orden[k]], f = forward(p.x, p.y), a1 = f.a1, out = f.out;
+      // BCE + sigmoide → dL/dz2 se simplifica a (out - y)
+      var dz2 = out - p.lab;
+      // gradientes capa salida
+      for (var i = 0; i < H; i++) W2[i] -= lr * dz2 * a1[i];
+      b2 -= lr * dz2;
+      // gradientes capa oculta (derivada de tanh = 1 - a^2)
+      for (i = 0; i < H; i++) {
+        var dz1 = dz2 * W2[i] * (1 - a1[i] * a1[i]);
+        W1[i][0] -= lr * dz1 * p.x;
+        W1[i][1] -= lr * dz1 * p.y;
+        b1[i]    -= lr * dz1;
+      }
+    }
+    epoca++;
+  }
+
+  function metricas() {
+    var loss = 0, ok = 0, e = 1e-7;
+    for (var k = 0; k < datos.length; k++) {
+      var p = datos[k], out = forward(p.x, p.y).out;
+      loss += -(p.lab * Math.log(out + e) + (1 - p.lab) * Math.log(1 - out + e));
+      if ((out > 0.5 ? 1 : 0) === p.lab) ok++;
+    }
+    return { loss: loss / datos.length, acc: ok / datos.length };
+  }
+
+  // ---------- render ----------
+  var bg = document.getElementById('bg'), pc = document.getElementById('pts');
+  var bgx = bg.getContext('2d'), pcx = pc.getContext('2d');
+  var loss = document.getElementById('loss'), lx = loss.getContext('2d');
+  var RES = 56;                          // grilla de la frontera (RES x RES celdas)
+  function px(v, s) { return (v + 1) / 2 * s; }   // dato [-1,1] -> pixel
+
+  function pintarFondo() {
+    var W = bg.width, Hh = bg.height, cw = W / RES, ch = Hh / RES;
+    for (var iy = 0; iy < RES; iy++) {
+      for (var ix = 0; ix < RES; ix++) {
+        var dx = (ix + 0.5) / RES * 2 - 1, dy = (iy + 0.5) / RES * 2 - 1;
+        var o = forward(dx, dy).out;     // 0 = clase A (azul), 1 = clase B (naranja)
+        var r = Math.round(56 + o * (251 - 56));
+        var g = Math.round(189 + o * (146 - 189));
+        var b = Math.round(248 + o * (60 - 248));
+        var a = 0.20 + Math.abs(o - 0.5) * 0.9;   // más opaco = más seguro
+        bgx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(3) + ')';
+        bgx.fillRect(ix * cw, iy * ch, cw + 1, ch + 1);
+      }
+    }
+  }
+  function pintarPuntos() {
+    var W = pc.width, Hh = pc.height; pcx.clearRect(0, 0, W, Hh);
+    for (var k = 0; k < datos.length; k++) {
+      var p = datos[k];
+      pcx.beginPath();
+      pcx.arc(px(p.x, W), px(p.y, Hh), 4.5, 0, 7);
+      pcx.fillStyle = p.lab ? '#fb923c' : '#38bdf8';
+      pcx.strokeStyle = 'rgba(15,23,42,.9)'; pcx.lineWidth = 1.5;
+      pcx.fill(); pcx.stroke();
+    }
+  }
+  function pintarLoss() {
+    var W = loss.width, Hh = loss.height; lx.clearRect(0, 0, W, Hh);
+    if (hist.length < 2) return;
+    var max = Math.max.apply(null, hist), min = Math.min.apply(null, hist);
+    var rng = (max - min) || 1;
+    lx.beginPath();
+    for (var i = 0; i < hist.length; i++) {
+      var x = i / (hist.length - 1) * W;
+      var y = Hh - 4 - (hist[i] - min) / rng * (Hh - 8);
+      i ? lx.lineTo(x, y) : lx.moveTo(x, y);
+    }
+    lx.strokeStyle = '#8b5cf6'; lx.lineWidth = 2; lx.stroke();
+  }
+  function pintarStats() {
+    var m = metricas();
+    hist.push(m.loss); if (hist.length > 160) hist.shift();
+    document.getElementById('epoca').textContent = epoca;
+    document.getElementById('perdida').textContent = m.loss.toFixed(3);
+    document.getElementById('acc').textContent = (m.acc * 100).toFixed(0) + '%';
+    pintarFondo(); pintarPuntos(); pintarLoss();
+  }
+  function fit() {
+    [bg, pc].forEach(function (c) { var r = c.getBoundingClientRect(); c.width = Math.max(120, r.width | 0); c.height = Math.max(120, r.height | 0); });
+    pintarStats();
+  }
+
+  // ---------- loop ----------
+  var corriendo = false, velocidad = 3, raf = 0;
+  function tick() {
+    if (!corriendo) return;
+    for (var i = 0; i < velocidad; i++) epoch();
+    pintarStats();
+    raf = requestAnimationFrame(tick);
+  }
+  function play() {
+    corriendo = !corriendo;
+    document.getElementById('play').textContent = corriendo ? '⏸ Pausar' : '▶ Entrenar';
+    document.getElementById('estado').textContent = corriendo ? 'entrenando…' : 'detenida';
+    if (corriendo) tick();
+  }
+  function reset() { initNet(); pintarStats(); }
+
+  // ---------- controles ----------
+  document.getElementById('play').onclick = play;
+  document.getElementById('step').onclick = function () { epoch(); pintarStats(); };
+  document.getElementById('reset').onclick = reset;
+  document.getElementById('datasets').addEventListener('click', function (e) {
+    var ds = e.target.getAttribute('data-ds'); if (!ds) return;
+    document.querySelectorAll('#datasets .chip').forEach(function (c) { c.classList.remove('on'); });
+    e.target.classList.add('on'); tipo = ds; datos = genData(ds); initNet(); pintarStats();
+  });
+  var hi = document.getElementById('hidden');
+  hi.oninput = function () { H = +hi.value; document.getElementById('hLab').textContent = H; document.getElementById('hv').textContent = H; initNet(); pintarStats(); };
+  var lri = document.getElementById('lr');
+  lri.oninput = function () { lr = +lri.value / 100; document.getElementById('lrLab').textContent = lr.toFixed(2); };
+  var spi = document.getElementById('speed');
+  spi.oninput = function () { velocidad = +spi.value; document.getElementById('spLab').textContent = velocidad; };
+
+  window.addEventListener('resize', fit);
+  initNet(); fit();
+})();
+</script>
+
+</body>
+</html>

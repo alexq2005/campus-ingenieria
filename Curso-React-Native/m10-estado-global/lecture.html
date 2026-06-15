@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 10 — Estado Global & Arquitectura · Curso de React Native</title>
+  <meta name="description" content="Prop-drilling, Context API, Zustand y cómo organizar las carpetas de una app real en React Native con Expo.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React Native</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-React/index.html">⚛️ Curso de React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 10</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M04, M05</span>
+</div>
+
+<article>
+
+<h1>Módulo 10 — Estado Global & Arquitectura</h1>
+
+<p>Hasta ahora cada pantalla manejaba su propio estado con <code>useState</code>. Pero apenas la app crece, aparece la pregunta incómoda: <strong>¿dónde vive el usuario logueado? ¿el carrito? ¿el tema oscuro?</strong> Esos datos los necesitan <em>muchas</em> pantallas a la vez. En este módulo vas a aprender a compartir estado entre toda la app sin volverte loco pasando props, y a organizar el proyecto como una app real.</p>
+
+<h2>El problema: prop-drilling</h2>
+
+<p>Imaginá que el usuario logueado vive en la pantalla raíz, pero quien lo muestra es un <code>&lt;Avatar&gt;</code> enterrado 4 niveles abajo. La única forma que conocés es pasar la prop por cada nivel intermedio:</p>
+
+<pre><code class="lang-jsx">&lt;App usuario={usuario}&gt;
+  &lt;Layout usuario={usuario}&gt;          {/* no lo usa, solo lo reenvía */}
+    &lt;Header usuario={usuario}&gt;        {/* tampoco lo usa */}
+      &lt;Nav usuario={usuario}&gt;         {/* tampoco */}
+        &lt;Avatar usuario={usuario} /&gt;  {/* recién acá se usa */}
+      &lt;/Nav&gt;
+    &lt;/Header&gt;
+  &lt;/Layout&gt;
+&lt;/App&gt;</code></pre>
+
+<div class="mistake">
+  <strong>Esto es <em>prop-drilling</em>:</strong> pasar una prop a través de componentes que no la necesitan, solo
+  para que llegue al fondo. Tres niveles ya cansa; en una app real son ocho. Si cambiás el nombre de la prop,
+  tocás cinco archivos. Es frágil y ruidoso.
+</div>
+
+<div class="analogy">
+  <strong>🔍 Pensalo así:</strong> prop-drilling es como pasar un vaso de agua mano en mano por toda una fila de
+  gente para que llegue al del fondo. El estado global es poner un <em>dispensador</em> en el medio: cualquiera
+  que tenga sed va y se sirve, sin molestar a los demás.
+</div>
+
+<h2>Context API (recap)</h2>
+
+<p>El <strong>Context API</strong> es la solución que trae React de fábrica. Lo viste en el Curso de React; acá funciona idéntico porque <strong>es el mismo React</strong>. Tiene tres piezas:</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>createContext()</code></td><td>Crea el "canal" por donde viaja el dato</td></tr>
+<tr><td><code>&lt;Provider value={...}&gt;</code></td><td>Pone el dato disponible para todo lo que esté adentro</td></tr>
+<tr><td><code>useContext(Canal)</code></td><td>Lee el dato desde cualquier componente, sin importar qué tan abajo esté</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">import { createContext, useContext, useState } from 'react';
+
+const TemaContext = createContext();   // 1. el canal
+
+export function TemaProvider({ children }) {
+  const [oscuro, setOscuro] = useState(false);
+  return (
+    &lt;TemaContext.Provider value={{ oscuro, setOscuro }}&gt;  {/* 2. proveer */}
+      {children}
+    &lt;/TemaContext.Provider&gt;
+  );
+}
+
+export const useTema = () =&gt; useContext(TemaContext);   // 3. hook para leer</code></pre>
+
+<p>Y desde cualquier componente, sin recibir props:</p>
+
+<pre><code class="lang-jsx">import { Pressable, Text } from 'react-native';
+import { useTema } from '../store/tema';
+
+function BotonTema() {
+  const { oscuro, setOscuro } = useTema();   // se sirve del dispensador
+  return (
+    &lt;Pressable onPress={() =&gt; setOscuro(!oscuro)}&gt;
+      &lt;Text&gt;{oscuro ? '🌙 Oscuro' : '☀️ Claro'}&lt;/Text&gt;
+    &lt;/Pressable&gt;
+  );
+}</code></pre>
+
+<div class="info">
+  <strong>Context brilla para datos que cambian poco:</strong> el tema, el idioma, el usuario logueado, la sesión.
+  Cosas que se setean una vez y rara vez se tocan. Para eso es perfecto y no necesitás nada más.
+</div>
+
+<div class="mistake">
+  <strong>El talón de Aquiles del Context:</strong> cuando el <code>value</code> cambia, <strong>TODOS</strong> los
+  componentes que hacen <code>useContext</code> se vuelven a renderizar — aunque solo les importe una parte del
+  valor. Si metés ahí estado que cambia muchas veces por segundo (la posición de un dedo arrastrando, un timer),
+  vas a re-renderizar medio árbol y la app se pone lenta.
+</div>
+
+<h2>Zustand: el estándar simple</h2>
+
+<div class="concept">
+  <strong>💡 Zustand</strong> es una librería de estado global minúscula y muy popular. Su gracia: <strong>cero
+  boilerplate</strong>. No hay Provider que envolver, no hay reducers, no hay acciones ceremoniales. Creás un
+  "store" (una cajita con datos y funciones) y lo usás como un hook desde cualquier lado.
+</div>
+
+<div class="step"><strong>1. Instalalo.</strong></div>
+
+<pre><code class="lang-bash">npx expo install zustand</code></pre>
+
+<div class="step"><strong>2. Creá el store</strong> con <code>create</code>. Recibe una función que devuelve el estado y las funciones que lo modifican (usando <code>set</code>):</div>
+
+<pre><code class="lang-jsx">import { create } from 'zustand';
+
+export const useContador = create((set) =&gt; ({
+  cuenta: 0,
+  sumar: () =&gt; set((estado) =&gt; ({ cuenta: estado.cuenta + 1 })),
+  reiniciar: () =&gt; set({ cuenta: 0 }),
+}));</code></pre>
+
+<div class="step"><strong>3. Usalo en cualquier componente</strong> como un hook. Pasás un <em>selector</em> para elegir solo lo que te interesa:</div>
+
+<pre><code class="lang-jsx">import { Text, View, Pressable } from 'react-native';
+import { useContador } from '../store/contador';
+
+function Pantalla() {
+  const cuenta = useContador((s) =&gt; s.cuenta);    // solo me suscribo a 'cuenta'
+  const sumar  = useContador((s) =&gt; s.sumar);
+
+  return (
+    &lt;View&gt;
+      &lt;Text&gt;{cuenta}&lt;/Text&gt;
+      &lt;Pressable onPress={sumar}&gt;&lt;Text&gt;+1&lt;/Text&gt;&lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El selector es la clave del rendimiento.</strong> Cuando hacés <code>useContador((s) =&gt; s.cuenta)</code>,
+  el componente <strong>solo</strong> se vuelve a renderizar si <code>cuenta</code> cambia — no si cambia otra parte
+  del store. Esto es lo que Context no te da gratis, y por eso Zustand escala mejor para estado que cambia seguido.
+</div>
+
+<h2>¿Context o Zustand? ¿Y Redux?</h2>
+
+<p>No hay un ganador absoluto; hay una herramienta para cada caso:</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Usala para…</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Context API</strong></td><td>Estado simple y estable: tema, idioma, usuario, sesión</td><td>Cero (viene en React); re-renderiza todo el árbol al cambiar</td></tr>
+<tr><td><strong>Zustand</strong></td><td>Estado global que cambia seguido: carrito, filtros, datos de la app</td><td>Una dependencia chica; selectores evitan re-renders</td></tr>
+<tr><td><strong>Redux</strong></td><td>Apps grandes con lógica de estado muy compleja y equipos grandes</td><td>Mucho boilerplate; potente pero pesado para apps chicas</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>💡 Regla práctica para empezar:</strong> usá <code>useState</code> mientras el estado sea de una sola
+  pantalla. Pasalo a <strong>Context</strong> si es global pero cambia poco. Pasalo a <strong>Zustand</strong> si
+  es global y cambia seguido. <strong>Redux</strong> solo si el equipo ya lo usa o la complejidad lo justifica de
+  verdad — para la mayoría de las apps con Zustand sobra.
+</div>
+
+<h2>Arquitectura de una app real</h2>
+
+<p>Una app de tres pantallas vive bien en un solo archivo. Una app de verdad necesita orden. La idea central: <strong>separar la lógica de la UI</strong>. Una estructura de carpetas habitual en Expo:</p>
+
+<pre><code class="lang-bash">src/
+├── components/    # piezas de UI reusables (Boton, Tarjeta, Avatar)
+├── screens/       # pantallas completas (Home, Perfil, Carrito)
+├── navigation/    # configuración de navegación entre pantallas
+├── hooks/         # custom hooks (useCarrito, useAuth)
+├── store/         # estado global (Zustand stores, Contexts)
+├── services/      # llamadas a APIs, fetch, cliente HTTP
+├── constants/     # colores, tamaños, textos fijos
+└── utils/         # funciones puras de ayuda (formatear precio, validar)</code></pre>
+
+<div class="info">
+  <strong>No es una ley sagrada</strong>, es un punto de partida sano. Lo que importa es la <em>intención</em>:
+  cada cosa tiene un lugar predecible. Cuando volvés al proyecto en dos meses, sabés exactamente dónde buscar la
+  lógica del carrito (<code>store/</code>), cómo se ve un botón (<code>components/</code>) o de dónde salen los
+  datos (<code>services/</code>).
+</div>
+
+<div class="rule">
+  <strong>📌 La regla de oro: separá lógica de UI.</strong> Un componente debería ocuparse de <em>cómo se ve</em>
+  algo. La lógica de <em>qué hace</em> (calcular totales, hablar con la API, manejar el carrito) va en el store,
+  los hooks o los services. Un <code>&lt;Pressable&gt;</code> que dispara <code>agregarAlCarrito()</code> no debería
+  saber cómo se calcula el total.
+</div>
+
+<h2>Ejemplo completo: carrito de compras con Zustand</h2>
+
+<p>Veamos un caso real. Un carrito necesita: una lista de items, agregar uno, quitarlo, y saber el total. Lo modelamos como un store de Zustand — toda la lógica vive acá, lejos de la UI:</p>
+
+<pre><code class="lang-jsx">// src/store/carrito.js
+import { create } from 'zustand';
+
+export const useCarrito = create((set, get) =&gt; ({
+  items: [],   // cada item: { id, nombre, precio, cantidad }
+
+  agregar: (producto) =&gt; set((estado) =&gt; {
+    const existe = estado.items.find((i) =&gt; i.id === producto.id);
+    if (existe) {
+      // ya está: subimos la cantidad
+      return {
+        items: estado.items.map((i) =&gt;
+          i.id === producto.id ? { ...i, cantidad: i.cantidad + 1 } : i
+        ),
+      };
+    }
+    // nuevo: lo agregamos con cantidad 1
+    return { items: [...estado.items, { ...producto, cantidad: 1 }] };
+  }),
+
+  quitar: (id) =&gt; set((estado) =&gt; ({
+    items: estado.items.filter((i) =&gt; i.id !== id),
+  })),
+
+  vaciar: () =&gt; set({ items: [] }),
+
+  // función derivada: lee el estado actual con get()
+  total: () =&gt; get().items.reduce((suma, i) =&gt; suma + i.precio * i.cantidad, 0),
+}));</code></pre>
+
+<p>Y la pantalla solo se ocupa de mostrar — toca el store, no implementa nada:</p>
+
+<pre><code class="lang-jsx">// src/screens/Carrito.js
+import { View, Text, Pressable, FlatList } from 'react-native';
+import { useCarrito } from '../store/carrito';
+
+export default function Carrito() {
+  const items  = useCarrito((s) =&gt; s.items);
+  const quitar = useCarrito((s) =&gt; s.quitar);
+  const total  = useCarrito((s) =&gt; s.total);
+
+  return (
+    &lt;View&gt;
+      &lt;FlatList
+        data={items}
+        keyExtractor={(i) =&gt; String(i.id)}
+        renderItem={({ item }) =&gt; (
+          &lt;View&gt;
+            &lt;Text&gt;{item.nombre} ×{item.cantidad} — ${item.precio * item.cantidad}&lt;/Text&gt;
+            &lt;Pressable onPress={() =&gt; quitar(item.id)}&gt;
+              &lt;Text&gt;Quitar&lt;/Text&gt;
+            &lt;/Pressable&gt;
+          &lt;/View&gt;
+        )}
+      /&gt;
+      &lt;Text&gt;Total: ${total()}&lt;/Text&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Fijate qué limpio quedó:</strong> la pantalla no sabe <em>cómo</em> se calcula el total ni qué pasa al
+  agregar un item repetido. Solo pide <code>total()</code> y muestra. Mañana cambiás la lógica de descuentos en el
+  store y ninguna pantalla se entera. Eso es separar lógica de UI.
+</div>
+
+<div class="warn">
+  <strong>⚠️ Cuidado con suscribirte a todo.</strong> Evitá <code>const carrito = useCarrito()</code> sin selector:
+  así el componente se re-renderiza ante <em>cualquier</em> cambio del store. Pedí solo lo que usás con un selector
+  (<code>useCarrito((s) =&gt; s.items)</code>). Es la diferencia entre una app fluida y una que tironea.
+</div>
+
+<h2>Errores típicos de arquitectura</h2>
+
+<div class="mistake">
+  <strong>Meter TODO en un Context gigante.</strong> Un único Context con usuario + carrito + tema + filtros hace
+  que cualquier cambio re-renderice toda la app. Separá por dominio, o mejor, usá Zustand para lo que cambia seguido.
+</div>
+<div class="mistake">
+  <strong>Lógica de negocio dentro del componente.</strong> Calcular totales, validar, transformar datos de la API
+  <em>dentro</em> del JSX vuelve el componente imposible de testear y reusar. Esa lógica va en <code>store/</code>,
+  <code>hooks/</code> o <code>utils/</code>.
+</div>
+<div class="mistake">
+  <strong>Un store gigante sin organizar.</strong> Tener un solo store con 40 propiedades de cosas no relacionadas
+  es tan malo como el Context monstruo. Hacé un store por dominio: <code>useCarrito</code>, <code>useAuth</code>,
+  <code>useFiltros</code>. Pequeños y enfocados.
+</div>
+
+<div class="danger">
+  <strong>🚨 No mutar el estado directamente.</strong> Nunca hagas <code>estado.items.push(x)</code> dentro de
+  <code>set</code>. Zustand (como React) detecta cambios por <em>referencia</em>: si mutás el array existente, la
+  referencia no cambia y la UI no se actualiza. Siempre devolvé objetos/arrays <strong>nuevos</strong>
+  (<code>[...estado.items, x]</code>).
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué es prop-drilling y por qué es un problema?</summary>
+<p>Es pasar una prop a través de componentes intermedios que no la usan, solo para que llegue a uno profundo. Es frágil (cualquier cambio toca varios archivos), ruidoso y difícil de mantener cuando la app crece. El estado global (Context o Zustand) lo resuelve dejando que el componente lea el dato directamente.</p></details>
+
+<details><summary>¿Cuándo conviene Context y cuándo Zustand?</summary>
+<p><strong>Context</strong> para estado simple y estable que cambia poco (tema, idioma, usuario logueado). <strong>Zustand</strong> para estado global que cambia seguido (carrito, filtros, datos), porque sus selectores evitan re-renderizar componentes que no usan la parte que cambió. Context, en cambio, re-renderiza todo lo suscrito ante cualquier cambio.</p></details>
+
+<details><summary>¿Por qué separar la lógica de la UI en carpetas como store/ y services/?</summary>
+<p>Para que cada cosa tenga un lugar predecible y para poder cambiar la lógica sin tocar las pantallas. Si la lógica del carrito vive en <code>store/</code>, podés cambiar cómo se calcula el total sin que ninguna pantalla se entere. Además hace el código testeable y reusable: una función pura en <code>utils/</code> se prueba sola, sin montar componentes.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá una app tuya con prop-drilling (una prop pasando por 3+ niveles) y reemplazala por un Context. Verificá que el componente del fondo la lee sin recibir props.</li>
+  <li>Instalá Zustand y creá un store <code>useContador</code> con <code>cuenta</code>, <code>sumar</code> y <code>reiniciar</code>. Usalo desde dos pantallas distintas y confirmá que comparten el mismo número.</li>
+  <li>Escribí el store de carrito del ejemplo. Agregá tres productos (uno repetido) y verificá que la cantidad sube en vez de duplicar el item.</li>
+  <li>Agregá al store del carrito una función <code>cantidadTotal()</code> que devuelva la suma de las cantidades de todos los items (no el precio). Mostrala en un badge.</li>
+  <li>Reorganizá un proyecto chico en las carpetas <code>components/</code>, <code>screens/</code>, <code>store/</code> y <code>utils/</code>. Mové la función que formatea precios a <code>utils/</code> y usala desde el carrito.</li>
+</ol>
+
+<section class="quiz" id="quizRN10">
+  <style>
+    #quizRN10{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRN10 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRN10 .q{margin-bottom:1.5rem}
+    #quizRN10 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRN10 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRN10 .opt:hover{border-color:var(--accent)}
+    #quizRN10 .opt:disabled{cursor:default}
+    #quizRN10 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRN10 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRN10 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRN10 .exp.show{display:block}
+    #quizRN10 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. ¿Qué es el "prop-drilling"?</p>
+    <button class="opt">Una técnica para optimizar el rendimiento pasando props memorizadas</button>
+    <button class="opt">Una forma de validar el tipo de las props</button>
+    <button class="opt">Pasar una prop por componentes intermedios que no la usan, solo para que llegue a uno profundo</button>
+    <div class="exp">Prop-drilling es ese reenvío de props a través de capas que no las necesitan. Es frágil y ruidoso; el estado global lo resuelve.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. ¿Cuál es la principal ventaja de Zustand frente a Context para estado que cambia seguido?</p>
+    <button class="opt">Que no necesita instalarse, viene incluido en React Native</button>
+    <button class="opt">Sus selectores hacen que un componente solo se re-renderice cuando cambia la parte del estado que usa</button>
+    <button class="opt">Que es la única forma de tener estado global en una app</button>
+    <div class="exp">El selector (<code>useStore((s) =&gt; s.x)</code>) suscribe el componente solo a esa porción. Context, en cambio, re-renderiza todo lo suscrito ante cualquier cambio del value.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cuál es el principio central de una buena arquitectura de app?</p>
+    <button class="opt">Separar la lógica (store, hooks, services) de la UI (components, screens)</button>
+    <button class="opt">Meter todo el estado en un único Context para tenerlo centralizado</button>
+    <button class="opt">Calcular los totales y validaciones dentro del JSX de cada pantalla</button>
+    <div class="exp">La UI se ocupa de cómo se ve; la lógica de qué hace vive aparte. Así podés cambiar la lógica sin tocar pantallas y todo queda testeable y reusable.</div>
+  </div>
+
+  <div class="score" id="scoreRN10"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRN10');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRN10').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M11.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m09-gestos-animaciones/lecture.html">← M09: Gestos & Animaciones</a>
+  <a href="../m11-build-publicacion/lecture.html">M11: Build & Publicación →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 03 — Listas Performantes · Curso de React Native</title>
+  <meta name="description" content="Por qué .map() + ScrollView traba la app con listas largas, cómo FlatList virtualiza el renderizado, scroll infinito, pull-to-refresh y SectionList.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React Native</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-React/index.html">⚛️ Curso de React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 03</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+</div>
+
+<article>
+
+<h1>Módulo 03 — Listas Performantes</h1>
+
+<p>Casi toda app móvil es, en el fondo, una lista: chats, contactos, feed de un social, productos de una tienda, notificaciones. Mostrar 10 elementos es trivial. Mostrar 10.000 sin que la app se trabe es donde se separan los principiantes de quienes entienden cómo funciona el renderizado en móvil. Este módulo es sobre eso.</p>
+
+<h2>El problema: <code>.map()</code> + <code>ScrollView</code></h2>
+
+<p>Viniendo de React, tu instinto es resolver una lista con <code>.map()</code>. Y para que se pueda scrollear, la metés dentro de un <code>&lt;ScrollView&gt;</code>. Funciona... hasta que la lista crece:</p>
+
+<pre><code class="lang-jsx">import { ScrollView, View, Text } from 'react-native';
+
+export default function Feed({ posts }) {   // posts = 5000 items
+  return (
+    &lt;ScrollView&gt;
+      {posts.map((post) =&gt; (
+        &lt;View key={post.id}&gt;
+          &lt;Text&gt;{post.titulo}&lt;/Text&gt;
+        &lt;/View&gt;
+      ))}
+    &lt;/ScrollView&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>⚠️ Esto monta los 5000 elementos de golpe.</strong> Aunque solo veas 8 en pantalla, RN crea las 5000 vistas
+  nativas, reserva memoria para todas y las mantiene vivas. Resultado: arranque lentísimo, scroll a tirones y, en
+  celulares de gama baja, la app directamente se cierra por falta de memoria.
+</div>
+
+<div class="concept">
+  <strong>💡 El <code>&lt;ScrollView&gt;</code> renderiza TODO su contenido de una sola vez.</strong> Es perfecto para
+  contenido <em>finito y conocido</em> (un formulario largo, una pantalla "Acerca de"). Es la herramienta equivocada
+  para listas de datos que pueden ser largas o vienen de una API.
+</div>
+
+<h2>La solución: <code>&lt;FlatList&gt;</code></h2>
+
+<div class="concept">
+  <strong>💡 <code>&lt;FlatList&gt;</code> usa <em>virtualización</em>: solo renderiza los elementos que están (o están por estar)
+  en pantalla.</strong> A medida que scrolleás, monta los que entran y desmonta los que salen, reciclando vistas.
+  Así muestra 100.000 ítems consumiendo la memoria de los ~10 visibles.
+</div>
+
+<p>En vez de hacer el <code>.map()</code> vos, le pasás los datos y una función que dice <em>cómo</em> dibujar un ítem. FlatList decide <em>cuándo</em> dibujarlo:</p>
+
+<pre><code class="lang-jsx">import { FlatList, View, Text } from 'react-native';
+
+export default function Feed({ posts }) {
+  return (
+    &lt;FlatList
+      data={posts}
+      keyExtractor={(item) =&gt; item.id}
+      renderItem={({ item }) =&gt; (
+        &lt;View&gt;
+          &lt;Text&gt;{item.titulo}&lt;/Text&gt;
+        &lt;/View&gt;
+      )}
+    /&gt;
+  );
+}</code></pre>
+
+<h3>Las tres props que SIEMPRE vas a usar</h3>
+
+<table>
+<thead><tr><th>Prop</th><th>Qué recibe</th><th>Para qué</th></tr></thead>
+<tbody>
+<tr><td><code>data</code></td><td>Un array</td><td>La fuente de datos a recorrer</td></tr>
+<tr><td><code>renderItem</code></td><td>Función <code>({ item }) =&gt; JSX</code></td><td>Cómo dibujar un solo elemento</td></tr>
+<tr><td><code>keyExtractor</code></td><td>Función <code>(item) =&gt; string</code></td><td>Dar a cada ítem una key única y estable</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Fijate en <code>renderItem</code>:</strong> recibe un objeto y vos desestructurás <code>{ item }</code> de adentro.
+  Un error clásico es escribir <code>renderItem={(item) =&gt; ...}</code> (sin llaves) y después preguntarse por qué
+  <code>item.titulo</code> es <code>undefined</code> — porque ahí <code>item</code> es el objeto completo, no el elemento.
+  El objeto también trae <code>index</code> y <code>separators</code> si los necesitás: <code>({ item, index })</code>.
+</div>
+
+<div class="rule">
+  <strong>📌 <code>keyExtractor</code> no es opcional en la práctica.</strong> Es lo que le permite a FlatList saber
+  qué ítem es cuál cuando la lista cambia (se agrega, borra o reordena algo). Devolvé siempre un identificador
+  <em>único y estable</em> del dato (un <code>id</code> de base de datos, no el índice).
+</div>
+
+<h2>Props que mejoran cualquier lista real</h2>
+
+<p>Una lista de producción rara vez es solo ítems pelados. Estas tres props cubren el 90% de los casos:</p>
+
+<table>
+<thead><tr><th>Prop</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>ItemSeparatorComponent</code></td><td>Componente dibujado <em>entre</em> ítems (una línea divisoria). No aparece antes del primero ni después del último.</td></tr>
+<tr><td><code>ListEmptyComponent</code></td><td>Qué mostrar cuando <code>data</code> está vacío (un mensaje "No hay nada todavía"). Sin esto, la lista vacía es una pantalla en blanco.</td></tr>
+<tr><td><code>ListHeaderComponent</code> / <code>ListFooterComponent</code></td><td>Contenido fijo arriba (un título, una barra de búsqueda) o abajo (un spinner de "cargando más"). Scrollean <em>con</em> la lista.</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔍 Pensalo como un sándwich:</strong> <code>ListHeaderComponent</code> es la tapa de arriba,
+  <code>renderItem</code> repetido es el relleno, <code>ItemSeparatorComponent</code> son las rebanadas que separan
+  cada capa, y <code>ListFooterComponent</code> es la tapa de abajo. Todo se scrollea junto, como una sola pieza.
+</div>
+
+<h2>Interacciones: scroll infinito y pull-to-refresh</h2>
+
+<h3>Scroll infinito — <code>onEndReached</code></h3>
+
+<p>Cuando el usuario se acerca al final, cargás más datos (la "página" siguiente de la API). Dos props trabajan juntas:</p>
+
+<table>
+<thead><tr><th>Prop</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>onEndReached</code></td><td>Función que se dispara cuando el scroll llega cerca del final.</td></tr>
+<tr><td><code>onEndReachedThreshold</code></td><td>Qué tan cerca del final disparar, como fracción de la pantalla visible. <code>0.5</code> = cuando falta media pantalla; <code>0</code> = justo en el borde.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">&lt;FlatList
+  data={posts}
+  keyExtractor={(item) =&gt; item.id}
+  renderItem={({ item }) =&gt; &lt;Post post={item} /&gt;}
+  onEndReached={cargarMas}
+  onEndReachedThreshold={0.5}
+/&gt;</code></pre>
+
+<h3>Pull-to-refresh — <code>refreshing</code> + <code>onRefresh</code></h3>
+
+<p>El gesto de "tirar hacia abajo desde arriba para recargar". FlatList lo trae integrado con dos props:</p>
+
+<table>
+<thead><tr><th>Prop</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>onRefresh</code></td><td>Función que corre cuando el usuario tira hacia abajo. Acá recargás los datos.</td></tr>
+<tr><td><code>refreshing</code></td><td>Booleano. Mientras sea <code>true</code>, se muestra el spinner de carga. Lo controlás vos con estado.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">import { useState } from 'react';
+import { FlatList } from 'react-native';
+
+export default function Feed() {
+  const [posts, setPosts] = useState([]);
+  const [refrescando, setRefrescando] = useState(false);
+
+  async function recargar() {
+    setRefrescando(true);
+    const data = await traerPosts();   // tu fetch a la API
+    setPosts(data);
+    setRefrescando(false);
+  }
+
+  return (
+    &lt;FlatList
+      data={posts}
+      keyExtractor={(item) =&gt; item.id}
+      renderItem={({ item }) =&gt; &lt;Post post={item} /&gt;}
+      refreshing={refrescando}
+      onRefresh={recargar}
+    /&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>💡 Tip:</strong> notá el patrón <code>setRefrescando(true)</code> antes del <code>await</code> y
+  <code>setRefrescando(false)</code> después. Si te olvidás del segundo, el spinner gira para siempre. Por eso
+  conviene envolver el fetch en un <code>try/finally</code> y apagar el spinner en el <code>finally</code>.
+</div>
+
+<h2><code>&lt;SectionList&gt;</code> — listas con secciones</h2>
+
+<p>Cuando los datos vienen <em>agrupados</em> (contactos por inicial, mensajes por fecha, tareas por categoría), querés encabezados de sección que se peguen arriba mientras scrolleás. Para eso existe <code>&lt;SectionList&gt;</code>, primo de FlatList.</p>
+
+<p>La diferencia clave está en la forma de los datos: en vez de <code>data</code> (un array plano), recibe <code>sections</code> (un array de grupos, cada uno con su <code>title</code> y su propio array <code>data</code>):</p>
+
+<pre><code class="lang-jsx">import { SectionList, View, Text } from 'react-native';
+
+const secciones = [
+  { title: 'A', data: ['Ana', 'Alberto'] },
+  { title: 'B', data: ['Bruno', 'Bianca'] },
+];
+
+export default function Agenda() {
+  return (
+    &lt;SectionList
+      sections={secciones}
+      keyExtractor={(item, index) =&gt; item + index}
+      renderItem={({ item }) =&gt; &lt;Text&gt;{item}&lt;/Text&gt;}
+      renderSectionHeader={({ section }) =&gt; (
+        &lt;View&gt;
+          &lt;Text&gt;{section.title}&lt;/Text&gt;
+        &lt;/View&gt;
+      )}
+    /&gt;
+  );
+}</code></pre>
+
+<div class="info">
+  <strong>Lo nuevo respecto de FlatList:</strong> la prop <code>sections</code> (no <code>data</code>) y
+  <code>renderSectionHeader</code>, que dibuja el encabezado de cada grupo recibiendo <code>{ section }</code>.
+  El resto (<code>renderItem</code>, <code>keyExtractor</code>) funciona igual.
+</div>
+
+<h2>Errores típicos con listas</h2>
+
+<div class="mistake">
+  <strong>Olvidar <code>keyExtractor</code>.</strong> Sin él (y sin un campo <code>key</code> en el ítem), RN tira un
+  warning y el reciclado de vistas se vuelve impredecible: ítems que parpadean, estado que se mezcla entre filas.
+</div>
+<div class="mistake">
+  <strong>Usar el <code>index</code> como key cuando la data cambia.</strong> Si insertás, borrás o reordenás
+  elementos, las keys por índice se "corren" y React asocia mal el estado de cada fila (un check tildado salta a
+  otro ítem). Usá un <code>id</code> estable del dato, no la posición.
+</div>
+<div class="mistake">
+  <strong>Anidar un <code>&lt;FlatList&gt;</code> dentro de un <code>&lt;ScrollView&gt;</code> en la misma dirección.</strong>
+  Los dos compiten por el gesto de scroll vertical, la virtualización se rompe (RN renderiza todo igual) y vas a ver
+  el warning <em>"VirtualizedLists should never be nested inside plain ScrollViews with the same orientation"</em>.
+  Si necesitás contenido fijo arriba de la lista, usá <code>ListHeaderComponent</code>, no un ScrollView por fuera.
+</div>
+
+<h2>Ejemplo completo: lista de contactos</h2>
+
+<p>Juntemos lo importante en un ejemplo realista: una lista de contactos con separador entre filas y un mensaje cuando está vacía.</p>
+
+<pre><code class="lang-jsx">import { FlatList, View, Text, StyleSheet } from 'react-native';
+
+const contactos = [
+  { id: '1', nombre: 'Ana Gómez', tel: '11-2345-6789' },
+  { id: '2', nombre: 'Bruno Díaz', tel: '11-9876-5432' },
+  { id: '3', nombre: 'Carla Ruiz', tel: '11-5555-1234' },
+];
+
+export default function Agenda() {
+  return (
+    &lt;FlatList
+      data={contactos}
+      keyExtractor={(item) =&gt; item.id}
+      renderItem={({ item }) =&gt; (
+        &lt;View style={styles.fila}&gt;
+          &lt;Text style={styles.nombre}&gt;{item.nombre}&lt;/Text&gt;
+          &lt;Text style={styles.tel}&gt;{item.tel}&lt;/Text&gt;
+        &lt;/View&gt;
+      )}
+      ItemSeparatorComponent={() =&gt; &lt;View style={styles.separador} /&gt;}
+      ListEmptyComponent={() =&gt; (
+        &lt;Text style={styles.vacio}&gt;Todavía no tenés contactos.&lt;/Text&gt;
+      )}
+    /&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  fila: { paddingVertical: 14, paddingHorizontal: 16 },
+  nombre: { fontSize: 16, fontWeight: 'bold' },
+  tel: { fontSize: 14, color: '#666' },
+  separador: { height: 1, backgroundColor: '#e0e0e0' },
+  vacio: { textAlign: 'center', marginTop: 40, color: '#999' },
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 Probá el caso vacío:</strong> cambiá <code>data={contactos}</code> por <code>data={[]}</code> y vas a ver
+  el <code>ListEmptyComponent</code> en acción. Manejar la lista vacía desde el día uno te evita la temida
+  "pantalla en blanco" que confunde al usuario.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>.map()</code> dentro de un <code>ScrollView</code> traba la app con listas largas?</summary>
+<p>Porque el <code>ScrollView</code> renderiza <strong>todos</strong> los elementos de una vez, aunque solo se vean unos pocos. Con miles de ítems eso monta miles de vistas nativas y reserva memoria para todas. <code>FlatList</code> en cambio <em>virtualiza</em>: solo renderiza lo visible y recicla las vistas a medida que scrolleás.</p></details>
+
+<details><summary>¿Cuáles son las tres props imprescindibles de <code>FlatList</code> y qué hace cada una?</summary>
+<p><code>data</code> (el array de origen), <code>renderItem</code> (función <code>({ item }) =&gt; JSX</code> que dibuja un elemento) y <code>keyExtractor</code> (función que devuelve una key única y estable por ítem, necesaria para el reciclado correcto).</p></details>
+
+<details><summary>¿Qué dos props usás para implementar pull-to-refresh y qué rol cumple cada una?</summary>
+<p><code>onRefresh</code> es la función que recarga los datos cuando el usuario tira hacia abajo. <code>refreshing</code> es un booleano controlado por estado: mientras sea <code>true</code> se ve el spinner; lo ponés en <code>true</code> antes de recargar y en <code>false</code> al terminar (idealmente en un <code>finally</code>).</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá una <code>FlatList</code> con un array de 10 objetos (por ejemplo, tus películas favoritas con <code>id</code> y <code>titulo</code>). Mostrá cada título en un <code>&lt;Text&gt;</code> y usá <code>keyExtractor</code> con el <code>id</code>.</li>
+  <li>Agregá un <code>ItemSeparatorComponent</code> que dibuje una línea fina entre cada ítem y un <code>ListHeaderComponent</code> con un título "Mis películas".</li>
+  <li>Vaciá el array (<code>data={[]}</code>) y agregá un <code>ListEmptyComponent</code> que muestre "No hay películas todavía". Confirmá que aparece.</li>
+  <li>Implementá pull-to-refresh: un estado <code>refrescando</code>, una función <code>onRefresh</code> que espere 1 segundo (con <code>setTimeout</code> o un <code>await</code>) y vuelva a poner <code>refrescando</code> en <code>false</code>. Tirá hacia abajo y mirá el spinner.</li>
+  <li>Convertí tu lista de películas en una <code>SectionList</code> agrupada por género (Acción, Drama, Comedia). Usá <code>renderSectionHeader</code> para mostrar el nombre del género arriba de cada grupo.</li>
+</ol>
+
+<section class="quiz" id="quizRN03">
+  <style>
+    #quizRN03{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRN03 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRN03 .q{margin-bottom:1.5rem}
+    #quizRN03 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRN03 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRN03 .opt:hover{border-color:var(--accent)}
+    #quizRN03 .opt:disabled{cursor:default}
+    #quizRN03 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRN03 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRN03 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRN03 .exp.show{display:block}
+    #quizRN03 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Por qué <code>FlatList</code> rinde mejor que <code>.map()</code> + <code>ScrollView</code> con listas largas?</p>
+    <button class="opt">Porque compila la lista a código nativo más rápido</button>
+    <button class="opt">Porque <strong>virtualiza</strong>: solo renderiza los ítems visibles y recicla las vistas al scrollear</button>
+    <button class="opt">Porque carga los datos desde la API automáticamente</button>
+    <div class="exp">El <code>ScrollView</code> monta todos los elementos de golpe. <code>FlatList</code> solo dibuja lo que está (o está por estar) en pantalla y recicla vistas, manteniendo el consumo de memoria bajo aunque la lista tenga miles de ítems.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Qué problema causa usar el <code>index</code> como <code>key</code> cuando la lista cambia?</p>
+    <button class="opt">Ninguno, el índice siempre es una key válida</button>
+    <button class="opt">Hace que la lista deje de scrollear</button>
+    <button class="opt">Al insertar, borrar o reordenar, las keys se corren y React asocia mal el estado de cada fila</button>
+    <div class="exp">Las keys por índice no son estables: si la data se reordena o se borra un elemento, el índice de cada ítem cambia y React mezcla el estado entre filas. Hay que usar un <code>id</code> estable del dato.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué prop usás para mostrar un mensaje cuando la lista no tiene datos?</p>
+    <button class="opt"><code>ListEmptyComponent</code></button>
+    <button class="opt"><code>ItemSeparatorComponent</code></button>
+    <button class="opt"><code>onEndReached</code></button>
+    <div class="exp"><code>ListEmptyComponent</code> se renderiza cuando <code>data</code> está vacío. Sin él, una lista vacía deja una pantalla en blanco que confunde al usuario.</div>
+  </div>
+
+  <div class="score" id="scoreRN03"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRN03');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRN03').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M04.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m02-estilos/lecture.html">← M02: Estilos</a>
+  <a href="../m04-navegacion/lecture.html">M04: Navegación →</a>
+</nav>
+
+</div>
+</body>
+</html>

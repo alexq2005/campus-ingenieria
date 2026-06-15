@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>📝 Notas Markdown — App real (MVP) · Campus CS-FE</title>
+<meta name="description" content="MVP funcionando del Proyecto 04: editor de notas con preview Markdown en vivo, búsqueda y guardado local. Corre 100% en el navegador, sin servidor.">
+<style>
+  :root{--bg:#0f172a;--surface:#1e293b;--surface-2:#334155;--text:#f1f5f9;--muted:#94a3b8;--accent:#38bdf8;--accent-2:#8b5cf6;--success:#10b981;--border:#334155;--code:#0b1220}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{display:flex;align-items:center;gap:.8rem;padding:.6rem 1rem;border-bottom:1px solid var(--border);background:var(--surface);flex-wrap:wrap}
+  .topbar a{color:var(--accent);text-decoration:none;font-size:.85em}
+  .topbar .marca{font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent-2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .topbar .demo-tag{font-size:.7em;background:rgba(16,185,129,.18);color:var(--success);padding:2px 8px;border-radius:999px;font-weight:700}
+  .app{flex:1;display:flex;min-height:0}
+  .sidebar{width:240px;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;min-height:0}
+  .sidebar .head{padding:.6rem;display:flex;gap:.4rem}
+  .sidebar input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:6px;font-size:.82em;font-family:inherit}
+  .btn{background:var(--accent);color:var(--bg);border:none;border-radius:6px;padding:.4rem .7rem;font-weight:700;cursor:pointer;font-size:.82em}
+  .btn:hover{filter:brightness(1.1)}
+  .lista{flex:1;overflow-y:auto}
+  .nota-item{padding:.6rem .8rem;border-bottom:1px solid var(--border);cursor:pointer;font-size:.85em}
+  .nota-item:hover{background:var(--surface-2)}
+  .nota-item.activa{background:var(--surface-2);border-left:3px solid var(--accent)}
+  .nota-item .t{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .nota-item .f{color:var(--muted);font-size:.82em;margin-top:2px}
+  .nota-item .del{float:right;color:var(--muted);border:none;background:none;cursor:pointer;font-size:.9em}
+  .nota-item .del:hover{color:#fb7185}
+  .editor-zona{flex:1;display:flex;min-height:0}
+  textarea{flex:1;background:var(--code);color:var(--text);border:none;padding:1.2rem;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.95em;line-height:1.6;resize:none}
+  textarea:focus{outline:none}
+  .preview{flex:1;padding:1.2rem 1.6rem;overflow-y:auto;border-left:1px solid var(--border);line-height:1.7}
+  .preview h1{font-size:1.7rem;margin:.6rem 0 .4rem;border-bottom:1px solid var(--border);padding-bottom:.3rem}
+  .preview h2{font-size:1.35rem;margin:1rem 0 .4rem}
+  .preview h3{font-size:1.1rem;margin:.8rem 0 .3rem}
+  .preview p{margin:.6rem 0}
+  .preview code{background:var(--code);padding:.15rem .4rem;border-radius:4px;font-family:ui-monospace,monospace;font-size:.88em}
+  .preview pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow:auto;margin:.8rem 0}
+  .preview pre code{background:none;padding:0}
+  .preview blockquote{border-left:3px solid var(--accent);padding:.3rem 1rem;color:var(--muted);margin:.8rem 0}
+  .preview ul,.preview ol{padding-left:1.5rem;margin:.6rem 0}
+  .preview a{color:var(--accent)}
+  .preview hr{border:none;border-top:1px solid var(--border);margin:1.2rem 0}
+  .vacio{color:var(--muted);text-align:center;margin-top:3rem;font-size:.9em}
+  @media(max-width:760px){.editor-zona{flex-direction:column}.preview{border-left:none;border-top:1px solid var(--border)}.sidebar{width:170px}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="marca">📝 Notas Markdown</span>
+  <span class="demo-tag">MVP REAL · corre sin servidor</span>
+  <span style="flex:1"></span>
+  <a href="../04-notas-markdown.html">← Ver la guía del proyecto</a>
+  <a href="../index.html">🛠️ Galería</a>
+</div>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="head">
+      <input id="buscar" type="search" placeholder="Buscar…" autocomplete="off">
+      <button class="btn" id="nueva" title="Nueva nota">+</button>
+    </div>
+    <div class="lista" id="lista"></div>
+  </aside>
+  <div class="editor-zona">
+    <textarea id="editor" placeholder="Escribí en Markdown…&#10;&#10;# Un título&#10;**negrita**, *cursiva*, `código`&#10;- una lista&#10;> una cita&#10;[un link](https://ejemplo.com)"></textarea>
+    <div class="preview" id="preview"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ===== Estado: notas en localStorage =====
+  var KEY = 'notas-md-v1';
+  var notas = [];
+  var activaId = null;
+  try { notas = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { notas = []; }
+
+  var $lista = document.getElementById('lista');
+  var $editor = document.getElementById('editor');
+  var $preview = document.getElementById('preview');
+  var $buscar = document.getElementById('buscar');
+
+  function guardar() { try { localStorage.setItem(KEY, JSON.stringify(notas)); } catch (e) {} }
+  function ahora() { return new Date().toLocaleString(); }
+  function id() { return 'n' + Date.now() + Math.floor(Math.random() * 1000); }
+  function tituloDe(txt) {
+    var l = (txt || '').split('\n').find(function (x) { return x.trim(); }) || 'Nota sin título';
+    return l.replace(/^#+\s*/, '').slice(0, 40) || 'Nota sin título';
+  }
+
+  // ===== Mini parser Markdown (sin dependencias) =====
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function inline(s) {
+    return s
+      .replace(/`([^`]+)`/g, function (m, c) { return '<code>' + esc(c) + '</code>'; })
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+  function md(src) {
+    var lines = src.split('\n'), out = [], i = 0;
+    while (i < lines.length) {
+      var l = lines[i];
+      if (/^```/.test(l.trim())) {
+        var buf = []; i++;
+        while (i < lines.length && !/^```/.test(lines[i].trim())) { buf.push(esc(lines[i])); i++; }
+        i++; out.push('<pre><code>' + buf.join('\n') + '</code></pre>'); continue;
+      }
+      var h = l.match(/^(#{1,3})\s+(.*)$/);
+      if (h) { var n = h[1].length; out.push('<h' + n + '>' + inline(esc(h[2])) + '</h' + n + '>'); i++; continue; }
+      if (/^\s*>\s?/.test(l)) {
+        var bq = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) { bq.push(inline(esc(lines[i].replace(/^\s*>\s?/, '')))); i++; }
+        out.push('<blockquote>' + bq.join('<br>') + '</blockquote>'); continue;
+      }
+      if (/^\s*[-*]\s+/.test(l)) {
+        var ul = [];
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { ul.push('<li>' + inline(esc(lines[i].replace(/^\s*[-*]\s+/, ''))) + '</li>'); i++; }
+        out.push('<ul>' + ul.join('') + '</ul>'); continue;
+      }
+      if (/^\s*\d+\.\s+/.test(l)) {
+        var ol = [];
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { ol.push('<li>' + inline(esc(lines[i].replace(/^\s*\d+\.\s+/, ''))) + '</li>'); i++; }
+        out.push('<ol>' + ol.join('') + '</ol>'); continue;
+      }
+      if (/^\s*---+\s*$/.test(l)) { out.push('<hr>'); i++; continue; }
+      if (!l.trim()) { i++; continue; }
+      var p = [l]; i++;
+      while (i < lines.length && lines[i].trim() && !/^(#{1,3}\s|```|\s*[-*]\s|\s*\d+\.\s|\s*>)/.test(lines[i])) { p.push(lines[i]); i++; }
+      out.push('<p>' + inline(esc(p.join(' '))) + '</p>');
+    }
+    return out.join('\n');
+  }
+
+  // ===== UI =====
+  function activa() { return notas.find(function (n) { return n.id === activaId; }); }
+  function render() {
+    var q = ($buscar.value || '').toLowerCase();
+    var vis = notas.filter(function (n) { return !q || (n.txt || '').toLowerCase().indexOf(q) !== -1; });
+    $lista.innerHTML = vis.length ? '' : '<div class="vacio">Sin notas. Tocá "+".</div>';
+    vis.forEach(function (n) {
+      var d = document.createElement('div');
+      d.className = 'nota-item' + (n.id === activaId ? ' activa' : '');
+      d.innerHTML = '<button class="del" title="Borrar">✕</button><div class="t">' + esc(tituloDe(n.txt)) + '</div><div class="f">' + n.fecha + '</div>';
+      d.onclick = function (e) { if (e.target.classList.contains('del')) return; abrir(n.id); };
+      d.querySelector('.del').onclick = function () { borrar(n.id); };
+      $lista.appendChild(d);
+    });
+    var a = activa();
+    $editor.value = a ? a.txt : '';
+    $preview.innerHTML = a ? md(a.txt) : '<div class="vacio">Elegí o creá una nota.</div>';
+  }
+  function abrir(nid) { activaId = nid; render(); $editor.focus(); }
+  function nueva() {
+    var n = { id: id(), txt: '# Nueva nota\n\n', fecha: ahora() };
+    notas.unshift(n); activaId = n.id; guardar(); render(); $editor.focus();
+  }
+  function borrar(nid) {
+    notas = notas.filter(function (n) { return n.id !== nid; });
+    if (activaId === nid) activaId = notas[0] ? notas[0].id : null;
+    guardar(); render();
+  }
+  $editor.addEventListener('input', function () {
+    var a = activa(); if (!a) return;
+    a.txt = $editor.value; a.fecha = ahora();
+    $preview.innerHTML = md(a.txt);
+    guardar();
+    // actualizar título en la lista sin perder foco
+    var item = $lista.querySelector('.nota-item.activa .t');
+    if (item) item.textContent = tituloDe(a.txt);
+  });
+  $buscar.addEventListener('input', render);
+  document.getElementById('nueva').onclick = nueva;
+
+  // primera vez: nota de bienvenida
+  if (!notas.length) {
+    notas.push({ id: id(), fecha: ahora(), txt: '# 👋 Bienvenido\n\nEsta es una **app real** del campus — no una guía, código que corre.\n\n- Escribí en Markdown a la izquierda\n- Mirá el preview en vivo a la derecha\n- Todo se guarda solo en tu navegador (localStorage)\n\n> Probá: cerrá y reabrí la página. Tus notas siguen acá.\n\n```\nfunciona 100% offline\nsin servidor, sin internet\n```\n\nTocá **+** para crear otra.' });
+    guardar();
+  }
+  activaId = notas[0].id;
+  render();
+})();
+</script>
+
+</body>
+</html>

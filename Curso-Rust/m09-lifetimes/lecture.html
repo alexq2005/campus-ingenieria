@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 09 — Lifetimes · Curso de Rust</title>
+  <meta name="description" content="Qué es un lifetime, por qué casi nunca los escribís (elision), cuándo hay que anotarlos, la sintaxis 'a, lifetimes en structs y 'static.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 09</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M03, M08</span>
+</div>
+
+<article>
+
+<h1>Módulo 09 — Lifetimes</h1>
+
+<p>Bienvenido a la parte más temida de Rust. Respirá: vamos despacio. Los <strong>lifetimes</strong> tienen mala fama porque la sintaxis se ve rara (<code>&amp;'a str</code>) y porque suelen aparecer en mensajes de error largos. Pero la <em>idea</em> es simple, y lo más importante: <strong>casi nunca vas a escribirlos a mano</strong>. Al terminar este módulo vas a entender qué son, por qué existen, y cuándo (en las pocas ocasiones) hay que anotarlos.</p>
+
+<h2>¿Qué es un lifetime?</h2>
+
+<div class="concept">
+  <strong>💡 Un lifetime es CUÁNTO VIVE una referencia.</strong> No es un tipo de dato ni un valor en memoria: es información que el compilador usa para garantizar que <strong>ninguna referencia sobreviva al dato que apunta</strong>. Ese es el objetivo único: cero <em>dangling references</em> (referencias colgadas que apuntan a memoria liberada). Los lifetimes <strong>no cambian el runtime</strong> — el programa compilado corre exactamente igual. Solo le informan al compilador para que pueda chequear tu código.
+</div>
+
+<p>Vení de M03 (borrowing): cuando hacés <code>&amp;x</code> tomás prestada una referencia a <code>x</code>. El borrow checker ya te asegura que no usás esa referencia después de que <code>x</code> se libere. Los lifetimes son simplemente las <strong>etiquetas</strong> que ese chequeo usa por debajo. La mayoría del tiempo el compilador las pone solo.</p>
+
+<h2>La buena noticia: casi nunca los escribís</h2>
+
+<div class="info">
+  <strong>Lifetime elision (elisión de lifetimes):</strong> el compilador deduce los lifetimes solo en la enorme mayoría de los casos siguiendo unas reglas fijas. Por eso podés llevar módulos enteros de Rust sin escribir una sola <code>'a</code>. Si venís asustado por capturas de pantalla de código lleno de <code>&amp;'a</code>, tranquilo: ese código es la excepción, no la regla del día a día.</div>
+
+<p>Por ejemplo, esta función toma una referencia y devuelve otra, y <strong>no necesita ninguna anotación</strong> — el compilador la infiere:</p>
+
+<pre><code class="lang-rust">// El compilador deduce los lifetimes: no escribís nada.
+fn primera_palabra(s: &amp;str) -&gt; &amp;str {
+    let bytes = s.as_bytes();
+    for (i, &amp;b) in bytes.iter().enumerate() {
+        if b == b' ' {
+            return &amp;s[0..i];
+        }
+    }
+    &amp;s[..]
+}</code></pre>
+
+<p>Funciona porque hay <strong>una sola</strong> referencia de entrada: el compilador asume que la salida está atada a esa entrada. No hay ambigüedad, así que no hace falta anotar.</p>
+
+<h2>¿Cuándo SÍ hay que anotarlos?</h2>
+
+<div class="rule">
+  <strong>📌 La regla práctica:</strong> tenés que anotar lifetimes cuando una función <strong>devuelve una referencia</strong> y el compilador <strong>no puede deducir a cuál de los inputs</strong> está atada. Si hay dos (o más) referencias de entrada y devolvés una referencia, el compilador no sabe cuál de las dos sobrevive en la salida — ahí tenés que decírselo vos.
+</div>
+
+<p>Ese es prácticamente el único escenario común. Si tu función no devuelve referencias, o solo recibe una, el elision te cubre.</p>
+
+<h2>La sintaxis: el parámetro <code>'a</code></h2>
+
+<p>Un lifetime se escribe con una comilla simple seguida de un nombre corto, casi siempre <code>'a</code>. Se declara entre <code>&lt;&gt;</code> después del nombre de la función, igual que un parámetro genérico de tipo (M07). Mirá la función clásica, "el más largo de dos strings":</p>
+
+<pre><code class="lang-rust">fn mas_largo&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str {
+    if x.len() &gt; y.len() {
+        x
+    } else {
+        y
+    }
+}</code></pre>
+
+<p>Leamos esa firma de izquierda a derecha, con calma:</p>
+
+<table>
+<thead><tr><th>Fragmento</th><th>Qué significa</th></tr></thead>
+<tbody>
+<tr><td><code>&lt;'a&gt;</code></td><td>Declarás un lifetime llamado <code>'a</code> (como declarar una variable genérica).</td></tr>
+<tr><td><code>x: &amp;'a str</code></td><td><code>x</code> es una referencia a <code>str</code> que vive durante <code>'a</code>.</td></tr>
+<tr><td><code>y: &amp;'a str</code></td><td><code>y</code> también vive durante <code>'a</code> — la <em>misma</em> etiqueta.</td></tr>
+<tr><td><code>-&gt; &amp;'a str</code></td><td>El valor que devolvés vive durante <code>'a</code> también.</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Qué promete esa firma:</strong> como <code>x</code>, <code>y</code> y el retorno comparten <code>'a</code>, le estás diciendo al compilador que <strong>el retorno vive tanto como el MENOR de los dos inputs</strong>. Es decir: la referencia devuelta es válida solo mientras AMBOS, <code>x</code> e <code>y</code>, sigan vivos. En cuanto el primero de los dos muere, la salida deja de ser válida. El compilador usa esa promesa para rechazar cualquier uso peligroso.
+</div>
+
+<h3>¿Por qué hace falta acá y no en <code>primera_palabra</code>?</h3>
+
+<p>Porque <code>mas_largo</code> recibe <strong>dos</strong> referencias y devuelve una. El compilador no puede adivinar si el retorno está atado a <code>x</code> o a <code>y</code> — depende de cuál sea más largo, algo que solo se sabe en runtime. Sin la anotación, no sabría cuánto tiempo es seguro usar el resultado. La <code>'a</code> resuelve la ambigüedad: "el resultado dura lo que dure el menor de los dos".</p>
+
+<div class="analogy">
+  <strong>🔗 Analogía:</strong> pensá los lifetimes como <strong>etiquetas adhesivas con fecha de vencimiento</strong> que le pegás a cada referencia. La etiqueta le dice al compilador: "esta referencia es válida durante este tramo, no más". No hacen nada cuando el programa corre — son una <em>promesa verificada en compilación</em>, no código que se ejecuta. Como el cartel "consumir antes de…": no cambia la comida, solo informa hasta cuándo es segura.
+</div>
+
+<h2>Lifetimes en structs que guardan referencias</h2>
+
+<p>Hasta ahora tus structs (M04) guardaban datos que poseían (<code>String</code>, <code>i32</code>). Pero un struct también puede guardar una <strong>referencia</strong> a un dato que vive afuera. Cuando lo hace, Rust te <em>obliga</em> a anotar el lifetime, porque el struct no puede sobrevivir al dato que referencia:</p>
+
+<pre><code class="lang-rust">struct Extracto&lt;'a&gt; {
+    parte: &amp;'a str,
+}
+
+fn main() {
+    let novela = String::from("Llamame Ismael. Hace algunos años...");
+    let primera = novela.split('.').next().unwrap();
+    let e = Extracto { parte: primera };
+    println!("{}", e.parte);
+}</code></pre>
+
+<p>El <code>&lt;'a&gt;</code> después de <code>Extracto</code> dice: "una instancia de <code>Extracto</code> no puede vivir más que la referencia <code>parte</code> que guarda adentro". Si <code>novela</code> se liberara mientras <code>e</code> todavía existe, sería una dangling reference — y el compilador no lo permite.</p>
+
+<div class="tip">
+  <strong>✅ Truco mental:</strong> si un struct tiene un campo que es <code>&amp;</code> (referencia), va a necesitar un lifetime. Si todos sus campos son dueños de sus datos (<code>String</code>, <code>Vec</code>, números), no necesita ninguno.
+</div>
+
+<h2>El lifetime especial <code>'static</code></h2>
+
+<p>Hay un lifetime con nombre propio: <code>'static</code>. Significa que la referencia <strong>vive durante todo el programa</strong>, de principio a fin. El caso más común son los <em>literales de string</em>, que están incrustados en el binario:</p>
+
+<pre><code class="lang-rust">// Todo literal de string tiene tipo &amp;'static str.
+let saludo: &amp;'static str = "Hola, mundo";</code></pre>
+
+<div class="warn">
+  <strong>⚠️ No abuses de <code>'static</code>:</strong> a veces, al pelear con el compilador, uno cae en la tentación de marcar todo como <code>'static</code> para "callar el error". Casi siempre es la solución equivocada — fuerza datos a vivir más de lo necesario o esconde el problema real. Usalo solo cuando el dato genuinamente vive todo el programa.
+</div>
+
+<h2>El error más común (y cómo NO sufrirlo)</h2>
+
+<div class="mistake">
+  <strong>Devolver una referencia a una variable LOCAL de la función.</strong> Esto es el clásico que no compila. La variable local se libera al terminar la función, así que la referencia quedaría colgada:
+</div>
+
+<pre><code class="lang-rust">// ❌ NO compila: `s` muere al salir de la función.
+fn roto() -&gt; &amp;str {
+    let s = String::from("hola");
+    &amp;s   // referencia a algo que está por desaparecer
+}</code></pre>
+
+<p>El compilador rechaza esto y te dice que <code>s</code> "no vive lo suficiente". Ninguna anotación de lifetime lo arregla, porque el problema es real: el dato desaparece. La solución no es pelear con <code>'a</code>, es <strong>devolver un valor que sea dueño de sí mismo</strong>:</p>
+
+<pre><code class="lang-rust">// ✅ Compila: devolvés un String owned, sin referencias colgadas.
+fn arreglado() -&gt; String {
+    String::from("hola")
+}</code></pre>
+
+<div class="danger">
+  <strong>🚫 La trampa más grande con lifetimes:</strong> ponerte a pelear con anotaciones <code>&lt;'a&gt;</code> cada vez más complicadas cuando devolver un valor <em>owned</em> (un <code>String</code>, o un <code>.clone()</code>) sería más simple y más claro. Antes de meter lifetimes en una firma, preguntate: <em>¿necesito de verdad devolver una referencia, o me conviene devolver el dato en propiedad?</em> Muchas veces la respuesta es lo segundo, y el código queda mucho más legible.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué representa un lifetime y afecta el rendimiento del programa?</summary>
+<p>Representa <strong>cuánto vive una referencia</strong>. Es solo información para el compilador, que la usa para garantizar que ninguna referencia sobreviva al dato que apunta. <strong>No afecta el runtime</strong>: el programa compilado corre igual con o sin las anotaciones.</p></details>
+
+<details><summary>¿Por qué <code>mas_largo&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code> necesita la anotación pero <code>primera_palabra(s: &amp;str) -&gt; &amp;str</code> no?</summary>
+<p>Porque <code>primera_palabra</code> tiene <strong>una sola</strong> referencia de entrada: el compilador deduce (elision) que la salida está atada a ella. <code>mas_largo</code> tiene <strong>dos</strong> referencias de entrada y devuelve una; el compilador no puede saber a cuál está atada la salida, así que vos se lo decís con <code>'a</code>: el retorno vive tanto como el menor de los dos inputs.</p></details>
+
+<details><summary>Tu función crea un <code>String</code> local y querés devolverlo por referencia, pero no compila. ¿Qué hacés?</summary>
+<p>No intentes arreglarlo con lifetimes: el problema es real, la variable local muere al salir de la función. Devolvé el valor <strong>owned</strong> (el <code>String</code> directamente, no <code>&amp;String</code>). Es más simple y correcto.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí <code>fn mas_largo&lt;'a&gt;(x: &amp;'a str, y: &amp;'a str) -&gt; &amp;'a str</code> y llamala con dos strings de distinto largo. Comprobá que devuelve el más largo.</li>
+  <li>Sacá la anotación <code>'a</code> de <code>mas_largo</code> y mirá el mensaje de error del compilador. Leelo entero: te dice exactamente qué lifetime falta.</li>
+  <li>Definí <code>struct Extracto&lt;'a&gt; { parte: &amp;'a str }</code> y construí una instancia tomando la primera oración de un <code>String</code>. Imprimí <code>e.parte</code>.</li>
+  <li>Escribí una función rota que devuelva <code>&amp;str</code> a una variable <code>String</code> local. Confirmá que no compila; después arreglala devolviendo <code>String</code> (owned) en vez de la referencia.</li>
+  <li>Declará <code>let s: &amp;'static str = "campus";</code> y explicá en un comentario por qué los literales de string son <code>'static</code>.</li>
+</ol>
+
+<section class="quiz" id="quizRs09">
+  <style>
+    #quizRs09{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs09 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs09 .q{margin-bottom:1.5rem}
+    #quizRs09 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs09 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs09 .opt:hover{border-color:var(--accent)}
+    #quizRs09 .opt:disabled{cursor:default}
+    #quizRs09 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs09 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs09 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs09 .exp.show{display:block}
+    #quizRs09 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué representa un lifetime en Rust?</p>
+    <button class="opt">El tamaño en bytes que ocupa una referencia en memoria</button>
+    <button class="opt">Cuánto vive una referencia, para garantizar que no sobreviva al dato que apunta</button>
+    <button class="opt">La velocidad a la que el garbage collector libera la referencia</button>
+    <div class="exp">Un lifetime es información sobre cuánto vive una referencia. El compilador la usa para evitar dangling references. No afecta el runtime y Rust no tiene garbage collector.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Cuándo tenés que anotar lifetimes a mano?</p>
+    <button class="opt">Siempre que uses una referencia, en cada función</button>
+    <button class="opt">Nunca: el compilador los infiere en el 100% de los casos</button>
+    <button class="opt">Cuando una función devuelve una referencia y el compilador no puede deducir a cuál input está atada</button>
+    <div class="exp">La mayoría se infieren por elision. Solo hace falta anotar cuando devolvés una referencia y hay ambigüedad sobre a cuál input pertenece (típicamente, dos o más referencias de entrada).</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu función arma un <code>String</code> local y querés devolver <code>&amp;str</code> apuntando a él, pero no compila. ¿La mejor solución?</p>
+    <button class="opt">Devolver el <code>String</code> owned en vez de una referencia (no pelear con lifetimes)</button>
+    <button class="opt">Marcar el retorno como <code>&amp;'static str</code> para silenciar el error</button>
+    <button class="opt">Agregar más anotaciones <code>&lt;'a&gt;</code> hasta que compile</button>
+    <div class="exp">El problema es real: la variable local muere al salir. Ningún lifetime lo arregla. Devolver el valor owned (<code>String</code>) es más simple y correcto; <code>'static</code> solo escondería el problema.</div>
+  </div>
+
+  <div class="score" id="scoreRs09"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs09');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs09').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Venciste a los lifetimes. Listo para el M10.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m08-traits/lecture.html">← M08: Traits</a>
+  <a href="../m10-concurrencia/lecture.html">M10: Concurrencia →</a>
+</nav>
+
+</div>
+</body>
+</html>

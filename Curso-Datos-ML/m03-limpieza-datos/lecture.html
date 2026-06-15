@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 03 — Limpieza de Datos · Curso de Datos & ML</title>
+  <meta name="description" content="El 80% del trabajo real: detectar y tratar nulos, duplicados, tipos inconsistentes y texto sucio. Estrategias dropna/fillna, astype/to_numeric/to_datetime, normalización de texto y un pipeline de limpieza completo.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 03</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M02</span>
+</div>
+
+<article>
+
+<h1>Módulo 03 — Limpieza de Datos</h1>
+
+<p>Hay una frase que se repite en cada equipo de datos: <em>"el 80% del trabajo es limpiar datos, el otro 20% es quejarse de limpiar datos"</em>. Es exagerada, pero apunta a una verdad incómoda: en proyectos reales los datos llegan <strong>sucios</strong> — con celdas vacías, fechas escritas como texto, nombres duplicados, mayúsculas inconsistentes. Antes de explorar o modelar nada, hay que ponerlos prolijos. Eso es lo que aprendés acá.</p>
+
+<div class="concept">
+  <strong>💡 Garbage in, garbage out.</strong> Un modelo (o un gráfico, o un promedio) es tan bueno como los datos que le metés. Si la columna <code>edad</code> tiene valores como <code>-5</code>, <code>"treinta"</code> o celdas vacías, ningún algoritmo va a salvarte: vas a sacar conclusiones falsas con total confianza. Datos sucios → resultados sucios. La limpieza no es un trámite previo: <em>es</em> el trabajo.
+</div>
+
+<h2>Lo primero: mirar el estado del dataset</h2>
+
+<p>Antes de tocar nada, hacés un diagnóstico. <code>info()</code> te muestra tipos y cuántos no-nulos tiene cada columna; <code>describe()</code> revela rangos sospechosos (un <code>max</code> de 999 en una columna de edad grita "error").</p>
+
+<pre><code class="lang-python">import pandas as pd
+
+df = pd.read_csv("clientes_sucio.csv")
+df.info()        # tipos de dato y conteo de no-nulos por columna
+df.describe()    # estadísticas: ¿hay min/max imposibles?
+df.head()        # ¿qué pinta tienen las primeras filas?</code></pre>
+
+<h2>Valores nulos (NaN)</h2>
+
+<p>Un nulo (<code>NaN</code>, "Not a Number") es una celda sin dato. Aparecen por encuestas incompletas, sensores que fallaron, joins que no encontraron pareja, etc. El primer paso siempre es <strong>contarlos</strong>:</p>
+
+<pre><code class="lang-python">df.isna().sum()              # cuántos nulos por columna
+df.isna().sum().sum()        # total de nulos en todo el DataFrame
+df.isna().mean() * 100       # % de nulos por columna (clave para decidir)</code></pre>
+
+<div class="info">
+  <code>isna()</code> y <code>isnull()</code> son <strong>exactamente lo mismo</strong> en pandas (alias). Usá la que prefieras; <code>isna()</code> es la más común hoy. Su opuesto es <code>notna()</code>.
+</div>
+
+<p>Una vez que sabés cuántos hay y dónde, tenés dos grandes estrategias: <strong>eliminar</strong> o <strong>rellenar</strong>.</p>
+
+<h3>Estrategia A — eliminar: <code>dropna()</code></h3>
+
+<pre><code class="lang-python">df.dropna()                          # tira filas con AL MENOS un nulo
+df.dropna(subset=["edad", "email"])  # solo si falta en esas columnas
+df.dropna(axis=1)                    # tira COLUMNAS con nulos (axis=1)
+df.dropna(thresh=3)                  # conservá filas con &gt;= 3 valores no-nulos</code></pre>
+
+<div class="rule">
+  <strong>📌 ¿Cuándo eliminar?</strong> Cuando los nulos son <em>pocos</em> (regla informal: menos del ~5% de las filas) y están <em>repartidos al azar</em>. Si una columna entera tiene 80% de nulos, lo razonable suele ser dropear <em>esa columna</em> (<code>axis=1</code>), no las filas.
+</div>
+
+<h3>Estrategia B — rellenar (imputar): <code>fillna()</code></h3>
+
+<p>Si no querés perder filas, las rellenás con un valor que represente "lo típico". Cuál usás depende del <strong>tipo</strong> de columna:</p>
+
+<table>
+<thead><tr><th>Relleno</th><th>Cuándo usarlo</th><th>Código</th></tr></thead>
+<tbody>
+<tr><td><strong>Media</strong></td><td>Numérica, distribución simétrica, sin outliers fuertes</td><td><code>df["x"].fillna(df["x"].mean())</code></td></tr>
+<tr><td><strong>Mediana</strong></td><td>Numérica con outliers o asimétrica (sueldos, precios)</td><td><code>df["x"].fillna(df["x"].median())</code></td></tr>
+<tr><td><strong>Moda</strong></td><td>Categórica / texto (el valor más frecuente)</td><td><code>df["c"].fillna(df["c"].mode()[0])</code></td></tr>
+<tr><td><strong>ffill / bfill</strong></td><td>Series temporales (arrastrar el último/siguiente valor)</td><td><code>df["x"].ffill()</code></td></tr>
+<tr><td><strong>Constante</strong></td><td>Cuando "faltante" es información (ej: "Desconocido")</td><td><code>df["c"].fillna("Desconocido")</code></td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔍 La mediana es más robusta que la media.</strong> Imaginá 5 sueldos: 1000, 1100, 1200, 1300 y 50000 (un CEO). La media da 10920 — no representa a nadie. La mediana da 1200 — esa es "la persona del medio". Cuando hay outliers, rellenar con la mediana mete menos sesgo que rellenar con la media.
+</div>
+
+<h2>Duplicados</h2>
+
+<p>Filas repetidas inflan los conteos y sesgan los promedios. Las detectás y eliminás así:</p>
+
+<pre><code class="lang-python">df.duplicated().sum()            # cuántas filas están repetidas
+df[df.duplicated()]              # ver cuáles son
+
+df = df.drop_duplicates()                       # elimina filas idénticas
+df = df.drop_duplicates(subset=["email"])       # duplicado = mismo email
+df = df.drop_duplicates(subset=["email"], keep="last")  # conservá la última</code></pre>
+
+<div class="info">
+  Por defecto <code>keep="first"</code>: conserva la primera aparición y descarta el resto. Usá <code>subset</code> cuando "duplicado" significa repetir una <em>clave</em> (un DNI, un email) aunque otras columnas difieran.
+</div>
+
+<h2>Tipos de dato</h2>
+
+<p>Un CSV no tiene tipos: todo entra como texto hasta que pandas adivina. Frecuentemente adivina mal — una columna de precios con un <code>"N/D"</code> perdido queda como <code>object</code> (texto), y no podés sumarla. Reparar tipos es central:</p>
+
+<pre><code class="lang-python">df.dtypes                                  # ver el tipo de cada columna
+
+# convertir explícitamente
+df["edad"] = df["edad"].astype(int)
+
+# texto → número, lo que no se pueda parsear se vuelve NaN (no rompe)
+df["precio"] = pd.to_numeric(df["precio"], errors="coerce")
+
+# texto → fecha (entiende muchos formatos)
+df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>errors="coerce"</code> es tu red de seguridad.</strong> En vez de tirar una excepción cuando encuentra un valor que no puede convertir (ej: <code>"desconocido"</code> en una columna numérica), lo transforma en <code>NaN</code>. Así convertís toda la columna de una y después tratás esos <code>NaN</code> con las estrategias de arriba.
+</div>
+
+<h2>Texto sucio</h2>
+
+<p>El texto humano es un desastre: <code>" Buenos Aires"</code>, <code>"buenos aires"</code> y <code>"BUENOS AIRES"</code> son la misma ciudad para vos, pero tres categorías distintas para pandas. El accessor <code>.str</code> te da métodos vectorizados de Python para limpiarlo:</p>
+
+<pre><code class="lang-python">df["ciudad"] = df["ciudad"].str.strip()       # saca espacios al inicio/final
+df["ciudad"] = df["ciudad"].str.lower()       # todo a minúsculas
+df["ciudad"] = df["ciudad"].str.title()       # "Buenos Aires" (Cada Palabra)
+
+# normalizar categorías inconsistentes a un valor canónico
+df["pais"] = df["pais"].replace({"Arg": "Argentina", "AR": "Argentina"})
+
+# reemplazo de subcadenas (regex opcional)
+df["tel"] = df["tel"].str.replace("-", "", regex=False)</code></pre>
+
+<div class="info">
+  Encadenar está bien visto: <code>df["ciudad"].str.strip().str.lower()</code> aplica las dos limpiezas en una línea. Ojo: <code>.str</code> sobre nulos devuelve <code>NaN</code> (no rompe), así que limpiá nulos antes si te molesta.
+</div>
+
+<h2>Renombrar y descartar</h2>
+
+<p>Columnas con nombres horribles (<code>"Unnamed: 0"</code>, <code>"Importe $ (USD)"</code>) o que no aportan se arreglan con <code>rename</code> y <code>drop</code>:</p>
+
+<pre><code class="lang-python"># renombrar columnas
+df = df.rename(columns={"Importe $ (USD)": "importe_usd", "Nombre y Apellido": "nombre"})
+
+# descartar columnas que no sirven
+df = df.drop(columns=["Unnamed: 0", "comentarios_internos"])
+
+# descartar filas por índice
+df = df.drop(index=[0, 1])</code></pre>
+
+<div class="tip">
+  <strong>✅ Convención:</strong> nombres de columna en <code>snake_case</code>, sin espacios, sin acentos, en minúsculas (<code>fecha_alta</code>, no <code>"Fecha de Alta"</code>). Te ahorra escribir <code>df["Fecha de Alta"]</code> con corchetes para siempre y evita bugs por un espacio invisible.
+</div>
+
+<h2>Outliers (valores atípicos)</h2>
+
+<p>Un outlier es un valor extremo: una edad de 200, un precio de -50, un ingreso 100× la media. Pueden ser <em>errores</em> (a corregir) o <em>casos reales raros</em> (a conservar). Detectarlos es el primer paso; qué hacer con ellos es una decisión de criterio, no automática.</p>
+
+<table>
+<thead><tr><th>Método</th><th>Idea</th><th>Regla típica</th></tr></thead>
+<tbody>
+<tr><td><strong>Rango lógico</strong></td><td>Lo que es físicamente imposible</td><td>edad &lt; 0 o &gt; 120 → error</td></tr>
+<tr><td><strong>IQR</strong></td><td>Fuera de 1.5× el rango intercuartil (Q1–Q3)</td><td>&lt; Q1 − 1.5·IQR o &gt; Q3 + 1.5·IQR</td></tr>
+<tr><td><strong>Z-score</strong></td><td>A cuántas desviaciones estándar está de la media</td><td>|z| &gt; 3 suele marcarse como atípico</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># detección por IQR (la más usada porque no asume distribución normal)
+q1 = df["precio"].quantile(0.25)
+q3 = df["precio"].quantile(0.75)
+iqr = q3 - q1
+limite_inf = q1 - 1.5 * iqr
+limite_sup = q3 + 1.5 * iqr
+outliers = df[(df["precio"] &lt; limite_inf) | (df["precio"] &gt; limite_sup)]</code></pre>
+
+<div class="warn">
+  <strong>⚠️ No borres outliers por reflejo.</strong> Un ingreso de un millón puede ser un error de carga... o el cliente más valioso. Investigá antes de eliminar: ¿es imposible (edad 200) o solo raro (un sueldo alto real)? Lo profundizamos en M04 (EDA).
+</div>
+
+<h2>Errores típicos al limpiar</h2>
+
+<div class="mistake"><strong>Rellenar todos los nulos con la media sin pensar.</strong> Si una columna tiene 40% de nulos y los rellenás con la media, achicás artificialmente la varianza y le clavás un pico falso a la distribución. La media también es mala elección cuando hay outliers (usá mediana) o cuando la columna es categórica (usá moda o "Desconocido").</div>
+
+<div class="mistake"><strong>Convertir tipos sin verificar primero.</strong> Hacer <code>astype(int)</code> sobre una columna con un nulo o un <code>"N/D"</code> escondido tira una excepción y te frena el script. Usá <code>pd.to_numeric(..., errors="coerce")</code> para degradar a <code>NaN</code> de forma controlada y recién después decidir.</div>
+
+<div class="mistake"><strong>Tirar filas a lo loco con <code>dropna()</code>.</strong> Un <code>df.dropna()</code> sin <code>subset</code> elimina cualquier fila a la que le falte <em>una sola</em> celda. En datasets anchos podés perder la mitad de los datos por columnas que ni te importaban. Apuntá con <code>subset</code> a las columnas que realmente necesitás completas.</div>
+
+<h2>Ejemplo — un pipeline de limpieza completo</h2>
+
+<p>Juntemos todo. Partimos de un dataset sucio (nulos + duplicados + tipos mal + texto inconsistente) y lo dejamos listo para explorar. Fijate que cada paso ataca un problema concreto de los de arriba:</p>
+
+<pre><code class="lang-python">import pandas as pd
+
+# 0. cargar y diagnosticar
+df = pd.read_csv("ventas_sucio.csv")
+print(df.shape)
+print(df.isna().sum())
+print(df.dtypes)
+
+# 1. nombres de columna prolijos (snake_case)
+df = df.rename(columns={
+    "Fecha de Venta": "fecha",
+    "Importe $": "importe",
+    "Ciudad ": "ciudad",   # ojo: tenía un espacio al final
+})
+
+# 2. tipos: texto -&gt; número y texto -&gt; fecha (coerce = no rompe)
+df["importe"] = pd.to_numeric(df["importe"], errors="coerce")
+df["fecha"]   = pd.to_datetime(df["fecha"], errors="coerce")
+
+# 3. texto: normalizar la categoría 'ciudad'
+df["ciudad"] = df["ciudad"].str.strip().str.title()
+df["ciudad"] = df["ciudad"].replace({"Bs As": "Buenos Aires", "Caba": "Buenos Aires"})
+
+# 4. duplicados: misma venta cargada dos veces (clave = id_venta)
+df = df.drop_duplicates(subset=["id_venta"], keep="first")
+
+# 5. nulos: el importe es crítico -&gt; dropeo esas filas;
+#    la ciudad la relleno con la moda (la más frecuente)
+df = df.dropna(subset=["importe"])
+df["ciudad"] = df["ciudad"].fillna(df["ciudad"].mode()[0])
+
+# 6. control final
+print(df.shape)
+print(df.isna().sum())   # idealmente 0 en las columnas que importan</code></pre>
+
+<div class="step"><strong>El orden importa:</strong> primero arreglás <em>tipos</em> (porque <code>to_numeric</code> con <code>coerce</code> crea los nulos reales), después <em>texto/categorías</em>, después <em>duplicados</em>, y recién al final tratás los <em>nulos</em> — cuando ya sabés cuáles son genuinos.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tengo una columna numérica con outliers fuertes (sueldos) y varios nulos. ¿Con qué la relleno: media o mediana?</summary>
+<p>Con la <strong>mediana</strong>. La media se va para arriba por los pocos sueldos altísimos y deja de representar al sueldo "típico"; la mediana (el valor del medio) es robusta a esos outliers e introduce menos sesgo.</p></details>
+
+<details><summary>¿Qué hace <code>pd.to_numeric(col, errors="coerce")</code> con un valor que no puede convertir, como <code>"N/D"</code>?</summary>
+<p>Lo transforma en <code>NaN</code> en vez de tirar una excepción. Eso te deja convertir toda la columna de una sola pasada y después tratar esos <code>NaN</code> con <code>dropna</code> o <code>fillna</code>, en vez de que el script se frene en el primer valor raro.</p></details>
+
+<details><summary>¿Por qué <code>df.dropna()</code> sin <code>subset</code> puede ser peligroso?</summary>
+<p>Porque elimina cualquier fila que tenga <em>al menos un</em> nulo en <em>cualquier</em> columna. En un dataset ancho podés perder gran parte de las filas por culpa de columnas que ni siquiera necesitabas. Lo correcto suele ser <code>dropna(subset=[...])</code> apuntando solo a las columnas críticas.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Conseguí un CSV cualquiera (o creá uno sucio a mano) y corré <code>df.isna().sum()</code> y <code>df.isna().mean()*100</code>. ¿Qué columna tiene más nulos en porcentaje?</li>
+  <li>Tomá una columna numérica con nulos y rellenala de dos formas distintas (media y mediana). Compará <code>df["col"].describe()</code> antes y después de cada una: ¿cuánto cambió la desviación estándar?</li>
+  <li>Detectá duplicados con <code>df.duplicated().sum()</code>. Si hay, eliminá usando una columna-clave con <code>drop_duplicates(subset=[...])</code> y verificá que el <code>shape</code> bajó.</li>
+  <li>Agarrá una columna de texto categórico (ciudad, país, categoría) y normalizala: <code>.str.strip().str.title()</code> + un <code>replace</code> que unifique al menos dos variantes ("Bs As" y "CABA" → "Buenos Aires"). Contá las categorías únicas antes y después con <code>.nunique()</code>.</li>
+  <li>Escribí tu propio pipeline de limpieza (como el del ejemplo) en una sola celda, respetando el orden tipos → texto → duplicados → nulos, y dejá un <code>print(df.isna().sum())</code> al final que dé 0 en las columnas críticas.</li>
+</ol>
+
+<section class="quiz" id="quizDML03">
+  <style>
+    #quizDML03{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML03 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML03 .q{margin-bottom:1.5rem}
+    #quizDML03 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML03 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML03 .opt:hover{border-color:var(--accent)}
+    #quizDML03 .opt:disabled{cursor:default}
+    #quizDML03 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML03 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML03 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML03 .exp.show{display:block}
+    #quizDML03 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Una columna de sueldos tiene nulos y unos pocos valores altísimos (outliers). ¿Con qué conviene rellenar los nulos?</p>
+    <button class="opt">Con la media, siempre es la mejor opción</button>
+    <button class="opt">Con cero, para no inventar datos</button>
+    <button class="opt">Con la mediana, porque es robusta a los outliers</button>
+    <div class="exp">La media se infla por los pocos sueldos altísimos y deja de representar lo típico. La mediana (valor del medio) es robusta a outliers e introduce menos sesgo. Cero distorsionaría la distribución.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. ¿Qué hace <code>pd.to_numeric(df["precio"], errors="coerce")</code> con un valor como <code>"N/D"</code>?</p>
+    <button class="opt">Tira una excepción y frena el script</button>
+    <button class="opt">Lo convierte en NaN sin romper</button>
+    <button class="opt">Lo deja como el texto "N/D"</button>
+    <div class="exp"><code>errors="coerce"</code> transforma en <code>NaN</code> todo lo que no pueda parsear, en vez de lanzar una excepción. Así convertís toda la columna y después tratás esos NaN con dropna/fillna.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Por qué <code>df.dropna()</code> (sin <code>subset</code>) puede ser riesgoso?</p>
+    <button class="opt">Elimina cualquier fila con al menos un nulo en cualquier columna, y podés perder muchísimos datos</button>
+    <button class="opt">Solo funciona con columnas numéricas</button>
+    <button class="opt">Rellena los nulos con la media automáticamente</button>
+    <div class="exp">Sin <code>subset</code>, <code>dropna()</code> tira toda fila a la que le falte una sola celda en cualquier columna. En datasets anchos perdés filas por columnas que ni te importaban. Mejor apuntar con <code>subset=[...]</code> a las columnas críticas.</div>
+  </div>
+
+  <div class="score" id="scoreDML03"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML03');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML03').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Datos limpios, listo para el EDA.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m02-pandas/lecture.html">← M02: pandas</a>
+  <a href="../m04-eda/lecture.html">M04: EDA →</a>
+</nav>
+
+</div>
+</body>
+</html>

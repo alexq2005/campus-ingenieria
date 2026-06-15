@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 04 — Estructuras de Datos · Curso de Go</title>
+  <meta name="description" content="Arrays de tamaño fijo, slices dinámicos (append, len/cap, slicing), maps con el idiom comma-ok y structs para modelar datos.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 04</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M01, M03</span>
+</div>
+
+<article>
+
+<h1>Módulo 04 — Estructuras de Datos</h1>
+
+<p>Hasta acá manejaste valores sueltos: un <code>int</code>, un <code>string</code>, un <code>bool</code>. Pero el software real trabaja con <strong>colecciones</strong>: una lista de usuarios, un diccionario de precios, una ficha con varios campos. Go te da cuatro herramientas para esto, y entender la diferencia entre ellas (sobre todo array vs slice) es lo que separa al que copia código del que lo entiende. En este módulo dominás arrays, <strong>slices</strong> (la estrella), maps y structs.</p>
+
+<h2>Arrays: tamaño fijo, parte del tipo</h2>
+
+<p>Un array tiene una longitud <strong>fija que forma parte de su tipo</strong>. Un <code>[3]int</code> y un <code>[4]int</code> son tipos distintos: no podés asignar uno al otro.</p>
+
+<pre><code class="lang-go">var notas [3]int        // array de 3 enteros, todos en cero
+notas[0] = 10
+notas[1] = 7
+fmt.Println(notas)      // [10 7 0]
+fmt.Println(len(notas)) // 3 (la longitud es fija para siempre)
+
+primos := [4]int{2, 3, 5, 7}  // declarar e inicializar de una</code></pre>
+
+<div class="info">
+  En la práctica vas a usar arrays <strong>directamente</strong> muy poco. Su tamaño rígido los hace incómodos: casi nunca sabés de antemano cuántos elementos vas a tener. Para eso existen los <strong>slices</strong>, que son lo que de verdad vas a usar el 95% del tiempo. El array sigue ahí debajo, pero raramente lo tocás a mano.</div>
+
+<h2>Slices: la estrella del módulo</h2>
+
+<div class="concept">
+  <strong>💡 Un slice es una vista dinámica sobre un array.</strong> No guarda los datos: guarda un <strong>puntero</strong> al array subyacente, una <strong>longitud</strong> (<code>len</code>, cuántos elementos ves) y una <strong>capacidad</strong> (<code>cap</code>, cuántos entran antes de tener que agrandar). Vos lo tratás como una lista que crece sola; Go maneja el array de abajo.</div>
+
+<p>Se crea con <code>make</code> o con un literal, y crece con <code>append</code>:</p>
+
+<pre><code class="lang-go">s := make([]int, 0)   // slice de int, longitud 0
+s = append(s, 10)     // [10]
+s = append(s, 20, 30) // [10 20 30] — append devuelve el slice nuevo
+fmt.Println(s, len(s)) // [10 20 30] 3
+
+// también con literal:
+colores := []string{"rojo", "verde", "azul"}</code></pre>
+
+<div class="rule">
+  <strong>📌 Siempre reasigná el resultado de <code>append</code>:</strong> <code>s = append(s, x)</code>. Cuando el slice se queda sin capacidad, <code>append</code> crea un array más grande y devuelve un slice nuevo que apunta a él. Si escribís <code>append(s, x)</code> sin el <code>s =</code>, perdés el resultado.</div>
+
+<h3>Slicing: cortar un pedazo</h3>
+
+<p>Con <code>s[inicio:fin]</code> obtenés una sub-vista. El índice <code>inicio</code> se incluye; <code>fin</code> NO se incluye (igual que en Python):</p>
+
+<pre><code class="lang-go">nums := []int{0, 10, 20, 30, 40}
+fmt.Println(nums[1:3])  // [10 20]  (índices 1 y 2; el 3 queda afuera)
+fmt.Println(nums[:2])   // [0 10]   (desde el principio)
+fmt.Println(nums[2:])   // [20 30 40] (hasta el final)</code></pre>
+
+<div class="mistake">
+  <strong>⚠️ Cuidado: el slicing comparte memoria.</strong> <code>nums[1:3]</code> NO copia los datos: es otra ventana sobre el <strong>mismo array</strong>. Si modificás un elemento a través de la sub-vista, también cambia en el slice original. Dos slices pueden apuntar al mismo array subyacente sin que se note.</div>
+
+<pre><code class="lang-go">base := []int{1, 2, 3, 4}
+vista := base[0:2]   // [1 2] — comparte memoria con base
+vista[0] = 99
+fmt.Println(base)    // [99 2 3 4]  ← ¡también cambió base!</code></pre>
+
+<h2>Maps: pares clave → valor</h2>
+
+<p>Un map es un diccionario: asocia claves con valores. Se crea con <code>make</code> y se escribe/lee con corchetes:</p>
+
+<pre><code class="lang-go">edades := make(map[string]int)  // claves string, valores int
+edades["ana"] = 30
+edades["luis"] = 25
+fmt.Println(edades["ana"])  // 30
+delete(edades, "luis")      // borra la clave "luis"</code></pre>
+
+<h3>El idiom comma-ok: ¿la clave existe?</h3>
+
+<div class="concept">
+  <strong>💡 Leer una clave que NO existe NO da error: devuelve el <em>zero value</em> del tipo del valor</strong> (0 para int, "" para string, false para bool). Por eso, para saber si una clave realmente está, usás la forma de dos valores: <code>v, ok := m[clave]</code>. El segundo valor (<code>ok</code>) es un bool que dice si la clave existía.</div>
+
+<pre><code class="lang-go">edades := map[string]int{"ana": 30}
+
+v, ok := edades["ana"]
+fmt.Println(v, ok)  // 30 true   → existe
+
+v, ok = edades["pepe"]
+fmt.Println(v, ok)  // 0 false   → NO existe (0 es el zero value, no un dato real)</code></pre>
+
+<div class="mistake">
+  <strong>⚠️ El error clásico:</strong> hacer <code>if edades["pepe"] == 0</code> y creer que detectás "no existe". ¡No! Una persona con edad 0 daría lo mismo que una clave ausente. Para distinguir "está y vale 0" de "no está", <strong>siempre</strong> usá <code>v, ok := m[clave]</code>.</div>
+
+<h2>Structs: agrupar campos con nombre</h2>
+
+<p>Un struct es un tipo que junta varios campos relacionados bajo un solo nombre. Es como modelar una "ficha":</p>
+
+<pre><code class="lang-go">type Persona struct {
+    Nombre string
+    Edad   int
+}
+
+p := Persona{Nombre: "Ana", Edad: 30}  // instanciar con campos nombrados
+fmt.Println(p.Nombre)  // Ana
+p.Edad = 31            // acceder y modificar un campo con punto
+fmt.Println(p)         // {Ana 31}</code></pre>
+
+<p>Los structs pueden <strong>anidarse</strong> (un struct dentro de otro) y también existen los <strong>anónimos</strong> (sin declarar un tipo con nombre, útil para algo de un solo uso):</p>
+
+<pre><code class="lang-go">type Direccion struct {
+    Ciudad string
+    Pais   string
+}
+type Empleado struct {
+    Nombre string
+    Dir    Direccion   // struct anidado
+}
+e := Empleado{Nombre: "Luis", Dir: Direccion{Ciudad: "Córdoba", Pais: "AR"}}
+fmt.Println(e.Dir.Ciudad)  // Córdoba
+
+// struct anónimo (un solo uso, sin nombre de tipo):
+config := struct {
+    Debug bool
+    Port  int
+}{Debug: true, Port: 8080}
+fmt.Println(config.Port)  // 8080</code></pre>
+
+<h2>¿Cuándo uso cada uno?</h2>
+
+<table>
+<thead><tr><th>Estructura</th><th>Para qué sirve</th><th>Tamaño</th></tr></thead>
+<tbody>
+<tr><td><code>[N]T</code> (array)</td><td>Colección de tamaño fijo conocido (poco común directo)</td><td>Fijo, parte del tipo</td></tr>
+<tr><td><code>[]T</code> (slice)</td><td>Lista que crece/encoge: lo que más vas a usar</td><td>Dinámico (<code>append</code>)</td></tr>
+<tr><td><code>map[K]V</code> (map)</td><td>Buscar valores por clave (índice, diccionario)</td><td>Dinámico</td></tr>
+<tr><td><code>struct</code></td><td>Agrupar campos relacionados (modelar entidades)</td><td>Fijo (los campos declarados)</td></tr>
+</tbody>
+</table>
+
+<h2>Los tres errores que más cuestan al empezar</h2>
+
+<div class="mistake"><strong>Confundir array (fijo) con slice (dinámico).</strong> <code>[3]int</code> tiene siempre 3 elementos y no le podés hacer <code>append</code> útilmente. <code>[]int</code> crece solo. Si dudás, casi siempre querés un slice.</div>
+<div class="mistake"><strong>Leer una clave de map inexistente y creer que "falló".</strong> Devuelve el zero value, no un error. Usá <code>v, ok := m[clave]</code> para saber de verdad si está.</div>
+<div class="mistake"><strong>Olvidar que dos slices pueden compartir memoria.</strong> Un <code>s[1:3]</code> o un slice copiado por asignación apunta al mismo array de abajo: modificás uno y mutás el otro. Si necesitás una copia real, usá <code>copy(destino, origen)</code>.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia esencial entre un array y un slice?</summary>
+<p>El array tiene tamaño fijo que forma parte de su tipo (<code>[3]int</code> ≠ <code>[4]int</code>). El slice es una vista dinámica sobre un array: crece con <code>append</code> y guarda puntero + <code>len</code> + <code>cap</code>. En la práctica casi siempre usás slices.</p></details>
+
+<details><summary>¿Qué devuelve leer una clave que no existe en un map, y cómo detectás si la clave estaba?</summary>
+<p>Devuelve el <em>zero value</em> del tipo del valor (0, "", false…), NO un error. Para saber si la clave existía usás el idiom comma-ok: <code>v, ok := m[clave]</code>, donde <code>ok</code> es <code>true</code> si la clave estaba.</p></details>
+
+<details><summary>¿Por qué <code>vista := base[0:2]; vista[0] = 99</code> también cambia <code>base</code>?</summary>
+<p>Porque el slicing no copia los datos: <code>vista</code> es otra ventana sobre el <strong>mismo array subyacente</strong> que <code>base</code>. Modificar un elemento por una vista lo modifica en todas las que comparten ese array. Para una copia independiente usás <code>copy</code>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un slice vacío con <code>make([]string, 0)</code> y agregale 3 nombres con <code>append</code>. Imprimí el slice y su <code>len</code>.</li>
+  <li>Partiendo de <code>nums := []int{0, 10, 20, 30, 40}</code>, imprimí <code>nums[1:4]</code>, <code>nums[:2]</code> y <code>nums[3:]</code>. Predecí el resultado antes de correrlo.</li>
+  <li>Creá un <code>map[string]int</code> de stock de productos. Usá el idiom comma-ok para imprimir "hay N" si una clave existe o "no tenemos ese producto" si no.</li>
+  <li>Demostrá la memoria compartida: creá un slice <code>base</code>, sacá una <code>vista := base[0:2]</code>, modificá <code>vista[0]</code> y mostrá que <code>base</code> también cambió.</li>
+  <li>Definí un struct <code>Persona</code> con <code>Nombre</code> y <code>Edad</code>, creá un slice <code>[]Persona</code> con 3 personas y recorrelo con <code>for ... range</code> imprimiendo cada nombre.</li>
+</ol>
+
+<section class="quiz" id="quizGo04">
+  <style>
+    #quizGo04{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo04 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo04 .q{margin-bottom:1.5rem}
+    #quizGo04 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo04 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo04 .opt:hover{border-color:var(--accent)}
+    #quizGo04 .opt:disabled{cursor:default}
+    #quizGo04 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo04 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo04 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo04 .exp.show{display:block}
+    #quizGo04 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué hace <code>s = append(s, 5)</code> en un slice?</p>
+    <button class="opt">Modifica el array fijo en su lugar sin devolver nada</button>
+    <button class="opt">Agrega el 5 al final y devuelve el slice (que hay que reasignar)</button>
+    <button class="opt">Da error porque los slices no crecen</button>
+    <div class="exp"><code>append</code> agrega elementos y devuelve el slice resultante; si no hay capacidad, crea un array más grande. Por eso siempre se reasigna: <code>s = append(s, ...)</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés <code>m := map[string]int{}</code> y leés <code>v := m["x"]</code> con "x" inexistente. ¿Qué pasa?</p>
+    <button class="opt">Lanza un panic (error en tiempo de ejecución)</button>
+    <button class="opt">Devuelve <code>nil</code></button>
+    <button class="opt">Devuelve el zero value (0); por eso para saber si existe se usa <code>v, ok := m["x"]</code></button>
+    <div class="exp">Leer una clave ausente devuelve el zero value, NO un error. Para distinguir "no está" de "está y vale 0" se usa el idiom comma-ok: <code>v, ok := m["x"]</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. <code>base := []int{1,2,3}; v := base[0:2]; v[0] = 99</code>. ¿Cuánto vale <code>base</code> después?</p>
+    <button class="opt"><code>[99 2 3]</code> — el slicing comparte el array subyacente</button>
+    <button class="opt"><code>[1 2 3]</code> — <code>v</code> es una copia independiente</button>
+    <button class="opt">Da error porque no se puede cortar un slice</button>
+    <div class="exp">El slicing no copia: <code>v</code> es otra vista sobre el mismo array que <code>base</code>. Modificar <code>v[0]</code> también cambia <code>base</code>. Para una copia real se usa <code>copy</code>.</div>
+  </div>
+
+  <div class="score" id="scoreGo04"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo04');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo04').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M05.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m03-control-flujo/lecture.html">← M03: Control de Flujo</a>
+  <a href="../m05-punteros-structs/lecture.html">M05: Punteros & Métodos →</a>
+</nav>
+
+</div>
+</body>
+</html>

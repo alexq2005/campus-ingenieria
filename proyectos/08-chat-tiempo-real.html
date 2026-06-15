@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 08 — Chat en Tiempo Real · Campus CS-FE</title>
+<meta name="description" content="Chat con salas, mensajes en vivo vía WebSockets, presencia ('escribiendo...'), historial persistido. El proyecto que enseña real-time de verdad.">
+<link rel="stylesheet" href="./proyecto.css">
+<style>
+  .fig { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin:1.2rem 0; }
+  .fig svg { width:100%; height:auto; display:block; }
+  .fig figcaption { color:var(--muted); font-size:0.85em; text-align:center; margin-top:0.6rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-React/m10-data-fetching/lecture.html">⚛️ React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 08</span>
+  <span class="badge nivel-avan">Avanzado</span>
+  <span class="badge">⏱ ~1-2 semanas</span>
+  <span class="badge">WebSockets</span>
+</div>
+
+<article>
+
+<h1>💬 Chat en Tiempo Real</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> un chat con <strong>salas</strong>, mensajes que aparecen <strong>en vivo</strong> sin recargar, indicador de <strong>presencia</strong> ("Fulano está escribiendo…") e <strong>historial persistido</strong>. Es el proyecto que enseña <em>real-time de verdad</em>: el servidor te empuja los mensajes apenas pasan, en vez de que vos le preguntes todo el tiempo.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../Curso-React/m10-data-fetching/lecture.html">React</a> (estado en vivo, efectos),
+  <a href="../Curso-React/m11-estado-global/lecture.html">estado global</a>,
+  <a href="../../Curso%20ingenieria%20sistemas/area-03-sistemas-y-arquitectura/m15-redes-de-computadoras/lecture.html">M15 Redes</a> (TCP, protocolo WebSocket) y
+  <a href="./23-api-rest-sql.html">P23 API+SQL</a> (persistir el historial).
+</div>
+
+<h2>Cómo funciona — por qué WebSockets y no HTTP</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 200" role="img" aria-label="HTTP el cliente pregunta una y otra vez; WebSocket el servidor empuja el mensaje al instante por un canal abierto">
+  <defs>
+    <marker id="ac" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#fb7185"/></marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#3fb950"/></marker>
+  </defs>
+  <!-- HTTP polling -->
+  <text x="190" y="20" text-anchor="middle" fill="#fb7185" font-size="12" font-family="system-ui" font-weight="700">HTTP polling: preguntar sin parar (lento, gasta)</text>
+  <text x="60" y="55" fill="#8b95a8" font-size="9" font-family="system-ui">cliente</text>
+  <text x="320" y="55" fill="#8b95a8" font-size="9" font-family="system-ui">servidor</text>
+  <line x1="60" y1="60" x2="60" y2="170" stroke="#2a3247" stroke-width="2"/>
+  <line x1="320" y1="60" x2="320" y2="170" stroke="#2a3247" stroke-width="2"/>
+  <line x1="60" y1="75" x2="320" y2="80" stroke="#fb7185" stroke-width="1.5" marker-end="url(#ac)"/>
+  <text x="190" y="73" text-anchor="middle" fill="#8b95a8" font-size="8" font-family="system-ui">¿hay algo? no</text>
+  <line x1="60" y1="105" x2="320" y2="110" stroke="#fb7185" stroke-width="1.5" marker-end="url(#ac)"/>
+  <text x="190" y="103" text-anchor="middle" fill="#8b95a8" font-size="8" font-family="system-ui">¿hay algo? no</text>
+  <line x1="60" y1="135" x2="320" y2="140" stroke="#fb7185" stroke-width="1.5" marker-end="url(#ac)"/>
+  <text x="190" y="133" text-anchor="middle" fill="#8b95a8" font-size="8" font-family="system-ui">¿hay algo? sí (¡tarde!)</text>
+
+  <!-- WebSocket -->
+  <text x="575" y="20" text-anchor="middle" fill="#3fb950" font-size="12" font-family="system-ui" font-weight="700">WebSocket: canal abierto, el server empuja</text>
+  <text x="440" y="55" fill="#8b95a8" font-size="9" font-family="system-ui">cliente</text>
+  <text x="700" y="55" fill="#8b95a8" font-size="9" font-family="system-ui">servidor</text>
+  <line x1="440" y1="60" x2="440" y2="170" stroke="#2a3247" stroke-width="2"/>
+  <line x1="700" y1="60" x2="700" y2="170" stroke="#2a3247" stroke-width="2"/>
+  <line x1="440" y1="75" x2="700" y2="75" stroke="#58a6ff" stroke-width="2"/>
+  <text x="570" y="70" text-anchor="middle" fill="#58a6ff" font-size="8" font-family="system-ui">handshake (1 vez) → canal abierto</text>
+  <line x1="700" y1="110" x2="440" y2="115" stroke="#3fb950" stroke-width="2" marker-end="url(#ag)"/>
+  <text x="570" y="108" text-anchor="middle" fill="#3fb950" font-size="8" font-family="system-ui">¡mensaje nuevo! (al instante)</text>
+  <line x1="700" y1="145" x2="440" y2="150" stroke="#3fb950" stroke-width="2" marker-end="url(#ag)"/>
+  <text x="570" y="143" text-anchor="middle" fill="#3fb950" font-size="8" font-family="system-ui">otro mensaje (empujado)</text>
+</svg>
+<figcaption>Con HTTP el cliente pregunta "¿hay algo nuevo?" mil veces (gasta y llega tarde). El WebSocket abre <strong>un canal bidireccional una sola vez</strong>: el servidor empuja el mensaje apenas ocurre. Eso es "tiempo real".</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li>El protocolo <strong>WebSocket</strong>: handshake, canal persistente, bidireccional (M15).</li>
+  <li>Diferencia entre <strong>polling</strong> (preguntar) y <strong>push</strong> (que te empujen).</li>
+  <li><strong>Broadcast a una sala</strong>: reenviar un mensaje a todos los conectados menos al que lo mandó.</li>
+  <li><strong>Presencia y estado efímero</strong>: "está escribiendo…", quién está online.</li>
+  <li><strong>Persistir historial</strong> en base de datos y cargarlo al entrar (P23).</li>
+  <li><strong>Reconexión</strong>: qué pasa cuando se corta la red y vuelve (el problema real del real-time).</li>
+</ul>
+
+<h2>Stack</h2>
+<p>Backend: Node + <strong>Socket.IO</strong> (o <code>ws</code>), o Python con <strong>FastAPI WebSockets</strong>. Frontend: <strong>React</strong>. Persistencia: PostgreSQL/SQLite (P23). Empezá con un solo servidor; escalar a varios pide Redis pub/sub (P24).</p>
+
+<h2>Código clave (servidor que reenvía a la sala)</h2>
+
+<pre><code class="lang-javascript">// Servidor (Socket.IO) — el corazón del real-time
+io.on("connection", (socket) => {
+  socket.on("entrar_sala", (sala) => {
+    socket.join(sala);
+    socket.to(sala).emit("presencia", "alguien entró");
+  });
+
+  socket.on("mensaje", async ({ sala, texto, autor }) => {
+    await db.guardar(sala, autor, texto);          // persistir (P23)
+    // reenviar a TODOS los de la sala, al instante (broadcast)
+    io.to(sala).emit("mensaje", { autor, texto, hora: Date.now() });
+  });
+
+  socket.on("escribiendo", (sala) =>
+    socket.to(sala).emit("escribiendo", socket.id) // estado efímero, no se guarda
+  );
+});</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> La clave es <code>io.to(sala).emit(...)</code>: el servidor <strong>empuja</strong> el mensaje a todos los de la sala sin que nadie pregunte. Notá que el mensaje se <strong>persiste</strong> (P23) pero el "está escribiendo" NO — es estado efímero. Distinguir lo que se guarda de lo que es momentáneo es media batalla del diseño real-time.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> conexión WebSocket básica: el cliente manda un texto, el servidor lo devuelve (eco). Verificá el canal abierto.</div>
+<div class="fase"><strong>Fase 2:</strong> broadcast: un mensaje de un cliente llega a TODOS los conectados, en vivo.</div>
+<div class="fase"><strong>Fase 3:</strong> salas: separar conversaciones. Solo recibís lo de tu sala.</div>
+<div class="fase"><strong>Fase 4:</strong> persistencia (P23): guardar mensajes y cargar el historial al entrar a una sala.</div>
+<div class="fase"><strong>Fase 5:</strong> presencia ("escribiendo…", online) + reconexión automática al cortarse la red.</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Dos navegadores en la misma sala se ven los mensajes al instante.</li>
+    <li>Las salas están aisladas (no te llega lo de otra).</li>
+    <li>El historial persiste y se carga al entrar.</li>
+    <li>Funciona el "está escribiendo…" y se ve quién está online.</li>
+    <li>Si se corta la red, el cliente se reconecta solo y no pierde mensajes.</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Autenticación: que cada usuario tenga su identidad (conecta con login/JWT).</li>
+  <li>Escalado horizontal: varios servidores con <strong>Redis pub/sub</strong> (P24) para sincronizar salas.</li>
+  <li>Mensajes con archivos/imágenes (subida + almacenamiento).</li>
+  <li>Notificaciones push cuando no estás en la app.</li>
+  <li>Cifrado extremo a extremo de los mensajes (conecta con M29 y P19).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./06-url-shortener.html">← Acortador de URLs</a>
+  <a href="./09-semaforo-inteligente.html">Siguiente: Semáforo Inteligente →</a>
+</nav>
+
+</div>
+</body>
+</html>

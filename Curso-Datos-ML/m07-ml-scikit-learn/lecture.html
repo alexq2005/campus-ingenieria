@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — ML con scikit-learn · Curso de Datos & ML</title>
+  <meta name="description" content="La API unificada de scikit-learn (fit/predict), la estructura X/y de los datos, regresión lineal, el flujo split→fit→predict→evaluar y las métricas MSE, RMSE y R².">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M06</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — ML con scikit-learn</h1>
+
+<p>Llegó el momento que esperabas: <strong>entrenar un modelo</strong>. Y la buena noticia es que <code>scikit-learn</code> hace que sea casi sospechosamente fácil. Todos los modelos de la librería —de la regresión más simple al bosque aleatorio— se usan exactamente igual. Aprendés un patrón y lo aplicás a docenas de algoritmos.</p>
+
+<h2>La API unificada — el patrón que vale por todo el curso</h2>
+
+<div class="concept">
+  <strong>💡 Toda estimación en sklearn sigue dos pasos:</strong> <code>model.fit(X, y)</code> para <em>entrenar</em> (el modelo "aprende" de los datos) y <code>model.predict(X)</code> para <em>predecir</em> sobre datos nuevos. Cambiás el algoritmo (de <code>LinearRegression</code> a <code>RandomForestRegressor</code>) y el resto del código queda igual. Eso es lo que se llama una API <em>consistente</em>.
+</div>
+
+<p>Este diseño es la razón por la que sklearn se volvió el estándar de ML clásico. No tenés que aprender una interfaz distinta por cada algoritmo: <code>fit</code> entrena, <code>predict</code> predice, <code>score</code> evalúa. Siempre.</p>
+
+<pre><code class="lang-python">from sklearn.linear_model import LinearRegression
+
+model = LinearRegression()   # 1. elegís el modelo
+model.fit(X_train, y_train)  # 2. lo entrenás con los datos de train
+preds = model.predict(X_test)  # 3. predecís sobre datos nuevos
+model.score(X_test, y_test)  # 4. lo evaluás (R² por defecto)</code></pre>
+
+<h2>La estructura de los datos: X e y</h2>
+
+<p>Antes de entrenar, los datos tienen que estar en una forma muy concreta. sklearn espera <strong>dos cosas separadas</strong>:</p>
+
+<table>
+<thead><tr><th>Nombre</th><th>Qué es</th><th>Forma</th></tr></thead>
+<tbody>
+<tr><td><code>X</code> (mayúscula)</td><td><strong>Features</strong>: las variables de entrada que el modelo usa para predecir</td><td>Matriz <strong>2D</strong> — filas = ejemplos, columnas = variables</td></tr>
+<tr><td><code>y</code> (minúscula)</td><td><strong>Target</strong>: lo que querés predecir</td><td>Vector <strong>1D</strong> — un valor por ejemplo</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  La convención <code>X</code> mayúscula / <code>y</code> minúscula no es capricho: refleja el álgebra. <code>X</code> es una <strong>matriz</strong> (2D) porque tenés muchas variables por ejemplo; <code>y</code> es un <strong>vector</strong> (1D) porque querés predecir un solo número por ejemplo.
+</div>
+
+<p>Si tenés una tabla de casas con columnas <code>metros2</code>, <code>ambientes</code> y <code>precio</code>, y querés predecir el precio:</p>
+
+<pre><code class="lang-python">X = df[["metros2", "ambientes"]]   # features → 2D (las columnas que entran)
+y = df["precio"]                    # target → 1D (lo que sale)</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Pensalo como un examen.</strong> <code>X</code> son las <em>preguntas</em> (los datos que ve el modelo) y <code>y</code> es la <em>respuesta correcta</em> (lo que tiene que aprender a dar). En el entrenamiento le mostrás preguntas Y respuestas; en el test le das solo las preguntas y comparás lo que respondió con la verdad.
+</div>
+
+<h2>Regresión — predecir un número continuo</h2>
+
+<div class="concept">
+  <strong>💡 Regresión = predecir un valor numérico continuo:</strong> un precio, una temperatura, las ventas del mes que viene. Se diferencia de la <em>clasificación</em> (M08), que predice una categoría (spam / no-spam, perro / gato). Si la respuesta es "¿cuánto?", es regresión; si es "¿cuál?", es clasificación.
+</div>
+
+<p>El modelo más fundamental es la <strong>regresión lineal</strong>. La idea es simple: encontrar la <strong>recta</strong> (o, con varias features, el <strong>hiperplano</strong>) que mejor se ajusta a los puntos. Con una sola feature es la recta clásica de la secundaria:</p>
+
+<pre><code class="lang-python">y = m * x + b
+#   ↑       ↑
+#   coef    intercepto</code></pre>
+
+<p>El modelo "aprende" los valores de <code>m</code> (la pendiente / coeficiente) y <code>b</code> (la ordenada al origen / intercepto) que hacen que la recta pase lo más cerca posible de todos los puntos. Con varias features, hay un coeficiente por cada una y la recta se convierte en un hiperplano:</p>
+
+<pre><code class="lang-python">precio = w1 * metros2 + w2 * ambientes + b</code></pre>
+
+<h2>El flujo completo — split → fit → predict → evaluar</h2>
+
+<div class="rule">
+  <strong>📌 El ritual de todo modelo supervisado:</strong><br>
+  <code>1. separar X e y → 2. split train/test → 3. fit en TRAIN → 4. predict en TEST → 5. evaluar</code><br>
+  El paso 2 (split) viene de M06. El paso 3 entrena <strong>solo</strong> con train; el test queda intacto para medir si generaliza.
+</div>
+
+<pre><code class="lang-python">import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+
+# 1. separar features y target
+X = df[["metros2"]]      # 2D: una columna → matriz de una variable
+y = df["precio"]          # 1D: el número a predecir
+
+# 2. split (M06) — 80% train, 20% test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42)
+
+# 3. entrenar SOLO con train
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+# 4. predecir sobre el test (datos que el modelo nunca vio)
+y_pred = model.predict(X_test)
+
+# 5. evaluar
+print("Coeficiente (pendiente):", model.coef_)
+print("Intercepto:", model.intercept_)
+print("R²:", r2_score(y_test, y_pred))</code></pre>
+
+<h2>Métricas de regresión — ¿qué tan bueno es el modelo?</h2>
+
+<p>Un modelo de regresión devuelve números, así que para evaluarlo medimos <strong>qué tan lejos</strong> quedaron las predicciones de los valores reales. Dos familias de métricas:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué mide</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td><strong>MSE</strong> (Mean Squared Error)</td><td>Promedio de los errores al cuadrado</td><td>Más chico = mejor. En unidades²</td></tr>
+<tr><td><strong>RMSE</strong> (Root MSE)</td><td>Raíz del MSE</td><td>Más chico = mejor. En las <strong>mismas unidades</strong> que el target</td></tr>
+<tr><td><strong>R²</strong> (coeficiente de determinación)</td><td>Proporción de la varianza que el modelo explica</td><td>De 0 a 1. Más cerca de 1 = mejor</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>RMSE</strong> es la más fácil de interpretar porque está en las unidades reales: si predecís precios en dólares, un RMSE de 5000 significa "en promedio me equivoco unos 5000 dólares". El <strong>R²</strong> es relativo: 0.85 quiere decir "el modelo explica el 85% de la variación del precio; el 15% restante se le escapa". Un R² de 0 significa que el modelo no es mejor que predecir siempre el promedio.
+</div>
+
+<pre><code class="lang-python">from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+
+mse = mean_squared_error(y_test, y_pred)
+rmse = np.sqrt(mse)
+r2 = r2_score(y_test, y_pred)
+
+print(f"MSE:  {mse:.2f}")
+print(f"RMSE: {rmse:.2f}")   # en la unidad del target (ej: dólares)
+print(f"R²:   {r2:.3f}")     # 0 a 1; más alto, mejor</code></pre>
+
+<h2>Ejemplo completo — predecir precio desde metros²</h2>
+
+<p>Juntamos todo en un ejemplo de punta a punta con datos de juguete:</p>
+
+<pre><code class="lang-python">import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+
+# datos de ejemplo: metros² → precio (en miles)
+df = pd.DataFrame({
+    "metros2": [40, 55, 62, 78, 90, 110, 125, 140, 160, 185],
+    "precio":  [80, 105, 118, 150, 170, 205, 235, 260, 295, 340],
+})
+
+X = df[["metros2"]]   # 2D — doble corchete devuelve un DataFrame
+y = df["precio"]       # 1D — corchete simple devuelve una Series
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42)
+
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+
+print("Pendiente (precio por m²):", round(model.coef_[0], 2))
+print("Intercepto:", round(model.intercept_, 2))
+print("RMSE:", round(np.sqrt(mean_squared_error(y_test, y_pred)), 2))
+print("R²:", round(r2_score(y_test, y_pred), 3))
+
+# predecir el precio de una casa nueva de 100 m²
+nueva = pd.DataFrame({"metros2": [100]})
+print("Precio estimado (100 m²):", round(model.predict(nueva)[0], 1))</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake"><strong>Pasar X como 1D.</strong> Si hacés <code>X = df["metros2"]</code> (corchete simple) obtenés una Series 1D y sklearn tira error: <code>Expected 2D array, got 1D array</code>. Solución: doble corchete <code>df[["metros2"]]</code>, o si es un array de NumPy, <code>X.reshape(-1, 1)</code>.</div>
+
+<div class="mistake"><strong>Evaluar en train en vez de test.</strong> Hacer <code>model.score(X_train, y_train)</code> te da un número optimista y mentiroso: el modelo ya vio esos datos. Siempre evaluá con el test: <code>model.score(X_test, y_test)</code>.</div>
+
+<div class="mistake"><strong>Olvidar separar X e y.</strong> Si dejás el target dentro de <code>X</code>, el modelo "predice" usando la respuesta como entrada y da un R² perfecto y falso. Sacá siempre la columna target de <code>X</code>.</div>
+
+<div class="warn">Entrenar con todos los datos y no dejar test (<code>model.fit(X, y)</code> sobre el dataset completo) te deja sin forma de saber si el modelo generaliza. El split de M06 no es opcional.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuáles son los dos métodos centrales de todo modelo de sklearn?</summary>
+<p><code>fit(X, y)</code> para entrenar (el modelo aprende de los datos) y <code>predict(X)</code> para predecir sobre datos nuevos. Ese patrón es idéntico para todos los modelos de la librería.</p></details>
+
+<details><summary>¿Por qué X tiene que ser 2D y qué hago si tengo una sola feature?</summary>
+<p>sklearn siempre espera <code>X</code> como matriz 2D (filas = ejemplos, columnas = variables), aunque haya una sola variable. Con pandas usás doble corchete <code>df[["col"]]</code>; con un array de NumPy usás <code>X.reshape(-1, 1)</code>.</p></details>
+
+<details><summary>Tu modelo da R² = 0.30. ¿Qué significa?</summary>
+<p>Que el modelo explica solo el 30% de la varianza del target; el 70% se le escapa. Es un ajuste pobre: quizá faltan features relevantes, la relación no es lineal, o los datos tienen mucho ruido.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá un <code>DataFrame</code> con dos columnas (una feature y un target numérico) y separá <code>X</code> (doble corchete) e <code>y</code> (corchete simple). Verificá las formas con <code>X.shape</code> e <code>y.shape</code>.</li>
+  <li>Hacé el split 80/20 con <code>train_test_split</code> y <code>random_state=42</code>. Imprimí cuántas filas quedaron en train y cuántas en test.</li>
+  <li>Entrená un <code>LinearRegression</code> con el train y mostrá <code>model.coef_</code> y <code>model.intercept_</code>. Interpretá qué significa la pendiente en el contexto de tus datos.</li>
+  <li>Predecí sobre el test y calculá MSE, RMSE y R². ¿En qué unidad está el RMSE respecto del target?</li>
+  <li>Provocá el error a propósito: pasá <code>X</code> como 1D (corchete simple) a <code>fit</code> y leé el mensaje de error. Después arreglalo con doble corchete o <code>reshape(-1, 1)</code>.</li>
+</ol>
+
+<section class="quiz" id="quizDML07">
+  <style>
+    #quizDML07{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML07 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML07 .q{margin-bottom:1.5rem}
+    #quizDML07 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML07 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML07 .opt:hover{border-color:var(--accent)}
+    #quizDML07 .opt:disabled{cursor:default}
+    #quizDML07 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML07 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML07 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML07 .exp.show{display:block}
+    #quizDML07 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué método de sklearn usás para entrenar un modelo?</p>
+    <button class="opt">model.predict(X)</button>
+    <button class="opt">model.fit(X, y)</button>
+    <button class="opt">model.train(X, y)</button>
+    <div class="exp"><code>fit(X, y)</code> entrena: le pasás features y target para que el modelo aprenda. <code>predict(X)</code> es para predecir después; <code>train()</code> no existe en la API de sklearn.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés una sola feature y sklearn te tira "Expected 2D array, got 1D array". ¿Cómo lo arreglás?</p>
+    <button class="opt">Cambiando el modelo por uno más simple</button>
+    <button class="opt">Pasando y como 2D en vez de X</button>
+    <button class="opt">Usando doble corchete df[["col"]] o reshape(-1, 1)</button>
+    <div class="exp"><code>X</code> siempre debe ser 2D. Con pandas se logra con doble corchete (devuelve DataFrame); con NumPy, con <code>reshape(-1, 1)</code>. El corchete simple devuelve una Series 1D y rompe.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu modelo de regresión da R² = 0.90. ¿Qué significa?</p>
+    <button class="opt">El modelo explica el 90% de la varianza del target</button>
+    <button class="opt">El modelo acierta el 90% de las categorías</button>
+    <button class="opt">El error promedio es del 90%</button>
+    <div class="exp">R² mide la proporción de varianza explicada: 0.90 = el modelo captura el 90% de la variación del target. "Acertar categorías" es de clasificación (M08), no de regresión.</div>
+  </div>
+
+  <div class="score" id="scoreDML07"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML07');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML07').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M08.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m06-estadistica/lecture.html">← M06: Estadística</a>
+  <a href="../m08-clasificacion/lecture.html">M08: Clasificación →</a>
+</nav>
+
+</div>
+</body>
+</html>

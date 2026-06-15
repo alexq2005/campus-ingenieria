@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto 27 — Osciloscopio DIY · Campus CS-FE</title>
+<meta name="description" content="Construí un osciloscopio de bajo costo: microcontrolador muestrea una señal y la dibuja en una pantalla o en el navegador. Muestreo, Nyquist y DSP (E06/E07) en vivo.">
+<link rel="stylesheet" href="./proyecto.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="./index.html">← Galería</a>
+  <a href="../index.html">🏠 Campus</a>
+  <a href="../Curso-Computacion-Fisica/e06-senales-sistemas/lecture.html">⚡ E06 Señales</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Proyecto 27</span>
+  <span class="badge nivel-puente">⚡ Puente HW+SW</span>
+  <span class="badge">⏱ ~2 semanas</span>
+  <span class="badge">Muestreo + DSP</span>
+</div>
+
+<article>
+
+<h1>📟 Osciloscopio DIY</h1>
+
+<div class="objetivo">
+  <strong>🎯 Objetivo:</strong> construir un osciloscopio casero —un instrumento que <em>dibuja</em> cómo cambia un voltaje en el tiempo— con un microcontrolador que muestrea rápido por su ADC y manda los datos a una pantalla o al navegador. Vas a <strong>ver</strong> las señales que estudiás en teoría: una onda, el rebote de un botón, el PWM de un motor. Es el instrumento que todo el que toca electrónica termina queriendo.
+</div>
+
+<div class="bridge">
+  <span>🔗</span> <strong>Conexión con el campus:</strong>
+  <a href="../Curso-Computacion-Fisica/e06-senales-sistemas/lecture.html">E06 Señales</a> (muestreo, Nyquist, dominio tiempo),
+  <a href="../Curso-Computacion-Fisica/e07-dsp/lecture.html">E07 DSP</a> (FFT, filtros, trigger),
+  <a href="../Curso-Computacion-Fisica/e03-microcontroladores-1/lecture.html">E03</a> (ADC rápido) y el
+  <a href="./12-vumetro-fft.html">Vúmetro con FFT (P12)</a> — comparten el motor de DSP.
+</div>
+
+<h2>Cómo funciona — de voltaje a dibujo</h2>
+
+<figure class="fig">
+<svg viewBox="0 0 760 185" role="img" aria-label="Una señal analógica se muestrea con el ADC a alta velocidad, se guarda en un buffer, un trigger la estabiliza y se dibuja en pantalla">
+  <defs>
+    <marker id="o1" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f0883e"/></marker>
+  </defs>
+  <!-- señal -->
+  <rect x="15" y="60" width="120" height="60" rx="8" fill="#1f2638" stroke="#fb7185" stroke-width="2"/>
+  <path d="M30,90 Q45,68 60,90 T90,90 T120,90" fill="none" stroke="#fb7185" stroke-width="2"/>
+  <text x="75" y="135" text-anchor="middle" fill="#8b95a8" font-size="9" font-family="system-ui">señal real (E06)</text>
+  <line x1="135" y1="90" x2="180" y2="90" stroke="#f0883e" stroke-width="2" marker-end="url(#o1)"/>
+  <!-- ADC -->
+  <rect x="185" y="60" width="115" height="60" rx="8" fill="#1f2638" stroke="#58a6ff" stroke-width="2"/>
+  <text x="242" y="84" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">ADC (E03)</text>
+  <text x="242" y="101" text-anchor="middle" fill="#8b95a8" font-size="8.5" font-family="system-ui">muestrea rápido</text>
+  <line x1="300" y1="90" x2="345" y2="90" stroke="#f0883e" stroke-width="2" marker-end="url(#o1)"/>
+  <!-- buffer + trigger -->
+  <rect x="350" y="60" width="130" height="60" rx="8" fill="#1f2638" stroke="#fbbf24" stroke-width="2"/>
+  <text x="415" y="84" text-anchor="middle" fill="#e8edf4" font-size="11" font-family="system-ui">buffer + trigger</text>
+  <text x="415" y="101" text-anchor="middle" fill="#8b95a8" font-size="8.5" font-family="system-ui">estabiliza la onda (E07)</text>
+  <line x1="480" y1="90" x2="525" y2="90" stroke="#f0883e" stroke-width="2" marker-end="url(#o1)"/>
+  <!-- pantalla -->
+  <rect x="530" y="50" width="215" height="80" rx="8" fill="#0e1422" stroke="#3fb950" stroke-width="2"/>
+  <path d="M545,90 L560,90 L560,68 L590,68 L590,112 L620,112 L620,68 L650,68 L650,90 L730,90" fill="none" stroke="#3fb950" stroke-width="2"/>
+  <text x="637" y="145" text-anchor="middle" fill="#3fb950" font-size="9" font-family="system-ui">🖥️ pantalla / navegador</text>
+</svg>
+<figcaption>El ADC convierte el voltaje en números muchas miles de veces por segundo; el <strong>trigger</strong> (E07) "engancha" siempre en el mismo punto de la onda para que se vea quieta y no temblando. La frecuencia de muestreo decide qué tan rápido podés "ver": <strong>Nyquist</strong> (E06) manda — para ver una señal de X Hz, hay que muestrear a más de 2X.</figcaption>
+</figure>
+
+<h2>Qué vas a aprender</h2>
+<ul>
+  <li><strong>Muestreo y Nyquist</strong>: por qué la frecuencia de muestreo limita lo que podés ver (E06).</li>
+  <li>Leer el <strong>ADC rápido</strong> (DMA) sin que el micro se cuelgue (E03).</li>
+  <li>El <strong>trigger</strong>: estabilizar una onda repetitiva para que no "viaje" (E07).</li>
+  <li>Dibujar la forma de onda (en OLED, TFT o canvas del navegador).</li>
+  <li>Escalas de tiempo/voltaje y medir frecuencia/amplitud.</li>
+  <li>Opcional: FFT en vivo (el espectro, como el Vúmetro P12).</li>
+</ul>
+
+<h2>Componentes</h2>
+<p>ESP32 (ADC + WiFi para ver en el navegador) o un micro con ADC rápido · divisor resistivo / acondicionamiento de entrada (proteger el pin) · pantalla OLED/TFT, o servir la onda por WebSocket a una página. ⚠️ Solo señales de baja tensión y seguras.</p>
+
+<h2>Código clave (muestrear + trigger)</h2>
+
+<pre><code class="lang-cpp">uint16_t buffer[N];
+
+void capturar() {
+  for (int i = 0; i &lt; N; i++) {
+    buffer[i] = analogRead(PIN);          // muestrea (E03)
+    delayMicroseconds(US_ENTRE_MUESTRAS); // define la base de tiempo (E06)
+  }
+}
+
+// Trigger: arrancar a dibujar cuando la señal cruza un umbral subiendo
+int encontrarTrigger() {
+  for (int i = 1; i &lt; N; i++)
+    if (buffer[i-1] &lt; UMBRAL &amp;&amp; buffer[i] &gt;= UMBRAL)  // cruce ascendente (E07)
+      return i;        // dibujar desde acá → la onda se ve QUIETA
+  return 0;
+}</code></pre>
+
+<div class="bridge">
+  <span>🔗</span> El <strong>trigger</strong> es la diferencia entre una onda ilegible que tiembla y una imagen estable: en vez de dibujar desde un punto cualquiera, arrancás siempre en el mismo lugar de la onda (un cruce por umbral). Es DSP puro (E07). Y la separación entre muestras define tu "base de tiempo": muy lento y te perdés los detalles rápidos (violás Nyquist, E06); muy rápido y ves poco intervalo.
+</div>
+
+<h2>Fases</h2>
+<div class="fase"><strong>Fase 1:</strong> leé el ADC y mandá los valores por serial. Graficalos con el Serial Plotter.</div>
+<div class="fase"><strong>Fase 2:</strong> buffer + dibujo en pantalla/navegador. Ya tenés un "osciloscopio" básico.</div>
+<div class="fase"><strong>Fase 3:</strong> trigger por umbral: que una onda repetitiva se vea quieta.</div>
+<div class="fase"><strong>Fase 4:</strong> controles: base de tiempo, escala de voltaje, medir frecuencia/amplitud.</div>
+<div class="fase"><strong>Fase 5:</strong> modo FFT (espectro) reutilizando el motor del Vúmetro (P12).</div>
+
+<div class="done">
+  <strong>✅ Terminado cuando:</strong>
+  <ul>
+    <li>Mostrás una onda real (un generador, el PWM de un pin, un audio) de forma estable.</li>
+    <li>El trigger mantiene la onda quieta en vez de viajar.</li>
+    <li>Podés medir su frecuencia y amplitud aproximadas.</li>
+    <li>Entendés y respetás Nyquist (no "inventás" señales que no podés muestrear).</li>
+    <li>La entrada está protegida (no le metés tensión peligrosa al pin).</li>
+  </ul>
+</div>
+
+<h2>Variantes</h2>
+<ol>
+  <li>Dos canales (comparar dos señales).</li>
+  <li>Analizador lógico (señales digitales, protocolos I2C/SPI).</li>
+  <li>Generador de funciones integrado (sacás una onda por DAC/PWM y la medís).</li>
+  <li>Captura y exportá la onda como CSV para analizar (P18 EDA).</li>
+  <li>Interfaz web completa con WebSocket en vivo (Curso-React).</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="./26-consola-retro.html">← Consola Retro</a>
+  <a href="./28-control-acceso-rfid.html">Siguiente: Control de Acceso RFID →</a>
+</nav>
+
+</div>
+</body>
+</html>

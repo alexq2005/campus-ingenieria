@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 14 — NumPy: Cómputo Numérico · Curso de Python</title>
+  <meta name="description" content="NumPy desde cero: arrays, vectorización, broadcasting, producto matricial (@), ufuncs y máscaras. La base para Ciencia de Datos e IA — y para escribir una red neuronal a mano.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Python</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 14</span>
+  <span class="badge">⏱ ~90 min</span>
+  <span class="badge">🎯 Pre-req: Módulos 03, 05, 06</span>
+  <span class="badge">🔗 Base de Datos e IA</span>
+</div>
+
+<article>
+
+<h1>Módulo 14 — NumPy: Cómputo Numérico</h1>
+
+<p>Este es el módulo que cruza el puente: del Python "de listas y bucles" al Python "de datos e inteligencia artificial". Casi toda la ciencia de datos, el machine learning y <strong>todas las redes neuronales</strong> corren sobre <strong>NumPy</strong> (o librerías construidas encima de él, como pandas, scikit-learn y PyTorch).</p>
+
+<div class="info">
+  <strong>📌 Para qué te sirve esto:</strong> es la base directa de los proyectos
+  <a href="../../proyectos/16-clasificador-imagenes.html">P16 Clasificador CNN</a>,
+  <a href="../../proyectos/18-analisis-datos-eda.html">P18 Análisis de Datos</a> y
+  <a href="../../proyectos/30-red-neuronal.html">P30 Red Neuronal desde Cero</a>.
+  Al terminar este módulo vas a tener <em>todo</em> lo necesario para escribir una red neuronal a mano.
+</div>
+
+<h2>Por qué NumPy (y no listas de Python)</h2>
+
+<p>Una <code>list</code> de Python guarda <em>punteros</em> a objetos dispersos por la memoria; cada número es un objeto completo. Un <strong>ndarray</strong> de NumPy guarda los números crudos, del mismo tipo, <strong>contiguos en memoria</strong>. Eso permite operar sobre todo el bloque de una sola vez, en código C optimizado — decenas de veces más rápido.</p>
+
+<pre><code class="lang-python"># Sumar dos millones de números, elemento a elemento
+
+# ❌ Estilo lista (lento): un bucle en Python puro
+resultado = [a[i] + b[i] for i in range(len(a))]
+
+# ✅ Estilo NumPy (rápido): una operación sobre todo el array
+import numpy as np
+resultado = a + b            # ¡sin bucle! NumPy lo hace en bloque, en C</code></pre>
+
+<div class="concept">
+  <strong>💡 La idea central: "pensar vectorizado".</strong> En NumPy casi nunca escribís un <code>for</code>
+  sobre los elementos. Operás sobre <strong>arrays enteros</strong> de una vez. Si te encontrás escribiendo
+  un bucle para recorrer un array número por número, casi siempre hay una forma vectorizada (más corta y más rápida).
+</div>
+
+<h2>Instalar e importar</h2>
+
+<pre><code class="lang-python">pip install numpy        # en tu terminal, dentro del venv del proyecto
+
+import numpy as np        # la convención universal: SIEMPRE se importa como "np"</code></pre>
+
+<h2>Crear arrays</h2>
+
+<pre><code class="lang-python">import numpy as np
+
+np.array([1, 2, 3])                 # desde una lista        -> [1 2 3]
+np.array([[1, 2], [3, 4]])          # matriz 2x2 (lista de listas)
+
+np.zeros((2, 3))                    # matriz 2x3 de ceros
+np.ones((3, 1))                     # matriz 3x1 de unos
+np.full((2, 2), 7)                  # matriz 2x2 llena de 7
+
+np.arange(0, 10, 2)                 # como range() pero array -> [0 2 4 6 8]
+np.linspace(0, 1, 5)               # 5 valores equiespaciados -> [0. 0.25 0.5 0.75 1.]
+np.eye(3)                           # matriz identidad 3x3</code></pre>
+
+<p>Todo array tiene un <strong><code>dtype</code></strong> (tipo de sus elementos: <code>int64</code>, <code>float64</code>, <code>bool</code>…). NumPy lo infiere, pero podés forzarlo:</p>
+
+<pre><code class="lang-python">np.array([1, 2, 3], dtype=float)    # -> [1. 2. 3.]  (floats)
+np.zeros(3).dtype                   # -> dtype('float64')</code></pre>
+
+<h2>Números al azar (y reproducibles)</h2>
+
+<p>La forma moderna usa un <strong>generador</strong> con semilla. Misma semilla → mismos números: clave para depurar y para que un experimento sea repetible.</p>
+
+<pre><code class="lang-python">rng = np.random.default_rng(semilla=0)   # un "dado" reproducible
+
+rng.uniform(-1, 1, size=(3, 2))     # matriz 3x2 de floats entre -1 y 1
+rng.normal(0, 1, size=5)            # 5 valores de una distribución normal
+rng.integers(0, 10, size=4)         # 4 enteros entre 0 y 9
+rng.random((2, 2))                  # floats en [0, 1)</code></pre>
+
+<div class="rule">
+  <strong>🎲 Reproducibilidad:</strong> <code>default_rng(0)</code> siempre genera la misma secuencia.
+  Por eso en el proyecto <a href="../../proyectos/30-red-neuronal.html">P30</a> la función <code>generar_xor</code>
+  recibe una <code>semilla</code>: para que cada vez que corras el entrenamiento partas de los mismos datos y
+  puedas comparar resultados de verdad.
+</div>
+
+<h2>Forma: <code>shape</code>, <code>ndim</code>, <code>reshape</code></h2>
+
+<p>La <strong>forma</strong> (shape) de un array es lo más importante de tener siempre en la cabeza: la mayoría de los bugs en datos e IA son <em>shapes que no encajan</em>.</p>
+
+<pre><code class="lang-python">a = np.array([[1, 2, 3], [4, 5, 6]])
+
+a.shape          # (2, 3)  -> 2 filas, 3 columnas
+a.ndim           # 2       -> es bidimensional (una matriz)
+a.size           # 6       -> total de elementos
+
+a.reshape(3, 2)  # reorganiza a 3x2 (mismos datos, otra forma)
+a.reshape(-1, 1) # el -1 = "calculá vos cuántas filas": -> columna (6, 1)
+a.reshape(1, -1) # fila (1, 6)
+a.T              # transpuesta: (3, 2)</code></pre>
+
+<div class="mistake">
+  <strong>⚠️ Error clásico: <code>(n,)</code> NO es lo mismo que <code>(n, 1)</code>.</strong>
+  Un vector "plano" <code>(n,)</code> y una columna <code>(n, 1)</code> se ven parecidos pero se comportan
+  distinto al combinarlos con otros arrays (broadcasting). Cuando una etiqueta o salida tenga que ser columna,
+  usá <code>.reshape(-1, 1)</code>.
+</div>
+
+<h2>Operaciones vectorizadas y broadcasting</h2>
+
+<p>Las operaciones aritméticas se aplican <strong>elemento a elemento</strong>, sin bucles:</p>
+
+<pre><code class="lang-python">x = np.array([1, 2, 3])
+y = np.array([10, 20, 30])
+
+x + y        # [11 22 33]
+x * y        # [10 40 90]   (elemento a elemento)
+x ** 2       # [1 4 9]
+x + 100      # [101 102 103]   (el escalar se "reparte" a todos)</code></pre>
+
+<p><strong>Broadcasting</strong> es la regla por la que NumPy "estira" automáticamente un array más chico para que encaje con uno más grande:</p>
+
+<pre><code class="lang-python">M = np.array([[1, 2, 3],
+              [4, 5, 6]])      # (2, 3)
+fila = np.array([10, 20, 30])  # (3,)
+
+M + fila     # la fila se suma a CADA fila de M:
+# [[11 22 33]
+#  [14 25 36]]</code></pre>
+
+<div class="tip">
+  Esto es exactamente cómo una red neuronal suma el <strong>sesgo</strong> (bias) a cada ejemplo del lote
+  de una sola vez: <code>X @ W + b</code>, donde <code>b</code> se reparte por broadcasting.
+</div>
+
+<h2>El producto matricial: <code>@</code> vs <code>*</code></h2>
+
+<div class="rule">
+  <strong>La distinción que más importa en IA:</strong><br>
+  <code>A * B</code> → multiplicación <strong>elemento a elemento</strong> (necesita misma forma).<br>
+  <code>A @ B</code> → <strong>producto matricial</strong> (filas × columnas, el del álgebra lineal).
+</div>
+
+<pre><code class="lang-python">X = np.array([[1, 2],
+              [3, 4],
+              [5, 6]])         # (3, 2)  -> 3 ejemplos, 2 features
+W = np.array([[0.1, 0.2, 0.3],
+              [0.4, 0.5, 0.6]])# (2, 3)  -> 2 entradas, 3 neuronas
+
+X @ W        # (3, 2) @ (2, 3) = (3, 3)   ✅ las dimensiones internas (2 y 2) coinciden
+# cada fila de X se combina con cada columna de W</code></pre>
+
+<div class="mistake">
+  <strong>⚠️ Confundir <code>*</code> con <code>@</code> es EL error #1 al armar una red.</strong>
+  Una capa neuronal es un <em>producto matricial</em> (<code>@</code>), no una multiplicación elemento a elemento.
+  Si ves un error de shapes raro, lo primero a revisar es si pusiste <code>*</code> donde iba <code>@</code>.
+</div>
+
+<h2>Funciones universales (ufuncs)</h2>
+
+<p>NumPy trae funciones matemáticas que se aplican a <strong>todo el array de una vez</strong>:</p>
+
+<pre><code class="lang-python">x = np.array([-1.0, 0.0, 1.0, 2.0])
+
+np.exp(x)        # exponencial de cada elemento
+np.log(x + 2)    # logaritmo natural
+np.sqrt(np.abs(x))
+np.tanh(x)       # tangente hiperbólica (activación de redes)
+np.maximum(0, x) # ReLU: max(0, x) elemento a elemento -> [0 0 1 2]
+
+# La sigmoide, escrita con ufuncs (la salida de la red P30):
+def sigmoide(z):
+    return 1 / (1 + np.exp(-z))</code></pre>
+
+<h2>Reducciones con <code>axis</code></h2>
+
+<p>Sumar, promediar o buscar el máximo a lo largo de un eje. <code>axis=0</code> = por columnas (hacia abajo), <code>axis=1</code> = por filas (hacia los lados), sin <code>axis</code> = todo el array.</p>
+
+<pre><code class="lang-python">M = np.array([[1, 2, 3],
+              [4, 5, 6]])
+
+M.sum()             # 21   (todo)
+M.sum(axis=0)       # [5 7 9]    (suma cada columna)
+M.sum(axis=1)       # [6 15]     (suma cada fila)
+M.mean()            # 3.5
+M.max(axis=1)       # [3 6]
+M.argmax(axis=1)    # [2 2]  (índice del máximo en cada fila)</code></pre>
+
+<div class="tip">
+  La <strong>pérdida promedio</strong> de la red (<code>loss.mean()</code>) y la <strong>precisión</strong>
+  (porcentaje de aciertos) se calculan con estas reducciones.
+</div>
+
+<h2>Indexado y máscaras booleanas</h2>
+
+<p>Podés indexar como en listas, pero también con <strong>condiciones</strong>, que es donde NumPy brilla:</p>
+
+<pre><code class="lang-python">x = np.array([-3, -1, 0, 2, 5])
+
+x[0]            # -3
+x[1:3]          # [-1 0]
+x[x > 0]        # [2 5]   <- máscara booleana: solo los que cumplen
+
+# Una máscara es un array de True/False:
+x > 0           # [False False False True True]
+(x > 0).astype(int)   # [0 0 0 1 1]   <- convertir a 0/1
+
+np.where(x > 0, 1, 0) # [0 0 0 1 1]   <- "si cumple, 1; si no, 0"</code></pre>
+
+<div class="info">
+  En el proyecto, la etiqueta XOR ("¿tienen el mismo signo?") se calcula así, sin un solo <code>if</code>:
+  <code>(x * y > 0).astype(int)</code>. Eso es pensar vectorizado.
+</div>
+
+<h2>Todo junto: una capa neuronal en una línea</h2>
+
+<p>Ya sabés lo suficiente para escribir el corazón de una red. Mirá cómo el <strong>forward pass</strong> entero del proyecto P30 son apenas dos líneas de NumPy:</p>
+
+<pre><code class="lang-python"># X: (n, 2)  los datos  |  W1: (2, h), b1: (h,)  |  W2: (h, 1), b2: (1,)
+
+a1  = np.tanh(X @ W1 + b1)            # capa oculta: producto matricial + bias + activación
+out = 1 / (1 + np.exp(-(a1 @ W2 + b2)))  # capa de salida: sigmoide -> probabilidad 0..1</code></pre>
+
+<div class="concept">
+  <strong>🧠 Eso es una red neuronal.</strong> Producto matricial (<code>@</code>), suma del bias (broadcasting),
+  y una activación (<code>np.tanh</code>, <code>sigmoide</code>) — todo lo que viste en este módulo. No hay magia:
+  es álgebra lineal vectorizada. Ahora estás listo para el proyecto
+  <a href="../../proyectos/30-red-neuronal.html">P30 Red Neuronal desde Cero</a>.
+</div>
+
+<h2>Errores comunes</h2>
+
+<table>
+<thead><tr><th>Error</th><th>Causa</th><th>Solución</th></tr></thead>
+<tbody>
+<tr><td><code>shapes not aligned</code></td><td>Producto matricial con dimensiones que no encajan</td><td>Verificá que las dimensiones internas coincidan: <code>(n,k) @ (k,m)</code></td></tr>
+<tr><td>Resultado raro al sumar</td><td>Confundir <code>(n,)</code> con <code>(n,1)</code></td><td><code>.reshape(-1, 1)</code> cuando necesitás columna</td></tr>
+<tr><td>Multiplicación da mal</td><td>Usaste <code>*</code> en vez de <code>@</code></td><td><code>@</code> para producto matricial</td></tr>
+<tr><td>Modificás un array y cambia otro</td><td>El slicing devuelve una <em>vista</em>, no una copia</td><td>Usá <code>.copy()</code> si necesitás un array independiente</td></tr>
+</tbody>
+</table>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia entre <code>A * B</code> y <code>A @ B</code>?</summary>
+<p><code>*</code> multiplica elemento a elemento (requiere misma forma o broadcasting). <code>@</code> es el producto matricial del álgebra lineal (filas por columnas). Una capa neuronal usa <code>@</code>.</p></details>
+
+<details><summary>¿Qué hace <code>.reshape(-1, 1)</code> y por qué el <code>-1</code>?</summary>
+<p>Reorganiza el array en una sola columna. El <code>-1</code> significa "calculá vos cuántas filas hacen falta" para que todos los elementos entren. Si el array tiene 6 elementos, da forma <code>(6, 1)</code>.</p></details>
+
+<details><summary>¿Por qué pasar una semilla a <code>default_rng</code>?</summary>
+<p>Para reproducibilidad: la misma semilla genera siempre los mismos números al azar, así podés depurar y comparar experimentos de forma justa.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá una matriz <code>4x4</code> de números al azar entre 0 y 1 con una semilla fija. Imprimí su <code>shape</code> y su media por columna.</li>
+  <li>Dado <code>x = np.linspace(-5, 5, 11)</code>, calculá la sigmoide de cada valor sin usar ningún bucle.</li>
+  <li>Generá 100 puntos 2D al azar en <code>[-1, 1]</code> y etiquetá con 1 los que estén dentro del círculo de radio 0.5 (pista: <code>x**2 + y**2</code>), todo vectorizado.</li>
+  <li>Con <code>X (5,2)</code> y <code>W (2,3)</code> al azar, calculá <code>X @ W</code> y verificá que la forma sea <code>(5,3)</code>. Probá qué error da si usás <code>*</code>.</li>
+  <li>Escribí las dos líneas del forward pass (capa oculta + salida) para un <code>X (10, 2)</code> inventado. No tiene que "aprender" — solo producir una salida <code>(10, 1)</code> entre 0 y 1.</li>
+</ol>
+
+<section class="quiz" id="quizNumpy">
+  <style>
+    #quizNumpy{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizNumpy h3{margin:0 0 1rem;color:var(--accent)}
+    #quizNumpy .q{margin-bottom:1.5rem}
+    #quizNumpy .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizNumpy .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizNumpy .opt:hover{border-color:var(--accent)}
+    #quizNumpy .opt:disabled{cursor:default}
+    #quizNumpy .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizNumpy .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizNumpy .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizNumpy .exp.show{display:block}
+    #quizNumpy .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Para calcular la salida de una capa neuronal (producto matricial entre datos y pesos), ¿qué operador usás?</p>
+    <button class="opt">El asterisco <code>*</code></button>
+    <button class="opt">El arroba <code>@</code></button>
+    <button class="opt">El signo más <code>+</code></button>
+    <div class="exp"><code>@</code> es el producto matricial. <code>*</code> multiplica elemento a elemento, que NO es lo que hace una capa.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. <code>np.array([1, 2, 3, 4]).reshape(-1, 1)</code> produce un array de forma…</p>
+    <button class="opt"><code>(1, 4)</code> — una fila</button>
+    <button class="opt"><code>(4,)</code> — plano</button>
+    <button class="opt"><code>(4, 1)</code> — una columna</button>
+    <div class="exp">El <code>-1</code> hace que NumPy calcule las filas (4) para dejar 1 columna: forma <code>(4, 1)</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cómo etiquetás con 1/0 los elementos de <code>x</code> que son positivos, sin bucles?</p>
+    <button class="opt"><code>(x > 0).astype(int)</code></button>
+    <button class="opt"><code>for v in x: if v > 0...</code></button>
+    <button class="opt"><code>x.positivos()</code></button>
+    <div class="exp"><code>x > 0</code> da una máscara booleana; <code>.astype(int)</code> la convierte a 1/0. Vectorizado, sin bucle.</div>
+  </div>
+
+  <div class="score" id="scoreNumpy"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizNumpy');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreNumpy').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el proyecto P30.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-13-proyectos/lecture.html">← Anterior: Proyectos Integradores</a>
+  <a href="../../proyectos/30-red-neuronal.html">Aplicalo → Proyecto: Red Neuronal desde Cero</a>
+</nav>
+
+</div>
+</body>
+</html>

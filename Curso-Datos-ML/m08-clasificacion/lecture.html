@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 08 — Clasificación · Curso de Datos & ML</title>
+  <meta name="description" content="Clasificación: predecir categorías con LogisticRegression, KNN y árboles de decisión. Métricas que importan (accuracy engaña), precision, recall, F1, matriz de confusión y predict_proba.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M07</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Clasificación</h1>
+
+<p>En el módulo anterior aprendiste a <em>predecir números</em> (regresión). Ahora vamos a <em>predecir categorías</em>: ¿este email es spam o no? ¿este tumor es benigno o maligno? ¿qué especie de flor es esta? La buena noticia: la mecánica de scikit-learn es la misma que ya conocés. La parte nueva e importante es <strong>cómo medir si el modelo es bueno</strong>, porque acá la <code>accuracy</code> sola te puede mentir.</p>
+
+<h2>¿Qué es clasificación?</h2>
+
+<div class="concept">
+  <strong>💡 Clasificación = predecir una CATEGORÍA</strong> (una clase), no un número. La salida es discreta: <code>spam</code>/<code>no-spam</code>, <code>enfermo</code>/<code>sano</code>, <code>perro</code>/<code>gato</code>/<code>pájaro</code>. Compará con <strong>regresión</strong> (M07), que predice un valor continuo como un precio o una temperatura.
+</div>
+
+<table>
+<thead><tr><th></th><th>Regresión (M07)</th><th>Clasificación (M08)</th></tr></thead>
+<tbody>
+<tr><td><strong>Predice</strong></td><td>Un número continuo</td><td>Una categoría / clase</td></tr>
+<tr><td><strong>Ejemplo</strong></td><td>Precio de una casa: $250.000</td><td>Email: spam o no-spam</td></tr>
+<tr><td><strong>Métrica típica</strong></td><td>MAE, RMSE, R²</td><td>accuracy, precision, recall, F1</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Lo bueno:</strong> el flujo de scikit-learn es idéntico al de M07. Creás el modelo, <code>.fit(X_train, y_train)</code> para entrenar y <code>.predict(X_test)</code> para predecir. Lo único que cambia es <em>qué modelo</em> usás y <em>cómo lo evaluás</em>.
+</div>
+
+<h2>Tres modelos de clasificación</h2>
+
+<p>scikit-learn trae decenas de clasificadores. Estos tres son el punto de partida clásico, y cada uno tiene una idea intuitiva detrás:</p>
+
+<h3>1. LogisticRegression — la línea que separa</h3>
+
+<div class="mistake">
+  <strong>El nombre engaña:</strong> <code>LogisticRegression</code> <em>clasifica</em>, no hace regresión. El "regression" viene de su origen estadístico, pero su trabajo es separar clases.
+</div>
+
+<p>Traza una <strong>frontera de decisión</strong> (una línea o plano) entre las clases y, en vez de devolver un número crudo, lo pasa por una función que lo convierte en una <strong>probabilidad entre 0 y 1</strong>. Es rápido, simple y un excelente punto de partida (baseline).</p>
+
+<h3>2. KNeighborsClassifier (KNN) — "decime con quién andás"</h3>
+
+<div class="analogy">
+  <strong>🔍 KNN clasifica por vecindad:</strong> para un punto nuevo, mira a sus <em>k vecinos más cercanos</em> y vota la clase mayoritaria entre ellos. Si tus 5 vecinos más parecidos son spam, vos también sos spam. No "aprende" una fórmula: guarda los datos y compara distancias en el momento de predecir.
+</div>
+
+<h3>3. DecisionTreeClassifier — el árbol de preguntas</h3>
+
+<p>Un <strong>árbol de decisión</strong> arma una serie de preguntas tipo "¿esta característica es mayor que X?" y va ramificando hasta llegar a una clase. Es muy fácil de interpretar (podés leer las reglas), pero tiende a <em>sobreajustar</em> (memorizar) si lo dejás crecer sin límite — algo que veremos en profundidad en M09.</p>
+
+<table>
+<thead><tr><th>Modelo</th><th>Idea intuitiva</th><th>Punto fuerte</th></tr></thead>
+<tbody>
+<tr><td><code>LogisticRegression</code></td><td>Traza una frontera y devuelve probabilidades</td><td>Simple, rápido, buen baseline</td></tr>
+<tr><td><code>KNeighborsClassifier</code></td><td>Vota según los k vecinos más cercanos</td><td>Intuitivo, sin entrenamiento real</td></tr>
+<tr><td><code>DecisionTreeClassifier</code></td><td>Cadena de preguntas if/else</td><td>Interpretable (leés las reglas)</td></tr>
+</tbody>
+</table>
+
+<h2>Métricas: por qué la accuracy SOLA engaña</h2>
+
+<div class="concept">
+  <strong>💡 Accuracy</strong> = (predicciones correctas) / (total). Suena perfecta... hasta que el dataset está <strong>desbalanceado</strong>.
+</div>
+
+<div class="warn">
+  <strong>El ejemplo que tenés que recordar:</strong> imaginá un test de una enfermedad rara donde el 99% de la gente está sana. Un modelo que predice "sano" para <em>todos</em>, sin mirar nada, acierta el <strong>99% de las veces</strong> → accuracy del 99%. Suena genial. Pero no detecta <em>ni un solo enfermo</em>: es completamente inútil. La accuracy alta esconde el desastre.
+</div>
+
+<p>Por eso necesitamos métricas que miren <em>qué tipo</em> de error comete el modelo. Para entenderlas, primero la herramienta base: la matriz de confusión.</p>
+
+<h3>La matriz de confusión</h3>
+
+<p>Cruza lo que el modelo <strong>predijo</strong> contra lo que <strong>realmente era</strong>. Para dos clases (positivo / negativo) da cuatro casillas:</p>
+
+<table>
+<thead><tr><th></th><th>Predijo Positivo</th><th>Predijo Negativo</th></tr></thead>
+<tbody>
+<tr><td><strong>Era Positivo</strong></td><td>✅ VP (verdadero positivo)</td><td>❌ FN (falso negativo)</td></tr>
+<tr><td><strong>Era Negativo</strong></td><td>❌ FP (falso positivo)</td><td>✅ VN (verdadero negativo)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>FN</strong> = el modelo dijo "negativo" pero era positivo (se le escapó). <strong>FP</strong> = dijo "positivo" pero era negativo (falsa alarma). Casi toda la teoría de métricas se construye sobre estas cuatro casillas.
+</div>
+
+<h3>Precision vs Recall</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Fórmula</th><th>Qué mide</th><th>Cuándo importa</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>Precision</strong></td>
+  <td><code>VP / (VP + FP)</code></td>
+  <td>De lo que marqué como positivo, ¿cuánto era realmente positivo?</td>
+  <td>Cuando un <strong>falso positivo</strong> es caro (ej: marcar como spam un email importante)</td>
+</tr>
+<tr>
+  <td><strong>Recall</strong></td>
+  <td><code>VP / (VP + FN)</code></td>
+  <td>De todos los positivos reales, ¿cuántos detecté?</td>
+  <td>Cuando un <strong>falso negativo</strong> es caro (ej: no detectar una enfermedad o un fraude)</td>
+</tr>
+<tr>
+  <td><strong>F1</strong></td>
+  <td><code>2 · (P·R)/(P+R)</code></td>
+  <td>Promedio (armónico) que equilibra precision y recall</td>
+  <td>Cuando querés un solo número que balancee ambas</td>
+</tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Precision y recall casi siempre están en tensión.</strong> Si subís el recall (atrapar todos los positivos) solés bajar la precision (más falsas alarmas), y viceversa. <strong>F1</strong> resume ese equilibrio en un único valor. Volviendo al ejemplo de la enfermedad rara: el modelo "todo sano" tenía recall = 0 para la clase enferma, así que su F1 sería pésimo — y por eso F1 sí lo delata, mientras que la accuracy lo escondía.
+</div>
+
+<h2>predict_proba y el umbral de decisión</h2>
+
+<p>La mayoría de los clasificadores no solo dicen "clase A" — internamente calculan una <strong>probabilidad por clase</strong>. Lo ves con <code>predict_proba</code>:</p>
+
+<pre><code class="lang-python">probs = modelo.predict_proba(X_test)
+# Devuelve, por fila, la probabilidad de CADA clase:
+# [[0.92, 0.08],   -&gt; 92% clase 0, 8% clase 1
+#  [0.30, 0.70]]   -&gt; 30% clase 0, 70% clase 1</code></pre>
+
+<div class="concept">
+  <strong>💡 El umbral de decisión.</strong> Por defecto, <code>.predict()</code> usa el umbral 0.5: si <code>P(clase 1) &gt;= 0.5</code>, predice clase 1. Pero podés <em>moverlo</em>. ¿Querés detectar más casos positivos aunque te equivoques más (más recall)? Bajá el umbral a 0.3. ¿Querés estar más seguro antes de marcar positivo (más precision)? Subilo a 0.7. El umbral es la perilla con la que negociás precision contra recall.
+</div>
+
+<pre><code class="lang-python"># Predicción manual con un umbral de 0.3 (más sensible / más recall)
+import numpy as np
+p_clase1 = modelo.predict_proba(X_test)[:, 1]
+y_pred = np.where(p_clase1 &gt;= 0.3, 1, 0)</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake"><strong>Usar solo accuracy en datos desbalanceados.</strong> Un 99% de accuracy puede significar un modelo inútil. Mirá siempre precision, recall y F1 por clase.</div>
+<div class="mistake"><strong>Confundir precision con recall.</strong> Precision = de lo que marqué positivo, cuánto acerté. Recall = de los positivos reales, cuántos atrapé. No son lo mismo y cada uno importa en contextos distintos.</div>
+<div class="mistake"><strong>No mirar la matriz de confusión.</strong> Es donde ves <em>qué tipo</em> de error comete el modelo (¿se le escapan positivos? ¿da falsas alarmas?). Sin ella, las métricas son números sin contexto.</div>
+
+<h2>Ejemplo completo — clasificar con LogisticRegression</h2>
+
+<p>Tomamos el dataset Iris (clasificar especies de flores), entrenamos un modelo y lo evaluamos con las métricas que importan:</p>
+
+<pre><code class="lang-python">from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, classification_report
+
+# 1. Cargar datos
+X, y = load_iris(return_X_y=True)
+
+# 2. Separar train / test (regla de oro de M00)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42)
+
+# 3. Entrenar (mismo fit/predict de M07)
+modelo = LogisticRegression(max_iter=200)
+modelo.fit(X_train, y_train)
+
+# 4. Predecir
+y_pred = modelo.predict(X_test)
+
+# 5. Evaluar -- NO con accuracy sola
+print(confusion_matrix(y_test, y_pred))
+print(classification_report(y_test, y_pred))</code></pre>
+
+<div class="info">
+  <code>classification_report</code> te imprime precision, recall y F1 <strong>por cada clase</strong>, más los promedios. Es la forma rápida de ver si el modelo falla en alguna clase concreta. <code>confusion_matrix</code> te muestra el conteo crudo de aciertos y errores por casilla.</div>
+
+<p>Una salida típica de <code>classification_report</code> se lee así:</p>
+
+<pre><code class="lang-python">              precision    recall  f1-score   support
+           0       1.00      1.00      1.00        10
+           1       1.00      0.89      0.94         9
+           2       0.92      1.00      0.96        11
+    accuracy                           0.97        30</code></pre>
+
+<div class="tip">
+  <strong>Leyendo la tabla:</strong> la clase 1 tiene recall 0.89 → se le escapó 1 de cada 9 ejemplos reales de esa clase. <code>support</code> es cuántos ejemplos reales había de cada clase en el test. Mirá siempre el recall/precision de la clase que <em>menos</em> ejemplos tiene: ahí es donde la accuracy global suele esconder problemas.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué la accuracy sola puede engañar?</summary>
+<p>Porque en datasets desbalanceados (ej: 99% de una clase), un modelo que siempre predice la clase mayoritaria tiene accuracy altísima pero no detecta la clase minoritaria. Hay que mirar precision, recall y F1 por clase, y la matriz de confusión.</p></details>
+
+<details><summary>¿Cuál es la diferencia entre precision y recall?</summary>
+<p>Precision = de lo que marqué como positivo, cuánto era realmente positivo (penaliza falsos positivos). Recall = de todos los positivos reales, cuántos detecté (penaliza falsos negativos). Precision importa cuando una falsa alarma es cara; recall cuando dejar pasar un positivo es caro.</p></details>
+
+<details><summary>¿Qué hace predict_proba y para qué sirve mover el umbral?</summary>
+<p><code>predict_proba</code> devuelve la probabilidad de cada clase, no solo la etiqueta. El umbral (0.5 por defecto) decide a partir de qué probabilidad se predice positivo. Bajarlo aumenta el recall (atrapás más positivos, con más falsas alarmas); subirlo aumenta la precision (más seguro antes de marcar positivo).</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Cargá el dataset Iris (o el de breast cancer con <code>load_breast_cancer</code>), separalo en train/test y entrená un <code>LogisticRegression</code>. Imprimí el <code>classification_report</code>.</li>
+  <li>Repetí el mismo flujo con <code>KNeighborsClassifier</code> y con <code>DecisionTreeClassifier</code>. Compará el F1 de los tres modelos sobre el mismo test set.</li>
+  <li>Imprimí y analizá la <code>confusion_matrix</code> de tu mejor modelo: ¿comete más falsos positivos o falsos negativos?</li>
+  <li>Usá <code>predict_proba</code> y aplicá un umbral de 0.3 manualmente (con <code>np.where</code>). Compará precision y recall contra el umbral 0.5 por defecto.</li>
+  <li>Inventá un caso de negocio (detección de fraude, filtro de spam, diagnóstico médico) y argumentá con tus palabras si para ese caso te importa más la precision o el recall, y por qué.</li>
+</ol>
+
+<section class="quiz" id="quizDML08">
+  <style>
+    #quizDML08{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML08 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML08 .q{margin-bottom:1.5rem}
+    #quizDML08 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML08 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML08 .opt:hover{border-color:var(--accent)}
+    #quizDML08 .opt:disabled{cursor:default}
+    #quizDML08 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML08 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML08 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML08 .exp.show{display:block}
+    #quizDML08 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué hace un modelo de clasificación?</p>
+    <button class="opt">Predice un número continuo, como un precio</button>
+    <button class="opt">Predice una categoría o clase, como spam / no-spam</button>
+    <button class="opt">Solo limpia y ordena los datos</button>
+    <div class="exp">Clasificación predice una categoría discreta (clase). Predecir un número continuo es regresión (M07).</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. En un dataset donde el 99% está sano, un modelo que predice "sano" para todos tiene 99% de accuracy. ¿Por qué es un mal modelo?</p>
+    <button class="opt">Porque la accuracy del 99% es demasiado baja</button>
+    <button class="opt">Porque LogisticRegression nunca llega al 99%</button>
+    <button class="opt">Porque no detecta ni un solo enfermo: su recall para esa clase es 0</button>
+    <div class="exp">En datos desbalanceados la accuracy engaña. El modelo ignora por completo la clase minoritaria (recall 0), justo la que importa. Por eso miramos precision, recall, F1 y la matriz de confusión.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué mide el <em>recall</em>?</p>
+    <button class="opt">De todos los positivos reales, cuántos detectó el modelo</button>
+    <button class="opt">De lo que el modelo marcó positivo, cuánto era realmente positivo</button>
+    <button class="opt">La velocidad de entrenamiento del modelo</button>
+    <div class="exp">Recall = VP / (VP + FN): de todos los positivos reales, cuántos atrapaste. "De lo que marqué positivo, cuánto acerté" es precision. Importa el recall cuando un falso negativo es caro (no detectar un fraude o una enfermedad).</div>
+  </div>
+
+  <div class="score" id="scoreDML08"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML08');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML08').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M09.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m07-ml-scikit-learn/lecture.html">← M07: scikit-learn</a>
+  <a href="../m09-validacion-overfitting/lecture.html">M09: Validación →</a>
+</nav>
+
+</div>
+</body>
+</html>

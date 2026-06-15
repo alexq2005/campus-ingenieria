@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 11 — Cargo, Crates &amp; Testing · Curso de Rust</title>
+  <meta name="description" content="Cargo a fondo, crates.io, organización en módulos con mod/pub/use, testing built-in con #[test] y cargo test, y documentación con cargo doc.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 11</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M06</span>
+</div>
+
+<article>
+
+<h1>Módulo 11 — Cargo, Crates &amp; Testing</h1>
+
+<p>Hasta ahora escribiste Rust en un solo archivo. Pero los proyectos reales crecen: necesitás <strong>organizar el código</strong>, <strong>reusar librerías de otra gente</strong> y <strong>verificar que todo funciona</strong>. Esas tres tareas tienen un mismo protagonista: <strong>Cargo</strong>, el toolchain de Rust. En este módulo vas a dominar Cargo a fondo, entender el ecosistema de <em>crates</em>, organizar tu código en módulos y escribir tests que corren con un solo comando.</p>
+
+<h2>Cargo a fondo: Cargo.toml y Cargo.lock</h2>
+
+<div class="concept">
+  <strong>💡 Cargo es a Rust lo que npm es a Node o pip a Python.</strong> Crea proyectos, los compila, descarga dependencias, corre tests y genera documentación. El centro de todo es un archivo de manifiesto: <code>Cargo.toml</code>.
+</div>
+
+<p>Cuando hacés <code>cargo new mi_proyecto</code>, Cargo genera un <code>Cargo.toml</code> como este:</p>
+
+<pre><code class="lang-toml">[package]
+name = "mi_proyecto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"
+rand = "0.8.5"</code></pre>
+
+<p>Hay dos secciones clave: <code>[package]</code> tiene la <strong>metadata</strong> de tu proyecto (nombre, versión, edición del lenguaje), y <code>[dependencies]</code> lista las <strong>librerías externas</strong> que usás, cada una con su versión.</p>
+
+<div class="info">
+  <strong>Cargo.toml vs Cargo.lock.</strong> Vos editás <code>Cargo.toml</code> (decís <em>qué</em> querés, ej: <code>serde = "1.0"</code>). Cargo genera <code>Cargo.lock</code> automáticamente, anotando las <strong>versiones exactas</strong> que resolvió (ej: <code>serde 1.0.197</code>). El <code>.lock</code> garantiza que vos y tus compañeros compilen con las mismas versiones — no lo edites a mano.
+</div>
+
+<h3>Agregar dependencias</h3>
+
+<p>Tenés dos formas de agregar una dependencia. La rápida, con el subcomando <code>cargo add</code>:</p>
+
+<pre><code class="lang-bash">cargo add serde
+cargo add rand@0.8.5      # versión específica</code></pre>
+
+<p>O editando <code>Cargo.toml</code> a mano y dejando que Cargo resuelva en el próximo build:</p>
+
+<pre><code class="lang-toml">[dependencies]
+serde = "1.0"</code></pre>
+
+<h3>crates.io: el registro de paquetes</h3>
+
+<p>¿De dónde salen <code>serde</code>, <code>rand</code> y compañía? De <strong><a href="https://crates.io" target="_blank">crates.io</a></strong>, el registro oficial de paquetes de Rust. Un <strong>crate</strong> es una unidad de compilación/distribución: tu propio proyecto es un crate, y cada librería que importás también lo es.</p>
+
+<table>
+<thead><tr><th>Ecosistema</th><th>Registro</th><th>Manifiesto</th><th>Lockfile</th></tr></thead>
+<tbody>
+<tr><td>Rust</td><td>crates.io</td><td><code>Cargo.toml</code></td><td><code>Cargo.lock</code></td></tr>
+<tr><td>Node</td><td>npm</td><td><code>package.json</code></td><td><code>package-lock.json</code></td></tr>
+<tr><td>Python</td><td>PyPI</td><td><code>pyproject.toml</code></td><td><code>requirements.txt</code></td></tr>
+</tbody>
+</table>
+
+<h2>Módulos: organizar el código</h2>
+
+<p>Un archivo enorme es ingobernable. Rust te deja partir el código en <strong>módulos</strong> con tres palabras clave: <code>mod</code>, <code>pub</code> y <code>use</code>.</p>
+
+<div class="rule">
+  <strong>📌 Las tres palabras del sistema de módulos:</strong> <code>mod</code> declara un módulo, <code>pub</code> hace algo visible desde afuera (por defecto <strong>todo es privado</strong>), y <code>use</code> trae un nombre al alcance para no escribir la ruta completa cada vez.
+</div>
+
+<p>Podés declarar un módulo inline dentro del mismo archivo:</p>
+
+<pre><code class="lang-rust">mod matematica {
+    // privado por defecto: NO accesible desde afuera
+    fn interno() -&gt; i32 { 42 }
+
+    // pub: visible desde fuera del módulo
+    pub fn sumar(a: i32, b: i32) -&gt; i32 {
+        a + b
+    }
+}
+
+fn main() {
+    // ruta completa con :: para llegar a la función
+    let r = matematica::sumar(2, 3);
+    println!("{}", r); // 5
+}</code></pre>
+
+<p>O moverlo a su propio archivo. Si en <code>main.rs</code> escribís <code>mod matematica;</code> (con punto y coma, sin bloque), Cargo busca el código en <code>src/matematica.rs</code>.</p>
+
+<h3>El árbol de módulos y <code>use</code></h3>
+
+<p>Los módulos forman un árbol que arranca en la raíz del crate: <code>crate</code>. Para no repetir rutas largas, <code>use</code> trae un nombre al alcance:</p>
+
+<pre><code class="lang-rust">mod matematica {
+    pub fn sumar(a: i32, b: i32) -&gt; i32 { a + b }
+}
+
+use crate::matematica::sumar;   // lo traigo al alcance
+
+fn main() {
+    let r = sumar(10, 5);        // ya no hace falta matematica::
+    println!("{}", r);           // 15
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔭 El árbol de módulos es como carpetas y archivos.</strong> <code>crate::</code> es la raíz (como <code>/</code> en el filesystem), cada <code>mod</code> es una subcarpeta, y <code>::</code> separa niveles como <code>/</code> separa carpetas. <code>use</code> es como crear un atajo (symlink) a algo que está hondo en el árbol.
+</div>
+
+<h2>Testing built-in</h2>
+
+<p>Rust trae testing <strong>de fábrica</strong> — no necesitás instalar nada. Marcás una función con el atributo <code>#[test]</code> y dentro usás <em>macros de aserción</em> para verificar resultados.</p>
+
+<table>
+<thead><tr><th>Macro</th><th>Verifica que…</th></tr></thead>
+<tbody>
+<tr><td><code>assert!(cond)</code></td><td>la condición es <code>true</code></td></tr>
+<tr><td><code>assert_eq!(a, b)</code></td><td><code>a</code> es igual a <code>b</code></td></tr>
+<tr><td><code>assert_ne!(a, b)</code></td><td><code>a</code> es distinto de <code>b</code></td></tr>
+</tbody>
+</table>
+
+<p>La convención es agrupar los tests en un módulo marcado con <code>#[cfg(test)]</code>, que le dice al compilador: <em>"compilá esto solo cuando corras los tests, no en el build normal"</em>.</p>
+
+<pre><code class="lang-rust">pub fn duplicar(x: i32) -&gt; i32 {
+    x * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;   // trae duplicar() al alcance del módulo de tests
+
+    #[test]
+    fn duplica_positivo() {
+        assert_eq!(duplicar(21), 42);
+    }
+
+    #[test]
+    fn duplica_cero() {
+        assert_eq!(duplicar(0), 0);
+    }
+
+    #[test]
+    fn no_es_lo_mismo() {
+        assert_ne!(duplicar(5), 5);
+    }
+}</code></pre>
+
+<p>Y corrés todo con un comando:</p>
+
+<pre><code class="lang-bash">cargo test</code></pre>
+
+<p>Cargo compila los tests, los ejecuta y te muestra cuántos pasaron y cuántos fallaron.</p>
+
+<h3>Tests de integración</h3>
+
+<div class="info">
+  <strong>Unit tests vs tests de integración.</strong> Los <code>#[cfg(test)] mod tests</code> que viven <em>dentro</em> de tu código fuente son <strong>unit tests</strong> (prueban funciones internas, incluso privadas). Los <strong>tests de integración</strong> van en una carpeta <code>tests/</code> en la raíz del proyecto, en archivos separados, y prueban tu crate <em>desde afuera</em>, como lo usaría otro usuario — solo ven la API <code>pub</code>.
+</div>
+
+<h2>Documentación con cargo doc</h2>
+
+<p>Rust convierte tus comentarios en documentación HTML navegable. Los <strong>doc comments</strong> usan <code>///</code> (tres barras) en vez de <code>//</code>, y van <em>arriba</em> de lo que documentan:</p>
+
+<pre><code class="lang-rust">/// Duplica un número entero.
+///
+/// # Ejemplo
+/// ```
+/// let r = duplicar(21);
+/// assert_eq!(r, 42);
+/// ```
+pub fn duplicar(x: i32) -&gt; i32 {
+    x * 2
+}</code></pre>
+
+<p>Y generás el sitio HTML con:</p>
+
+<pre><code class="lang-bash">cargo doc --open</code></pre>
+
+<div class="tip">
+  <strong>💡 Los ejemplos de los doc comments también se testean.</strong> Cuando corrés <code>cargo test</code>, Rust compila y ejecuta el código dentro de los bloques <code>```</code> de tu documentación. Así tu doc nunca queda desactualizada: si el ejemplo deja de compilar, el test falla.
+</div>
+
+<h2>Errores comunes</h2>
+
+<div class="mistake"><strong>Olvidar <code>pub</code>.</strong> Si declarás un módulo o función sin <code>pub</code>, NO es accesible desde afuera. El compilador te dirá algo como <em>"function is private"</em>. Recordá: todo es privado por defecto en Rust.</div>
+<div class="mistake"><strong>Un test sin aserción.</strong> Una función <code>#[test]</code> que no tiene ningún <code>assert!</code> y no hace <code>panic!</code> <em>siempre pasa</em>, aunque no verifique nada. Un test que no afirma nada da una falsa sensación de seguridad.</div>
+<div class="mistake"><strong>No fijar versiones de dependencias.</strong> Dejar dependencias sin versión clara (o borrar el <code>Cargo.lock</code> de un binario) lleva a que builds distintos usen versiones distintas — el clásico "en mi máquina funciona". Fijá versiones y versioná el <code>Cargo.lock</code>.</div>
+
+<div class="warn">
+  <strong>⚠️ <code>cargo test</code> corre todo en paralelo por defecto.</strong> Si tus tests comparten estado global (un archivo, una variable estática), pueden pisarse. Mantené cada test independiente; si hace falta, usá <code>cargo test -- --test-threads=1</code> para correrlos en serie.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia entre <code>Cargo.toml</code> y <code>Cargo.lock</code>?</summary>
+<p><code>Cargo.toml</code> lo escribís vos y declara <em>qué</em> dependencias querés (ej: <code>serde = "1.0"</code>). <code>Cargo.lock</code> lo genera Cargo y anota las <em>versiones exactas</em> resueltas (ej: <code>serde 1.0.197</code>), para que todos compilen igual. No edites el <code>.lock</code> a mano.</p></details>
+
+<details><summary>¿Por qué una función dentro de un <code>mod</code> no se ve desde afuera?</summary>
+<p>Porque en Rust todo es <strong>privado por defecto</strong>. Hay que marcarla con <code>pub</code> para que sea accesible fuera del módulo. Lo mismo aplica al propio <code>mod</code>.</p></details>
+
+<details><summary>¿Qué hace <code>#[cfg(test)]</code> sobre el módulo de tests?</summary>
+<p>Le dice al compilador que ese módulo se compile <strong>solo</strong> cuando corrés <code>cargo test</code>, no en el build normal. Así los tests no pesan en el binario final de producción.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un proyecto con <code>cargo new</code> y agregá la dependencia <code>rand</code> con <code>cargo add rand</code>. Mirá cómo cambió tu <code>Cargo.toml</code> y qué apareció en <code>Cargo.lock</code>.</li>
+  <li>Definí un módulo <code>mod geometria</code> con una función <code>pub fn area_rectangulo(ancho: f64, alto: f64) -&gt; f64</code> y llamala desde <code>main</code> con la ruta completa.</li>
+  <li>Agregá un <code>use crate::geometria::area_rectangulo;</code> y volvé a llamar la función sin el prefijo del módulo.</li>
+  <li>Escribí un bloque <code>#[cfg(test)] mod tests</code> con dos funciones <code>#[test]</code> que verifiquen <code>area_rectangulo</code> usando <code>assert_eq!</code>. Corré <code>cargo test</code>.</li>
+  <li>Agregá un doc comment con <code>///</code> a <code>area_rectangulo</code>, incluí un ejemplo en un bloque <code>```</code> y generá la documentación con <code>cargo doc --open</code>.</li>
+</ol>
+
+<section class="quiz" id="quizRs11">
+  <style>
+    #quizRs11{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs11 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs11 .q{margin-bottom:1.5rem}
+    #quizRs11 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs11 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs11 .opt:hover{border-color:var(--accent)}
+    #quizRs11 .opt:disabled{cursor:default}
+    #quizRs11 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs11 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs11 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs11 .exp.show{display:block}
+    #quizRs11 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Cuál archivo declarás vos para pedir una dependencia y cuál genera Cargo con las versiones exactas?</p>
+    <button class="opt">Vos escribís <code>Cargo.lock</code>; Cargo genera <code>Cargo.toml</code></button>
+    <button class="opt">Vos escribís <code>Cargo.toml</code>; Cargo genera <code>Cargo.lock</code></button>
+    <button class="opt">Ambos los escribís a mano siempre</button>
+    <div class="exp">Vos declarás en <code>Cargo.toml</code> qué querés; Cargo resuelve y fija las versiones exactas en <code>Cargo.lock</code>, que no se edita a mano.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés <code>mod util { fn ayuda() {} }</code> y querés llamar <code>ayuda()</code> desde <code>main</code>. ¿Por qué falla?</p>
+    <button class="opt">Porque <code>fn</code> no se puede usar dentro de un <code>mod</code></button>
+    <button class="opt">Porque falta importar el crate <code>util</code> de crates.io</button>
+    <button class="opt">Porque <code>ayuda()</code> es privada: en Rust todo es privado por defecto, falta <code>pub</code></button>
+    <div class="exp">Todo es privado por defecto en Rust. Para verla desde afuera del módulo hay que declararla <code>pub fn ayuda()</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué macro usás dentro de un <code>#[test]</code> para verificar que dos valores son iguales?</p>
+    <button class="opt"><code>assert_eq!(a, b)</code></button>
+    <button class="opt"><code>println!(a, b)</code></button>
+    <button class="opt"><code>mod test(a, b)</code></button>
+    <div class="exp"><code>assert_eq!(a, b)</code> falla el test si <code>a</code> y <code>b</code> no son iguales. Para "distinto" se usa <code>assert_ne!</code>.</div>
+  </div>
+
+  <div class="score" id="scoreRs11"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs11');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs11').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M12.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m10-concurrencia/lecture.html">← M10: Concurrencia</a>
+  <a href="../m12-proyectos/lecture.html">M12: Proyectos →</a>
+</nav>
+
+</div>
+</body>
+</html>

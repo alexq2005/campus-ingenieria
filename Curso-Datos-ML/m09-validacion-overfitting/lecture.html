@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 09 — Validación & Overfitting · Curso de Datos & ML</title>
+  <meta name="description" content="Overfitting vs underfitting, el equilibrio bias-variance, validación cruzada (K-fold), regularización (Ridge/Lasso), feature scaling dentro de Pipeline para evitar data leakage y tuning con GridSearchCV.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 09</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M07, M08</span>
+</div>
+
+<article>
+
+<h1>Módulo 09 — Validación & Overfitting</h1>
+
+<p>Ya sabés entrenar modelos de regresión (M07) y clasificación (M08). Pero entrenar es fácil; lo difícil es saber si el modelo <em>realmente aprendió</em> o solo se <em>memorizó</em> los datos. Este módulo es el corazón del machine learning: cómo medir si un modelo generaliza, por qué falla, y qué herramientas tenés para arreglarlo.</p>
+
+<h2>El problema central: overfitting vs underfitting</h2>
+
+<div class="concept">
+  <strong>💡 Overfitting (sobreajuste):</strong> el modelo <em>memoriza</em> el train en vez de aprender el patrón general. Es perfecto en los datos que ya vio y malo en datos nuevos. <br>
+  <strong>Underfitting (subajuste):</strong> el modelo es demasiado simple y ni siquiera captura el patrón — malo en train <em>y</em> malo en test.
+</div>
+
+<p>La analogía clásica: un estudiante que <strong>memoriza</strong> las respuestas del examen del año pasado saca 10 en ese examen exacto, pero se hunde con preguntas nuevas. Eso es overfitting. Otro que no estudió nada va mal en todo: underfitting. Querés al que <strong>entendió la materia</strong> y rinde bien en cualquier examen.</p>
+
+<div class="analogy">
+  <strong>🔍 Pensalo como ajustar una curva a puntos:</strong> una recta para datos curvos = underfitting (demasiado rígida). Una curva que pasa exactamente por cada punto, incluido el ruido = overfitting (demasiado flexible). El buen modelo pasa <em>cerca</em> de los puntos siguiendo la tendencia, ignorando el ruido.
+</div>
+
+<h2>El equilibrio: bias-variance</h2>
+
+<p>Todo error de un modelo se descompone en dos fuerzas opuestas:</p>
+
+<table>
+<thead><tr><th>Término</th><th>Qué significa</th><th>Se asocia con</th></tr></thead>
+<tbody>
+<tr><td><strong>Bias (sesgo)</strong></td><td>Error por suposiciones demasiado simples — el modelo no captura el patrón</td><td>Underfitting</td></tr>
+<tr><td><strong>Variance (varianza)</strong></td><td>Error por sensibilidad al ruido — el modelo cambia mucho con pequeños cambios en los datos</td><td>Overfitting</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El tradeoff bias-variance:</strong> bajar el bias (modelo más complejo) suele subir la varianza, y viceversa. El objetivo NO es eliminar uno, sino encontrar el <strong>punto óptimo</strong> donde la suma de ambos errores es mínima — el modelo más simple que captura el patrón real.
+</div>
+
+<h2>Cómo se detecta: train score vs test score</h2>
+
+<p>La herramienta de diagnóstico más simple: comparar el rendimiento en train contra el de test.</p>
+
+<table>
+<thead><tr><th>Train score</th><th>Test score</th><th>Diagnóstico</th></tr></thead>
+<tbody>
+<tr><td>Alto (0.98)</td><td>Bajo (0.65)</td><td><strong>Overfitting</strong> — memorizó el train</td></tr>
+<tr><td>Bajo (0.60)</td><td>Bajo (0.58)</td><td><strong>Underfitting</strong> — demasiado simple</td></tr>
+<tr><td>Alto (0.90)</td><td>Alto (0.88)</td><td><strong>Buen ajuste</strong> ✓ generaliza</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">from sklearn.tree import DecisionTreeClassifier
+
+modelo = DecisionTreeClassifier(max_depth=None)   # sin límite = memoriza
+modelo.fit(X_train, y_train)
+
+print("Train:", modelo.score(X_train, y_train))   # ej: 1.00
+print("Test :", modelo.score(X_test, y_test))     # ej: 0.71  -&gt; overfitting</code></pre>
+
+<div class="rule">
+  <strong>📌 La señal clave:</strong> si <code>train_score</code> &gt;&gt; <code>test_score</code> (la brecha es grande), tenés overfitting. Si ambos son bajos y parecidos, underfitting.
+</div>
+
+<h2>Validación cruzada (K-fold)</h2>
+
+<p>Un solo split train/test tiene un problema: <strong>depende de la suerte</strong>. Si justo cayeron los casos fáciles en el test, el score se ve mejor de lo que es. La validación cruzada lo resuelve.</p>
+
+<div class="concept">
+  <strong>💡 K-fold cross-validation:</strong> partís los datos en <em>K</em> partes (folds). Entrenás K veces; cada vez usás K-1 folds para entrenar y 1 fold distinto para evaluar. Al final tenés K scores y promediás. Cada dato fue test exactamente una vez.
+</div>
+
+<pre><code class="lang-python">from sklearn.model_selection import cross_val_score
+from sklearn.linear_model import LogisticRegression
+
+modelo = LogisticRegression(max_iter=1000)
+scores = cross_val_score(modelo, X, y, cv=5)   # 5 folds
+
+print("Scores por fold:", scores)
+print("Media:", scores.mean(), "± Desvío:", scores.std())</code></pre>
+
+<div class="info">
+  El <strong>desvío estándar</strong> de los scores te dice cuán <em>estable</em> es el modelo. Una media de 0.85 con desvío 0.02 es mucho más confiable que 0.85 con desvío 0.15 (este último varía demasiado según qué datos le toquen).
+</div>
+
+<div class="rule">
+  <strong>📌 Por qué K-fold es más robusto:</strong> un solo split te da un número que puede ser engañoso por azar. K-fold promedia sobre K particiones distintas, dándote una estimación más estable y honesta de cómo generaliza el modelo.
+</div>
+
+<h2>Regularización: penalizar la complejidad</h2>
+
+<p>Si el modelo overfittea porque es demasiado flexible, una solución es <strong>penalizarlo</strong> por ser complejo. La regularización agrega un término al error que crece con el tamaño de los coeficientes — el modelo prefiere coeficientes chicos (menos sensibles al ruido).</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Penalización</th><th>Efecto</th></tr></thead>
+<tbody>
+<tr><td><strong>Ridge (L2)</strong></td><td>Suma de los <em>cuadrados</em> de los coeficientes</td><td>Achica todos los coeficientes hacia 0 (sin anularlos)</td></tr>
+<tr><td><strong>Lasso (L1)</strong></td><td>Suma de los <em>valores absolutos</em> de los coeficientes</td><td>Lleva algunos coeficientes a 0 exacto → selección de features</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">from sklearn.linear_model import Ridge, Lasso
+
+ridge = Ridge(alpha=1.0)   # alpha = fuerza de la penalización
+lasso = Lasso(alpha=0.1)   # alpha alto = más regularización = más simple
+
+ridge.fit(X_train, y_train)
+lasso.fit(X_train, y_train)
+# Lasso pone en 0 los coeficientes de features inútiles
+print("Coefs Lasso:", lasso.coef_)</code></pre>
+
+<div class="info">
+  <strong>Regla práctica:</strong> usá <strong>Lasso (L1)</strong> cuando sospechás que muchas features son inútiles y querés que el modelo las descarte solo. Usá <strong>Ridge (L2)</strong> cuando todas aportan algo y solo querés controlar la magnitud. <code>alpha</code> más alto = más regularización = modelo más simple.
+</div>
+
+<h2>Feature scaling: poner todo en la misma escala</h2>
+
+<p>Muchos modelos (regresión regularizada, KNN, SVM, redes) son sensibles a la <strong>escala</strong> de las features. Si "edad" va de 0 a 100 y "salario" de 0 a 200.000, el salario domina por su magnitud, no por su importancia real.</p>
+
+<div class="concept">
+  <strong>💡 StandardScaler:</strong> transforma cada feature para que tenga <strong>media 0 y desvío 1</strong>. La fórmula es <code>z = (x − media) / desvío</code>. Así todas las features quedan comparables y ninguna domina por su escala.
+</div>
+
+<div class="danger">
+  <strong>🚨 El error que arruina todo: data leakage.</strong> Si ajustás el scaler con <code>fit()</code> sobre TODO el dataset (train + test) antes de hacer el split, estás filtrando información del test (su media y desvío) hacia el entrenamiento. El modelo "espía" el test y tus scores quedan inflados — pero en producción, con datos realmente nuevos, falla.
+</div>
+
+<div class="rule">
+  <strong>📌 La regla de oro del scaling:</strong> el scaler se ajusta (<code>fit</code>) SOLO con el train. Al test se le aplica (<code>transform</code>) la transformación aprendida del train. La forma segura de garantizar esto es meter el scaler dentro de un <code>Pipeline</code>.
+</div>
+
+<h2>El Pipeline: scaler + modelo, sin leakage</h2>
+
+<p>Un <code>Pipeline</code> encadena pasos (transformaciones + modelo final) en un solo objeto. Cuando lo usás con <code>cross_val_score</code>, sklearn ajusta el scaler <em>dentro de cada fold</em>, usando solo los datos de entrenamiento de ese fold. Imposible filtrar el test.</p>
+
+<pre><code class="lang-python">from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),               # paso 1: escalar
+    ("modelo", LogisticRegression(max_iter=1000))  # paso 2: clasificar
+])
+
+# El scaler se ajusta SOLO con el train de cada fold -&gt; sin leakage
+scores = cross_val_score(pipe, X, y, cv=5)
+print("Accuracy media:", scores.mean(), "±", scores.std())</code></pre>
+
+<div class="tip">
+  <strong>✅ El Pipeline es la forma correcta y profesional de trabajar.</strong> No solo evita el leakage automáticamente: además podés tratar todo el preprocesamiento + modelo como una sola unidad para guardar, reusar y poner en producción.
+</div>
+
+<h2>Tuning de hiperparámetros: GridSearchCV</h2>
+
+<p>Los <strong>hiperparámetros</strong> (como <code>alpha</code> en Ridge, o <code>max_depth</code> en un árbol) no se aprenden de los datos: los elegís vos antes de entrenar. ¿Cómo elegir los mejores sin hacer trampa mirando el test? Con <code>GridSearchCV</code>: prueba combinaciones usando validación cruzada interna.</p>
+
+<pre><code class="lang-python">from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("modelo", LogisticRegression(max_iter=1000))
+])
+
+# Probar varios valores de C (inverso de la regularización)
+grid = {"modelo__C": [0.01, 0.1, 1, 10, 100]}
+
+busqueda = GridSearchCV(pipe, grid, cv=5, scoring="accuracy")
+busqueda.fit(X_train, y_train)
+
+print("Mejor C:", busqueda.best_params_)
+print("Mejor score (CV):", busqueda.best_score_)
+# Recién AHORA tocamos el test, una sola vez:
+print("Score en test :", busqueda.score(X_test, y_test))</code></pre>
+
+<div class="info">
+  La notación <code>"modelo__C"</code> (doble guión bajo) le dice a GridSearch: "el parámetro <code>C</code> del paso llamado <code>modelo</code> del Pipeline". Así podés tunear cualquier paso del pipeline por su nombre.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake"><strong>Ajustar el scaler con TODO el dataset</strong> (train + test) antes del split. Es data leakage: el modelo espía el test y los scores quedan inflados. Solución: <code>Pipeline</code> + <code>cross_val_score</code>.</div>
+<div class="mistake"><strong>Elegir hiperparámetros mirando el test set.</strong> Si tuneás contra el test, ese test ya no es independiente — se vuelve parte del entrenamiento. Tuneá con validación cruzada sobre el train; tocá el test UNA sola vez, al final.</div>
+<div class="mistake"><strong>Modelo demasiado complejo para pocos datos.</strong> Un árbol sin límite o una red gigante con 200 filas memoriza todo. Con pocos datos: modelos simples + regularización.</div>
+<div class="mistake"><strong>Confiar en un solo split train/test.</strong> Puede ser engañoso por azar. Usá K-fold para una estimación estable.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cómo detectás overfitting comparando scores?</summary>
+<p>Si el score en train es mucho más alto que en test (la brecha es grande), el modelo memorizó el train y no generaliza: eso es overfitting. Si ambos son bajos y parecidos, es underfitting.</p></details>
+
+<details><summary>¿Por qué K-fold es más robusto que un solo split?</summary>
+<p>Un solo split da un número que puede ser engañoso por azar (según qué datos cayeron en el test). K-fold entrena y evalúa K veces sobre particiones distintas y promedia, dando una estimación más estable y un desvío que mide la estabilidad del modelo.</p></details>
+
+<details><summary>¿Por qué el scaler tiene que ir dentro de un Pipeline?</summary>
+<p>Para evitar data leakage. Si ajustás (<code>fit</code>) el scaler con todo el dataset, filtrás info del test (media y desvío) al entrenamiento. El Pipeline + cross_val_score ajusta el scaler solo con el train de cada fold, garantizando que el test quede realmente independiente.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Entrená un <code>DecisionTreeClassifier(max_depth=None)</code> y compará <code>score</code> en train vs test. Confirmá que hay overfitting (train ≈ 1.0, test bajo). Después poné <code>max_depth=3</code> y observá cómo cambia la brecha.</li>
+  <li>Tomá un modelo cualquiera y corré <code>cross_val_score(modelo, X, y, cv=5)</code>. Reportá la media y el desvío. ¿Es estable?</li>
+  <li>Compará un <code>Ridge(alpha=1.0)</code> con un <code>Lasso(alpha=0.1)</code> sobre los mismos datos. Imprimí <code>.coef_</code> de ambos y verificá que Lasso pone algunos coeficientes en 0 exacto.</li>
+  <li>Armá un <code>Pipeline([("scaler", StandardScaler()), ("modelo", LogisticRegression())])</code> y evalualo con <code>cross_val_score</code>. Compará el resultado contra el mismo modelo SIN escalar.</li>
+  <li>Usá <code>GridSearchCV</code> para tunear el parámetro <code>C</code> de la regresión logística (probá <code>[0.01, 0.1, 1, 10, 100]</code>) sobre el Pipeline del ejercicio 4. Reportá el mejor <code>C</code>, el mejor score de CV, y recién al final el score en test.</li>
+</ol>
+
+<section class="quiz" id="quizDML09">
+  <style>
+    #quizDML09{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML09 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML09 .q{margin-bottom:1.5rem}
+    #quizDML09 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML09 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML09 .opt:hover{border-color:var(--accent)}
+    #quizDML09 .opt:disabled{cursor:default}
+    #quizDML09 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML09 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML09 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML09 .exp.show{display:block}
+    #quizDML09 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu modelo da 0.99 en train y 0.68 en test. ¿Qué pasa?</p>
+    <button class="opt">Underfitting — es demasiado simple</button>
+    <button class="opt">Overfitting — memorizó el train y no generaliza</button>
+    <button class="opt">Buen ajuste — ambos scores son altos</button>
+    <div class="exp">La brecha enorme entre train (0.99) y test (0.68) es la firma del overfitting: el modelo memorizó los datos de entrenamiento en vez de aprender el patrón general.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Por qué se mete el StandardScaler dentro de un Pipeline?</p>
+    <button class="opt">Porque escribir menos líneas hace el modelo más preciso</button>
+    <button class="opt">Porque pandas lo exige para escalar</button>
+    <button class="opt">Para que el scaler se ajuste solo con el train de cada fold y evitar data leakage</button>
+    <div class="exp">El Pipeline + cross_val_score ajusta (fit) el scaler usando únicamente el train de cada fold. Así no se filtra info del test (su media y desvío) al entrenamiento.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué diferencia hay entre la regularización Lasso (L1) y Ridge (L2)?</p>
+    <button class="opt">Lasso puede llevar coeficientes a 0 exacto (selección de features); Ridge solo los achica</button>
+    <button class="opt">Ridge es para clasificación y Lasso solo para regresión</button>
+    <button class="opt">No hay diferencia, son dos nombres de lo mismo</button>
+    <div class="exp">Lasso (L1) penaliza el valor absoluto de los coeficientes y puede anularlos por completo, descartando features. Ridge (L2) penaliza el cuadrado y los achica hacia 0 sin eliminarlos.</div>
+  </div>
+
+  <div class="score" id="scoreDML09"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML09');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML09').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M10.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m08-clasificacion/lecture.html">← M08: Clasificación</a>
+  <a href="../m10-pytorch-tensores/lecture.html">M10: PyTorch →</a>
+</nav>
+
+</div>
+</body>
+</html>
