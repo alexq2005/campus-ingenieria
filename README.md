@@ -1,146 +1,100 @@
-# CS-FE Campus
+# 🎓 Campus CS-FE
 
-**Cinco cursos completos de Ciencias de la Computación — estilo Harvard CS50**
+> Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **100 % offline**.
 
-> *"This is CS-FE — and this is your first step toward software."*
+**9 cursos · 171 lecciones · 52 proyectos · sin servidor · sin build · sin internet**
 
-Campus con 5 cursos hermanos que comparten metodología y rigor, más un campus extendido de Ingeniería en Sistemas:
-
-| Curso | Módulos | Foco |
-|-------|---------|------|
-| 🌐 [**Frontend (CS-FE)**](#-curso-1--desarrollo-web-frontend) | 14 + 8 senior | HTML, CSS, JS, React, TypeScript, performance, A11y |
-| 🐍 [**Python**](./Curso-Python/) | 14 | De cero hasta async, POO, biblioteca estándar y proyectos |
-| 🐧 [**Linux**](./Curso-Linux/) | 14 | Shell, permisos, procesos, redes, bash, systemd, seguridad |
-| ⚛️ [**React**](./Curso-React/) | 15 | JSX, hooks, estado, Next.js 15, RSC, TanStack Query |
-| 🔌 [**Computación Física**](./Curso-Computacion-Fisica/) | 10 | Electrónica, microcontroladores, sensores, DSP, control, FPGA |
-| 🎓 [**Ingeniería en Sistemas**](../Curso%20ingenieria%20sistemas/) | 40+ | Matemática, arquitectura, SO, redes, bases de datos, IA |
-
-> 🔗 **Computación Física e Ingeniería en Sistemas se complementan**: el software y el hardware se referencian mutuamente. Ver el [Mapa de Complementariedad](./Curso-Computacion-Fisica/mapa-complementariedad.html).
-
-Punto de entrada visual: [**`index.html`**](./index.html) — abrí ese archivo en tu navegador y vas a ver el portal de los 3 cursos.
+Nueve cursos que van **de cero a empleable** — del primer `<div>` a entrenar una red neuronal y escribir Rust para un microcontrolador. Todo en **HTML estático**: se abre directo en el navegador, sin instalar nada.
 
 ---
 
-## Filosofía común
+## 🚀 Cómo usar
 
-Estos no son tutoriales. Son **cursos universitarios** diseñados con el rigor de Harvard CS50 y CS50W: entendemos el *por qué* antes de memorizar el *cómo*. Cada módulo tiene:
+1. **Descargá** el repo (botón verde *Code → Download ZIP*, o `git clone`).
+2. Abrí **`index.html`** en cualquier navegador (doble clic).
+3. Listo. Funciona desde `file://` — sin servidor, sin build, sin conexión.
 
-- **Teoría** con contexto histórico, modelos mentales y trade-offs.
-- **Ejemplos ejecutables** comentados.
-- **Ejercicios graduados** al final de cada módulo.
-- **Proyectos integradores** al final del curso.
-
-Cada curso termina con **proyectos production-grade** que combinan todo el contenido.
-
----
-
-## Requisitos previos
-
-- Saber usar una computadora (abrir carpetas, instalar programas).
-- Curiosidad y paciencia. **No** se requiere experiencia previa en programación.
-- Un navegador moderno (Chrome, Firefox, Edge, Safari).
-- Un editor de texto — recomiendo [VS Code](https://code.visualstudio.com/).
-- Node.js 20+ (lo instalaremos en el módulo 9).
+```bash
+git clone https://github.com/alexq2005/curso-frontend.git
+cd curso-frontend
+# abrí index.html en tu navegador
+```
 
 ---
 
-## 🌐 Curso 1 — Desarrollo Web Frontend
+## 📚 Los 9 cursos
 
-**Syllabus de 14 módulos**
-
-| Semana | Módulo | Tema | Lecture | Problem Set |
-|-------:|--------|------|---------|-------------|
-| 0 | [`00`](./modulo-00-sillabus/) | Syllabus y setup del entorno | — | Setup |
-| 1 | [`01`](./modulo-01-como-funciona-web/) | Cómo funciona la Web (HTTP, DNS, render pipeline) | ✅ | PS1 |
-| 2 | [`02`](./modulo-02-html/) | HTML — Semántica y estructura del documento | ✅ | PS2 |
-| 3 | [`03`](./modulo-03-css/) | CSS — Cascada, especificidad, selectores, box model | ✅ | PS3 |
-| 4 | [`04`](./modulo-04-css-layout/) | CSS Layout — Flexbox, Grid, responsive design | ✅ | PS4 |
-| 5 | [`05`](./modulo-05-javascript-fundamentos/) | JavaScript — Fundamentos del lenguaje | ✅ | PS5 |
-| 6 | [`06`](./modulo-06-dom-eventos/) | DOM, Eventos y programación interactiva | ✅ | PS6 |
-| 7 | [`07`](./modulo-07-javascript-moderno/) | JavaScript moderno — ES6+, módulos, clases | ✅ | PS7 |
-| 8 | [`08`](./modulo-08-async-apis/) | Asincronía, Promises, async/await, Fetch API | ✅ | PS8 |
-| 9 | [`09`](./modulo-09-tooling/) | Tooling — npm, Vite, Git, ESLint, Prettier | ✅ | PS9 |
-| 10 | [`10`](./modulo-10-react/) | React — Componentes, hooks, estado, routing | ✅ | PS10 |
-| 11 | [`11`](./modulo-11-typescript/) | TypeScript — Tipado estático para JS | ✅ | PS11 |
-| 12 | [`12`](./modulo-12-performance-a11y-seo/) | Performance, Accesibilidad (WCAG), SEO | ✅ | PS12 |
-| 13 | [`13`](./modulo-13-proyecto-final/) | **Proyecto final** | — | Capstone |
+| # | Curso | Contenido | Entrar |
+|---|-------|-----------|--------|
+| 1 | 🌐 **Frontend** | HTML, CSS, JS, DOM, async, React, TypeScript, performance | [Abrir](modulo-00-sillabus/lecture.html) |
+| 2 | 🐍 **Python** | Tipos, POO, errores, concurrencia, stdlib, **NumPy** | [Abrir](Curso-Python/index.html) |
+| 3 | 🐧 **Linux** | Filesystem, permisos, procesos, redes, bash, systemd | [Abrir](Curso-Linux/index.html) |
+| 4 | ⚛️ **React** | Hooks, Router, TanStack Query, Zustand, Next.js | [Abrir](Curso-React/index.html) |
+| 5 | ⚡ **Computación Física** | Del bit al voltaje: lógica, microcontroladores, sensores, IoT | [Abrir](Curso-Computacion-Fisica/index.html) |
+| 6 | 📱 **React Native** | Apps de celular con Expo: de componentes nativos a publicación | [Abrir](Curso-React-Native/index.html) |
+| 7 | 📊 **Datos & ML** | NumPy → pandas → scikit-learn → PyTorch | [Abrir](Curso-Datos-ML/index.html) |
+| 8 | 🐹 **Go** | Sintaxis, goroutines/channels, API REST — el lenguaje de la nube | [Abrir](Curso-Go/index.html) |
+| 9 | 🦀 **Rust** | Ownership, borrowing, lifetimes, traits, concurrencia, embebido | [Abrir](Curso-Rust/index.html) |
 
 ---
 
-## 🐍 Curso 2 — Python
+## 🛠️ Más allá de las lecciones
 
-**Syllabus de 14 módulos** · ver índice completo en [`Curso-Python/`](./Curso-Python/)
-
-| # | Módulo | Tema |
-|--:|--------|------|
-| 00 | [Introducción](./Curso-Python/modulo-00-introduccion/) | Instalación, REPL, Zen of Python |
-| 01 | [Variables y tipos](./Curso-Python/modulo-01-variables-y-tipos/) | int, float, str, bool, f-strings |
-| 02 | [Operadores](./Curso-Python/modulo-02-operadores/) | Aritméticos, lógicos, walrus |
-| 03 | [Estructuras de datos](./Curso-Python/modulo-03-estructuras-de-datos/) | list, tuple, set, dict, Counter |
-| 04 | [Control de flujo](./Curso-Python/modulo-04-control-de-flujo/) | if, for, while, match/case |
-| 05 | [Funciones](./Curso-Python/modulo-05-funciones/) | def, lambda, decoradores, closures |
-| 06 | [POO](./Curso-Python/modulo-06-poo/) | Clases, herencia, dataclasses, ABC |
-| 07 | [Manejo de errores](./Curso-Python/modulo-07-manejo-de-errores/) | try/except, custom, context managers |
-| 08 | [Archivos e I/O](./Curso-Python/modulo-08-archivos-io/) | open, pathlib, JSON, CSV, argparse |
-| 09 | [Módulos y paquetes](./Curso-Python/modulo-09-modulos-y-paquetes/) | import, venv, pip, pyproject.toml |
-| 10 | [Programación funcional](./Curso-Python/modulo-10-programacion-funcional/) | map, filter, generadores, itertools |
-| 11 | [Concurrencia](./Curso-Python/modulo-11-concurrencia/) | threading, asyncio, multiprocessing |
-| 12 | [Biblioteca estándar](./Curso-Python/modulo-12-biblioteca-estandar/) | os, datetime, re, logging, subprocess |
-| 13 | [**Proyectos**](./Curso-Python/modulo-13-proyectos/) | Tareas CLI · Web scraper · API REST |
+- **[🗺️ Ruta de aprendizaje](ruta-aprendizaje.html)** — el camino visual de cero a empleable, conectando los 9 cursos.
+- **[🧪 Galería de proyectos](proyectos/index.html)** — 52 proyectos de dificultad creciente: del Tic-Tac-Toe a un robot con PID, fullstack, IoT, IA e impacto social.
+- **MVPs jugables** (corren de verdad en el navegador):
+  - [⭕ Tic-Tac-Toe con IA imbatible](proyectos/demos/tic-tac-toe-app.html)
+  - [📝 Notas Markdown](proyectos/demos/notas-markdown-app.html)
+  - [🔗 Acortador de URLs](proyectos/demos/url-shortener-app.html)
+  - [🧠 Red Neuronal que entrenás en vivo](proyectos/demos/red-neuronal-app.html)
+- **Buscador + seguimiento de progreso** — en la portada (`index.html`).
+- **Track Senior** — patrones, arquitectura, state machines, testing, observabilidad y liderazgo técnico.
 
 ---
 
-## 🐧 Curso 3 — Linux
+## ✨ Qué lo hace distinto
 
-**Syllabus de 14 módulos** · ver índice completo en [`Curso-Linux/`](./Curso-Linux/)
-
-| # | Módulo | Tema |
-|--:|--------|------|
-| 00 | [Introducción](./Curso-Linux/modulo-00-introduccion/) | Distros, filosofía Unix, el shell |
-| 01 | [Sistema de archivos](./Curso-Linux/modulo-01-sistema-archivos/) | FHS, inodos, links, mount |
-| 02 | [Comandos básicos](./Curso-Linux/modulo-02-comandos-basicos/) | ls, find, grep, pipes, awk, sed |
-| 03 | [Editores](./Curso-Linux/modulo-03-editores/) | nano, vim (4 modos), emacs |
-| 04 | [Permisos](./Curso-Linux/modulo-04-permisos/) | chmod, chown, setuid, ACL |
-| 05 | [Procesos](./Curso-Linux/modulo-05-procesos/) | ps, top, kill, señales, tmux |
-| 06 | [Usuarios y grupos](./Curso-Linux/modulo-06-usuarios-grupos/) | useradd, sudo, ssh keys |
-| 07 | [Paquetes](./Curso-Linux/modulo-07-paquetes/) | apt, dnf, pacman, flatpak |
-| 08 | [Redes](./Curso-Linux/modulo-08-redes/) | ip, ss, ssh, rsync, ufw |
-| 09 | [Bash scripting](./Curso-Linux/modulo-09-bash-scripting/) | set -euo, condicionales, traps |
-| 10 | [systemd](./Curso-Linux/modulo-10-systemd/) | systemctl, units, timers, journal |
-| 11 | [Seguridad](./Curso-Linux/modulo-11-seguridad/) | Hardening, fail2ban, SELinux, TLS |
-| 12 | [Administración](./Curso-Linux/modulo-12-administracion/) | cron, logrotate, LVM, backups |
-| 13 | [**Proyectos**](./Curso-Linux/modulo-13-proyectos/) | Nginx + HTTPS · sys-report · Deploy app |
+- **100 % offline** — funciona desde `file://`, sin servidor ni conexión.
+- **Cero dependencias / cero build** — es HTML, CSS y JS plano. No hay `npm install`.
+- **Aprender construyendo** — cada curso termina en proyectos reales.
+- **Interactivo** — quizzes autoevaluables, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
+- **Puente hardware ↔ software** — Computación Física conecta la informática con la electrónica (Arduino/ESP32), y Rust llega hasta el microcontrolador.
 
 ---
 
-## Cómo estudiar estos cursos
+## 🧭 Cómo estudiar
 
-1. **Lee el lecture completo** antes de tocar código. Evita el copy-paste mental.
-2. **Escribe los ejemplos a mano.** Sí, a mano. El cerebro aprende distinto cuando tipea.
-3. **Resuelve los ejercicios sin ver la solución.** Falla, frustrate, vuelve a intentar. Así se aprende.
-4. **Explica en voz alta** lo que acabás de aprender (técnica Feynman). Si no lo podés explicar, no lo entendiste.
-5. **Construí algo propio** cada semana. Un mini-proyecto, un clon, un experimento.
-
----
-
-## Evaluación (si te autoimpones disciplina)
-
-- 60% problem sets (12 PS × 5%)
-- 40% proyecto final
-
-Aprobación: >= 70%. No te mientas — si copiaste, no aprendiste.
+1. **Leé el lecture completo** antes de tocar código.
+2. **Escribí los ejemplos a mano** — el cerebro aprende distinto cuando tipea.
+3. **Resolvé los ejercicios sin ver la solución.** Fallá, frustrate, reintentá.
+4. **Explicá en voz alta** lo que aprendiste (técnica Feynman).
+5. **Construí algo propio** cada semana.
 
 ---
 
-## Código de honor
+## 📂 Estructura
 
-> *"You are welcome to discuss the course's material with others in order to better understand it, but the work you ultimately turn in must be your own."*
-> — CS50 Academic Honesty
+```
+index.html                  ← portada del campus (empezá acá)
+ruta-aprendizaje.html       ← roadmap visual
+modulo-00..12/              ← Curso 1 (Frontend)
+Curso-Python/               ← Curso 2  (incluye módulo 14: NumPy)
+Curso-Linux/                ← Curso 3
+Curso-React/                ← Curso 4
+Curso-Computacion-Fisica/   ← Curso 5
+Curso-React-Native/         ← Curso 6
+Curso-Datos-ML/             ← Curso 7
+Curso-Go/                   ← Curso 8
+Curso-Rust/                 ← Curso 9
+proyectos/                  ← galería de 52 proyectos + demos jugables
+track-senior/               ← track de nivel senior
+multimedia/                 ← visualizaciones interactivas
+```
 
 ---
 
-## Licencia
+## 📄 Licencia
 
-MIT. Usá este material libremente. Si lo compartís, citá la fuente.
+MIT — usá este material libremente. Si lo compartís, citá la fuente.
 
-— Prof. Claude, Frontend Faculty
+*Hecho con cariño para que cualquiera pueda aprender a programar, sin barreras.*
