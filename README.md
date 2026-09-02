@@ -15,8 +15,8 @@ Nueve cursos que van **de cero a empleable** — del primer `<div>` a entrenar u
 3. Listo. Funciona desde `file://` — sin servidor, sin build, sin conexión.
 
 ```bash
-git clone https://github.com/alexq2005/curso-frontend.git
-cd curso-frontend
+git clone https://github.com/alexq2005/campus-ingenieria.git
+cd campus-ingenieria
 # abrí index.html en tu navegador
 ```
 
