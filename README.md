@@ -1,4 +1,4 @@
-# 🎓 Campus CS-FE
+# 🎓 Campus de Ingeniería
 
 > Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **100 % offline**.
 
@@ -26,15 +26,15 @@ cd campus-ingenieria
 
 | # | Curso | Contenido | Entrar |
 |---|-------|-----------|--------|
-| 1 | 🌐 **Frontend** | HTML, CSS, JS, DOM, async, React, TypeScript, performance | [Abrir](modulo-00-sillabus/lecture.html) |
-| 2 | 🐍 **Python** | Tipos, POO, errores, concurrencia, stdlib, **NumPy** | [Abrir](Curso-Python/index.html) |
-| 3 | 🐧 **Linux** | Filesystem, permisos, procesos, redes, bash, systemd | [Abrir](Curso-Linux/index.html) |
-| 4 | ⚛️ **React** | Hooks, Router, TanStack Query, Zustand, Next.js | [Abrir](Curso-React/index.html) |
-| 5 | ⚡ **Computación Física** | Del bit al voltaje: lógica, microcontroladores, sensores, IoT | [Abrir](Curso-Computacion-Fisica/index.html) |
-| 6 | 📱 **React Native** | Apps de celular con Expo: de componentes nativos a publicación | [Abrir](Curso-React-Native/index.html) |
-| 7 | 📊 **Datos & ML** | NumPy → pandas → scikit-learn → PyTorch | [Abrir](Curso-Datos-ML/index.html) |
-| 8 | 🐹 **Go** | Sintaxis, goroutines/channels, API REST — el lenguaje de la nube | [Abrir](Curso-Go/index.html) |
-| 9 | 🦀 **Rust** | Ownership, borrowing, lifetimes, traits, concurrencia, embebido | [Abrir](Curso-Rust/index.html) |
+| 1 | 🌐 **Frontend** | HTML, CSS, JS, DOM, async, React, TypeScript, performance | [Abrir](desarrollo-web/modulo-00-sillabus/lecture.html) |
+| 2 | 🐍 **Python** | Tipos, POO, errores, concurrencia, stdlib, **NumPy** | [Abrir](lenguajes/Curso-Python/index.html) |
+| 3 | 🐧 **Linux** | Filesystem, permisos, procesos, redes, bash, systemd | [Abrir](sistemas/Curso-Linux/index.html) |
+| 4 | ⚛️ **React** | Hooks, Router, TanStack Query, Zustand, Next.js | [Abrir](desarrollo-web/Curso-React/index.html) |
+| 5 | ⚡ **Computación Física** | Del bit al voltaje: lógica, microcontroladores, sensores, IoT | [Abrir](sistemas/Curso-Computacion-Fisica/index.html) |
+| 6 | 📱 **React Native** | Apps de celular con Expo: de componentes nativos a publicación | [Abrir](desarrollo-web/Curso-React-Native/index.html) |
+| 7 | 📊 **Datos & ML** | NumPy → pandas → scikit-learn → PyTorch | [Abrir](datos-ia/Curso-Datos-ML/index.html) |
+| 8 | 🐹 **Go** | Sintaxis, goroutines/channels, API REST — el lenguaje de la nube | [Abrir](lenguajes/Curso-Go/index.html) |
+| 9 | 🦀 **Rust** | Ownership, borrowing, lifetimes, traits, concurrencia, embebido | [Abrir](lenguajes/Curso-Rust/index.html) |
 
 ---
 
@@ -77,15 +77,10 @@ cd campus-ingenieria
 ```
 index.html                  ← portada del campus (empezá acá)
 ruta-aprendizaje.html       ← roadmap visual
-modulo-00..12/              ← Curso 1 (Frontend)
-Curso-Python/               ← Curso 2  (incluye módulo 14: NumPy)
-Curso-Linux/                ← Curso 3
-Curso-React/                ← Curso 4
-Curso-Computacion-Fisica/   ← Curso 5
-Curso-React-Native/         ← Curso 6
-Curso-Datos-ML/             ← Curso 7
-Curso-Go/                   ← Curso 8
-Curso-Rust/                 ← Curso 9
+desarrollo-web/             ← Frontend (modulo-00..13) · React · React Native
+lenguajes/                  ← Python · Go · Rust
+sistemas/                   ← Linux · Computación Física (electrónica)
+datos-ia/                   ← Datos & ML
 proyectos/                  ← galería de 52 proyectos + demos jugables
 track-senior/               ← track de nivel senior
 multimedia/                 ← visualizaciones interactivas
