@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 01 — Sintaxis & Tipos · Curso de Go</title>
+  <meta name="description" content="Declarar variables (var, inferencia, :=), zero values, tipos básicos, constantes con iota, conversión explícita de tipos y strings UTF-8 en Go.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 01</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M00</span>
+</div>
+
+<article>
+
+<h1>Módulo 01 — Sintaxis & Tipos</h1>
+
+<p>En M00 corriste tu primer binario. Ahora vamos al corazón del lenguaje: cómo se declaran variables, qué tipos básicos existen, y la regla que más choca viniendo de Python o JavaScript — Go <strong>no convierte tipos por vos</strong>. Lo que en otros lenguajes pasa silencioso, acá te lo exige explícito. Esa "rigidez" es justamente lo que hace al código Go tan predecible.</p>
+
+<h2>Tres formas de declarar variables</h2>
+
+<p>Go te da tres maneras de crear una variable, y conviene conocer las tres porque vas a verlas en código real:</p>
+
+<pre><code class="lang-go">var x int = 5   // explícita: nombre, tipo y valor
+var y = 5       // inferida: Go deduce que y es int por el valor
+z := 5          // short: la más común DENTRO de funciones</code></pre>
+
+<div class="concept">
+  <strong>💡 El operador <code>:=</code> declara y asigna en un solo paso, infiriendo el tipo.</strong> Es la forma idiomática dentro de funciones. Pero ojo: <code>:=</code> <strong>solo funciona dentro de una función</strong>. A nivel de paquete (fuera de toda función) tenés que usar <code>var</code>.
+</div>
+
+<p>Podés declarar y asignar varias variables a la vez. Esto se usa muchísimo, sobre todo cuando una función devuelve dos valores:</p>
+
+<pre><code class="lang-go">a, b := 1, 2          // a=1, b=2
+nombre, edad := "Ana", 30  // tipos distintos, sin problema
+a, b = b, a           // swap clásico: ahora a=2, b=1 (sin variable temporal)</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla:</strong> <code>var</code> sirve en cualquier lado (paquete o función). <code>:=</code> solo dentro de funciones. Si estás declarando una variable global del paquete, no te queda otra que <code>var</code>.
+</div>
+
+<h2>Zero values: nada queda "indefinido"</h2>
+
+<p>Esta es una de las decisiones de diseño más elegantes de Go. En JavaScript una variable sin asignar es <code>undefined</code>; en Go <strong>toda variable tiene un valor por defecto garantizado</strong> según su tipo. Nunca trabajás con basura de memoria.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Zero value</th></tr></thead>
+<tbody>
+<tr><td>números (<code>int</code>, <code>float64</code>, <code>byte</code>...)</td><td><code>0</code></td></tr>
+<tr><td><code>string</code></td><td><code>""</code> (cadena vacía)</td></tr>
+<tr><td><code>bool</code></td><td><code>false</code></td></tr>
+<tr><td>punteros, slices, maps, funciones, interfaces</td><td><code>nil</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-go">var contador int      // vale 0, no "undefined"
+var activo bool       // vale false
+var msg string        // vale "" (no nil — un string nunca es nil)</code></pre>
+
+<div class="info">
+  Que no haya <code>undefined</code> elimina toda una clase de bugs. En Go nunca te preguntás "¿esta variable está inicializada?": si la declaraste, tiene un valor usable desde el primer instante.
+</div>
+
+<h2>Tipos básicos</h2>
+
+<p>Estos son los tipos que vas a usar el 90% del tiempo:</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Qué guarda</th><th>Ejemplo</th></tr></thead>
+<tbody>
+<tr><td><code>int</code></td><td>Entero (tamaño según la máquina: 64 bits hoy)</td><td><code>42</code></td></tr>
+<tr><td><code>int64</code></td><td>Entero de 64 bits, tamaño fijo</td><td><code>9000000000</code></td></tr>
+<tr><td><code>float64</code></td><td>Número con decimales (doble precisión)</td><td><code>3.14</code></td></tr>
+<tr><td><code>string</code></td><td>Texto inmutable, codificado en UTF-8</td><td><code>"hola"</code></td></tr>
+<tr><td><code>bool</code></td><td>Verdadero o falso</td><td><code>true</code></td></tr>
+<tr><td><code>byte</code></td><td>Alias de <code>uint8</code>: un byte (0–255)</td><td><code>'A'</code> → 65</td></tr>
+<tr><td><code>rune</code></td><td>Alias de <code>int32</code>: un carácter Unicode</td><td><code>'ñ'</code>, <code>'語'</code></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 <code>byte</code> y <code>rune</code> son alias, no tipos nuevos.</strong> <code>byte</code> es exactamente <code>uint8</code> y representa un byte crudo. <code>rune</code> es exactamente <code>int32</code> y representa un <strong>punto de código Unicode</strong> — es decir, un carácter completo, aunque ocupe varios bytes. Por eso una <code>ñ</code> es una sola <code>rune</code> pero dos <code>byte</code>.
+</div>
+
+<h2>Constantes y <code>iota</code></h2>
+
+<p>Una constante se declara con <code>const</code> y su valor se fija en tiempo de compilación — no se puede cambiar después:</p>
+
+<pre><code class="lang-go">const Pi = 3.14159
+const MaxUsuarios int = 100</code></pre>
+
+<p>Cuando necesitás una serie de constantes relacionadas (un "enumerado"), Go te da <code>iota</code>: un contador que arranca en <code>0</code> y se incrementa automáticamente en cada línea del bloque <code>const</code>.</p>
+
+<pre><code class="lang-go">const (
+    Lunes = iota   // 0
+    Martes         // 1
+    Miercoles      // 2
+    Jueves         // 3
+    Viernes        // 4
+)
+
+// Útil para flags o estados:
+const (
+    Pendiente = iota  // 0
+    Activo            // 1
+    Cerrado           // 2
+)</code></pre>
+
+<div class="info">
+  No hace falta repetir <code>= iota</code> en cada línea: una vez que lo escribís en la primera, Go aplica el mismo patrón a las siguientes. <code>iota</code> se reinicia a <code>0</code> en cada nuevo bloque <code>const (...)</code>.
+</div>
+
+<h2>Conversión de tipos: SIEMPRE explícita</h2>
+
+<p>Acá está la regla que más sorprende. En Python <code>1 + 2.5</code> funciona; en JavaScript también. En Go, <strong>no podés mezclar tipos numéricos distintos sin convertir a mano</strong>. No hay conversión implícita.</p>
+
+<pre><code class="lang-go">var i int = 10
+var f float64 = 3.5
+
+// suma := i + f   // ❌ ERROR de compilación: mismatched types int and float64
+
+suma := float64(i) + f   // ✅ convertís i a float64 explícitamente → 13.5
+entero := int(f)         // ✅ convertís f a int (trunca, no redondea) → 3</code></pre>
+
+<div class="analogy">
+  Pensalo como aduana: cada tipo es un país con su moneda. Para pasar un <code>int</code> al "país" <code>float64</code> tenés que cambiar la moneda explícitamente con <code>float64(i)</code>. Go no te deja cruzar la frontera con la moneda equivocada "asumiendo" el cambio — te obliga a declararlo, así nunca hay una conversión silenciosa que pierda precisión sin que te enteres.
+</div>
+
+<div class="rule">
+  <strong>📌 Sintaxis:</strong> la conversión se escribe <code>tipoDestino(valor)</code>: <code>int(f)</code>, <code>float64(i)</code>, <code>string(r)</code>, <code>byte(n)</code>. Convertir <code>float64</code> a <code>int</code> <strong>trunca</strong> (descarta los decimales), no redondea.
+</div>
+
+<h2>Strings: inmutables y UTF-8</h2>
+
+<p>En Go un <code>string</code> es una secuencia <strong>inmutable</strong> de bytes codificada en UTF-8. "Inmutable" significa que no podés cambiar un carácter en el lugar: para "modificar" un string creás uno nuevo.</p>
+
+<pre><code class="lang-go">s := "café"
+fmt.Println(len(s))   // 5, NO 4 — len cuenta BYTES, y la 'é' ocupa 2
+
+// s[0] = 'C'   // ❌ ERROR: los strings son inmutables</code></pre>
+
+<div class="concept">
+  <strong>💡 <code>len(s)</code> cuenta bytes, no caracteres.</strong> Como Go usa UTF-8, los caracteres ASCII (a–z, 0–9) ocupan 1 byte, pero acentos y emojis ocupan 2 a 4. La <code>é</code> de <code>"café"</code> son 2 bytes, así que <code>len("café")</code> da <code>5</code>. Para contar caracteres reales (runes) se usan otras herramientas que verás más adelante.</strong>
+</div>
+
+<h2>Errores típicos al empezar</h2>
+
+<div class="mistake"><strong>Esperar conversión implícita.</strong> <code>int + float64</code> no compila. Go exige <code>float64(i) + f</code>. Esto no es un capricho: te protege de perder precisión sin darte cuenta.</div>
+<div class="mistake"><strong>Usar <code>:=</code> fuera de una función.</strong> A nivel de paquete <code>:=</code> es error de sintaxis. Para una variable global usá <code>var nombre = valor</code>.</div>
+<div class="mistake"><strong>Dejar una variable sin usar.</strong> Igual que un import sin usar, una variable declarada y nunca leída es un <strong>error de compilación</strong>, no un warning. El programa no compila hasta que la uses (o la borres).</div>
+
+<h2>Ejemplo completo</h2>
+
+<p>Este programa junta todo: las tres formas de declarar, una constante con <code>iota</code> y una conversión explícita.</p>
+
+<pre><code class="lang-go">package main
+
+import "fmt"
+
+// A nivel de paquete: var (NO :=)
+var version = "1.0"
+
+const (
+    Bronce = iota  // 0
+    Plata          // 1
+    Oro            // 2
+)
+
+func main() {
+    // 1) explícita
+    var edad int = 30
+    // 2) inferida
+    var nombre = "Ana"
+    // 3) short (solo dentro de funciones)
+    activo := true
+
+    // asignación múltiple
+    ancho, alto := 1920, 1080
+
+    // conversión EXPLÍCITA: int → float64 para poder dividir con decimales
+    ratio := float64(ancho) / float64(alto)
+
+    fmt.Println("versión:", version)
+    fmt.Println(nombre, edad, activo)
+    fmt.Println("nivel Oro =", Oro)        // 2
+    fmt.Printf("ratio = %.3f\n", ratio)    // 1.778
+}</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>len("café")</code> devuelve 5 y no 4?</summary>
+<p>Porque <code>len</code> cuenta <strong>bytes</strong>, no caracteres, y los strings de Go son UTF-8. La <code>é</code> ocupa 2 bytes, así que <code>c</code>+<code>a</code>+<code>f</code> (1 byte cada uno) + <code>é</code> (2 bytes) = 5 bytes.</p></details>
+
+<details><summary>Tenés <code>var i int = 10</code> y <code>var f float64 = 2.0</code>. ¿Por qué <code>i + f</code> no compila y cómo lo arreglás?</summary>
+<p>Go no convierte tipos implícitamente: <code>int</code> y <code>float64</code> son tipos distintos y no se pueden sumar directamente. Lo arreglás convirtiendo a mano: <code>float64(i) + f</code> (o <code>i + int(f)</code> si querés el resultado en int).</p></details>
+
+<details><summary>¿Cuál es el zero value de un <code>bool</code>, un <code>string</code> y un <code>int</code>? ¿Y por qué importa?</summary>
+<p><code>bool</code> → <code>false</code>, <code>string</code> → <code>""</code>, <code>int</code> → <code>0</code>. Importa porque significa que en Go <strong>no existe <code>undefined</code></strong>: toda variable declarada arranca con un valor válido y usable, eliminando bugs de "variable sin inicializar".</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Declará la misma variable de las tres formas (<code>var x int = 5</code>, <code>var y = 5</code>, <code>z := 5</code>) e imprimí las tres. Después intentá poner <code>:=</code> fuera de <code>main()</code> y mirá el error.</li>
+  <li>Declará un <code>int</code> y un <code>float64</code> sin asignarles valor e imprimílos. Confirmá que muestran sus zero values (<code>0</code> y <code>0</code>) sin error.</li>
+  <li>Creá un bloque <code>const</code> con <code>iota</code> para los días de la semana (Lunes=0 … Domingo=6) e imprimí el valor de <code>Miercoles</code>.</li>
+  <li>Tomá un <code>int</code> y un <code>float64</code>, sumálos (vas a tener que convertir uno) e imprimí el resultado. Después convertí un <code>float64</code> como <code>9.99</code> a <code>int</code> y observá que trunca a <code>9</code>.</li>
+  <li>Asigná <code>"piñón"</code> a un string e imprimí su <code>len</code>. Explicá por qué el número no coincide con la cantidad de caracteres que ves.</li>
+</ol>
+
+<section class="quiz" id="quizGo01">
+  <style>
+    #quizGo01{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo01 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo01 .q{margin-bottom:1.5rem}
+    #quizGo01 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo01 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo01 .opt:hover{border-color:var(--accent)}
+    #quizGo01 .opt:disabled{cursor:default}
+    #quizGo01 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo01 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo01 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo01 .exp.show{display:block}
+    #quizGo01 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Dónde se puede usar el operador <code>:=</code>?</p>
+    <button class="opt">En cualquier lado, igual que <code>var</code></button>
+    <button class="opt">Solo dentro de una función</button>
+    <button class="opt">Solo a nivel de paquete</button>
+    <div class="exp"><code>:=</code> (short declaration) solo es válido dentro de funciones. A nivel de paquete tenés que declarar con <code>var</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés <code>var i int = 3</code> y <code>var f float64 = 1.5</code>. ¿Qué pasa con <code>i + f</code>?</p>
+    <button class="opt">Da 4.5: Go convierte <code>i</code> a float64 automáticamente</button>
+    <button class="opt">Da 4: Go convierte <code>f</code> a int automáticamente</button>
+    <button class="opt">No compila: Go no convierte tipos implícitamente</button>
+    <div class="exp">Go exige conversión explícita. <code>i + f</code> es un error de tipos; tenés que escribir <code>float64(i) + f</code> (o <code>i + int(f)</code>).</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cuál es el zero value de un <code>string</code> en Go?</p>
+    <button class="opt"><code>""</code> (cadena vacía)</button>
+    <button class="opt"><code>nil</code></button>
+    <button class="opt"><code>undefined</code></button>
+    <div class="exp">El zero value de un <code>string</code> es la cadena vacía <code>""</code>, nunca <code>nil</code> ni <code>undefined</code>. En Go toda variable declarada arranca con un valor válido.</div>
+  </div>
+
+  <div class="score" id="scoreGo01"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo01');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo01').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M02.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m00-introduccion/lecture.html">← M00: Introducción</a>
+  <a href="../m02-funciones/lecture.html">M02: Funciones →</a>
+</nav>
+
+</div>
+</body>
+</html>

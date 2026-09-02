@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E09 — FPGA y HDL · Computación Física</title>
+<meta name="description" content="Verilog/VHDL y lógica reconfigurable: compilar a hardware. El espejo de M16 Compiladores.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E09</span>
+  <span class="badge">⏱ ~80 min</span>
+  <span class="badge">🎯 Pre-req: E02 + M16 Compiladores</span>
+  <span class="badge">Fase 3 · Final</span>
+</div>
+
+<article>
+
+<h1>E09 — FPGA y HDL</h1>
+
+<blockquote class="author">"En software escribís código que CORRE sobre hardware fijo. Con FPGA escribís código que SE VUELVE el hardware. Esa es la diferencia que vуela la cabeza." — el módulo que cierra el campus</blockquote>
+
+<blockquote>El último módulo del curso, y uno de los más profundos: en vez de programar un procesador, <strong>diseñás el circuito digital mismo</strong>. Verilog/VHDL describen hardware; una FPGA lo materializa. Es el espejo perfecto de los compiladores — pero "compilás" a silicio.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El espejo de M16:</strong> en <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m16-compiladores/lecture.html">M16</a> un compilador traduce C → instrucciones x86 que un CPU FIJO ejecuta. Acá, un <strong>sintetizador</strong> traduce Verilog → una configuración de compuertas que SE CONVIERTE en el circuito. M16 compila a software que corre; E09 "compila" a hardware que ES. Mismo concepto de traducción, destino radicalmente distinto.
+</div>
+
+<h2>1. La diferencia fundamental: CPU vs FPGA</h2>
+
+<table>
+<thead><tr><th></th><th>CPU / Microcontrolador</th><th>FPGA</th></tr></thead>
+<tbody>
+<tr><td>Qué hacés</td><td>Escribís instrucciones que ejecuta</td><td>Describís un circuito que se construye</td></tr>
+<tr><td>Hardware</td><td>Fijo (la arquitectura no cambia)</td><td>Reconfigurable (cambia con tu diseño)</td></tr>
+<tr><td>Ejecución</td><td>Secuencial (una instrucción a la vez)</td><td>Paralela real (todo a la vez, físicamente)</td></tr>
+<tr><td>Lenguaje</td><td>C, Python (imperativo)</td><td>Verilog, VHDL (descriptivo, concurrente)</td></tr>
+<tr><td>Analogía</td><td>Un chef que sigue una receta paso a paso</td><td>Una fábrica donde diseñás las máquinas</td></tr>
+</tbody>
+</table>
+
+<div class="concept">Una <strong>FPGA</strong> (Field-Programmable Gate Array) es un chip con miles de compuertas lógicas (E02) y conexiones que vos configurás. Es "hardware en blanco" que toma la forma del circuito que describas.</div>
+
+<h2>2. El cambio mental más difícil: concurrencia real</h2>
+
+<div class="warn">En software, las líneas se ejecutan una tras otra. En Verilog, <strong>todo pasa A LA VEZ</strong>, en paralelo físico. No es "concurrencia simulada" (threads del SO, M14) — son circuitos distintos funcionando simultáneamente porque SON hardware separado.</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El paralelismo "verdadero" de M18:</strong> en <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m18-concurrencia-y-paralelismo/lecture.html">M18</a> distinguiste concurrencia (intercalar tareas en un CPU) de paralelismo real (varios cores). La FPGA es el paralelismo llevado al extremo: cada operación es un circuito físico independiente. 1000 sumas no tardan 1000 ciclos — tardan 1, porque hay 1000 sumadores reales.
+</div>
+
+<h2>3. Verilog: describir hardware</h2>
+
+<pre><code class="lang-verilog">// Una compuerta AND (la de E02) descrita en Verilog
+module and_gate(input a, input b, output y);
+  assign y = a & b;     // y ES físicamente a AND b — siempre, en paralelo
+endmodule
+
+// Un sumador de 4 bits — NO es un loop, es un circuito
+module sumador(input [3:0] a, input [3:0] b, output [4:0] suma);
+  assign suma = a + b;  // el sintetizador genera las compuertas del sumador (E02)
+endmodule
+
+// Un contador con reloj (lógica secuencial — flip-flops de E02)
+module contador(input clk, input reset, output reg [7:0] cuenta);
+  always @(posedge clk) begin     // en cada flanco del reloj
+    if (reset) cuenta &lt;= 0;
+    else       cuenta &lt;= cuenta + 1;
+  end
+endmodule</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>E02 cobra vida:</strong> el <code>&amp;</code> es la compuerta AND de E02. El <code>always @(posedge clk)</code> son los flip-flops sincronizados por reloj de E02. El sumador es el circuito que viste construido con XOR/AND. Verilog es el lenguaje para describir TODO lo de E02 sin dibujar compuertas a mano — y M01 (álgebra booleana) es la matemática que lo gobierna.
+</div>
+
+<!-- ═══════════ SIMULADOR DE FLIP-FLOP (timing) ═══════════ -->
+<div class="ffsim">
+<style>
+.ffsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.ffsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.ffsim .ff-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.ffsim canvas{width:100%;height:200px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.ffsim .ff-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.ffsim button{background:#26302a;color:#e8efe9;border:1px solid #2d3a31;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.84rem;font-family:inherit;transition:.15s}
+.ffsim button:hover{border-color:#f0883e;color:#f0883e}
+.ffsim button.dhi{border-color:#3fb950;color:#3fb950}
+.ffsim .ff-sl{flex:1;min-width:150px}
+.ffsim .ff-sl label{display:flex;justify-content:space-between;font-size:.8rem;color:#8fa394;margin-bottom:3px}
+.ffsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.ffsim .ff-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+.ffsim code{background:#0a0f0b;padding:1px 5px;border-radius:4px;color:#58a6ff}
+</style>
+  <h4>⏱️ Flip-flop D — el reloj captura el dato</h4>
+  <div class="ff-sub">El corazón de la lógica secuencial (<code>always @(posedge clk)</code>). La salida <b style="color:#58a6ff">Q</b> NO sigue a <b style="color:#3fb950">D</b> al instante — solo copia su valor en el <b>flanco de subida</b> del reloj. Cambiá D entre flancos y mirá que Q espera.</div>
+  <canvas id="ffCv" width="900" height="200"></canvas>
+  <div class="ff-row">
+    <button id="ffD">D = 0  (clic para cambiar)</button>
+    <div class="ff-sl"><label>Velocidad del reloj <b id="ffSpv">1.0</b>×</label><input type="range" id="ffSp" min="0.3" max="2.5" step="0.1" value="1"></div>
+  </div>
+  <div class="ff-hint" id="ffHint">Cambiá D (verde) en cualquier momento. Q (azul) lo ignora hasta el próximo flanco ↑ del reloj — ahí "muestrea" D y lo mantiene hasta el siguiente flanco. Eso es un registro: memoria sincronizada por el clock.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("ffCv"), ctx=cv.getContext("2d");
+  const N=120; let d=0, q=0, speed=1, t=0, half=14, clkPrev=0;
+  const hist=[]; // {clk,d,q}
+  for(let i=0;i<N;i++)hist.push({clk:0,d:0,q:0});
+  function clkAt(tt){return Math.floor(tt/half)%2;} // square wave
+  function step(){
+    t+=speed;
+    const clk=clkAt(t);
+    if(clk===1&&clkPrev===0){q=d;} // flanco de subida → captura
+    clkPrev=clk;
+    hist.push({clk,d,q}); if(hist.length>N)hist.shift();
+  }
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const rows=[{lab:"CLK",col:"#f0883e",key:"clk",y:40},{lab:"D",col:"#3fb950",key:"d",y:100},{lab:"Q",col:"#58a6ff",key:"q",y:160}];
+    rows.forEach(r=>{
+      ctx.fillStyle=r.col;ctx.font="bold 13px monospace";ctx.fillText(r.lab,8,r.y+4);
+      ctx.strokeStyle=r.col;ctx.lineWidth=2;ctx.beginPath();
+      const hi=r.y-22,lo=r.y+22,x0=40,ww=(w-50)/N;
+      for(let i=0;i<hist.length;i++){const v=hist[i][r.key],x=x0+i*ww,y=v?hi:lo;
+        if(i===0)ctx.moveTo(x,y);else{const pv=hist[i-1][r.key];if(pv!==v)ctx.lineTo(x,pv?hi:lo);ctx.lineTo(x,y);}}
+      ctx.stroke();
+    });
+    // marcar flancos de subida del clock con línea vertical
+    ctx.strokeStyle="#f0883e33";ctx.lineWidth=1;ctx.setLineDash([3,3]);
+    const x0=40,ww=(w-50)/N;
+    for(let i=1;i<hist.length;i++){if(hist[i].clk===1&&hist[i-1].clk===0){const x=x0+i*ww;ctx.beginPath();ctx.moveTo(x,18);ctx.lineTo(x,182);ctx.stroke();}}
+    ctx.setLineDash([]);
+  }
+  function loop(){step();draw();requestAnimationFrame(loop);}
+  $("ffD").addEventListener("click",()=>{d=d?0:1;const b=$("ffD");b.textContent="D = "+d+"  (clic para cambiar)";b.classList.toggle("dhi",d===1);});
+  $("ffSp").addEventListener("input",e=>{speed=+e.target.value;$("ffSpv").textContent=speed.toFixed(1);});
+  loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR FLIP-FLOP ═══════════ -->
+
+<h2>4. El flujo: de Verilog a silicio</h2>
+
+<pre><code>Verilog (descripción)
+   ↓ SÍNTESIS (≈ "compilar")  ← el espejo de M16
+Netlist (lista de compuertas y conexiones)
+   ↓ PLACE & ROUTE (ubicar en la FPGA)
+Bitstream (configuración física)
+   ↓ cargar en la FPGA
+El circuito EXISTE y funciona en paralelo</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> Compará con M16: <code>código → lexer/parser → IR → optimización → código máquina</code>. Acá: <code>Verilog → parser → netlist → optimización → bitstream</code>. <strong>La síntesis ES compilación</strong>, con las mismas etapas (parsing, representación intermedia, optimización), pero el output configura compuertas en vez de generar instrucciones.
+</div>
+
+<h2>5. ¿Cuándo FPGA y no CPU?</h2>
+
+<table>
+<thead><tr><th>Usá FPGA cuando...</th><th>Ejemplo</th></tr></thead>
+<tbody>
+<tr><td>Necesitás paralelismo masivo en tiempo real</td><td>Procesar video 4K pixel por pixel</td></tr>
+<tr><td>Latencia ultra baja y determinista</td><td>Trading de alta frecuencia (nanosegundos)</td></tr>
+<tr><td>Protocolos custom de alta velocidad</td><td>Telecom, instrumentación científica</td></tr>
+<tr><td>Acelerar un algoritmo específico</td><td>DSP (E07), criptografía (M29), inferencia ML</td></tr>
+<tr><td>Prototipar un chip antes de fabricarlo (ASIC)</td><td>Diseño de CPUs, GPUs</td></tr>
+</tbody>
+</table>
+
+<div class="tip">El CPU es generalista (hace de todo, secuencial). La FPGA es especialista (hace UNA cosa, en paralelo, rapidísimo). GPU está en el medio. Por eso la IA de inferencia a veces va en FPGA: un circuito dedicado a tu red neuronal es más eficiente que un CPU genérico.</div>
+
+<h2>6. FPGA vs ASIC</h2>
+
+<div class="concept"><strong>FPGA</strong>: reconfigurable, ideal para prototipos y bajos volúmenes. <strong>ASIC</strong> (Application-Specific Integrated Circuit): un chip fabricado para UNA función — más rápido y barato a gran escala, pero millones de dólares de diseño y no se puede cambiar. Tu CPU, tu GPU, el chip de tu celular son ASICs.</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El ciclo se cierra del todo:</strong> un ASIC se diseña en Verilog (como acá), se simula, y se fabrica como silicio fijo. Tu CPU —la de M13 Arquitectura— FUE descrita en un HDL como este antes de existir. E09 te muestra el origen de TODO el hardware del campus: alguien lo escribió en Verilog primero.
+</div>
+
+<h2>7. Empezar sin comprar una FPGA</h2>
+<ul>
+  <li><a href="https://www.edaplayground.com/" target="_blank">EDA Playground</a> — escribí y simulá Verilog en el browser, gratis.</li>
+  <li><a href="https://hdlbits.01xz.net/" target="_blank">HDLBits</a> — ejercicios interactivos de Verilog, de cero a avanzado. <strong>El mejor punto de entrada.</strong></li>
+  <li><a href="https://www.nand2tetris.org/" target="_blank">Nand2Tetris</a> — construí una CPU desde compuertas (conecta E02 + E09 + M13).</li>
+  <li>Hardware barato para después: placas iCE40 o Tang Nano (~$10-30) con toolchains open source (Yosys).</li>
+</ul>
+
+<figure class="foto">
+  <img src="../assets/img/fpga.jpg" alt="Placa FPGA Sipeed Tang Nano 9K">
+  <figcaption>Una Sipeed Tang Nano 9K: una FPGA de entrada (~$10-15) con toolchain open source (Yosys). El chip cuadrado del centro contiene miles de bloques lógicos que tu Verilog "cablea" para convertirse en el circuito que diseñaste. Foto: Popolon, vía <a href="https://commons.wikimedia.org/wiki/File:Sipeed_Tang_Nano_9K_FPGA.jpg" target="_blank">Wikimedia Commons</a> (CC0).</figcaption>
+</figure>
+
+<h2>8. Errores típicos del que viene del software</h2>
+<div class="mistake"><strong>Pensar en Verilog como código secuencial</strong>: <code>a = 1; b = 2;</code> NO se ejecutan en orden — son circuitos paralelos. El error mental #1.</div>
+<div class="mistake"><strong>Confundir <code>=</code> (blocking) con <code>&lt;=</code> (non-blocking)</strong>: en lógica secuencial usás <code>&lt;=</code>; mezclar causa bugs sutiles de timing.</div>
+<div class="mistake"><strong>Latches no intencionales</strong>: un <code>if</code> sin <code>else</code> en lógica combinacional crea memoria fantasma. Cubrí todos los casos.</div>
+<div class="mistake"><strong>Ignorar el timing/reloj</strong>: si la lógica entre flancos es muy lenta, el circuito falla a la frecuencia objetivo (lo viste en E02).</div>
+<div class="mistake"><strong>Querer "debuggear con prints"</strong>: en hardware se simula (testbench) y se usa un analizador lógico — no hay <code>console.log</code>.</div>
+
+<h2>9. Recursos</h2>
+<ul>
+  <li><a href="https://hdlbits.01xz.net/" target="_blank">HDLBits</a> — práctica interactiva imperdible</li>
+  <li><a href="https://nandland.com/" target="_blank">Nandland</a> — FPGA para principiantes</li>
+  <li>"Digital Design and Computer Architecture" (Harris & Harris) — une E02, E09 y M13</li>
+</ul>
+
+<hr>
+
+<h2>🎉 Cierre del curso de Computación Física</h2>
+
+<div class="rule" style="text-align:center; padding:1.5rem;">
+Recorriste el puente completo: del <strong>voltaje</strong> (E00) al <strong>circuito</strong> (E01), de la <strong>lógica</strong> (E02) al <strong>microcontrolador</strong> (E03-E04), del <strong>sensor/actuador</strong> (E05) a las <strong>señales</strong> (E06-E07), del <strong>control</strong> (E08) al <strong>hardware reconfigurable</strong> (E09).<br><br>
+Ahora entendés la columna completa: <strong>desde el electrón hasta el programa</strong>. Pocos ingenieros ven los dos lados — vos sí.
+</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El campus, cerrado:</strong> volvé al <a href="../mapa-complementariedad.html">Mapa de Complementariedad</a> y vas a ver que ahora TODOS los pares tienen sus dos caras construidas. M01↔E02, M07↔E03, M13↔E02, M15↔E03, M16↔E09, M42↔E07, M39↔E08. La informática y la electrónica del campus quedaron tejidas de punta a punta.
+</div>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Cuál es la diferencia fundamental entre programar un CPU y diseñar para FPGA?</summary>
+<p>En un CPU escribís instrucciones que un hardware fijo ejecuta secuencialmente. En FPGA describís un circuito que SE CONSTRUYE físicamente y corre en paralelo real. Software que corre vs hardware que ES.</p></details>
+
+<details><summary>2. ¿Por qué Verilog no es código secuencial?</summary>
+<p>Porque describe hardware: todo ocurre a la vez, en paralelo físico. Cada <code>assign</code> es un circuito permanente. No hay "orden de ejecución" — son compuertas reales funcionando simultáneamente.</p></details>
+
+<details><summary>3. ¿Cómo es la síntesis el espejo de M16 Compiladores?</summary>
+<p>Ambas traducen una descripción de alto nivel a algo ejecutable, con etapas similares (parsing, IR, optimización). M16: código → instrucciones máquina (software que corre). Síntesis: Verilog → bitstream (configuración de compuertas que ES el circuito).</p></details>
+
+<details><summary>4. ¿Cuándo conviene una FPGA sobre un CPU?</summary>
+<p>Cuando necesitás paralelismo masivo en tiempo real (video pixel a pixel), latencia ultra baja y determinista (trading), protocolos custom de alta velocidad, o acelerar un algoritmo específico (DSP, cripto, inferencia ML). El CPU es generalista; la FPGA es especialista paralela.</p></details>
+
+<details><summary>5. ¿Qué relación hay entre FPGA, ASIC y la CPU de M13?</summary>
+<p>Un ASIC es un chip fabricado para una función (tu CPU, GPU son ASICs). Se diseña en HDL como Verilog, se simula y se fabrica. La CPU de M13 fue descrita en un HDL antes de existir. E09 muestra el origen de todo el hardware del campus.</p></details>
+
+<details><summary>6. ¿Cómo conecta E09 con E02 y M01?</summary>
+<p>Verilog describe exactamente lo de E02 (compuertas con <code>&amp;</code>, flip-flops con <code>always @(posedge clk)</code>, sumadores) sin dibujar a mano. Y M01 (álgebra booleana) es la matemática que gobierna esas compuertas. E09 es la herramienta profesional para construir lo de E02 a escala.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e08-control/lecture.html">← E08 Sistemas de Control</a>
+  <a href="../index.html">🏠 Volver al curso</a>
+</nav>
+
+</div>
+</body>
+</html>

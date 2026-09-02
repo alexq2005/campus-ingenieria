@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 05 — Pattern Matching · Curso de Rust</title>
+  <meta name="description" content="match exhaustivo, desestructurar enums, Option y Result, if let y while let, guards, rangos y binding con @.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../sistemas/Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 05</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M04</span>
+</div>
+
+<article>
+
+<h1>Módulo 05 — Pattern Matching</h1>
+
+<p>En M04 conociste los enums, <code>Option</code> y <code>Result</code>. Ahora viene la herramienta que los hace brillar: el <strong>pattern matching</strong>. Es la forma idiomática de "abrir" un valor, ver qué hay adentro y reaccionar a cada caso. Si venís de otros lenguajes, pensalo como un <code>switch</code> con superpoderes — pero mucho más seguro, porque el compilador no te deja olvidarte de ningún caso.</p>
+
+<h2>match: el switch con superpoderes</h2>
+
+<p>La expresión <code>match</code> compara un valor contra una serie de <strong>patrones</strong> y ejecuta el código del primero que coincide. Cada rama se llama <em>brazo</em> y tiene la forma <code>patrón =&gt; expresión</code>.</p>
+
+<pre><code class="lang-rust">fn describir(n: i32) -&gt; &amp;'static str {
+    match n {
+        0 =&gt; "cero",
+        1 =&gt; "uno",
+        _ =&gt; "otro",   // el comodín: "el resto"
+    }
+}</code></pre>
+
+<div class="info">
+  <strong>El brazo usa <code>=&gt;</code> (flecha gorda), no <code>-&gt;</code>.</strong> La flecha fina <code>-&gt;</code> aparece en las firmas de funciones para indicar el tipo que devuelven. La flecha gorda <code>=&gt;</code> separa el patrón de su expresión dentro del <code>match</code>. Son dos cosas distintas — no las mezcles.
+</div>
+
+<p>Como <code>match</code> es una <strong>expresión</strong>, devuelve un valor: podés asignar el resultado directamente a una variable. Todos los brazos deben devolver el mismo tipo.</p>
+
+<pre><code class="lang-rust">let texto = match n {
+    0 =&gt; "cero",
+    _ =&gt; "no cero",
+};</code></pre>
+
+<h2>Exhaustividad: la red de seguridad</h2>
+
+<div class="concept">
+  <strong>💡 El compilador te obliga a cubrir TODOS los casos.</strong> Un <code>match</code> en Rust es <em>exhaustivo</em>: si dejás un caso sin manejar, no compila. Esto parece molesto al principio, pero es una red de seguridad enorme: si mañana agregás una variante nueva a un enum, el compilador te marca <strong>cada</strong> <code>match</code> que no la contempla. Bugs de "me olvidé un caso" atrapados gratis, antes de ejecutar.
+</div>
+
+<p>Por eso el comodín <code>_</code> es tan útil: cubre "todo lo demás" en un solo brazo. Pero usalo con cuidado — si ponés <code>_</code> de más, perdés la red de seguridad para las variantes que agregues después.</p>
+
+<h2>Desestructurar: sacar los datos de adentro</h2>
+
+<p>La verdadera potencia llega cuando el valor <em>contiene</em> datos. El patrón no solo compara: además <strong>extrae</strong> los datos a variables nuevas. Esto se llama desestructurar.</p>
+
+<h3>Enums con datos</h3>
+
+<pre><code class="lang-rust">enum Evento {
+    Click { x: i32, y: i32 },
+    Tecla(char),
+    Cerrar,
+}
+
+fn manejar(e: Evento) {
+    match e {
+        Evento::Click { x, y } =&gt; println!("click en {}, {}", x, y),
+        Evento::Tecla(c)       =&gt; println!("tecla: {}", c),
+        Evento::Cerrar         =&gt; println!("adiós"),
+    }
+}</code></pre>
+
+<h3>Option: Some(x) o None</h3>
+
+<pre><code class="lang-rust">let valor: Option&lt;i32&gt; = Some(7);
+
+match valor {
+    Some(x) =&gt; println!("hay un {}", x),
+    None    =&gt; println!("no hay nada"),
+}</code></pre>
+
+<h3>Result: Ok(v) o Err(e)</h3>
+
+<pre><code class="lang-rust">let r: Result&lt;i32, String&gt; = "42".parse().map_err(|e: std::num::ParseIntError| e.to_string());
+
+match r {
+    Ok(v)  =&gt; println!("número: {}", v),
+    Err(e) =&gt; println!("falló: {}", e),
+}</code></pre>
+
+<h3>Tuplas y structs</h3>
+
+<pre><code class="lang-rust">let punto = (0, 5);
+match punto {
+    (0, 0) =&gt; println!("origen"),
+    (0, y) =&gt; println!("sobre el eje Y, en {}", y),
+    (x, 0) =&gt; println!("sobre el eje X, en {}", x),
+    (x, y) =&gt; println!("en {}, {}", x, y),
+}
+
+struct Punto { x: i32, y: i32 }
+let p = Punto { x: 3, y: 4 };
+let Punto { x, y } = p;   // desestructurar directo con let
+println!("{} {}", x, y);</code></pre>
+
+<h2>if let: cuando solo te importa un patrón</h2>
+
+<p>A veces no querés cubrir todos los casos: solo te interesa <em>uno</em>. Escribir un <code>match</code> con un brazo y un <code>_ =&gt; {}</code> vacío es verboso. Para eso está <code>if let</code>, que es azúcar sintáctico para "si el valor coincide con este patrón, hacé esto".</p>
+
+<pre><code class="lang-rust">let config: Option&lt;i32&gt; = Some(100);
+
+if let Some(x) = config {
+    println!("configurado en {}", x);
+} else {
+    println!("usando default");
+}</code></pre>
+
+<h3>while let: repetir mientras coincida</h3>
+
+<p>El primo de <code>if let</code> para bucles: ejecuta el cuerpo mientras el patrón siga coincidiendo. Muy común al ir vaciando una colección.</p>
+
+<pre><code class="lang-rust">let mut pila = vec![1, 2, 3];
+
+while let Some(tope) = pila.pop() {
+    println!("saqué {}", tope);
+}
+// imprime 3, 2, 1 y para cuando pop() devuelve None</code></pre>
+
+<h2>Patrones avanzados</h2>
+
+<h3>Guards: un if dentro del brazo</h3>
+
+<p>Una <em>guard</em> es una condición extra (<code>if ...</code>) que se evalúa después de que el patrón coincide. El brazo solo se elige si el patrón coincide <strong>y</strong> la guard es verdadera.</p>
+
+<pre><code class="lang-rust">let n = 4;
+match n {
+    x if x &lt; 0 =&gt; println!("negativo"),
+    0          =&gt; println!("cero"),
+    x if x % 2 == 0 =&gt; println!("par positivo"),
+    _          =&gt; println!("impar positivo"),
+}</code></pre>
+
+<h3>Rangos: 1..=5</h3>
+
+<pre><code class="lang-rust">let nota = 8;
+match nota {
+    0..=3  =&gt; println!("insuficiente"),
+    4..=6  =&gt; println!("aprobado"),
+    7..=10 =&gt; println!("muy bien"),
+    _      =&gt; println!("nota inválida"),
+}</code></pre>
+
+<h3>Binding con @</h3>
+
+<p>El operador <code>@</code> te deja <strong>capturar</strong> el valor que coincidió con un patrón <em>al mismo tiempo</em> que lo testeás. Útil cuando el patrón es un rango pero igual querés el número concreto.</p>
+
+<pre><code class="lang-rust">let edad = 17;
+match edad {
+    n @ 0..=12  =&gt; println!("niño de {} años", n),
+    n @ 13..=17 =&gt; println!("adolescente de {} años", n),
+    n           =&gt; println!("adulto de {} años", n),
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Pensalo así:</strong> el rango <code>13..=17</code> es la pregunta ("¿está en este rango?") y <code>n @</code> es la cámara que saca la foto del valor exacto mientras pasa el control. Sin <code>@</code> sabrías que coincidió, pero no tendrías el número a mano dentro del brazo.
+</div>
+
+<h2>Ejemplo completo</h2>
+
+<p>Un enum, un <code>Option</code> y un <code>if let</code>, todo junto:</p>
+
+<pre><code class="lang-rust">enum Semaforo {
+    Rojo,
+    Amarillo,
+    Verde,
+}
+
+fn accion(s: &amp;Semaforo) -&gt; &amp;'static str {
+    match s {
+        Semaforo::Rojo     =&gt; "frená",
+        Semaforo::Amarillo =&gt; "atención",
+        Semaforo::Verde    =&gt; "avanzá",
+    }
+}
+
+fn main() {
+    let luz = Semaforo::Verde;
+    println!("{}", accion(&amp;luz));
+
+    let entrada: Option&lt;i32&gt; = "25".parse().ok();
+    match entrada {
+        Some(v) if v &gt;= 18 =&gt; println!("mayor de edad: {}", v),
+        Some(v)            =&gt; println!("menor: {}", v),
+        None               =&gt; println!("entrada inválida"),
+    }
+
+    // if let cuando solo me importa el caso Some
+    if let Some(v) = entrada {
+        println!("el valor era {}", v);
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla práctica:</strong> usá <code>match</code> cuando te importan varios casos (o querés la exhaustividad). Usá <code>if let</code> cuando solo te importa uno y el resto no hace nada. Elegir bien hace el código más legible.
+</div>
+
+<h2>Errores comunes</h2>
+
+<div class="mistake"><strong>Olvidar un caso (o el <code>_</code>).</strong> El <code>match</code> no compila si no es exhaustivo. Esto <em>es bueno</em>: el error te avisa antes de ejecutar. No lo "arregles" tapando todo con <code>_</code> sin pensar — a veces lo correcto es manejar cada variante.</div>
+<div class="mistake"><strong>Confundir <code>=&gt;</code> con <code>-&gt;</code>.</strong> Dentro del brazo va la flecha gorda <code>=&gt;</code>. La flecha fina <code>-&gt;</code> es solo para el tipo de retorno de una función.</div>
+<div class="mistake"><strong>Usar <code>match</code> para un solo caso.</strong> Si solo te interesa <code>Some(x)</code> y el resto no hace nada, un <code>match</code> con <code>_ =&gt; {}</code> es ruido. <code>if let Some(x) = ...</code> es más limpio.</div>
+<div class="mistake"><strong>Poner <code>_</code> demasiado pronto.</strong> Si ponés el comodín antes que un patrón más específico, ese patrón nunca se alcanza. Los brazos se evalúan de arriba hacia abajo: del más específico al más general.</div>
+
+<div class="warn">
+  <strong>El orden importa.</strong> Rust elige el <strong>primer</strong> brazo que coincide. Si <code>_</code> está al principio, atrapa todo y los demás brazos quedan muertos (el compilador incluso te avisa con un warning de "unreachable pattern").
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué significa que un <code>match</code> sea exhaustivo y por qué es útil?</summary>
+<p>Significa que debe cubrir todos los casos posibles del valor, o no compila. Es útil porque si agregás una variante nueva a un enum, el compilador te obliga a manejarla en cada <code>match</code> — atrapa el bug de "me olvidé un caso" en compilación, no en producción.</p></details>
+
+<details><summary>¿Cuándo conviene <code>if let</code> en vez de <code>match</code>?</summary>
+<p>Cuando solo te interesa <em>un</em> patrón y el resto no hace nada. Por ejemplo <code>if let Some(x) = opcion { ... }</code> es más limpio que un <code>match</code> con un brazo útil y un <code>_ =&gt; {}</code> vacío.</p></details>
+
+<details><summary>¿Para qué sirve el binding con <code>@</code>?</summary>
+<p>Para capturar el valor que coincidió a la vez que lo testeás contra un patrón. Por ejemplo <code>n @ 13..=17</code> verifica que esté en el rango y además guarda el número exacto en <code>n</code> para usarlo dentro del brazo.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí una función <code>dia(n: u32) -&gt; &amp;'static str</code> que con <code>match</code> devuelva el nombre del día (1 = lunes, ..., 7 = domingo) y use <code>_</code> para "día inválido".</li>
+  <li>Dado un <code>Option&lt;i32&gt;</code>, escribí un <code>match</code> que imprima el doble del valor si hay <code>Some</code> y "sin valor" si es <code>None</code>.</li>
+  <li>Definí un enum <code>Forma</code> con <code>Circulo(f64)</code> y <code>Rectangulo { ancho: f64, alto: f64 }</code>, y escribí una función que calcule el área con <code>match</code> desestructurando cada variante.</li>
+  <li>Usá un <code>match</code> con rangos para clasificar una temperatura: <code>..=0</code> "helada", <code>1..=20</code> "fría", <code>21..=30</code> "templada", el resto "calurosa". (Pista: para incluir negativos podés usar una guard <code>x if x &lt;= 0</code>.)</li>
+  <li>Reescribí este <code>match</code> verboso usando <code>if let</code>: <code>match opcion { Some(x) =&gt; println!("{}", x), _ =&gt; {} }</code>.</li>
+</ol>
+
+<section class="quiz" id="quizRs05">
+  <style>
+    #quizRs05{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs05 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs05 .q{margin-bottom:1.5rem}
+    #quizRs05 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs05 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs05 .opt:hover{border-color:var(--accent)}
+    #quizRs05 .opt:disabled{cursor:default}
+    #quizRs05 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs05 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs05 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs05 .exp.show{display:block}
+    #quizRs05 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Por qué un <code>match</code> en Rust debe ser exhaustivo?</p>
+    <button class="opt">Para que el código corra más rápido</button>
+    <button class="opt">Para garantizar que todos los casos posibles estén manejados; si falta uno, no compila</button>
+    <button class="opt">Porque Rust no tiene comodín <code>_</code></button>
+    <div class="exp">La exhaustividad obliga a cubrir todos los casos. Si agregás una variante a un enum, el compilador te marca cada <code>match</code> incompleto — bugs atrapados en compilación.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Qué flecha separa el patrón de su expresión en un brazo de <code>match</code>?</p>
+    <button class="opt"><code>-&gt;</code> (flecha fina)</button>
+    <button class="opt"><code>:</code> (dos puntos)</button>
+    <button class="opt"><code>=&gt;</code> (flecha gorda)</button>
+    <div class="exp">El brazo usa la flecha gorda <code>=&gt;</code>. La flecha fina <code>-&gt;</code> es solo para el tipo de retorno en la firma de una función.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Si solo te interesa el caso <code>Some(x)</code> y el resto no hace nada, ¿qué conviene usar?</p>
+    <button class="opt"><code>if let Some(x) = opcion { ... }</code></button>
+    <button class="opt">Un <code>match</code> con un brazo útil y un <code>_ =&gt; {}</code> vacío</button>
+    <button class="opt">Un bucle <code>while let</code></button>
+    <div class="exp"><code>if let</code> es azúcar para cuando solo te importa un patrón; es más limpio que un <code>match</code> con un <code>_ =&gt; {}</code> vacío.</div>
+  </div>
+
+  <div class="score" id="scoreRs05"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs05');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs05').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M06.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m04-structs-enums/lecture.html">← M04: Structs &amp; Enums</a>
+  <a href="../m06-manejo-errores/lecture.html">M06: Manejo de Errores →</a>
+</nav>
+
+</div>
+</body>
+</html>

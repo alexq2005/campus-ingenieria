@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 06 — Estadística para ML · Curso de Datos & ML</title>
+  <meta name="description" content="Tendencia central, dispersión, distribuciones, correlación vs causalidad, población vs muestra, y el concepto central de train/test split y data leakage.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../lenguajes/Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 06</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M04</span>
+</div>
+
+<article>
+
+<h1>Módulo 06 — Estadística para ML</h1>
+
+<p>No necesitás un doctorado en estadística para hacer machine learning, pero sí necesitás un puñado de conceptos para no engañarte a vos mismo con los datos. Este módulo es ese piso mínimo: cómo resumir datos sin mentir, cómo leer la forma de una distribución, y — lo más importante — cómo separar los datos para que tu evaluación sea honesta.</p>
+
+<h2>Tendencia central — ¿dónde está "el centro"?</h2>
+
+<p>Tres formas de responder "¿cuál es el valor típico?":</p>
+
+<table>
+<thead><tr><th>Medida</th><th>Qué es</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><strong>Media</strong> (promedio)</td><td>Sumás todo y dividís por la cantidad</td><td>Datos simétricos, sin valores extremos</td></tr>
+<tr><td><strong>Mediana</strong></td><td>El valor del medio al ordenar los datos</td><td>Datos sesgados o con outliers</td></tr>
+<tr><td><strong>Moda</strong></td><td>El valor que más se repite</td><td>Datos categóricos (color, marca)</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔍 Sueldos de una oficina:</strong> 10 empleados ganan ~$1.000 y el dueño gana $1.000.000. La <strong>media</strong> da ~$91.000 (¡nadie gana eso!), pero la <strong>mediana</strong> da $1.000 — que describe mucho mejor al empleado típico. Un solo outlier arrastró la media.
+</div>
+
+<div class="concept">
+  <strong>💡 Por qué la mediana resiste outliers:</strong> la media suma <em>el valor</em> de cada punto, así que un número gigante la infla. La mediana solo mira <em>la posición</em> del valor del medio — no le importa cuán grande sea el extremo. Por eso en distribuciones sesgadas (ingresos, precios de casas, vistas de videos) se reporta la mediana.
+</div>
+
+<pre><code class="lang-python">import numpy as np
+import pandas as pd
+
+sueldos = pd.Series([1000, 1000, 1000, 1000, 1000, 1000000])
+print(sueldos.mean())     # 167500.0  -- distorsionado por el outlier
+print(sueldos.median())   # 1000.0    -- el empleado típico
+print(sueldos.mode()[0])  # 1000      -- el valor más frecuente</code></pre>
+
+<h2>Dispersión — ¿qué tan "esparcidos" están?</h2>
+
+<p>El centro no alcanza. Dos grupos pueden tener la misma media y ser completamente distintos: <code>[50, 50, 50]</code> y <code>[0, 50, 100]</code> promedian 50, pero uno es constante y el otro está disperso. La <strong>dispersión</strong> mide eso.</p>
+
+<table>
+<thead><tr><th>Medida</th><th>Qué mide</th></tr></thead>
+<tbody>
+<tr><td><strong>Varianza</strong></td><td>Promedio de las distancias al cuadrado respecto de la media</td></tr>
+<tr><td><strong>Desvío estándar</strong> (std)</td><td>Raíz cuadrada de la varianza — en las <em>mismas unidades</em> que los datos</td></tr>
+<tr><td><strong>Percentiles / cuartiles</strong></td><td>Cortes que dividen los datos ordenados (Q1 = 25%, Q2 = mediana, Q3 = 75%)</td></tr>
+<tr><td><strong>IQR</strong> (rango intercuartílico)</td><td>Q3 − Q1: el rango donde vive el 50% central de los datos</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  El <strong>desvío estándar</strong> es más interpretable que la varianza porque está en las mismas unidades. Si los datos son alturas en cm, el std está en cm, pero la varianza está en cm². Por eso reportamos std, no varianza.
+</div>
+
+<pre><code class="lang-python">datos = pd.Series([12, 15, 14, 10, 18, 13, 90])   # el 90 es un outlier
+
+print(datos.std())                 # desvío estándar
+print(datos.var())                 # varianza
+print(datos.quantile(0.25))        # Q1 (percentil 25)
+print(datos.quantile(0.75))        # Q3 (percentil 75)
+
+Q1, Q3 = datos.quantile(0.25), datos.quantile(0.75)
+IQR = Q3 - Q1
+print("IQR:", IQR)                 # rango del 50% central</code></pre>
+
+<div class="tip">
+  El IQR es la base de la regla clásica para detectar outliers: un punto se considera atípico si cae por debajo de <code>Q1 − 1.5·IQR</code> o por encima de <code>Q3 + 1.5·IQR</code>. Es lo que dibujan los "bigotes" de un boxplot.
+</div>
+
+<h2>Distribuciones — la forma de los datos</h2>
+
+<p>Una <strong>distribución</strong> describe cómo se reparten los valores: cuáles son frecuentes y cuáles raros. La herramienta para verla es el <strong>histograma</strong> (lo viste en M05).</p>
+
+<div class="concept">
+  <strong>💡 La distribución normal (campana de Gauss):</strong> simétrica alrededor de la media, con la mayoría de los valores cerca del centro y pocos en los extremos. Muchos fenómenos naturales se parecen (alturas, errores de medición). En una normal: media ≈ mediana ≈ moda, y ~68% de los datos cae dentro de ±1 desvío estándar de la media.
+</div>
+
+<table>
+<thead><tr><th>Forma</th><th>Qué pasa</th><th>Señal</th></tr></thead>
+<tbody>
+<tr><td><strong>Normal</strong></td><td>Campana simétrica</td><td>media ≈ mediana</td></tr>
+<tr><td><strong>Sesgo a la derecha</strong></td><td>Cola larga hacia valores altos (ingresos, precios)</td><td>media &gt; mediana</td></tr>
+<tr><td><strong>Sesgo a la izquierda</strong></td><td>Cola larga hacia valores bajos</td><td>media &lt; mediana</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Siempre graficá un histograma antes de modelar.</strong> Las estadísticas resumen pueden esconder la forma real: dos datasets con la misma media y std pueden tener histogramas totalmente distintos. Tus ojos detectan sesgos, picos múltiples y outliers que un número solo no muestra.
+</div>
+
+<h2>Correlación vs causalidad</h2>
+
+<p>La <strong>correlación de Pearson</strong> mide qué tan fuerte se mueven juntas dos variables numéricas, en una escala de <strong>−1 a +1</strong>:</p>
+
+<table>
+<thead><tr><th>Valor</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>+1</code></td><td>Correlación positiva perfecta (una sube, la otra sube igual)</td></tr>
+<tr><td><code>0</code></td><td>Sin relación lineal</td></tr>
+<tr><td><code>−1</code></td><td>Correlación negativa perfecta (una sube, la otra baja)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">df = pd.DataFrame({
+    "horas_estudio": [1, 2, 3, 4, 5],
+    "nota":          [50, 58, 67, 74, 85],
+})
+print(df.corr())            # matriz de correlación de Pearson
+# horas_estudio vs nota: ~0.998  -- fuerte correlación positiva</code></pre>
+
+<div class="rule">
+  <strong>📌 Correlación NO implica causalidad.</strong> Que dos cosas se muevan juntas no significa que una <em>cause</em> la otra. Las ventas de helado y los ahogamientos están correlacionados — pero el helado no ahoga a nadie. Una tercera variable (el calor del verano) causa ambas. Confundir esto es el error más caro de la analítica.
+</div>
+
+<div class="analogy">
+  <strong>🔍 La cigüeña y los bebés:</strong> en algunos países hay correlación entre la cantidad de cigüeñas y la tasa de nacimientos. ¿Las cigüeñas traen bebés? No: los países más grandes tienen más casas (más cigüeñas) y más gente (más bebés). La causa común es el tamaño del país.
+</div>
+
+<h2>Población vs muestra</h2>
+
+<p>La <strong>población</strong> es <em>todo</em> lo que querés estudiar (todos los clientes, todos los emails). La <strong>muestra</strong> es el subconjunto que efectivamente medís. Casi nunca tenés la población entera, así que trabajás con muestras e <em>inferís</em> hacia la población.</p>
+
+<div class="concept">
+  <strong>💡 Sesgo de muestreo:</strong> ocurre cuando la muestra no representa a la población. Si encuestás "¿usás internet?" <em>por internet</em>, el 100% va a decir que sí — tu muestra excluyó justo a quienes no lo usan. Un modelo entrenado sobre una muestra sesgada aprende un mundo distorsionado y falla en la realidad.
+</div>
+
+<div class="mistake"><strong>Generalizar desde una muestra sesgada.</strong> Si tus datos de entrenamiento solo tienen clientes de una ciudad, no esperes que el modelo funcione en otra. La muestra define lo que el modelo "conoce".</div>
+
+<h2>El concepto central: train / test split</h2>
+
+<div class="concept">
+  <strong>💡 La idea más importante de todo el ML aplicado:</strong> separás tus datos en dos partes. Con el conjunto de <strong>entrenamiento (train)</strong> el modelo aprende; con el conjunto de <strong>prueba (test)</strong> medís si lo aprendido <em>generaliza</em> a datos que nunca vio. Es la única forma honesta de estimar cómo va a rendir en producción.
+</div>
+
+<p>¿Por qué? Porque un modelo puede <em>memorizar</em> los datos de entrenamiento y verse perfecto ahí, pero fallar con datos nuevos (eso es <em>overfitting</em>, lo vemos en M08). El test set es tu simulación de "el futuro": datos que el modelo no usó para aprender.</p>
+
+<div class="rule">
+  <strong>📌 El test set es sagrado.</strong> Se separa al principio y no se toca hasta el final, cuando ya elegiste y entrenaste tu modelo. Es tu único termómetro honesto. Si lo mirás antes, dejás de tenerlo.
+</div>
+
+<p>La herramienta estándar es <code>train_test_split</code> de scikit-learn:</p>
+
+<pre><code class="lang-python">from sklearn.model_selection import train_test_split
+
+X = df[["horas_estudio"]]   # features (lo que el modelo usa para predecir)
+y = df["aprobado"]          # target (lo que querés predecir)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,        # 20% para test, 80% para entrenar
+    random_state=42,      # semilla fija -&gt; split reproducible
+    stratify=y,           # mantiene la proporción de clases en ambos lados
+)</code></pre>
+
+<table>
+<thead><tr><th>Parámetro</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>test_size</code></td><td>Fracción que va a test (0.2 = 20%). Común: 0.2–0.3</td></tr>
+<tr><td><code>random_state</code></td><td>Semilla del azar. Fijala para que el split sea <strong>reproducible</strong></td></tr>
+<tr><td><code>stratify</code></td><td>Conserva la proporción de clases. Clave en datos desbalanceados</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>¿Por qué <code>stratify</code>?</strong> Si el 5% de tus datos son fraude y el split al azar deja casi todo el fraude en train, el test casi no tiene fraude y la evaluación no sirve. <code>stratify=y</code> garantiza que ambos conjuntos tengan ~5% de fraude, igual que el dataset original.
+</div>
+
+<h2>Data leakage — el enemigo silencioso</h2>
+
+<div class="concept">
+  <strong>💡 Data leakage (fuga de datos):</strong> ocurre cuando información del test se filtra al entrenamiento. El modelo "ve" indirectamente lo que debía predecir, así que da resultados espectaculares en tu evaluación... y se derrumba en producción. Es un bug que <em>no rompe nada</em> — simplemente te miente.
+</div>
+
+<div class="mistake"><strong>El leakage más común: escalar antes de splitear.</strong> Si normalizás (restar media, dividir por std) usando <em>todo</em> el dataset, la media y el std incluyen información del test. El train ya "sabe" algo del test.</div>
+
+<pre><code class="lang-python"># MAL -- leakage: el escalado mira todo el dataset (incluido el test)
+from sklearn.preprocessing import StandardScaler
+X_escalado = StandardScaler().fit_transform(X)   # fit sobre TODO
+X_train, X_test, ... = train_test_split(X_escalado, y)
+
+# BIEN -- primero splitear, fit SOLO con train, luego transformar ambos
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)   # aprende media/std SOLO del train
+X_test  = scaler.transform(X_test)        # aplica esos valores al test</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de oro contra leakage:</strong> cualquier transformación que <em>aprenda</em> de los datos (escalar, imputar nulos, codificar) se ajusta (<code>.fit</code>) <strong>solo con el train</strong>, y después se aplica (<code>.transform</code>) al test. Nunca al revés, nunca sobre todo junto.
+</div>
+
+<div class="info">
+  Cuando solo tenés un split train/test fijo, "gastás" datos en evaluar y dependés de ese único corte. La <strong>validación cruzada</strong> (cross-validation) resuelve eso rotando qué porción es test — lo vemos en detalle en el <strong>M09</strong>.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake"><strong>Mirar o usar el test set antes de tiempo.</strong> Apenas lo usás para tomar decisiones (elegir features, tunear), deja de ser una medida honesta de generalización.</div>
+<div class="mistake"><strong>Data leakage al preprocesar.</strong> Escalar, imputar o codificar usando todo el dataset filtra info del test al train. <code>.fit</code> siempre solo con train.</div>
+<div class="mistake"><strong>Confundir correlación con causalidad.</strong> Una correlación fuerte no prueba que A cause B; puede haber una tercera variable o ser pura coincidencia.</div>
+<div class="mistake"><strong>Reportar solo la media e ignorar la dispersión.</strong> "El promedio es 50" no dice nada si los datos van de 0 a 100. Siempre acompañá el centro con una medida de dispersión (std o IQR).</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuándo conviene la mediana en vez de la media?</summary>
+<p>Cuando los datos están sesgados o tienen outliers (ingresos, precios). La media se deja arrastrar por valores extremos; la mediana solo mira la posición central, así que describe mejor el valor típico.</p></details>
+
+<details><summary>¿Por qué se separa el test set y por qué no hay que tocarlo antes de tiempo?</summary>
+<p>Porque es la única forma honesta de medir si el modelo generaliza a datos nuevos. Si lo mirás o usás para tomar decisiones antes del final, la evaluación queda contaminada y deja de reflejar el rendimiento real en producción.</p></details>
+
+<details><summary>¿Qué es data leakage y cómo se evita al escalar?</summary>
+<p>Es cuando información del test se filtra al train, inflando los resultados. Al escalar se evita haciendo <code>scaler.fit</code> solo con <code>X_train</code> y aplicando <code>.transform</code> a <code>X_test</code> con esos mismos valores — nunca ajustando sobre todo el dataset.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá una columna numérica de cualquier dataset y calculá media, mediana y moda. ¿Hay diferencia grande entre media y mediana? ¿Qué te dice sobre el sesgo?</li>
+  <li>Para esa misma columna, calculá std, Q1, Q3 e IQR. Detectá si hay outliers con la regla <code>Q1 − 1.5·IQR</code> / <code>Q3 + 1.5·IQR</code>.</li>
+  <li>Graficá el histograma de la columna (M05) y decidí a ojo si es normal, sesgada a la derecha o a la izquierda. Verificá comparando media vs mediana.</li>
+  <li>Calculá la matriz de correlación con <code>df.corr()</code> y elegí el par más correlacionado. Escribí una hipótesis: ¿es causalidad, o podría haber una tercera variable?</li>
+  <li>Hacé un <code>train_test_split</code> con <code>test_size=0.2</code>, <code>random_state=42</code> y <code>stratify=y</code> sobre un dataset con target categórico. Verificá con <code>y_train.value_counts(normalize=True)</code> que las proporciones de clase se mantienen en train y test.</li>
+</ol>
+
+<section class="quiz" id="quizDML06">
+  <style>
+    #quizDML06{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML06 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML06 .q{margin-bottom:1.5rem}
+    #quizDML06 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML06 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML06 .opt:hover{border-color:var(--accent)}
+    #quizDML06 .opt:disabled{cursor:default}
+    #quizDML06 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML06 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML06 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML06 .exp.show{display:block}
+    #quizDML06 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tenés sueldos con un par de valores muy altos (sesgo a la derecha). ¿Qué medida describe mejor el sueldo típico?</p>
+    <button class="opt">La media, siempre es la más precisa</button>
+    <button class="opt">La mediana, porque resiste los outliers</button>
+    <button class="opt">La varianza</button>
+    <div class="exp">La media se deja arrastrar por los valores extremos. La mediana solo mira la posición central, así que en distribuciones sesgadas describe mejor el valor típico.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Vas a normalizar tus features (restar media, dividir por std). ¿Cuál es la forma correcta de evitar data leakage?</p>
+    <button class="opt">Escalar todo el dataset y después hacer el split</button>
+    <button class="opt">Escalar solo el test set</button>
+    <button class="opt">Splitear primero, hacer <code>fit</code> solo con el train y aplicar <code>transform</code> al test</button>
+    <div class="exp">Cualquier transformación que aprende de los datos se ajusta solo con el train. Hacer <code>fit</code> sobre todo el dataset filtra información del test al train: eso es data leakage.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Las ventas de helado y los ahogamientos suben juntos en verano. ¿Qué conclusión es correcta?</p>
+    <button class="opt">Están correlacionados, pero el helado no causa los ahogamientos (una tercera variable, el calor, causa ambos)</button>
+    <button class="opt">El helado causa los ahogamientos</button>
+    <button class="opt">No puede haber correlación si no hay causalidad</button>
+    <div class="exp">Correlación no implica causalidad. Acá una tercera variable (el calor del verano) hace subir ambas cosas a la vez. Confundir esto es uno de los errores más caros en analítica.</div>
+  </div>
+
+  <div class="score" id="scoreDML06"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML06');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML06').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M07.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m05-visualizacion/lecture.html">← M05: Visualización</a>
+  <a href="../m07-ml-scikit-learn/lecture.html">M07: scikit-learn →</a>
+</nav>
+
+</div>
+</body>
+</html>

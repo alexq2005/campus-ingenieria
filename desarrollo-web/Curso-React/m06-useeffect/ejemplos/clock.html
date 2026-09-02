@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>clock.jsx · Curso de React</title>
+<meta name="description" content="useEffect con timer, listeners, sync con document — todos con cleanup correcto.">
+<link rel="stylesheet" href="../../assets/lecture.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"></script>
+<style>
+  .script-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }
+  .btn { background: var(--surface); border: 1px solid var(--border); color: var(--accent); padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-size: 0.9em; font-family: inherit; text-decoration: none; transition: all 0.15s; display: inline-flex; align-items: center; gap: 0.4rem; }
+  .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .btn.copied { background: var(--success); color: var(--bg); border-color: var(--success); }
+  article pre { max-height: 600px; overflow-y: auto; }
+  .hljs { background: var(--code-bg) !important; padding: 1.2rem !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../../index.html">← Curso de React</a>
+  <a href="../lecture.html">← Módulo 06</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">⚛️ clock.jsx</span>
+  <span class="badge">useEffect</span>
+  <span class="badge">~100 líneas</span>
+  <span class="badge">Módulo 06</span>
+</div>
+
+<article>
+
+<h1>clock.jsx — useEffect con timer + listeners + cleanup</h1>
+
+<p>Demuestra los 4 usos canónicos de useEffect: <strong>timer</strong> (setInterval), <strong>listener de window</strong> (resize), <strong>browser API</strong> (online/offline), y <strong>sincronización con document</strong> (title). TODOS con cleanup correcto.</p>
+
+<h2>¿Qué demuestra?</h2>
+
+<ul>
+  <li><code>useEffect(fn, [])</code> — corre solo al montar.</li>
+  <li><code>useEffect(fn, [hora])</code> — re-corre cuando hora cambia.</li>
+  <li>Cleanup function: <code>return () =&gt; clearInterval(id)</code>.</li>
+  <li>Sin cleanup → leaks (listeners zombies, timers que siguen).</li>
+  <li>En dev con StrictMode: el cleanup se llama 2 veces para detectar bugs.</li>
+</ul>
+
+<h2>Cómo ejecutarlo</h2>
+
+<pre><code class="language-bash">npm run dev
+# Reemplazá src/App.jsx
+# Abrí DevTools console para ver los logs del cleanup</code></pre>
+
+<h2>Código fuente</h2>
+
+<div class="script-actions">
+  <button class="btn" id="copyBtn">📋 Copiar</button>
+  <a class="btn" href="./clock.jsx" download>⬇ Descargar .jsx</a>
+  <a class="btn" href="./clock.jsx" target="_blank">🔗 Ver crudo</a>
+</div>
+
+<pre><code class="language-javascript" id="code">// clock.jsx — useEffect con cleanup, listeners y timer.
+
+import { useState, useEffect } from 'react';
+
+export default function App() {
+  const [hora, setHora] = useState(new Date());
+  const [width, setWidth] = useState(window.innerWidth);
+  const [online, setOnline] = useState(navigator.onLine);
+
+  // ─── Effect 1: timer con cleanup ───
+  useEffect(() =&gt; {
+    console.log('⏰ Iniciando timer');
+    const id = setInterval(() =&gt; setHora(new Date()), 1000);
+    return () =&gt; {
+      console.log('⏰ Cancelando timer');
+      clearInterval(id);
+    };
+  }, []);
+
+  // ─── Effect 2: resize listener con cleanup ───
+  useEffect(() =&gt; {
+    function handleResize() { setWidth(window.innerWidth); }
+    window.addEventListener('resize', handleResize);
+    return () =&gt; window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // ─── Effect 3: online/offline ───
+  useEffect(() =&gt; {
+    function onConnect() { setOnline(true); }
+    function onDisconnect() { setOnline(false); }
+    window.addEventListener('online', onConnect);
+    window.addEventListener('offline', onDisconnect);
+    return () =&gt; {
+      window.removeEventListener('online', onConnect);
+      window.removeEventListener('offline', onDisconnect);
+    };
+  }, []);
+
+  // ─── Effect 4: sincronizar title del documento ───
+  useEffect(() =&gt; {
+    document.title = `${hora.toLocaleTimeString()} — Clock`;
+    return () =&gt; { document.title = 'App'; };
+  }, [hora]);
+
+  return (
+    // ... JSX en el archivo completo
+  );
+}
+</code></pre>
+
+<h2>Por qué cleanup es OBLIGATORIO</h2>
+
+<table>
+<thead><tr><th>Sin cleanup</th><th>Consecuencia</th></tr></thead>
+<tbody>
+<tr><td><code>setInterval</code> sin <code>clearInterval</code></td><td>Timer sigue corriendo tras desmontar → "no podés setear estado de componente desmontado"</td></tr>
+<tr><td><code>addEventListener</code> sin <code>removeEventListener</code></td><td>Cada mount agrega otro listener → cientos zombies al navegar</td></tr>
+<tr><td>WebSocket sin close</td><td>Conexión sigue activa → memory leak en server</td></tr>
+<tr><td>fetch sin AbortController</td><td>Race condition al desmontar antes del response</td></tr>
+</tbody>
+</table>
+
+<div class="rule">Regla simple: si tu effect <strong>"prende" algo</strong> (listener, timer, subscription), el cleanup debe <strong>"apagarlo"</strong>.</div>
+
+<h2>StrictMode y doble-mount en dev</h2>
+
+<p>Cuando ejecutes esto en dev verás "Iniciando timer" + "Cancelando timer" + "Iniciando timer" en console. Es <strong>esperado</strong>: React 18+ con StrictMode monta-desmonta tu componente DOS veces para detectar effects sin cleanup. En producción solo corre 1 vez.</p>
+
+<h2>Variantes para probar</h2>
+
+<ol>
+  <li>Pausar/reanudar el timer con un botón.</li>
+  <li>Cambiar intervalo dinámicamente (cada 1s, 5s, 10s) usando <code>[intervalo]</code> como dep.</li>
+  <li>Agregar countdown desde N segundos a 0.</li>
+  <li>Mostrar tiempo desde último click (resetea al click).</li>
+  <li>Tracker de scroll position con <code>window.scrollY</code>.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../../m05-listas-y-keys/ejemplos/lista-tareas.html">← lista-tareas.jsx</a>
+  <a href="../../m08-custom-hooks/ejemplos/use-local-storage.html">Siguiente: use-local-storage.jsx →</a>
+</nav>
+
+</div>
+
+<script>
+  hljs.highlightAll();
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const code = document.getElementById('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      const btn = document.getElementById('copyBtn');
+      const o = btn.textContent;
+      btn.textContent = '✓ Copiado';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = o; btn.classList.remove('copied'); }, 2000);
+    } catch (e) {}
+  });
+</script>
+
+</body>
+</html>

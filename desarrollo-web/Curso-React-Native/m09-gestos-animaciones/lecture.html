@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 09 — Gestos & Animaciones · Curso de React Native</title>
+  <meta name="description" content="Por qué 60fps importa, el hilo de JS vs el de UI, la Animated API, Reanimated (useSharedValue, useAnimatedStyle, withTiming/withSpring) y gestos con gesture-handler.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React Native</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-React/index.html">⚛️ Curso de React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 09</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M05</span>
+</div>
+
+<article>
+
+<h1>Módulo 09 — Gestos & Animaciones</h1>
+
+<p>Una app móvil que no se mueve con fluidez se <em>siente</em> rota, aunque funcione. En este módulo vas a entender por qué hay animaciones que tironean y otras que fluyen como manteca, y cómo construir las segundas: arrastrar una tarjeta, escalar al tocar, deslizar para borrar. El secreto está en <strong>quién hace el trabajo</strong> y <strong>qué propiedades animás</strong>.</p>
+
+<h2>Por qué 60fps importa: el hilo de JS vs el hilo de UI</h2>
+
+<div class="concept">
+  <strong>💡 Una pantalla móvil se redibuja ~60 veces por segundo (60fps).</strong>
+  Eso da un presupuesto de <strong>16,6 ms por frame</strong> para calcular y pintar todo. Si te pasás de ese
+  tiempo, el frame se "salta" y el ojo lo percibe como un tirón (<em>jank</em>). Animación fluida = no perder frames.
+</div>
+
+<p>React Native corre con (al menos) dos hilos importantes:</p>
+
+<ul>
+  <li><strong>Hilo de JS</strong>: ejecuta tu código React, el estado, los <code>useEffect</code>, las llamadas a APIs… toda tu lógica.</li>
+  <li><strong>Hilo de UI</strong> (el "main thread" nativo): el que efectivamente <em>dibuja</em> los píxeles en la pantalla, frame a frame.</li>
+</ul>
+
+<div class="analogy">
+  <strong>🔍 Pensalo como una cocina:</strong> el hilo de UI es el mozo que lleva los platos a la mesa (60 viajes
+  por segundo, sin parar). El hilo de JS es el cocinero. Si para cada viaje el mozo tiene que esperar que el cocinero
+  termine de pensar, los platos llegan tarde y la mesa lo nota. Lo ideal: que el mozo ya sepa qué llevar y no
+  dependa del cocinero en cada viaje.
+</div>
+
+<p>Acá está el problema central: si animás moviendo estado de React (<code>setState</code> en cada frame), cada
+cambio obliga al hilo de JS a re-renderizar el componente, y recién después el hilo de UI puede dibujar. Si el hilo
+de JS está ocupado (cargando datos, procesando una lista), la animación <strong>se cuelga</strong>. El truco moderno
+es animar <em>directamente en el hilo de UI</em>, sin molestar a JS en cada frame.</p>
+
+<div class="mistake">
+  <strong>Animar con <code>setState</code>.</strong> Hacer <code>setOpacidad(o + 0.05)</code> 60 veces por segundo
+  dispara 60 re-renders por segundo. Cada re-render compite con el resto de tu lógica → tironeo garantizado en
+  cuanto la app tenga algo más que hacer.
+</div>
+
+<h2>La Animated API (built-in): para entender el concepto</h2>
+
+<p>React Native trae una API de animación incluida, sin instalar nada: <code>Animated</code>. No es la mejor opción
+hoy, pero es perfecta para entender las <strong>tres piezas</strong> que toda animación necesita: un valor que cambia,
+una instrucción de cómo cambiarlo, y un componente que lo escucha.</p>
+
+<pre><code class="lang-jsx">import { useRef } from 'react';
+import { Animated, View, Pressable, Text, StyleSheet } from 'react-native';
+
+export default function App() {
+  // 1. Un valor animable que NO vive en el estado de React (por eso useRef).
+  const opacidad = useRef(new Animated.Value(0)).current;
+
+  const aparecer = () =&gt; {
+    // 2. La instrucción: llevá "opacidad" a 1 en 500 ms.
+    Animated.timing(opacidad, {
+      toValue: 1,
+      duration: 500,
+      useNativeDriver: true, // ⬅️ clave: corre en el hilo de UI
+    }).start();
+  };
+
+  return (
+    &lt;View style={styles.container}&gt;
+      {/* 3. Animated.View escucha el valor y se redibuja solo. */}
+      &lt;Animated.View style={[styles.caja, { opacity: opacidad }]} /&gt;
+      &lt;Pressable onPress={aparecer}&gt;
+        &lt;Text&gt;Mostrar&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 24 },
+  caja: { width: 120, height: 120, backgroundColor: '#a78bfa', borderRadius: 16 },
+});</code></pre>
+
+<div class="info">
+  <strong>¿Por qué <code>useRef</code> y no <code>useState</code>?</strong> El valor animado cambia decenas de veces
+  por segundo. Si fuera estado, cada cambio re-renderizaría el componente. Con <code>useRef</code> el valor persiste
+  entre renders <em>sin</em> provocar re-renders, y <code>Animated.View</code> se encarga de actualizar el píxel.
+</div>
+
+<div class="rule">
+  <strong>📌 <code>useNativeDriver: true</code> es lo que manda la animación al hilo de UI.</strong> Funciona solo
+  para <code>opacity</code> y <code>transform</code> (mover, rotar, escalar). NO funciona para <code>width</code>,
+  <code>height</code> ni colores de fondo — esas obligan a volver al hilo de JS y a recalcular el layout.
+</div>
+
+<h2>El estándar moderno: Reanimated</h2>
+
+<p>Para apps reales, hoy se usa <strong>react-native-reanimated</strong>. Su gran idea: tu código de animación corre
+<em>entero en el hilo de UI</em>, así que sigue fluido aunque el hilo de JS esté trabado. La API es más declarativa y
+se siente como hooks de React.</p>
+
+<pre><code class="lang-bash">npx expo install react-native-reanimated react-native-gesture-handler</code></pre>
+
+<p>Las tres piezas equivalentes a las de <code>Animated</code>, pero más limpias:</p>
+
+<table>
+<thead><tr><th>Pieza</th><th>En Reanimated</th><th>Para qué sirve</th></tr></thead>
+<tbody>
+<tr><td>El valor que cambia</td><td><code>useSharedValue(inicial)</code></td><td>Valor que vive en el hilo de UI, compartido entre JS y UI</td></tr>
+<tr><td>Conectar valor → estilo</td><td><code>useAnimatedStyle(() =&gt; ...)</code></td><td>Devuelve un estilo que se recalcula en UI cuando el valor cambia</td></tr>
+<tr><td>Cómo animar el cambio</td><td><code>withTiming</code> / <code>withSpring</code></td><td>Transición por duración fija / por física de resorte</td></tr>
+</tbody>
+</table>
+
+<p>Mismo ejemplo del fade, ahora con Reanimated:</p>
+
+<pre><code class="lang-jsx">import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+} from 'react-native-reanimated';
+import { View, Pressable, Text, StyleSheet } from 'react-native';
+
+export default function App() {
+  // 1. El valor compartido (vive en el hilo de UI).
+  const opacidad = useSharedValue(0);
+
+  // 2. El estilo derivado: se recalcula en UI cuando "opacidad" cambia.
+  const estiloCaja = useAnimatedStyle(() =&gt; ({
+    opacity: opacidad.value,
+  }));
+
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Animated.View style={[styles.caja, estiloCaja]} /&gt;
+      {/* 3. Al tocar, animamos el valor con withTiming. */}
+      &lt;Pressable onPress={() =&gt; (opacidad.value = withTiming(1, { duration: 500 }))}&gt;
+        &lt;Text&gt;Mostrar&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 24 },
+  caja: { width: 120, height: 120, backgroundColor: '#a78bfa', borderRadius: 16 },
+});</code></pre>
+
+<div class="info">
+  <strong>Fijate el detalle clave:</strong> a un shared value se lo lee y escribe con <code>.value</code>
+  (<code>opacidad.value = ...</code>), no con un setter. Y como todo corre en el hilo de UI, la animación sigue
+  fluida aunque tu app esté cargando una lista enorme al mismo tiempo.
+</div>
+
+<div class="concept">
+  <strong>💡 <code>withTiming</code> vs <code>withSpring</code>.</strong>
+  <code>withTiming(valor, { duration })</code> recorre el cambio en un tiempo exacto (lineal o con curva), bueno para
+  fades y transiciones predecibles. <code>withSpring(valor)</code> usa una simulación de <em>resorte</em>: rebota un
+  poquito y se asienta, dando esa sensación "viva" y natural típica de iOS. Para interacciones táctiles, casi siempre
+  querés <code>withSpring</code>.
+</div>
+
+<h2>Gestos: react-native-gesture-handler</h2>
+
+<p>Animar está bueno, pero lo que hace que una app se sienta nativa es <strong>responder al dedo</strong>: arrastrar,
+tocar, deslizar. Para eso se usa <strong>react-native-gesture-handler</strong>, que detecta gestos también en el hilo
+de UI y se combina de maravilla con Reanimated.</p>
+
+<div class="step"><strong>1. Envolvé tu app</strong> con <code>GestureHandlerRootView</code> una sola vez, en la raíz.</div>
+<div class="step"><strong>2. Creá un gesto</strong> con <code>Gesture.Pan()</code> (arrastrar) o <code>Gesture.Tap()</code> (tocar).</div>
+<div class="step"><strong>3. Conectá</strong> el gesto a la vista con <code>&lt;GestureDetector&gt;</code>, y dentro un <code>Animated.View</code>.</div>
+
+<p>Acá una caja que <strong>escala con resorte al tocarla</strong> y se puede <strong>arrastrar</strong>:</p>
+
+<pre><code class="lang-jsx">import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+} from 'react-native-reanimated';
+import { StyleSheet } from 'react-native';
+
+export default function App() {
+  const x = useSharedValue(0);
+  const y = useSharedValue(0);
+  const escala = useSharedValue(1);
+
+  // Tocar → escala con resorte y vuelve.
+  const tap = Gesture.Tap().onBegin(() =&gt; {
+    escala.value = withSpring(1.3);
+  }).onFinalize(() =&gt; {
+    escala.value = withSpring(1);
+  });
+
+  // Arrastrar → seguir el dedo en tiempo real.
+  const pan = Gesture.Pan().onChange((e) =&gt; {
+    x.value += e.changeX;
+    y.value += e.changeY;
+  });
+
+  // Combinamos ambos gestos en uno solo.
+  const gestos = Gesture.Simultaneous(tap, pan);
+
+  const estilo = useAnimatedStyle(() =&gt; ({
+    transform: [
+      { translateX: x.value },
+      { translateY: y.value },
+      { scale: escala.value },
+    ],
+  }));
+
+  return (
+    &lt;GestureHandlerRootView style={styles.container}&gt;
+      &lt;GestureDetector gesture={gestos}&gt;
+        &lt;Animated.View style={[styles.caja, estilo]} /&gt;
+      &lt;/GestureDetector&gt;
+    &lt;/GestureHandlerRootView&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  caja: { width: 120, height: 120, backgroundColor: '#a78bfa', borderRadius: 16 },
+});</code></pre>
+
+<div class="analogy">
+  <strong>🔍 El "swipe to delete" que ves en todos lados</strong> (deslizar un mail a la izquierda para borrarlo) es
+  exactamente esto: un <code>Gesture.Pan()</code> que mueve la fila con <code>translateX</code>, y cuando el
+  desplazamiento pasa un umbral, dispara la acción de borrado. Componentes como <code>Swipeable</code> de
+  gesture-handler ya lo empaquetan, pero por dentro es Pan + shared value + un estilo animado.
+</div>
+
+<div class="rule">
+  <strong>📌 Gestos + Reanimated van de la mano.</strong> El gesto actualiza un <code>useSharedValue</code> en el
+  hilo de UI, y <code>useAnimatedStyle</code> lo refleja en el píxel sin pasar por JS. Por eso arrastrar se siente
+  pegado al dedo, sin lag.
+</div>
+
+<h2>Qué propiedades animar (y cuáles no)</h2>
+
+<p>Aunque animes en el hilo de UI, no todas las propiedades cuestan lo mismo. Animar <code>transform</code> y
+<code>opacity</code> es barato: la GPU las compone sin recalcular nada. Animar <code>width</code>,
+<code>height</code>, <code>top</code> o <code>padding</code> obliga al motor a <strong>recalcular el layout</strong>
+de todo lo que está alrededor, frame a frame.</p>
+
+<div class="mistake">
+  <strong>Animar layout en vez de transform.</strong> Para "agrandar" una caja, NO animes <code>width</code>/<code>height</code>:
+  animá <code>scale</code>. Para moverla, NO animes <code>top</code>/<code>left</code>: animá <code>translateX</code>/<code>translateY</code>.
+  El resultado visual es casi igual, pero el costo en frames es muchísimo menor.
+</div>
+
+<h2>Animated vs Reanimated: cuándo usar cada uno</h2>
+
+<table>
+<thead><tr><th>Criterio</th><th>Animated (built-in)</th><th>Reanimated</th></tr></thead>
+<tbody>
+<tr><td>Instalación</td><td>Ya viene en RN</td><td>Hay que instalarlo</td></tr>
+<tr><td>Dónde corre</td><td>Híbrido (JS + UI con <code>useNativeDriver</code>)</td><td>Todo en el hilo de UI</td></tr>
+<tr><td>Gestos en vivo</td><td>Difícil / con lag</td><td>Fluido, integrado con gesture-handler</td></tr>
+<tr><td>Curva de aprendizaje</td><td>Simple para lo básico</td><td>Un poco más, pero más poderoso</td></tr>
+<tr><td>Recomendado para…</td><td>Animaciones simples, entender el concepto</td><td>Apps reales, gestos, todo lo serio</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla práctica:</strong> usá <code>Animated</code> para entender cómo funciona una animación y para un
+  fade puntual sin dependencias. Para todo lo demás —y especialmente cualquier cosa que involucre el dedo del
+  usuario— usá <strong>Reanimated + gesture-handler</strong>.
+</div>
+
+<div class="warn">
+  <strong>⚠️ No abuses de las animaciones.</strong> El movimiento debe <em>guiar</em> al usuario (de dónde vino algo,
+  a dónde va), no marearlo. Animaciones cortas (200–400 ms) y con propósito. Si todo rebota y vuela, la app se siente
+  caótica, no pulida.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué animar con <code>setState</code> produce tirones?</summary>
+<p>Porque cada cambio de estado dispara un re-render en el <strong>hilo de JS</strong>. A 60 frames por segundo son 60 re-renders, que compiten con el resto de tu lógica. Si el hilo de JS se traba, la animación se cuelga. Reanimated evita esto corriendo la animación en el <strong>hilo de UI</strong>, sin tocar el estado de React.</p></details>
+
+<details><summary>¿Qué hace <code>useSharedValue</code> y cómo se lee/escribe?</summary>
+<p>Crea un valor que vive en el hilo de UI y es compartido entre JS y UI. Se accede con <code>.value</code> (por ejemplo <code>x.value = withSpring(100)</code>). Cambiarlo no provoca re-renders: lo escucha <code>useAnimatedStyle</code>, que recalcula el estilo directamente en UI.</p></details>
+
+<details><summary>¿Por qué conviene animar <code>transform</code>/<code>opacity</code> y no <code>width</code>/<code>height</code>?</summary>
+<p>Porque <code>transform</code> y <code>opacity</code> las compone la GPU sin recalcular el layout, así que son baratas frame a frame. Animar <code>width</code>, <code>height</code> o posiciones de layout obliga a recalcular el acomodo de todo lo de alrededor en cada frame, lo que consume el presupuesto de 16,6 ms y causa jank.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instalá <code>react-native-reanimated</code> y <code>react-native-gesture-handler</code> con <code>npx expo install</code> y envolvé tu app en <code>GestureHandlerRootView</code>.</li>
+  <li>Hacé una caja que aparezca con un fade (<code>opacity</code> de 0 a 1) usando <code>useSharedValue</code> + <code>withTiming</code> al apretar un botón.</li>
+  <li>Cambiá ese <code>withTiming</code> por <code>withSpring</code> en una caja que escale al tocarla, y sentí la diferencia del rebote.</li>
+  <li>Implementá una caja arrastrable con <code>Gesture.Pan()</code> que siga el dedo usando <code>translateX</code>/<code>translateY</code>.</li>
+  <li>Combiná Pan + Tap con <code>Gesture.Simultaneous</code>: que la caja se pueda arrastrar y, al tocarla, escale con resorte y vuelva a su tamaño al soltar.</li>
+</ol>
+
+<section class="quiz" id="quizRN09">
+  <style>
+    #quizRN09{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRN09 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRN09 .q{margin-bottom:1.5rem}
+    #quizRN09 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRN09 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRN09 .opt:hover{border-color:var(--accent)}
+    #quizRN09 .opt:disabled{cursor:default}
+    #quizRN09 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRN09 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRN09 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRN09 .exp.show{display:block}
+    #quizRN09 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Por qué Reanimated produce animaciones más fluidas que animar con <code>setState</code>?</p>
+    <button class="opt">Porque usa menos memoria que el estado de React</button>
+    <button class="opt">Porque corre la animación en el <strong>hilo de UI</strong>, sin re-renderizar en el hilo de JS cada frame</button>
+    <button class="opt">Porque baja la pantalla a 30fps para ahorrar trabajo</button>
+    <div class="exp">Animar con <code>setState</code> dispara un re-render por frame en el hilo de JS. Reanimated mueve la animación al hilo de UI, así sigue fluida aunque JS esté ocupado.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. En Reanimated, ¿cómo se lee y escribe un <code>useSharedValue</code>?</p>
+    <button class="opt">Con un setter, como <code>setX(100)</code></button>
+    <button class="opt">Directamente como variable, <code>x = 100</code></button>
+    <button class="opt">Con la propiedad <code>.value</code>, por ejemplo <code>x.value = withSpring(100)</code></button>
+    <div class="exp">A un shared value se accede siempre con <code>.value</code>. Cambiarlo no provoca re-renders; lo escucha <code>useAnimatedStyle</code> y actualiza el estilo en el hilo de UI.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Para mover y agrandar una caja de forma fluida, ¿qué propiedades conviene animar?</p>
+    <button class="opt"><code>transform</code> (translate, scale) y <code>opacity</code></button>
+    <button class="opt"><code>width</code>, <code>height</code> y <code>top</code></button>
+    <button class="opt">Da igual, todas cuestan lo mismo</button>
+    <div class="exp"><code>transform</code> y <code>opacity</code> las compone la GPU sin recalcular el layout. Animar <code>width</code>/<code>height</code>/<code>top</code> obliga a recalcular el acomodo cada frame y causa jank.</div>
+  </div>
+
+  <div class="score" id="scoreRN09"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRN09');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRN09').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M10.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m08-apis-dispositivo/lecture.html">← M08: APIs del Dispositivo</a>
+  <a href="../m10-estado-global/lecture.html">M10: Estado Global →</a>
+</nav>
+
+</div>
+</body>
+</html>

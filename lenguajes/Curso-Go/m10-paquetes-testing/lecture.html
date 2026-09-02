@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 10 — Paquetes, Módulos &amp; Testing · Curso de Go</title>
+  <meta name="description" content="Organizar código en paquetes, visibilidad por mayúscula, módulos con go.mod/go.sum, y el testing built-in de Go: nombre_test.go, table-driven tests y benchmarks.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 10</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M02</span>
+</div>
+
+<article>
+
+<h1>Módulo 10 — Paquetes, Módulos &amp; Testing</h1>
+
+<p>Hasta acá escribiste todo en un solo archivo <code>main.go</code>. Eso no escala: un proyecto real tiene decenas de archivos repartidos en carpetas, depende de librerías de terceros, y necesita una red de seguridad de tests que avise cuando algo se rompe. En este módulo armás esa estructura: <strong>paquetes</strong> para organizar, <strong>módulos</strong> para manejar dependencias, y el <strong>testing built-in</strong> de Go para validar tu código sin instalar ningún framework.</p>
+
+<h2>Paquetes: organizar el código en carpetas</h2>
+
+<p>En Go, <strong>cada carpeta es un paquete</strong>. Todos los archivos <code>.go</code> de una misma carpeta declaran el mismo <code>package</code> en su primera línea y comparten un espacio de nombres: pueden verse entre sí sin importarse. Una estructura típica:</p>
+
+<pre><code class="lang-bash">miapp/
+├── go.mod
+├── main.go              # package main
+├── calculadora/
+│   ├── suma.go          # package calculadora
+│   └── resta.go         # package calculadora
+└── formato/
+    └── moneda.go        # package formato</code></pre>
+
+<p>Para usar algo de otro paquete, lo importás por su <em>ruta de import</em> (el nombre del módulo + la carpeta):</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "fmt"
+
+    "ejemplo.com/miapp/calculadora"
+)
+
+func main() {
+    fmt.Println(calculadora.Suma(2, 3)) // calificás con el nombre del paquete
+}</code></pre>
+
+<h2>Visibilidad: la Mayúscula manda</h2>
+
+<div class="concept">
+  <strong>💡 No hay <code>public</code> ni <code>private</code> en Go.</strong> La regla es una sola y se ve a simple vista: un identificador que empieza con <strong>Mayúscula</strong> es <strong>exportado</strong> (visible desde otros paquetes); uno que empieza con <strong>minúscula</strong> es <strong>privado</strong> al paquete que lo define. Esto aplica a funciones, tipos, structs, campos, métodos y constantes.
+</div>
+
+<pre><code class="lang-go">package calculadora
+
+// Suma es EXPORTADA: otros paquetes pueden llamar calculadora.Suma()
+func Suma(a, b int) int {
+    return sumarInterno(a, b)
+}
+
+// sumarInterno es privada: solo se usa DENTRO del paquete calculadora
+func sumarInterno(a, b int) int {
+    return a + b
+}</code></pre>
+
+<div class="info">
+  La misma regla decide qué campos de un <code>struct</code> son visibles. <code>type Usuario struct { Nombre string; clave string }</code> expone <code>Nombre</code> hacia afuera pero <code>clave</code> queda invisible (y por eso no se serializa a JSON automáticamente). Es el mecanismo de encapsulamiento de Go: el nombre <em>es</em> el modificador de acceso.
+</div>
+
+<h2>Módulos: manejar dependencias</h2>
+
+<p>Un proyecto Go moderno es un <strong>módulo</strong>. Lo iniciás una sola vez en la raíz del proyecto:</p>
+
+<pre><code class="lang-bash">go mod init ejemplo.com/miapp</code></pre>
+
+<p>Eso crea el archivo <code>go.mod</code>, que declara el nombre del módulo, la versión mínima de Go y las dependencias:</p>
+
+<pre><code class="lang-go">module ejemplo.com/miapp
+
+go 1.23
+
+require github.com/google/uuid v1.6.0</code></pre>
+
+<table>
+<thead><tr><th>Archivo / comando</th><th>Para qué sirve</th></tr></thead>
+<tbody>
+<tr><td><code>go.mod</code></td><td>Nombre del módulo, versión de Go y lista de dependencias directas (<code>require</code>).</td></tr>
+<tr><td><code>go.sum</code></td><td>Checksums criptográficos de cada dependencia (y sus dependencias). Garantiza que bajás <em>exactamente</em> el mismo código siempre. Se versiona en git.</td></tr>
+<tr><td><code>go get url@version</code></td><td>Agrega o actualiza una dependencia de terceros y la anota en <code>go.mod</code>/<code>go.sum</code>.</td></tr>
+<tr><td><code>go mod tidy</code></td><td>Sincroniza <code>go.mod</code>: agrega lo que importás y falta, elimina lo que ya no usás.</td></tr>
+</tbody>
+</table>
+
+<div class="step"><strong>1.</strong> Agregás una librería de terceros:</div>
+
+<pre><code class="lang-bash">go get github.com/google/uuid</code></pre>
+
+<div class="step"><strong>2.</strong> La usás en tu código importándola por su ruta:</div>
+
+<pre><code class="lang-go">import "github.com/google/uuid"
+
+func main() {
+    id := uuid.New()
+    fmt.Println(id.String())
+}</code></pre>
+
+<div class="step"><strong>3.</strong> Antes de commitear, dejás todo prolijo:</div>
+
+<pre><code class="lang-bash">go mod tidy   # agrega lo que falta, borra lo que sobra</code></pre>
+
+<div class="tip">
+  <strong>✅ Hábito sano:</strong> corré <code>go mod tidy</code> antes de cada commit. Mantiene <code>go.mod</code> reflejando exactamente lo que tu código importa, ni más ni menos. Un <code>go.mod</code> con dependencias fantasma es ruido que confunde a quien lea el proyecto.
+</div>
+
+<h2>Testing built-in: sin frameworks</h2>
+
+<p>Go trae el testing <strong>en la librería estándar y en la herramienta <code>go test</code></strong>. No instalás Jest, ni pytest, ni JUnit: la convención es el framework. Las reglas:</p>
+
+<ul>
+  <li>Los tests viven en archivos que terminan en <code>_test.go</code> (ej: <code>suma_test.go</code>), en la <strong>misma carpeta</strong> que el código que prueban.</li>
+  <li>Cada test es una función <code>func TestXxx(t *testing.T)</code> — empieza con <code>Test</code> y mayúscula, recibe un <code>*testing.T</code>.</li>
+  <li>Importás el paquete <code>"testing"</code> de la stdlib.</li>
+  <li>Un test <strong>falla</strong> cuando llamás a un método de error de <code>t</code>; si no llamás a ninguno, <strong>pasa</strong>.</li>
+</ul>
+
+<table>
+<thead><tr><th>Método</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>t.Errorf(...)</code></td><td>Marca el test como fallido y sigue ejecutando el resto del test.</td></tr>
+<tr><td><code>t.Fatalf(...)</code></td><td>Marca el test como fallido y <strong>corta</strong> ese test ahí mismo (útil si lo que sigue no tiene sentido sin lo anterior).</td></tr>
+<tr><td><code>t.Run("nombre", fn)</code></td><td>Crea un <em>subtest</em> con nombre propio (clave para los table-driven tests).</td></tr>
+</tbody>
+</table>
+
+<p>Para correrlos:</p>
+
+<pre><code class="lang-bash">go test              # corre los tests del paquete actual
+go test ./...        # corre TODOS los tests del módulo, recursivo
+go test -v           # modo verbose: muestra cada test y su resultado
+go test -cover       # muestra el % de cobertura del código</code></pre>
+
+<h2>Table-driven tests: el patrón idiomático</h2>
+
+<div class="concept">
+  <strong>💡 El patrón estrella de Go.</strong> En vez de copiar/pegar la misma lógica de aserción una vez por cada caso, definís un <strong>slice de structs</strong> con <code>{entrada, esperado}</code> y recorrés los casos con un <code>for</code>. Agregar un caso nuevo es agregar una línea a la tabla. Combinado con <code>t.Run</code>, cada caso aparece nombrado en la salida.
+</div>
+
+<p>Primero, la función a probar (en <code>calculadora/suma.go</code>):</p>
+
+<pre><code class="lang-go">package calculadora
+
+// Suma devuelve a + b.
+func Suma(a, b int) int {
+    return a + b
+}</code></pre>
+
+<p>Ahora su test table-driven (en <code>calculadora/suma_test.go</code>):</p>
+
+<pre><code class="lang-go">package calculadora
+
+import "testing"
+
+func TestSuma(t *testing.T) {
+    casos := []struct {
+        nombre   string
+        a, b     int
+        esperado int
+    }{
+        {"positivos", 2, 3, 5},
+        {"con cero", 7, 0, 7},
+        {"negativos", -4, -6, -10},
+        {"mixto", -5, 5, 0},
+    }
+
+    for _, c := range casos {
+        t.Run(c.nombre, func(t *testing.T) {
+            got := Suma(c.a, c.b)
+            if got != c.esperado {
+                t.Errorf("Suma(%d, %d) = %d; esperado %d",
+                    c.a, c.b, got, c.esperado)
+            }
+        })
+    }
+}</code></pre>
+
+<p>Al correr <code>go test -v</code> verías cada subtest por separado:</p>
+
+<pre><code class="lang-bash">=== RUN   TestSuma
+=== RUN   TestSuma/positivos
+=== RUN   TestSuma/con_cero
+=== RUN   TestSuma/negativos
+=== RUN   TestSuma/mixto
+--- PASS: TestSuma (0.00s)
+    --- PASS: TestSuma/positivos (0.00s)
+    --- PASS: TestSuma/con_cero (0.00s)
+    --- PASS: TestSuma/negativos (0.00s)
+    --- PASS: TestSuma/mixto (0.00s)
+PASS</code></pre>
+
+<div class="analogy">
+  <strong>🔗 Pensalo como una planilla.</strong> Cada fila de la tabla es un caso de prueba con sus columnas (entrada → salida esperada). El <code>for</code> es el "revisor" que recorre la planilla fila por fila y marca con rojo solo las que no cuadran. Para sumar un caso nuevo no tocás la lógica del revisor: agregás una fila.
+</div>
+
+<h2>Benchmarks (mención breve)</h2>
+
+<p>Además de tests, <code>go test</code> sabe medir <strong>rendimiento</strong>. Un benchmark es una función <code>func BenchmarkXxx(b *testing.B)</code> que repite el código <code>b.N</code> veces; Go ajusta <code>b.N</code> hasta tener una medición estable.</p>
+
+<pre><code class="lang-go">func BenchmarkSuma(b *testing.B) {
+    for i := 0; i &lt; b.N; i++ {
+        Suma(2, 3)
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">go test -bench=.    # corre los benchmarks del paquete</code></pre>
+
+<h2>Errores frecuentes</h2>
+
+<div class="mistake"><strong>Esperar que un identificador en minúscula sea accesible desde otro paquete.</strong> Si tu función se llama <code>suma</code> (minúscula), <code>calculadora.suma()</code> NO compila desde afuera: es privada. Para exportarla, renombrala a <code>Suma</code>.</div>
+<div class="mistake"><strong>Poner los tests fuera de un archivo <code>_test.go</code>.</strong> Si tu función <code>TestSuma</code> vive en <code>suma.go</code> en lugar de <code>suma_test.go</code>, <code>go test</code> no la encuentra (y peor: terminaría compilada dentro de tu binario de producción).</div>
+<div class="mistake"><strong>Un test que nunca llama a <code>t.Errorf</code> / <code>t.Fatalf</code>.</strong> Si calculás el resultado pero no lo comparás contra lo esperado (o comparás y no marcás el error), el test <em>siempre pasa</em>: no prueba nada. La señal de fallo en Go es llamar a un método de error de <code>t</code>.</div>
+
+<div class="warn">
+  <strong>⚠️ Cuidado con la variable del loop en versiones viejas de Go.</strong> Antes de Go 1.22, la variable <code>c</code> del <code>for</code> se reutilizaba entre iteraciones y los subtests paralelos podían leer el caso equivocado. Desde Go 1.22 cada iteración tiene su propia copia, así que el patrón de arriba es seguro. Si trabajás con un módulo declarado en <code>go 1.21</code> o menos, copiá <code>c := c</code> dentro del loop por las dudas.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cómo decidís en Go si una función es pública o privada?</summary>
+<p>Por la primera letra de su nombre. Mayúscula inicial = exportada (pública, visible desde otros paquetes). Minúscula inicial = privada al paquete. No hay palabras clave <code>public</code>/<code>private</code>: el nombre es el modificador de acceso.</p></details>
+
+<details><summary>¿Para qué sirven <code>go.mod</code>, <code>go.sum</code> y <code>go mod tidy</code>?</summary>
+<p><code>go.mod</code> declara el nombre del módulo, la versión de Go y las dependencias directas. <code>go.sum</code> guarda los checksums para garantizar que bajás siempre el mismo código. <code>go mod tidy</code> sincroniza <code>go.mod</code>: agrega lo que importás y falta, y elimina lo que ya no usás.</p></details>
+
+<details><summary>¿Qué es un table-driven test y por qué es idiomático?</summary>
+<p>Es definir un slice de structs con los casos <code>{entrada, esperado}</code> y recorrerlos con un <code>for</code>, usando <code>t.Run</code> para nombrar cada subtest. Es idiomático porque evita duplicar la lógica de aserción: agregar un caso nuevo es agregar una fila a la tabla, no copiar/pegar un bloque entero.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un módulo con <code>go mod init ejemplo.com/practica</code> y mirá el <code>go.mod</code> generado.</li>
+  <li>Movés una función a un paquete <code>calculadora/</code> (carpeta propia, <code>package calculadora</code>) e importala desde <code>main</code>. Hacela exportada con mayúscula inicial.</li>
+  <li>Probá renombrar esa función a minúscula y observá el error de compilación al usarla desde <code>main</code> (visibilidad en acción).</li>
+  <li>Escribí un test table-driven para una función <code>EsPar(n int) bool</code>, con al menos 4 casos y <code>t.Run</code> por caso. Corrélo con <code>go test -v</code>.</li>
+  <li>Agregá <code>github.com/google/uuid</code> con <code>go get</code>, generá un UUID, y después corré <code>go mod tidy</code> y mirá cómo quedan <code>go.mod</code> y <code>go.sum</code>.</li>
+</ol>
+
+<section class="quiz" id="quizGo10">
+  <style>
+    #quizGo10{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo10 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo10 .q{margin-bottom:1.5rem}
+    #quizGo10 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo10 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo10 .opt:hover{border-color:var(--accent)}
+    #quizGo10 .opt:disabled{cursor:default}
+    #quizGo10 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo10 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo10 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo10 .exp.show{display:block}
+    #quizGo10 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. En Go, ¿qué hace que <code>Calcular</code> sea accesible desde otro paquete pero <code>calcular</code> no?</p>
+    <button class="opt">La palabra clave <code>public</code> antes de la función</button>
+    <button class="opt">La Mayúscula inicial: identificadores con mayúscula son exportados, con minúscula son privados al paquete</button>
+    <button class="opt">Tenés que listarla en el <code>go.mod</code></button>
+    <div class="exp">Go no tiene <code>public</code>/<code>private</code>. La visibilidad la decide la primera letra: mayúscula = exportado, minúscula = privado al paquete. Aplica a funciones, tipos, campos y constantes.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Dónde tienen que vivir las funciones de test para que <code>go test</code> las encuentre?</p>
+    <button class="opt">En un archivo <code>tests.go</code> en la raíz del módulo</button>
+    <button class="opt">En cualquier archivo, mientras la función empiece con <code>Test</code></button>
+    <button class="opt">En un archivo terminado en <code>_test.go</code>, en la misma carpeta que el código que prueban</button>
+    <div class="exp">Los tests van en archivos <code>*_test.go</code> junto al código. Así <code>go test</code> los compila solo durante el testeo y no terminan dentro de tu binario de producción.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué define a un table-driven test?</p>
+    <button class="opt">Un slice de structs <code>{entrada, esperado}</code> recorrido con un <code>for</code>, usando <code>t.Run</code> por caso</button>
+    <button class="opt">Una función por cada caso de prueba, todas copiadas a mano</button>
+    <button class="opt">Un framework externo que genera los casos automáticamente</button>
+    <div class="exp">El patrón idiomático: definís la tabla de casos como slice de structs y la recorrés con un <code>for</code>, nombrando cada subtest con <code>t.Run</code>. Agregar un caso nuevo es agregar una fila, sin duplicar lógica.</div>
+  </div>
+
+  <div class="score" id="scoreGo10"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo10');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo10').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M11.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m09-concurrencia-avanzada/lecture.html">← M09: Concurrencia Avanzada</a>
+  <a href="../m11-http-api/lecture.html">M11: API REST →</a>
+</nav>
+
+</div>
+</body>
+</html>

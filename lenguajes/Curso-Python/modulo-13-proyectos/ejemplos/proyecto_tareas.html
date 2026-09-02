@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>proyecto_tareas.py · Curso de Python</title>
+  <meta name="description" content="Gestor de tareas CLI con persistencia JSON — Proyecto 1 del curso de Python.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+  <style>
+    .script-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }
+    .btn {
+      background: var(--surface); border: 1px solid var(--border); color: var(--accent);
+      padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-size: 0.9em;
+      font-family: inherit; text-decoration: none; transition: all 0.15s;
+      display: inline-flex; align-items: center; gap: 0.4rem;
+    }
+    .btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .btn.copied { background: var(--success); color: var(--bg); border-color: var(--success); }
+    article pre { max-height: 600px; overflow-y: auto; }
+    .hljs { background: var(--code-bg) !important; padding: 1.2rem !important; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../../index.html">← Curso de Python</a>
+  <a href="../lecture.html">← Módulo 13</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">🐍 proyecto_tareas.py</span>
+  <span class="badge">Python</span>
+  <span class="badge">~120 líneas</span>
+  <span class="badge">Proyecto 1 del Módulo 13</span>
+</div>
+
+<article>
+
+<h1>proyecto_tareas.py — Gestor de tareas CLI</h1>
+
+<p>CLI completa para manejar una lista de tareas con persistencia en JSON. Combina <code>argparse</code> con subcomandos, <code>@dataclass</code>, manejo de errores robusto y operaciones idempotentes.</p>
+
+<h2>Comandos disponibles</h2>
+
+<pre><code class="language-bash">python proyecto_tareas.py add "Comprar pan"     # agregar tarea
+python proyecto_tareas.py list                  # listar todas
+python proyecto_tareas.py done 1                # marcar #1 como hecha
+python proyecto_tareas.py rm 2                  # eliminar #2
+python proyecto_tareas.py clear                 # eliminar todas
+
+# Las tareas se guardan en ~/.tareas.json</code></pre>
+
+<h2>Ejemplo de sesión</h2>
+
+<pre><code class="language-bash">$ python proyecto_tareas.py add "Estudiar Python"
+✓ Tarea #1 agregada
+
+$ python proyecto_tareas.py add "Comprar leche"
+✓ Tarea #2 agregada
+
+$ python proyecto_tareas.py list
+  1  [ ] Estudiar Python
+  2  [ ] Comprar leche
+
+$ python proyecto_tareas.py done 1
+✓ Tarea #1 completada
+
+$ python proyecto_tareas.py list
+  1  [x] Estudiar Python
+  2  [ ] Comprar leche</code></pre>
+
+<h2>Código fuente</h2>
+
+<div class="script-actions">
+  <button class="btn" id="copyBtn">📋 Copiar código</button>
+  <a class="btn" href="./proyecto_tareas.py" download>⬇ Descargar .py</a>
+</div>
+
+<pre><code class="language-python" id="code">"""Proyecto 1: Gestor de Tareas CLI.
+
+Uso:
+    python proyecto_tareas.py add "Comprar pan"
+    python proyecto_tareas.py list
+    python proyecto_tareas.py done 1
+    python proyecto_tareas.py rm 1
+    python proyecto_tareas.py clear
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+ARCHIVO = Path.home() / ".tareas.json"
+
+
+@dataclass
+class Tarea:
+    id: int
+    descripcion: str
+    completada: bool = False
+    creada: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+def cargar() -&gt; list[Tarea]:
+    if not ARCHIVO.exists():
+        return []
+    try:
+        data = json.loads(ARCHIVO.read_text(encoding="utf-8"))
+        return [Tarea(**t) for t in data]
+    except (json.JSONDecodeError, TypeError):
+        print("⚠️  Archivo corrupto, empezando de cero", file=sys.stderr)
+        return []
+
+
+def guardar(tareas: list[Tarea]) -&gt; None:
+    ARCHIVO.write_text(
+        json.dumps([asdict(t) for t in tareas], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def cmd_add(args: argparse.Namespace) -&gt; None:
+    tareas = cargar()
+    nuevo_id = max((t.id for t in tareas), default=0) + 1
+    tareas.append(Tarea(id=nuevo_id, descripcion=args.descripcion))
+    guardar(tareas)
+    print(f"✓ Tarea #{nuevo_id} agregada")
+
+
+def cmd_list(args: argparse.Namespace) -&gt; None:
+    tareas = cargar()
+    if not tareas:
+        print("(sin tareas)")
+        return
+    for t in tareas:
+        marca = "[x]" if t.completada else "[ ]"
+        print(f"{t.id:&gt;3}  {marca} {t.descripcion}")
+
+
+def cmd_done(args: argparse.Namespace) -&gt; None:
+    tareas = cargar()
+    for t in tareas:
+        if t.id == args.id:
+            t.completada = True
+            guardar(tareas)
+            print(f"✓ Tarea #{args.id} completada")
+            return
+    sys.exit(f"Tarea #{args.id} no existe")
+
+
+def cmd_rm(args: argparse.Namespace) -&gt; None:
+    tareas = cargar()
+    nuevas = [t for t in tareas if t.id != args.id]
+    if len(nuevas) == len(tareas):
+        sys.exit(f"Tarea #{args.id} no existe")
+    guardar(nuevas)
+    print(f"✓ Tarea #{args.id} eliminada")
+
+
+def cmd_clear(args: argparse.Namespace) -&gt; None:
+    guardar([])
+    print("✓ Todas las tareas eliminadas")
+
+
+def main() -&gt; None:
+    parser = argparse.ArgumentParser(prog="tareas", description="Gestor de tareas CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_add = sub.add_parser("add", help="Agregar una tarea")
+    p_add.add_argument("descripcion")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="Listar tareas")
+    p_list.set_defaults(func=cmd_list)
+
+    p_done = sub.add_parser("done", help="Marcar como completada")
+    p_done.add_argument("id", type=int)
+    p_done.set_defaults(func=cmd_done)
+
+    p_rm = sub.add_parser("rm", help="Eliminar tarea")
+    p_rm.add_argument("id", type=int)
+    p_rm.set_defaults(func=cmd_rm)
+
+    p_clear = sub.add_parser("clear", help="Eliminar todas")
+    p_clear.set_defaults(func=cmd_clear)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<h2>Conceptos clave</h2>
+
+<ul>
+  <li><strong><code>@dataclass</code></strong>: genera <code>__init__</code>, <code>__repr__</code>, <code>__eq__</code> automáticamente. Boilerplate cero.</li>
+  <li><strong><code>field(default_factory=...)</code></strong>: defaults mutables o que dependen de runtime (evita el bug del default mutable).</li>
+  <li><strong><code>asdict()</code></strong>: convierte dataclass a dict para serializar a JSON.</li>
+  <li><strong><code>**t</code></strong>: unpacking de dict como kwargs al constructor de Tarea.</li>
+  <li><strong>Subcomandos con argparse</strong>: <code>add_subparsers()</code> + <code>set_defaults(func=...)</code> es el patrón canónico de CLIs estilo <code>git</code> o <code>docker</code>.</li>
+  <li><strong>EAFP</strong>: <code>try/except (JSONDecodeError, TypeError)</code> en lugar de validar antes — más pythónico.</li>
+  <li><strong><code>sys.exit("mensaje")</code></strong>: termina con código 1 imprimiendo el mensaje a stderr.</li>
+  <li><strong><code>from __future__ import annotations</code></strong>: permite usar <code>list[Tarea]</code> y otros types modernos en versiones más viejas.</li>
+</ul>
+
+<h2>Conceptos aplicados de módulos previos</h2>
+
+<ul>
+  <li>Módulo 03 (estructuras): list, dict, comprehension</li>
+  <li>Módulo 05 (funciones): definir y dispatchear funciones por nombre</li>
+  <li>Módulo 06 (POO): <code>@dataclass</code></li>
+  <li>Módulo 07 (errores): try/except con tuple, sys.exit</li>
+  <li>Módulo 08 (I/O): pathlib, json, read_text/write_text</li>
+  <li>Módulo 12 (stdlib): argparse, datetime</li>
+</ul>
+
+<h2>Ejercicios para extenderlo</h2>
+
+<ol>
+  <li>Agregar comando <code>edit ID "nueva descripción"</code>.</li>
+  <li>Soportar prioridades (<code>--priority high/medium/low</code>) y ordenar el list por ellas.</li>
+  <li>Agregar tags: <code>add "Comprar pan" --tag compras</code>; comando <code>list --tag compras</code>.</li>
+  <li>Color con <code>rich</code> o ANSI escape codes (verde = done, rojo = vencida).</li>
+  <li>Escribir tests con <code>pytest</code> usando un archivo temporal en lugar de <code>~/.tareas.json</code>.</li>
+  <li>Empaquetar como CLI instalable con <code>pyproject.toml</code> + <code>entry_points</code>.</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../lecture.html">← Volver al Módulo 13</a>
+  <a href="../../modulo-00-introduccion/ejemplos/hola.html">Volver al principio: hola.py</a>
+</nav>
+
+</div>
+
+<script>
+  hljs.highlightAll();
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const code = document.getElementById('code').innerText;
+    try {
+      await navigator.clipboard.writeText(code);
+      const btn = document.getElementById('copyBtn');
+      const original = btn.textContent;
+      btn.textContent = '✓ Copiado';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 2000);
+    } catch (err) {
+      alert('No se pudo copiar. Seleccioná el código manualmente.');
+    }
+  });
+</script>
+
+</body>
+</html>

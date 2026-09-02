@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 04 — Structs &amp; Enums · Curso de Rust</title>
+  <meta name="description" content="Structs para modelar datos, métodos con impl, enums con datos por variante, y Option: el enum que reemplaza al null.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../sistemas/Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 04</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+</div>
+
+<article>
+
+<h1>Módulo 04 — Structs &amp; Enums</h1>
+
+<p>Hasta ahora trabajaste con tipos sueltos: números, booleanos, strings. Pero un programa real modela <em>cosas</em>: un punto en el plano, un usuario, una forma geométrica, un estado. Rust te da dos herramientas para construir tus propios tipos: <strong>structs</strong> (agrupar datos relacionados) y <strong>enums</strong> (elegir entre variantes). Y como cierre, conocés <code>Option</code>: el enum que hace que <code>null</code> simplemente no exista.</p>
+
+<h2>Structs: agrupar datos relacionados</h2>
+
+<div class="concept">
+  <strong>💡 Un struct es un tipo hecho por vos.</strong> En vez de pasar por separado <code>x</code> e <code>y</code>, los juntás en un tipo <code>Punto</code> con nombre. El compilador ahora entiende "un punto", no "dos f64 sueltos que ojalá vayan juntos".
+</div>
+
+<p>Se define con <code>struct</code> y un bloque de campos con nombre y tipo:</p>
+
+<pre><code class="lang-rust">struct Punto {
+    x: f64,
+    y: f64,
+}
+
+fn main() {
+    // Instanciar: nombrás cada campo
+    let p = Punto { x: 3.0, y: 4.0 };
+
+    // Acceder a los campos con punto
+    println!("x = {}, y = {}", p.x, p.y);
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Para mutar campos, el binding entero debe ser <code>mut</code>.</strong> No podés marcar un solo campo como mutable: o todo el struct es mutable (<code>let mut p = ...</code>) o nada. Recién ahí podés hacer <code>p.x = 10.0;</code>.
+</div>
+
+<h2>Tuple structs: campos sin nombre</h2>
+
+<p>A veces el nombre del campo no aporta nada — pensá en un color RGB, donde "los tres números" ya se entienden por posición. Para eso existen los <strong>tuple structs</strong>: tienen tipo pero sus campos son posicionales, como una tupla.</p>
+
+<pre><code class="lang-rust">struct Color(u8, u8, u8);
+
+fn main() {
+    let rojo = Color(255, 0, 0);
+
+    // Se accede por índice, como una tupla
+    println!("R={} G={} B={}", rojo.0, rojo.1, rojo.2);
+}</code></pre>
+
+<div class="info">
+  <strong>¿Struct normal o tuple struct?</strong> Usá campos con nombre cuando el significado importa (<code>x</code>, <code>y</code>, <code>nombre</code>). Usá tuple struct cuando la posición ya es obvia y nombrar sería redundante (un wrapper, un color, una coordenada). En la duda, nombrá los campos.
+</div>
+
+<h2>Métodos: darle comportamiento al struct</h2>
+
+<p>Un struct guarda datos; los <strong>métodos</strong> le dan comportamiento. Se definen en un bloque <code>impl</code> (de <em>implementation</em>) asociado al tipo. El primer parámetro suele ser <code>&amp;self</code>: una referencia a la instancia sobre la que se llama el método.</p>
+
+<pre><code class="lang-rust">struct Punto {
+    x: f64,
+    y: f64,
+}
+
+impl Punto {
+    // Método: toma &amp;self (la instancia, prestada)
+    fn distancia_al_origen(&amp;self) -&gt; f64 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+}
+
+fn main() {
+    let p = Punto { x: 3.0, y: 4.0 };
+    println!("Distancia: {}", p.distancia_al_origen()); // 5
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔗 <code>&amp;self</code> es "este de acá".</strong> Cuando escribís <code>p.distancia_al_origen()</code>, Rust pasa <code>p</code> como <code>self</code> automáticamente. El <code>&amp;</code> significa que el método solo <em>lee</em> la instancia prestada, sin tomar posesión (borrowing, M03). Si necesitara modificarla, usaría <code>&amp;mut self</code>.
+</div>
+
+<h2>Métodos asociados: los constructores</h2>
+
+<p>No todos los métodos toman <code>self</code>. Los que <strong>no</strong> reciben <code>self</code> son <em>métodos asociados</em> (parecidos a los métodos estáticos de otros lenguajes). El uso clásico es un constructor que arma y devuelve una instancia con <code>Self</code> (mayúscula = "el tipo de este bloque <code>impl</code>"):</p>
+
+<pre><code class="lang-rust">impl Punto {
+    // Constructor: no toma self, devuelve Self
+    fn nuevo(x: f64, y: f64) -&gt; Self {
+        Punto { x, y }   // si el parámetro se llama igual que el campo, va corto
+    }
+}
+
+fn main() {
+    // Se llama con :: sobre el tipo, no con punto sobre una instancia
+    let p = Punto::nuevo(3.0, 4.0);
+    println!("{}", p.distancia_al_origen());
+}</code></pre>
+
+<div class="tip">
+  <strong>✅ Regla simple:</strong> si el método necesita una instancia para trabajar → <code>&amp;self</code>, se llama con <code>p.metodo()</code>. Si fabrica o no depende de una instancia → método asociado, se llama con <code>Tipo::metodo()</code>. Por convención el constructor se llama <code>new</code> (acá <code>nuevo</code>).
+</div>
+
+<h2>Enums: elegir entre variantes</h2>
+
+<p>Un struct dice "esto tiene <em>todos</em> estos campos". Un <strong>enum</strong> dice "esto es <em>una de</em> estas opciones". Lo poderoso en Rust: <strong>cada variante puede llevar sus propios datos</strong>, y cada una puede llevar datos distintos.</p>
+
+<pre><code class="lang-rust">enum Forma {
+    Circulo(f64),            // lleva un radio
+    Rectangulo(f64, f64),    // lleva ancho y alto
+    Punto,                   // no lleva nada
+}
+
+fn main() {
+    let formas = [
+        Forma::Circulo(2.0),
+        Forma::Rectangulo(3.0, 4.0),
+        Forma::Punto,
+    ];
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Esto es lo que hace especiales a los enums de Rust.</strong> En C un enum es solo una lista de nombres. En Rust una variante puede cargar datos (como un struct), y distintas variantes cargan datos distintos. <code>Forma</code> es <em>o</em> un círculo con su radio, <em>o</em> un rectángulo con sus dos lados, <em>o</em> nada — nunca dos a la vez.
+</div>
+
+<h2><code>match</code>: usar el enum</h2>
+
+<p>Para hacer algo distinto según la variante, usás <code>match</code>. Acá lo vemos en su forma básica para sacarle los datos a cada variante — lo exprimimos a fondo en el <strong>M05 (Pattern Matching)</strong>.</p>
+
+<pre><code class="lang-rust">fn area(f: &amp;Forma) -&gt; f64 {
+    match f {
+        Forma::Circulo(r) =&gt; 3.14159 * r * r,
+        Forma::Rectangulo(ancho, alto) =&gt; ancho * alto,
+        Forma::Punto =&gt; 0.0,
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>match</code> debe ser exhaustivo.</strong> Si olvidás una variante, <strong>no compila</strong>. El compilador te obliga a contemplar todos los casos posibles — adiós a los <code>switch</code> que se olvidan un caso y revientan en runtime.
+</div>
+
+<h2><code>Option</code>: el enum que reemplaza al null</h2>
+
+<p>Acá llegamos a una de las ideas más queridas de Rust. En la mayoría de los lenguajes existe <code>null</code> / <code>nil</code> / <code>None</code>, y olvidarse de manejarlo es la fuente de bugs número uno ("el error de los mil millones de dólares", según su propio inventor). <strong>Rust no tiene <code>null</code>.</strong></p>
+
+<p>En su lugar, la ausencia de un valor se modela con el enum <code>Option&lt;T&gt;</code>, que viene en la librería estándar y tiene dos variantes:</p>
+
+<pre><code class="lang-rust">enum Option&lt;T&gt; {
+    Some(T),   // hay un valor de tipo T adentro
+    None,      // no hay valor
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Si algo puede faltar, su tipo lo dice.</strong> Una función que devuelve <code>Option&lt;i32&gt;</code> está declarando en su firma: "a veces hay un número, a veces no". No te podés olvidar de manejar el <code>None</code>, porque el tipo no es <code>i32</code> directo — para sacar el número de adentro <em>tenés</em> que abrir el <code>Option</code> con <code>match</code> (u otros métodos).
+</div>
+
+<pre><code class="lang-rust">// Busca el primer número par. Puede no haber ninguno → Option
+fn primer_par(nums: &amp;[i32]) -&gt; Option&lt;i32&gt; {
+    for &amp;n in nums {
+        if n % 2 == 0 {
+            return Some(n);   // lo encontramos
+        }
+    }
+    None                      // no había ninguno par
+}
+
+fn main() {
+    let datos = [1, 3, 4, 7];
+    match primer_par(&amp;datos) {
+        Some(n) =&gt; println!("Primer par: {}", n),
+        None =&gt; println!("No hay pares"),
+    }
+}</code></pre>
+
+<div class="tip">
+  <strong>✅ El tipo te guía.</strong> Mientras programás, ver <code>Option&lt;T&gt;</code> en una firma es una señal clara: "manejá la ausencia acá". El compilador no te deja seguir hasta que cubrís el caso <code>None</code>. El bug que en otros lenguajes explota en producción, en Rust ni compila.
+</div>
+
+<h2><code>#[derive(Debug)]</code>: imprimir tus tipos</h2>
+
+<p>Si intentás imprimir un struct propio con <code>println!("{}", p)</code>, no compila: Rust no sabe cómo mostrar tu tipo. La solución rápida para depurar es derivar <code>Debug</code> y usar el marcador <code>{:?}</code>:</p>
+
+<pre><code class="lang-rust">#[derive(Debug)]
+struct Punto {
+    x: f64,
+    y: f64,
+}
+
+fn main() {
+    let p = Punto { x: 3.0, y: 4.0 };
+    println!("{:?}", p);    // Punto { x: 3.0, y: 4.0 }
+    println!("{:#?}", p);   // versión "pretty", en varias líneas
+}</code></pre>
+
+<div class="info">
+  <strong><code>{}</code> vs <code>{:?}</code>.</strong> <code>{}</code> (<em>Display</em>) es la salida "linda" para el usuario final y la tenés que escribir vos. <code>{:?}</code> (<em>Debug</em>) es la salida para vos, el programador, y la generás gratis con <code>#[derive(Debug)]</code>. Para depurar, casi siempre alcanza con <code>Debug</code>.
+</div>
+
+<h2>Errores típicos al empezar</h2>
+
+<div class="mistake"><strong>Querer un campo "vacío" o "null".</strong> No existe. Si un campo puede no tener valor, su tipo es <code>Option&lt;T&gt;</code>: por ejemplo <code>apodo: Option&lt;String&gt;</code>. Ausencia = <code>None</code>, presencia = <code>Some(valor)</code>.</div>
+<div class="mistake"><strong>Olvidar manejar el caso <code>None</code>.</strong> No te va a pasar: el compilador no te deja usar el valor de adentro sin antes abrir el <code>Option</code>. Eso es exactamente lo que previene la clase de bugs del null.</div>
+<div class="mistake"><strong>Querer imprimir un struct sin derivar <code>Debug</code>.</strong> <code>println!("{:?}", p)</code> falla si el tipo no tiene <code>#[derive(Debug)]</code> encima. Agregalo y listo.</div>
+
+<div class="warn">
+  <strong>⚠️ <code>Option</code> no es lo mismo que <code>null</code> disfrazado.</strong> La diferencia es que el tipo te <em>obliga</em> a tratar el caso vacío. Con <code>null</code> el lenguaje confía en que no te olvides; con <code>Option</code> el compilador lo verifica por vos.
+</div>
+
+<h2>Todo junto: struct + impl + enum + Option</h2>
+
+<pre><code class="lang-rust">#[derive(Debug)]
+struct Circulo {
+    radio: f64,
+}
+
+impl Circulo {
+    fn nuevo(radio: f64) -&gt; Self {
+        Circulo { radio }
+    }
+    fn area(&amp;self) -&gt; f64 {
+        3.14159 * self.radio * self.radio
+    }
+}
+
+// Busca un círculo "grande"; puede no haber → Option
+fn buscar_grande(circulos: &amp;[Circulo]) -&gt; Option&lt;&amp;Circulo&gt; {
+    for c in circulos {
+        if c.radio &gt; 10.0 {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn main() {
+    let c = Circulo::nuevo(5.0);
+    println!("{:?} → área {}", c, c.area());
+
+    let lista = [Circulo::nuevo(2.0), Circulo::nuevo(15.0)];
+    match buscar_grande(&amp;lista) {
+        Some(grande) =&gt; println!("Hay uno grande: {:?}", grande),
+        None =&gt; println!("Ninguno supera radio 10"),
+    }
+}</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué diferencia hay entre un struct y un enum?</summary>
+<p>Un <strong>struct</strong> agrupa datos que van <em>todos juntos</em> (un punto tiene <code>x</code> <em>y</em> <code>y</code>). Un <strong>enum</strong> representa <em>una de</em> varias variantes (una <code>Forma</code> es círculo <em>o</em> rectángulo <em>o</em> punto, nunca dos a la vez). En Rust cada variante del enum puede llevar sus propios datos.</p></details>
+
+<details><summary>¿Por qué <code>Option&lt;T&gt;</code> es mejor que <code>null</code>?</summary>
+<p>Porque el tipo declara explícitamente que el valor puede faltar, y el compilador te <em>obliga</em> a manejar el caso <code>None</code> antes de usar el valor. Con <code>null</code>, olvidarse de chequear compila igual y explota en runtime; con <code>Option</code> ese bug ni compila.</p></details>
+
+<details><summary>¿Cuándo un método lleva <code>&amp;self</code> y cuándo no?</summary>
+<p>Lleva <code>&amp;self</code> cuando opera sobre una instancia existente (se llama <code>p.metodo()</code>). Si no toma <code>self</code>, es un <em>método asociado</em> — típicamente un constructor que devuelve <code>Self</code> — y se llama con <code>Tipo::metodo()</code>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Definí un struct <code>Rectangulo { ancho: f64, alto: f64 }</code> con <code>#[derive(Debug)]</code>, instancialo e imprimilo con <code>{:?}</code>.</li>
+  <li>Agregale un bloque <code>impl</code> con un método <code>area(&amp;self) -&gt; f64</code> y un constructor asociado <code>nuevo(ancho, alto) -&gt; Self</code>.</li>
+  <li>Definí un enum <code>Semaforo</code> con variantes <code>Rojo</code>, <code>Amarillo</code>, <code>Verde</code> y una función que con <code>match</code> devuelva los segundos de cada luz.</li>
+  <li>Escribí una función <code>dividir(a: f64, b: f64) -&gt; Option&lt;f64&gt;</code> que devuelva <code>None</code> si <code>b</code> es 0 y <code>Some(a / b)</code> si no. Usala con <code>match</code>.</li>
+  <li>Definí un struct <code>Usuario</code> con un campo opcional <code>apodo: Option&lt;String&gt;</code>. Imprimí "Hola, &lt;apodo&gt;" si hay apodo, o "Hola, anónimo" con <code>match</code> si es <code>None</code>.</li>
+</ol>
+
+<section class="quiz" id="quizRs04">
+  <style>
+    #quizRs04{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs04 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs04 .q{margin-bottom:1.5rem}
+    #quizRs04 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs04 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs04 .opt:hover{border-color:var(--accent)}
+    #quizRs04 .opt:disabled{cursor:default}
+    #quizRs04 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs04 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs04 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs04 .exp.show{display:block}
+    #quizRs04 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué hace especial a un enum de Rust frente al de C?</p>
+    <button class="opt">Solo puede tener tres variantes como máximo</button>
+    <button class="opt">Cada variante puede llevar sus propios datos (distintos por variante)</button>
+    <button class="opt">Se imprime automáticamente sin <code>#[derive(Debug)]</code></button>
+    <div class="exp">En Rust una variante puede cargar datos como un struct, y cada variante puede cargar datos distintos. <code>Forma::Circulo(f64)</code> y <code>Forma::Rectangulo(f64, f64)</code> conviven en el mismo enum.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Cómo modela Rust la ausencia de un valor, ya que no existe <code>null</code>?</p>
+    <button class="opt">Con un puntero vacío</button>
+    <button class="opt">Lanzando una excepción</button>
+    <button class="opt">Con el enum <code>Option&lt;T&gt;</code>: <code>Some(valor)</code> o <code>None</code></button>
+    <div class="exp">Rust no tiene <code>null</code>. La ausencia se representa con <code>Option&lt;T&gt;</code>, y el compilador te obliga a manejar el caso <code>None</code> antes de usar el valor.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué necesitás para imprimir un struct propio con <code>println!("{:?}", p)</code>?</p>
+    <button class="opt">Poner <code>#[derive(Debug)]</code> encima del struct</button>
+    <button class="opt">Que el struct sea un tuple struct</button>
+    <button class="opt">Nada, todos los tipos se imprimen igual</button>
+    <div class="exp"><code>{:?}</code> usa el trait <em>Debug</em>, que se genera gratis con <code>#[derive(Debug)]</code>. Sin eso, Rust no sabe cómo mostrar tu tipo y no compila.</div>
+  </div>
+
+  <div class="score" id="scoreRs04"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs04');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs04').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M05.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m03-borrowing-referencias/lecture.html">← M03: Borrowing</a>
+  <a href="../m05-pattern-matching/lecture.html">M05: Pattern Matching →</a>
+</nav>
+
+</div>
+</body>
+</html>

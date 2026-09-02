@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 02 — Funciones · Curso de Go</title>
+  <meta name="description" content="Funciones en Go: tipos después del nombre, múltiples retornos, el patrón (resultado, error), retornos nombrados, variadic, closures y defer.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 02</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+</div>
+
+<article>
+
+<h1>Módulo 02 — Funciones</h1>
+
+<p>Las funciones son el corazón de cualquier programa en Go. Pero la forma en que Go las trata tiene varias sorpresas si venís de C, Java, Python o JavaScript: el tipo va <strong>después</strong> del nombre, una función puede devolver <strong>varios valores a la vez</strong>, y existe <code>defer</code> para diferir limpieza. En este módulo dejás de pelearte con la sintaxis y empezás a escribir Go idiomático.</p>
+
+<h2>Sintaxis básica</h2>
+
+<p>Una función en Go se declara con la palabra clave <code>func</code>, el nombre, los parámetros (con su tipo), y el tipo de retorno:</p>
+
+<pre><code class="lang-go">func saludar(nombre string) string {
+    return "Hola, " + nombre
+}
+
+func sumar(a int, b int) int {
+    return a + b
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 El tipo va DESPUÉS del nombre.</strong> En C/Java escribís <code>int sumar(int a, int b)</code>. En Go es al revés: <code>func sumar(a int, b int) int</code>. La regla es "nombre, después tipo" — se lee de izquierda a derecha como en una oración. Si varios parámetros comparten tipo, podés agruparlos: <code>func sumar(a, b int) int</code>.
+</div>
+
+<table>
+<thead><tr><th>Lenguaje</th><th>Cómo se declara</th></tr></thead>
+<tbody>
+<tr><td>C / Java</td><td><code>int sumar(int a, int b)</code></td></tr>
+<tr><td>Python</td><td><code>def sumar(a, b):</code> (sin tipos obligatorios)</td></tr>
+<tr><td>Go</td><td><code>func sumar(a, b int) int</code></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Si una función no devuelve nada, simplemente no ponés tipo de retorno: <code>func saludar(nombre string) { ... }</code>. Y recordá de M00: una función o variable declarada y no usada es <strong>error de compilación</strong>, no un warning.
+</div>
+
+<h2>Múltiples valores de retorno — el idiom estrella</h2>
+
+<p>Esta es la característica que más distingue a Go. Una función puede devolver <strong>varios valores a la vez</strong>, sin tener que armar una tupla, una lista o un objeto:</p>
+
+<pre><code class="lang-go">func divmod(a, b int) (int, int) {
+    return a / b, a % b   // devuelve cociente Y resto
+}
+
+func main() {
+    coc, resto := divmod(17, 5)
+    fmt.Println(coc, resto)   // 3 2
+}</code></pre>
+
+<p>Fijate que el tipo de retorno ahora va entre paréntesis: <code>(int, int)</code>. Y del lado de quien llama, recibís ambos valores con <code>:=</code> en una sola línea.</p>
+
+<div class="concept">
+  <strong>💡 El patrón (resultado, error).</strong> El uso MÁS común de los múltiples retornos en Go es devolver <strong>un resultado y un error</strong>. En lugar de excepciones (try/except), Go devuelve el error como un valor normal que vos chequeás:
+</div>
+
+<pre><code class="lang-go">import (
+    "fmt"
+    "strconv"
+)
+
+func main() {
+    n, err := strconv.Atoi("42")   // string a int: devuelve (int, error)
+    if err != nil {
+        fmt.Println("no se pudo convertir:", err)
+        return
+    }
+    fmt.Println("el número es", n)   // el número es 42
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La convención sagrada de Go:</strong> el <strong>error siempre es el último valor de retorno</strong>, y siempre se chequea con <code>if err != nil</code>. Si <code>err</code> es <code>nil</code>, todo salió bien. Vas a escribir este patrón miles de veces — es el reemplazo de las excepciones.
+</div>
+
+<h2>Retornos nombrados (named returns)</h2>
+
+<p>Go te deja ponerle <strong>nombre a los valores de retorno</strong> en la firma. Esos nombres se comportan como variables ya declaradas dentro de la función, y un <code>return</code> sin argumentos (return "desnudo") devuelve sus valores actuales:</p>
+
+<pre><code class="lang-go">func divmod(a, b int) (cociente, resto int) {
+    cociente = a / b
+    resto = a % b
+    return            // return DESNUDO: devuelve cociente y resto
+}</code></pre>
+
+<div class="info">
+  El <strong>return desnudo</strong> (<code>return</code> sin valores) es cómodo en funciones cortas porque autodocumenta qué devolvés. En funciones largas conviene evitarlo: es fácil perderle el rastro a qué valores van a salir. Usalo con criterio.
+</div>
+
+<h2>Parámetros variadic (cantidad variable)</h2>
+
+<p>Si querés que una función acepte una <strong>cantidad indefinida</strong> de argumentos del mismo tipo, usás <code>...</code> antes del tipo. Adentro, ese parámetro es un <em>slice</em> (lo viste en M01):</p>
+
+<pre><code class="lang-go">func suma(nums ...int) int {
+    total := 0
+    for _, n := range nums {
+        total += n
+    }
+    return total
+}
+
+func main() {
+    fmt.Println(suma(1, 2, 3))        // 6
+    fmt.Println(suma(10, 20, 30, 40)) // 100
+    fmt.Println(suma())               // 0 (cero argumentos también vale)
+}</code></pre>
+
+<div class="info">
+  Si ya tenés un slice y querés pasarlo a una función variadic, lo "desparramás" con <code>...</code> al llamarla: <code>suma(misNumeros...)</code>. Es la operación inversa.
+</div>
+
+<h2>Funciones como valores (first-class) y closures</h2>
+
+<p>En Go las funciones son <strong>valores de primera clase</strong>: las podés guardar en una variable, pasarlas como argumento y devolverlas desde otra función — igual que un <code>int</code> o un <code>string</code>.</p>
+
+<pre><code class="lang-go">func main() {
+    // una función guardada en una variable
+    doble := func(x int) int {
+        return x * 2
+    }
+    fmt.Println(doble(21))   // 42
+}</code></pre>
+
+<p>Un <strong>closure</strong> es una función que <strong>captura variables del entorno</strong> donde fue creada. Esas variables siguen vivas mientras el closure exista, aunque la función que las creó ya haya terminado:</p>
+
+<pre><code class="lang-go">func contador() func() int {
+    n := 0
+    return func() int {   // este closure "recuerda" n
+        n++
+        return n
+    }
+}
+
+func main() {
+    siguiente := contador()
+    fmt.Println(siguiente())  // 1
+    fmt.Println(siguiente())  // 2
+    fmt.Println(siguiente())  // 3 — n se conserva entre llamadas
+}</code></pre>
+
+<div class="analogy">
+  <strong>🧩 Pensá en un closure como una mochila.</strong> La función se lleva en su mochila las variables que necesita del lugar donde nació. Aunque salga de ese lugar (la función externa retornó), sigue cargando la mochila y puede leer y modificar lo que hay adentro.
+</div>
+
+<h2>defer: limpieza garantizada</h2>
+
+<p><code>defer</code> <strong>difiere</strong> la ejecución de una llamada hasta que la función que la rodea esté por <strong>retornar</strong>. Es la herramienta ideal para limpieza: cerrar un archivo, soltar un lock, cerrar una conexión. Escribís la apertura y el cierre juntos, y Go se encarga de ejecutar el cierre al final pase lo que pase.</p>
+
+<pre><code class="lang-go">func main() {
+    fmt.Println("inicio")
+    defer fmt.Println("esto se ejecuta AL FINAL")
+    fmt.Println("medio")
+}
+// Imprime:
+// inicio
+// medio
+// esto se ejecuta AL FINAL</code></pre>
+
+<div class="concept">
+  <strong>💡 Varios defer se ejecutan en orden LIFO</strong> (Last In, First Out): el último <code>defer</code> que escribiste es el primero en ejecutarse, como una pila de platos. Tiene sentido para limpieza: lo último que abriste es lo primero que cerrás.
+</div>
+
+<pre><code class="lang-go">func main() {
+    defer fmt.Println("1")
+    defer fmt.Println("2")
+    defer fmt.Println("3")
+}
+// Imprime: 3, luego 2, luego 1 (LIFO)</code></pre>
+
+<h2>Ejemplo completo: retorno (resultado, error) + defer</h2>
+
+<p>Juntemos todo. Una función que "abre un recurso", lo usa, y garantiza el cierre con <code>defer</code> — y que reporta errores con el patrón <code>(resultado, error)</code>:</p>
+
+<pre><code class="lang-go">import (
+    "errors"
+    "fmt"
+)
+
+// dividir devuelve el resultado Y un error si el divisor es 0
+func dividir(a, b int) (int, error) {
+    if b == 0 {
+        return 0, errors.New("división por cero")
+    }
+    return a / b, nil
+}
+
+func usarRecurso() {
+    fmt.Println("abriendo recurso...")
+    defer fmt.Println("cerrando recurso (siempre se ejecuta)")
+
+    r, err := dividir(10, 0)
+    if err != nil {
+        fmt.Println("error:", err)   // error: división por cero
+        return   // aunque retornemos acá, el defer igual cierra el recurso
+    }
+    fmt.Println("resultado:", r)
+}
+
+func main() {
+    usarRecurso()
+}
+// Imprime:
+// abriendo recurso...
+// error: división por cero
+// cerrando recurso (siempre se ejecuta)</code></pre>
+
+<div class="rule">
+  <strong>📌 Por qué <code>defer</code> es tan poderoso:</strong> aunque la función retorne temprano por un error (o incluso entre en pánico), el <code>defer</code> <strong>igual se ejecuta</strong>. Por eso jamás te olvidás de cerrar un archivo o soltar un recurso: lo declarás justo después de abrirlo y te despreocupás.
+</div>
+
+<h2>Errores comunes</h2>
+
+<div class="mistake"><strong>Ignorar el segundo valor de retorno (el error).</strong> Hacer <code>n, _ := strconv.Atoi(texto)</code> descarta el error con <code>_</code>. Si la conversión falla, <code>n</code> queda en 0 y nunca te enterás. Chequeá <code>err</code> salvo que tengas una razón MUY clara para ignorarlo.</div>
+
+<div class="mistake"><strong>Confundir el orden LIFO de varios <code>defer</code>.</strong> Si escribís <code>defer A()</code> y luego <code>defer B()</code>, se ejecuta <strong>B primero, después A</strong>. No es el orden en que los escribiste — es el inverso.</div>
+
+<div class="warn"><strong>Capturar la variable de loop en un closure.</strong> Clásico: lanzar closures dentro de un <code>for</code> que usan la variable del loop. En versiones viejas de Go todos terminaban viendo el ÚLTIMO valor. Desde Go 1.22 cada iteración tiene su propia variable, pero si dependés de una versión vieja, copiá la variable adentro del loop: <code>n := n</code> antes de usarla en el closure.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿En qué orden van el nombre y el tipo de un parámetro en Go?</summary>
+<p>Primero el nombre, después el tipo: <code>func sumar(a, b int) int</code>. Es al revés que C/Java. Si varios parámetros comparten tipo, lo escribís una sola vez al final del grupo.</p></details>
+
+<details><summary>¿Cuál es la convención de Go para reportar errores?</summary>
+<p>Devolver el error como el <strong>último valor de retorno</strong> y chequearlo con <code>if err != nil</code>. Si <code>err == nil</code>, todo salió bien. Reemplaza a las excepciones (try/except).</p></details>
+
+<details><summary>Si escribís <code>defer A()</code> y luego <code>defer B()</code>, ¿en qué orden se ejecutan al retornar?</summary>
+<p>Primero <code>B()</code> y después <code>A()</code> — orden LIFO (Last In, First Out), como una pila. El último <code>defer</code> declarado es el primero en correr.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí una función <code>minMax(nums ...int) (int, int)</code> variadic que devuelva el menor y el mayor de los números recibidos.</li>
+  <li>Implementá <code>dividir(a, b float64) (float64, error)</code> que devuelva un error si <code>b</code> es 0, y usala chequeando <code>err</code> con <code>if err != nil</code>.</li>
+  <li>Reescribí <code>divmod</code> usando <strong>retornos nombrados</strong> y un <code>return</code> desnudo.</li>
+  <li>Creá un closure <code>acumulador()</code> que devuelva una función; cada llamada le suma su argumento a un total interno y lo devuelve. Verificá que el total se conserva entre llamadas.</li>
+  <li>Escribí una función con tres <code>defer</code> que impriman "uno", "dos" y "tres", y predecí en qué orden se imprimen antes de ejecutarla. Confirmá que es LIFO.</li>
+</ol>
+
+<section class="quiz" id="quizGo02">
+  <style>
+    #quizGo02{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo02 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo02 .q{margin-bottom:1.5rem}
+    #quizGo02 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo02 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo02 .opt:hover{border-color:var(--accent)}
+    #quizGo02 .opt:disabled{cursor:default}
+    #quizGo02 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo02 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo02 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo02 .exp.show{display:block}
+    #quizGo02 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Cómo se declara correctamente en Go una función que recibe dos enteros y devuelve un entero?</p>
+    <button class="opt"><code>int sumar(int a, int b)</code></button>
+    <button class="opt"><code>func sumar(a, b int) int</code></button>
+    <button class="opt"><code>func int sumar(int a, int b)</code></button>
+    <div class="exp">En Go el tipo va después del nombre, y si los parámetros comparten tipo se escribe una sola vez: <code>func sumar(a, b int) int</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. En el patrón idiomático de Go, ¿cómo se reporta y maneja un error?</p>
+    <button class="opt">Lanzando una excepción con <code>throw</code></button>
+    <button class="opt">Con un bloque <code>try / catch</code></button>
+    <button class="opt">Devolviéndolo como último valor de retorno y chequeando <code>if err != nil</code></button>
+    <div class="exp">Go no tiene excepciones para errores normales: la función devuelve <code>(resultado, error)</code> y vos chequeás <code>if err != nil</code>. Es la convención sagrada del lenguaje.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Si una función tiene <code>defer A()</code> seguido de <code>defer B()</code>, ¿en qué orden se ejecutan cuando la función retorna?</p>
+    <button class="opt">Primero <code>B()</code>, después <code>A()</code> (LIFO)</button>
+    <button class="opt">Primero <code>A()</code>, después <code>B()</code> (en orden de escritura)</button>
+    <button class="opt">Se ejecutan en paralelo</button>
+    <div class="exp">Los <code>defer</code> se apilan y se ejecutan en orden LIFO (Last In, First Out): el último declarado es el primero en correr. Por eso <code>B()</code> va antes que <code>A()</code>.</div>
+  </div>
+
+  <div class="score" id="scoreGo02"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo02');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo02').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M03.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m01-sintaxis-tipos/lecture.html">← M01: Sintaxis</a>
+  <a href="../m03-control-flujo/lecture.html">M03: Control de Flujo →</a>
+</nav>
+
+</div>
+</body>
+</html>

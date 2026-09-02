@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 09 — Bash Scripting · Curso de Linux</title>
+  <meta name="description" content="set -euo pipefail, condicionales, loops, funciones, arrays, traps.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 09</span>
+  <span class="badge">⏱ ~120 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 08</span>
+</div>
+
+<article>
+
+<h1>Módulo 09 — Bash Scripting</h1>
+
+<h2>Anatomía de un script</h2>
+<figure class="foto">
+  <img src="../assets/img/09-bash.jpg" alt="Código fuente en un monitor">
+  <figcaption>Código en pantalla: un script de bash automatiza tareas encadenando comandos — el pegamento de la administración de sistemas. Foto: Markus Spiske, vía <a href="https://commons.wikimedia.org/wiki/File:Code_on_computer_monitor_%28Unsplash%29.jpg" target="_blank">Wikimedia Commons</a> (CC0).</figcaption>
+</figure>
+
+
+<pre><code class="lang-bash">#!/bin/bash
+# Comentario sobre qué hace el script
+
+set -euo pipefail              # ⭐ buenas prácticas (ver abajo)
+
+echo "Hola desde script"</code></pre>
+
+<h3>Ejecutar</h3>
+
+<pre><code class="lang-bash">chmod +x script.sh
+./script.sh                    # usa el shebang
+bash script.sh                 # ejecuta con bash explícito
+sh script.sh                   # ⚠️ puede usar dash, no bash</code></pre>
+
+<h3>El shebang</h3>
+
+<p>La primera línea (<code>#!</code>) le dice al kernel qué intérprete usar:</p>
+
+<pre><code>#!/bin/bash
+#!/usr/bin/env bash      # más portable
+#!/usr/bin/env python3</code></pre>
+
+<h3>Modo estricto recomendado</h3>
+
+<pre><code class="lang-bash">set -e          # salir si algún comando falla
+set -u          # error si se usa variable no definida
+set -o pipefail # falla si cualquier comando del pipe falla
+set -x          # debug: imprime cada comando antes de ejecutarlo
+
+# Forma compacta
+set -euo pipefail</code></pre>
+
+<h2>Variables</h2>
+
+<pre><code class="lang-bash">nombre="Ana"                   # ⚠️ sin espacios alrededor del =
+edad=30
+saludo="Hola $nombre"          # interpolación
+saludo="Hola ${nombre}!"       # con llaves (más seguro)
+echo "$saludo"
+
+readonly PI=3.14               # constante
+unset variable                 # borrar</code></pre>
+
+<h3>Comillas</h3>
+
+<table>
+<thead><tr><th>Tipo</th><th>Comportamiento</th></tr></thead>
+<tbody>
+<tr><td><code>"doble"</code></td><td>Interpola <code>$variables</code> y <code>$(comandos)</code></td></tr>
+<tr><td><code>'simple'</code></td><td>Literal — todo se imprime tal cual</td></tr>
+<tr><td>Sin comillas</td><td>Sujeto a word splitting y glob expansion (peligroso)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">echo "Hola $nombre"            # Hola Ana
+echo 'Hola $nombre'            # Hola $nombre</code></pre>
+
+<div class="rule"><strong>Regla de oro</strong>: cuando dudes, usá <code>"comillas dobles"</code>. Especialmente con paths: <code>"$archivo"</code>.</div>
+
+<h3>Variables de entorno</h3>
+
+<pre><code class="lang-bash">echo $HOME $USER $PATH $PWD
+export MI_VAR="valor"          # disponible para procesos hijos</code></pre>
+
+<h3>Argumentos</h3>
+
+<pre><code class="lang-bash">$0          # nombre del script
+$1, $2, ... # primer, segundo argumento
+$#          # cantidad de argumentos
+$@          # todos como lista
+$*          # todos como un string
+$?          # exit code del último comando
+$$          # PID del script
+$!          # PID del último background</code></pre>
+
+<pre><code class="lang-bash"># script.sh argumento1 argumento2
+echo "Script: $0"
+echo "Primer: $1"
+echo "Total: $#"</code></pre>
+
+<h3><code>shift</code> — desplazar argumentos</h3>
+
+<pre><code class="lang-bash">while [ $# -gt 0 ]; do
+    echo "$1"
+    shift
+done</code></pre>
+
+<h2>Sustitución de comandos</h2>
+
+<pre><code class="lang-bash">fecha=$(date +%Y-%m-%d)        # forma moderna
+fecha=`date +%Y-%m-%d`         # forma vieja (no usar)
+echo "Hoy es $fecha"
+
+archivos_count=$(ls | wc -l)</code></pre>
+
+<h2>Aritmética</h2>
+
+<pre><code class="lang-bash">((suma = 5 + 3))
+echo $((10 * 2))
+((contador++))
+
+# Con expr (legacy)
+total=$(expr 5 + 3)</code></pre>
+
+<h2>Condicionales</h2>
+
+<h3><code>if</code></h3>
+
+<pre><code class="lang-bash">if [ "$edad" -ge 18 ]; then
+    echo "Mayor"
+elif [ "$edad" -ge 13 ]; then
+    echo "Adolescente"
+else
+    echo "Niño"
+fi</code></pre>
+
+<h3><code>[ ]</code> vs <code>[[ ]]</code></h3>
+
+<ul>
+  <li><code>[ ]</code> es POSIX, funciona en sh; sintaxis estricta</li>
+  <li><code>[[ ]]</code> es de bash, más features (regex, sin word splitting)</li>
+</ul>
+
+<pre><code class="lang-bash">[[ $nombre == "Ana" ]]                     # bash, recomendado
+[[ $archivo == *.txt ]]                    # glob match
+[[ $email =~ ^[a-z]+@[a-z]+\.[a-z]+$ ]]   # regex con =~</code></pre>
+
+<h3>Operadores de comparación</h3>
+
+<h4>Numérica (en <code>[ ]</code> o <code>[[ ]]</code>)</h4>
+
+<table>
+<thead><tr><th>Operador</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>-eq</code></td><td>igual</td></tr>
+<tr><td><code>-ne</code></td><td>distinto</td></tr>
+<tr><td><code>-lt</code></td><td>menor</td></tr>
+<tr><td><code>-le</code></td><td>menor o igual</td></tr>
+<tr><td><code>-gt</code></td><td>mayor</td></tr>
+<tr><td><code>-ge</code></td><td>mayor o igual</td></tr>
+</tbody>
+</table>
+
+<h4>String</h4>
+
+<table>
+<thead><tr><th>Operador</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>=</code> o <code>==</code></td><td>igual</td></tr>
+<tr><td><code>!=</code></td><td>distinto</td></tr>
+<tr><td><code>-z</code></td><td>longitud cero</td></tr>
+<tr><td><code>-n</code></td><td>longitud no cero</td></tr>
+<tr><td><code>&lt;</code>, <code>&gt;</code></td><td>orden lexicográfico (con <code>[[ ]]</code>)</td></tr>
+</tbody>
+</table>
+
+<h4>Archivos</h4>
+
+<table>
+<thead><tr><th>Operador</th><th>Verdadero si</th></tr></thead>
+<tbody>
+<tr><td><code>-e archivo</code></td><td>existe</td></tr>
+<tr><td><code>-f archivo</code></td><td>es archivo regular</td></tr>
+<tr><td><code>-d archivo</code></td><td>es directorio</td></tr>
+<tr><td><code>-L archivo</code></td><td>es symlink</td></tr>
+<tr><td><code>-r archivo</code></td><td>legible</td></tr>
+<tr><td><code>-w archivo</code></td><td>escribible</td></tr>
+<tr><td><code>-x archivo</code></td><td>ejecutable</td></tr>
+<tr><td><code>-s archivo</code></td><td>tamaño &gt; 0</td></tr>
+<tr><td><code>f1 -nt f2</code></td><td>f1 más nuevo que f2</td></tr>
+</tbody>
+</table>
+
+<h4>Lógicos</h4>
+
+<ul>
+  <li><code>&amp;&amp;</code> — y</li>
+  <li><code>||</code> — o</li>
+  <li><code>!</code> — not</li>
+</ul>
+
+<pre><code class="lang-bash">if [[ -f "$archivo" &amp;&amp; -r "$archivo" ]]; then
+    echo "Existe y es legible"
+fi</code></pre>
+
+<h3><code>case</code></h3>
+
+<pre><code class="lang-bash">case "$1" in
+    start)
+        echo "Iniciando..."
+        ;;
+    stop)
+        echo "Deteniendo..."
+        ;;
+    restart|reload)
+        echo "Recargando..."
+        ;;
+    *)
+        echo "Uso: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac</code></pre>
+
+<h2>Bucles</h2>
+
+<h3><code>for</code></h3>
+
+<pre><code class="lang-bash">for i in 1 2 3 4 5; do
+    echo $i
+done
+
+for archivo in *.txt; do
+    echo "Procesando $archivo"
+done
+
+for i in {1..10}; do            # rango
+    echo $i
+done
+
+for i in {0..20..2}; do         # con paso (de 2 en 2)
+    echo $i
+done
+
+for ((i=0; i&lt;10; i++)); do      # estilo C
+    echo $i
+done</code></pre>
+
+<h3><code>while</code></h3>
+
+<pre><code class="lang-bash">contador=0
+while [ $contador -lt 5 ]; do
+    echo $contador
+    ((contador++))
+done
+
+# Leer archivo línea por línea
+while IFS= read -r linea; do
+    echo "$linea"
+done &lt; archivo.txt
+
+# Leer stdin
+while read -r line; do
+    echo "&gt;&gt;&gt; $line"
+done</code></pre>
+
+<h3><code>until</code> — opuesto a while</h3>
+
+<pre><code class="lang-bash">until [ $contador -ge 5 ]; do
+    ((contador++))
+done</code></pre>
+
+<h3><code>break</code> y <code>continue</code></h3>
+
+<pre><code class="lang-bash">for i in {1..10}; do
+    [[ $i == 3 ]] &amp;&amp; continue
+    [[ $i == 7 ]] &amp;&amp; break
+    echo $i
+done</code></pre>
+
+<h2>Funciones</h2>
+
+<pre><code class="lang-bash">saludar() {
+    local nombre="$1"           # local: scope a la función
+    echo "Hola, $nombre"
+    return 0                    # exit code (no valor)
+}
+
+saludar "Ana"
+
+# Capturar "valor de retorno" (vía echo)
+mensaje=$(saludar "Luis")
+echo "Capturado: $mensaje"</code></pre>
+
+<blockquote>En bash, <code>return</code> es solo el exit code (0-255). Para devolver datos, usá <code>echo</code> y captura con <code>$(...)</code>.</blockquote>
+
+<h3>Argumentos en funciones</h3>
+<p>Igual que el script: <code>$1</code>, <code>$2</code>, <code>$@</code>, <code>$#</code>.</p>
+
+<h2>Arrays</h2>
+
+<pre><code class="lang-bash">frutas=("manzana" "pera" "uva")
+echo "${frutas[0]}"             # primer elemento
+echo "${frutas[@]}"             # todos
+echo "${#frutas[@]}"            # cantidad
+frutas+=("kiwi")                # agregar
+
+# Iterar
+for f in "${frutas[@]}"; do
+    echo "$f"
+done</code></pre>
+
+<h3>Diccionarios (associative arrays, bash 4+)</h3>
+
+<pre><code class="lang-bash">declare -A persona
+persona[nombre]="Ana"
+persona[edad]=30
+echo "${persona[nombre]}"
+
+for clave in "${!persona[@]}"; do
+    echo "$clave = ${persona[$clave]}"
+done</code></pre>
+
+<h2>Strings</h2>
+
+<pre><code class="lang-bash">texto="Hola Mundo"
+echo "${#texto}"                 # longitud
+echo "${texto,,}"                # minúsculas
+echo "${texto^^}"                # mayúsculas
+echo "${texto:5}"                # desde índice 5
+echo "${texto:0:4}"              # substring (desde 0, longitud 4)
+echo "${texto/Mundo/Linux}"      # reemplazar primera
+echo "${texto//o/0}"             # reemplazar todas
+echo "${archivo%.txt}"           # quitar sufijo .txt
+echo "${ruta##*/}"               # quitar todo hasta el último /
+echo "${ruta%/*}"                # quitar el último componente</code></pre>
+
+<h2>I/O y redirección (recap módulo 02)</h2>
+
+<pre><code class="lang-bash">comando &gt; out.log 2&gt; err.log
+comando &amp;&gt; all.log
+comando | tee log.txt            # tee: escribe a archivo y a stdout
+echo "linea" &gt;&gt; log.txt          # append</code></pre>
+
+<h3>Heredoc</h3>
+
+<pre><code class="lang-bash">cat &lt;&lt;EOF &gt; config.txt
+nombre=Ana
+edad=30
+EOF
+
+cat &lt;&lt;'EOF'                     # comillas → no interpola
+$variable literal
+EOF</code></pre>
+
+<h3>Read del usuario</h3>
+
+<pre><code class="lang-bash">read -p "Nombre: " nombre
+read -s -p "Contraseña: " pwd   # silencioso
+echo
+read -t 5 -p "Algo: " x         # timeout 5 segundos</code></pre>
+
+<h2>Trap — manejo de señales y limpieza</h2>
+
+<pre><code class="lang-bash">limpiar() {
+    echo "Limpiando..."
+    rm -f /tmp/temporal.$$
+}
+trap limpiar EXIT               # ejecutar al salir
+trap "echo Interrumpido; exit 1" INT TERM</code></pre>
+
+<h2>Debugging</h2>
+
+<pre><code class="lang-bash">bash -x script.sh                # imprime cada línea ejecutada
+bash -n script.sh                # solo verifica sintaxis
+set -x                           # activar debug en runtime
+set +x                           # desactivar</code></pre>
+
+<h3><code>shellcheck</code> — linter (instalable)</h3>
+
+<pre><code class="lang-bash">shellcheck script.sh</code></pre>
+
+<div class="tip">Usá <code>shellcheck</code> siempre. Detecta bugs sutiles antes de que rompan en producción.</div>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Script que recibe un directorio y muestra los 5 archivos más grandes</li>
+  <li>Backup script: comprime una carpeta con timestamp y la copia a <code>/var/backups</code></li>
+  <li>Script que valida un email con regex usando <code>[[ =~ ]]</code></li>
+  <li>Procesador de logs: cuenta cuántas veces aparece cada IP en <code>auth.log</code></li>
+  <li>CLI con subcomandos <code>add</code>, <code>list</code>, <code>done</code> simulando un gestor de tareas</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-08-redes/lecture.html">← Anterior: Redes</a>
+  <a href="../modulo-10-systemd/lecture.html">Siguiente: systemd →</a>
+</nav>
+
+</div>
+</body>
+</html>

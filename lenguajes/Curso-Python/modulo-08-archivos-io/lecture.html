@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 08 — Archivos e I/O · Curso de Python</title>
+  <meta name="description" content="open, with, pathlib, JSON, CSV, argparse, encoding.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Python</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~75 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 07</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Archivos e I/O</h1>
+
+<h2>Abrir y cerrar archivos</h2>
+<figure class="foto">
+  <img src="../assets/img/08-archivos.jpg" alt="Mueble antiguo con cajones">
+  <figcaption>Un mueble con cajones: la E/S de archivos es abrir un cajón (open), leer o escribir, y cerrarlo (with). Foto: Cooper Hewitt, Smithsonian Design Museum, vía <a href="https://commons.wikimedia.org/wiki/File:Cabinet_On_Stand_%28probably_England%29%2C_1675-1700_%28CH_18312379-8%29.jpg" target="_blank">Wikimedia Commons</a> (Public domain).</figcaption>
+</figure>
+
+
+
+<h3>Forma manual (no recomendada)</h3>
+
+<pre><code class="lang-python">f = open("datos.txt", "r")
+contenido = f.read()
+f.close()              # ⚠️ si hay excepción antes, no se cierra</code></pre>
+
+<h3>Forma correcta — <code>with</code></h3>
+
+<pre><code class="lang-python">with open("datos.txt", "r", encoding="utf-8") as f:
+    contenido = f.read()
+# se cierra automáticamente, incluso si hay excepción</code></pre>
+
+<div class="warn"><strong>Siempre especificar <code>encoding="utf-8"</code></strong> — en Windows el default es cp1252, que falla con caracteres no-ASCII.</div>
+
+<h2>Modos de apertura</h2>
+
+<table>
+<thead><tr><th>Modo</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>r</code></td><td>Lectura (default) — falla si no existe</td></tr>
+<tr><td><code>w</code></td><td>Escritura — <strong>trunca</strong> el archivo</td></tr>
+<tr><td><code>a</code></td><td>Append — agrega al final</td></tr>
+<tr><td><code>x</code></td><td>Exclusivo — falla si ya existe</td></tr>
+<tr><td><code>r+</code></td><td>Lectura y escritura</td></tr>
+<tr><td><code>b</code></td><td>Binario (combinar: <code>rb</code>, <code>wb</code>)</td></tr>
+<tr><td><code>t</code></td><td>Texto (default)</td></tr>
+</tbody>
+</table>
+
+<h2>Leer</h2>
+
+<pre><code class="lang-python">with open("datos.txt", encoding="utf-8") as f:
+    todo = f.read()                  # todo como string
+
+with open("datos.txt", encoding="utf-8") as f:
+    primera_linea = f.readline()     # una sola línea
+    segunda_linea = f.readline()
+
+with open("datos.txt", encoding="utf-8") as f:
+    lineas = f.readlines()           # lista de líneas
+
+with open("datos.txt", encoding="utf-8") as f:
+    for linea in f:                  # iteración línea por línea (recomendado para archivos grandes)
+        print(linea.rstrip())</code></pre>
+
+<h2>Escribir</h2>
+
+<pre><code class="lang-python">with open("salida.txt", "w", encoding="utf-8") as f:
+    f.write("Primera línea\n")
+    f.write("Segunda línea\n")
+    f.writelines(["a\n", "b\n", "c\n"])
+
+# Append
+with open("log.txt", "a", encoding="utf-8") as f:
+    f.write(f"{datetime.now()}: evento\n")</code></pre>
+
+<h2>Archivos binarios</h2>
+
+<pre><code class="lang-python">with open("imagen.jpg", "rb") as f:
+    bytes_data = f.read()
+
+with open("copia.jpg", "wb") as f:
+    f.write(bytes_data)</code></pre>
+
+<h2>Pathlib (forma moderna)</h2>
+
+<p><code>pathlib</code> reemplaza a <code>os.path</code> con una API orientada a objetos:</p>
+
+<pre><code class="lang-python">from pathlib import Path
+
+p = Path("datos") / "archivos" / "input.txt"
+p.exists()              # True/False
+p.is_file()
+p.is_dir()
+p.suffix                # '.txt'
+p.stem                  # 'input'
+p.name                  # 'input.txt'
+p.parent                # Path('datos/archivos')
+p.absolute()
+p.read_text(encoding="utf-8")
+p.write_text("contenido", encoding="utf-8")
+p.read_bytes()
+p.write_bytes(b"...")
+
+# Crear directorios
+Path("logs").mkdir(exist_ok=True)
+Path("a/b/c").mkdir(parents=True, exist_ok=True)
+
+# Listar
+for archivo in Path(".").iterdir():
+    print(archivo)
+
+for archivo in Path(".").glob("*.py"):
+    print(archivo)
+
+for archivo in Path(".").rglob("*.py"):    # recursivo
+    print(archivo)
+
+# Eliminar
+Path("temp.txt").unlink(missing_ok=True)   # archivo
+Path("vacio").rmdir()                       # directorio vacío</code></pre>
+
+<h2>JSON</h2>
+
+<pre><code class="lang-python">import json
+
+datos = {"nombre": "Ana", "edad": 30, "tags": ["a", "b"]}
+
+# Escribir
+with open("usuario.json", "w", encoding="utf-8") as f:
+    json.dump(datos, f, indent=2, ensure_ascii=False)
+
+# Leer
+with open("usuario.json", encoding="utf-8") as f:
+    leido = json.load(f)
+
+# String &lt;-&gt; dict
+texto = json.dumps(datos, indent=2)
+de_texto = json.loads(texto)</code></pre>
+
+<h3>Tipos compatibles JSON</h3>
+<p><code>dict</code>, <code>list</code>, <code>tuple</code>, <code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code>, <code>None</code>. Tipos custom requieren <code>default=</code> en <code>dump</code>.</p>
+
+<h2>CSV</h2>
+
+<pre><code class="lang-python">import csv
+
+# Leer
+with open("personas.csv", encoding="utf-8", newline="") as f:
+    reader = csv.reader(f)
+    for fila in reader:
+        print(fila)
+
+# Leer como dict (con header)
+with open("personas.csv", encoding="utf-8", newline="") as f:
+    reader = csv.DictReader(f)
+    for fila in reader:
+        print(fila["nombre"], fila["edad"])
+
+# Escribir
+with open("salida.csv", "w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["nombre", "edad"])
+    writer.writerows([("Ana", 30), ("Luis", 25)])
+
+# Escribir con dict
+with open("salida.csv", "w", encoding="utf-8", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["nombre", "edad"])
+    writer.writeheader()
+    writer.writerow({"nombre": "Ana", "edad": 30})</code></pre>
+
+<blockquote><code>newline=""</code> es importante en Windows para evitar líneas en blanco extras.</blockquote>
+
+<h2>Otros formatos</h2>
+
+<table>
+<thead><tr><th>Formato</th><th>Módulo</th><th>Notas</th></tr></thead>
+<tbody>
+<tr><td>YAML</td><td><code>pyyaml</code> (externo)</td><td><code>pip install pyyaml</code></td></tr>
+<tr><td>TOML</td><td><code>tomllib</code> (3.11+, lectura) / <code>tomli-w</code> (escritura)</td><td>Config moderna</td></tr>
+<tr><td>XML</td><td><code>xml.etree.ElementTree</code></td><td>Built-in</td></tr>
+<tr><td>Excel</td><td><code>openpyxl</code> (externo)</td><td><code>.xlsx</code></td></tr>
+<tr><td>Pickle</td><td><code>pickle</code></td><td>Solo Python — no usar con datos no confiables</td></tr>
+</tbody>
+</table>
+
+<h2>Streams estándar</h2>
+
+<pre><code class="lang-python">import sys
+
+sys.stdin           # entrada
+sys.stdout          # salida normal
+sys.stderr          # errores
+
+print("error", file=sys.stderr)
+
+# Leer todo de stdin (típico para pipes)
+datos = sys.stdin.read()</code></pre>
+
+<h2>Argumentos de línea de comandos</h2>
+
+<pre><code class="lang-python">import sys
+
+# Forma simple
+script, *argumentos = sys.argv
+
+# Forma robusta
+import argparse
+parser = argparse.ArgumentParser(description="Procesa archivos")
+parser.add_argument("input", help="Archivo de entrada")
+parser.add_argument("--output", default="salida.txt")
+parser.add_argument("--verbose", "-v", action="store_true")
+args = parser.parse_args()
+print(args.input, args.output, args.verbose)</code></pre>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Leer un <code>.txt</code> y contar palabras, líneas y caracteres</li>
+  <li>Convertir un CSV a JSON</li>
+  <li>Buscar todos los <code>.py</code> recursivamente y reportar los más grandes</li>
+  <li>Crear un logger que escriba a archivo con timestamp</li>
+  <li>Script que reciba <code>--input</code> y <code>--output</code> con argparse y haga conversión de mayúsculas</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-07-manejo-de-errores/lecture.html">← Anterior: Manejo de Errores</a>
+  <a href="../modulo-09-modulos-y-paquetes/lecture.html">Siguiente: Módulos y Paquetes →</a>
+</nav>
+
+</div>
+</body>
+</html>

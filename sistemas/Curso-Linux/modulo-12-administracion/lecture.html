@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 12 — Administración Avanzada · Curso de Linux</title>
+  <meta name="description" content="cron, logrotate, LVM, RAID, backups (rsync/borg), monitoreo.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 12</span>
+  <span class="badge">⏱ ~120 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 11</span>
+</div>
+
+<article>
+
+<h1>Módulo 12 — Administración Avanzada</h1>
+
+<h2>cron — tareas programadas (clásico)</h2>
+<figure class="foto">
+  <img src="../assets/img/12-admin.jpg" alt="Data center con servidores">
+  <figcaption>Un data center: la administración (cron, logs, backups, LVM) mantiene los servidores vivos y predecibles. Foto: BalticServers.com, vía <a href="https://commons.wikimedia.org/wiki/File:BalticServers_data_center.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 3.0).</figcaption>
+</figure>
+
+
+<p><code>cron</code> ejecuta comandos en horarios definidos.</p>
+
+<h3>Sintaxis del crontab</h3>
+
+<pre><code>┌─────── minuto (0-59)
+│ ┌───── hora (0-23)
+│ │ ┌─── día del mes (1-31)
+│ │ │ ┌─ mes (1-12)
+│ │ │ │ ┌ día de la semana (0-7, 0 y 7 = domingo)
+│ │ │ │ │
+* * * * * comando</code></pre>
+
+<h3>Ejemplos</h3>
+
+<pre><code>*/5 * * * *       /script.sh           # cada 5 minutos
+0 */2 * * *       /script.sh           # cada 2 horas en :00
+30 2 * * *        /backup.sh           # diario 02:30
+0 9 * * 1-5       /aviso.sh            # lunes a viernes 09:00
+0 0 1 * *         /mensual.sh          # primer día del mes
+0 0 * * 0         /domingo.sh          # cada domingo a medianoche
+@reboot           /script.sh           # al arrancar
+@hourly           /script.sh           # cada hora
+@daily            /script.sh           # diario
+@weekly           /script.sh
+@monthly          /script.sh</code></pre>
+
+<h3>Comandos</h3>
+
+<pre><code class="lang-bash">crontab -e                      # editar crontab del usuario actual
+crontab -l                      # listar
+crontab -r                      # eliminar (¡cuidado!)
+sudo crontab -e -u ana          # de otro usuario
+
+# Variables comunes en crontab
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SHELL=/bin/bash
+MAILTO=root@example.com</code></pre>
+
+<h3>Crontabs del sistema</h3>
+
+<pre><code>/etc/crontab                    # crontab principal del sistema
+/etc/cron.d/                    # archivos sueltos
+/etc/cron.hourly/               # scripts ejecutados cada hora
+/etc/cron.daily/                # diarios
+/etc/cron.weekly/
+/etc/cron.monthly/</code></pre>
+
+<div class="mistake"><strong>Trampa típica</strong>: cron tiene <code>PATH</code> mínimo. Si tu script usa <code>python3</code> y funciona en shell, en cron puede fallar. Solución: usar <strong>rutas absolutas</strong> o setear <code>PATH=</code> al inicio del crontab.</div>
+
+<h2>anacron — para máquinas que no están encendidas siempre</h2>
+
+<p>A diferencia de cron, ejecuta tareas que se hayan perdido cuando la máquina vuelve. Útil en laptops.</p>
+
+<p><code>/etc/anacrontab</code>:</p>
+
+<pre><code>1       5       cron.daily      run-parts /etc/cron.daily
+7       10      cron.weekly     run-parts /etc/cron.weekly</code></pre>
+
+<h2>Logs — diagnóstico</h2>
+
+<h3>Logs tradicionales</h3>
+
+<table>
+<thead><tr><th>Archivo</th><th>Contenido</th></tr></thead>
+<tbody>
+<tr><td><code>/var/log/syslog</code></td><td>General (Debian/Ubuntu)</td></tr>
+<tr><td><code>/var/log/messages</code></td><td>General (RHEL/Fedora)</td></tr>
+<tr><td><code>/var/log/auth.log</code></td><td>Autenticación (Debian)</td></tr>
+<tr><td><code>/var/log/secure</code></td><td>Autenticación (RHEL)</td></tr>
+<tr><td><code>/var/log/kern.log</code></td><td>Kernel</td></tr>
+<tr><td><code>/var/log/dmesg</code></td><td>Boot del kernel</td></tr>
+<tr><td><code>/var/log/dpkg.log</code></td><td>Paquetes instalados (Debian)</td></tr>
+<tr><td><code>/var/log/apt/history.log</code></td><td>Historial de apt</td></tr>
+<tr><td><code>/var/log/yum.log</code>/<code>dnf.log</code></td><td>Idem en RHEL</td></tr>
+<tr><td><code>/var/log/cron</code></td><td>Logs de cron</td></tr>
+<tr><td><code>/var/log/nginx/</code>, <code>/var/log/apache2/</code></td><td>Servicios</td></tr>
+</tbody>
+</table>
+
+<h3><code>dmesg</code> — buffer del kernel</h3>
+
+<pre><code class="lang-bash">dmesg                                       # ⚠️ en distros modernas requiere sudo
+sudo dmesg
+sudo dmesg -T                               # con timestamps legibles
+sudo dmesg --follow                         # en vivo
+sudo dmesg --level=err,warn                 # solo errores y warnings</code></pre>
+
+<h3><code>journalctl</code> (recap módulo 10)</h3>
+
+<pre><code class="lang-bash">journalctl -xe                              # últimos errores con explicación
+journalctl --disk-usage
+sudo journalctl --vacuum-time=2weeks</code></pre>
+
+<h2>Rotación de logs — <code>logrotate</code></h2>
+
+<p>Evita que los logs llenen el disco. Config:</p>
+
+<pre><code>/etc/logrotate.conf
+/etc/logrotate.d/*              # un archivo por servicio</code></pre>
+
+<p>Ejemplo:</p>
+
+<pre><code>/var/log/miapp/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 miapp adm
+    sharedscripts
+    postrotate
+        systemctl reload miapp &gt;/dev/null 2&gt;&amp;1 || true
+    endscript
+}</code></pre>
+
+<table>
+<thead><tr><th>Directiva</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>daily/weekly/monthly</code></td><td>Frecuencia</td></tr>
+<tr><td><code>rotate N</code></td><td>Mantener N versiones</td></tr>
+<tr><td><code>compress</code></td><td>gzip de los rotados</td></tr>
+<tr><td><code>delaycompress</code></td><td>No comprimir el más reciente</td></tr>
+<tr><td><code>missingok</code></td><td>No fallar si no existe</td></tr>
+<tr><td><code>notifempty</code></td><td>No rotar si está vacío</td></tr>
+<tr><td><code>create MODE OWNER GROUP</code></td><td>Crear nuevo con esos atributos</td></tr>
+<tr><td><code>postrotate ... endscript</code></td><td>Comandos después de rotar</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">sudo logrotate -d /etc/logrotate.conf       # debug (no hace nada)
+sudo logrotate -f /etc/logrotate.conf       # forzar ahora</code></pre>
+
+<h2>Discos y filesystems</h2>
+
+<h3>Información</h3>
+
+<pre><code class="lang-bash">lsblk                                       # árbol de bloques
+lsblk -f                                    # con filesystems
+fdisk -l                                    # tabla de particiones (sudo)
+parted -l                                   # alternativa moderna
+df -h                                       # uso por filesystem
+df -i                                       # inodos
+du -sh /var/*                               # uso por carpeta
+ncdu /                                      # navegador interactivo (instalable)
+blkid                                       # UUIDs y tipos</code></pre>
+
+<h3>Particionar</h3>
+
+<pre><code class="lang-bash">sudo fdisk /dev/sdb                         # interactivo
+sudo parted /dev/sdb                         # alternativa
+sudo cfdisk /dev/sdb                         # TUI cómoda</code></pre>
+
+<h3>Crear filesystem</h3>
+
+<pre><code class="lang-bash">sudo mkfs.ext4 /dev/sdb1
+sudo mkfs.xfs /dev/sdb1
+sudo mkfs.btrfs /dev/sdb1
+sudo mkfs.vfat -F32 /dev/sdb1               # FAT32 (USBs)</code></pre>
+
+<h3>Montar</h3>
+
+<pre><code class="lang-bash">sudo mount /dev/sdb1 /mnt/datos
+sudo mount -t ntfs /dev/sdb1 /mnt/datos
+sudo umount /mnt/datos
+mount | column -t                           # listar montajes activos
+findmnt</code></pre>
+
+<h3>Persistente — <code>/etc/fstab</code></h3>
+
+<pre><code>UUID=abc-def-...   /datos   ext4   defaults,nofail   0   2</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Dispositivo (UUID recomendado)</td></tr>
+<tr><td>2</td><td>Punto de montaje</td></tr>
+<tr><td>3</td><td>Tipo de FS</td></tr>
+<tr><td>4</td><td>Opciones</td></tr>
+<tr><td>5</td><td>Dump (0=no)</td></tr>
+<tr><td>6</td><td>fsck order (0=no, 1=root, 2=otros)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">sudo mount -a                               # montar todo lo de fstab</code></pre>
+
+<div class="danger"><strong>Cuidado</strong>: una entrada mal en fstab puede dejar el sistema sin arrancar. Probar siempre con <code>mount -a</code> antes de reiniciar.</div>
+
+<h2>LVM — Logical Volume Manager</h2>
+
+<p>Capa de abstracción sobre discos: permite redimensionar, hacer snapshots, etc.</p>
+
+<pre><code>PV (Physical Volume)  → /dev/sdb1
+   │
+VG (Volume Group)     → grupo de PVs
+   │
+LV (Logical Volume)   → "partición" lógica</code></pre>
+
+<pre><code class="lang-bash">sudo pvcreate /dev/sdb1 /dev/sdc1
+sudo vgcreate datos /dev/sdb1 /dev/sdc1
+sudo lvcreate -L 10G -n web datos
+sudo mkfs.ext4 /dev/datos/web
+sudo mount /dev/datos/web /var/www
+
+# Redimensionar
+sudo lvextend -L +5G /dev/datos/web
+sudo resize2fs /dev/datos/web
+
+# Info
+pvs / pvdisplay
+vgs / vgdisplay
+lvs / lvdisplay</code></pre>
+
+<h2>RAID por software — <code>mdadm</code></h2>
+
+<pre><code class="lang-bash">sudo mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc
+sudo mdadm --detail /dev/md0
+cat /proc/mdstat</code></pre>
+
+<h2>Backups</h2>
+
+<h3><code>tar</code> — clásico</h3>
+
+<pre><code class="lang-bash">tar -czf backup-$(date +%F).tar.gz /home/ana
+tar -xzf backup.tar.gz
+tar --exclude='node_modules' -czf code.tar.gz proyecto/</code></pre>
+
+<h3><code>rsync</code> — incremental</h3>
+
+<pre><code class="lang-bash">rsync -avz --delete /datos/ /backup/datos/
+rsync -avz --link-dest=/backup/ayer/ /datos/ /backup/hoy/   # snapshots con hardlinks</code></pre>
+
+<h3><code>borg</code> / <code>restic</code> — modernos, deduplican y cifran</h3>
+
+<pre><code class="lang-bash">borg init --encryption=repokey /backup/borg
+borg create /backup/borg::"hostname-{now}" /home /etc
+borg list /backup/borg
+borg prune --keep-daily=7 --keep-weekly=4 --keep-monthly=6 /backup/borg</code></pre>
+
+<h3>Snapshots con btrfs/zfs</h3>
+
+<pre><code class="lang-bash">sudo btrfs subvolume snapshot /datos /datos/.snap-$(date +%F)</code></pre>
+
+<h2>Monitoreo</h2>
+
+<h3>CPU, memoria, I/O</h3>
+
+<pre><code class="lang-bash">top, htop, btop                             # interactivo
+vmstat 1                                    # virtual memory cada 1s
+iostat -x 1                                 # I/O detallado
+mpstat -P ALL 1                             # CPU por core
+sar -u 1 5                                  # histórico (sysstat)
+glances                                     # all-in-one</code></pre>
+
+<h3>Red</h3>
+
+<pre><code class="lang-bash">iftop                                       # bandwidth por conexión
+nload                                       # gráfico simple
+nethogs                                     # por proceso
+ss -s                                       # stats de sockets</code></pre>
+
+<h3>Disco I/O</h3>
+
+<pre><code class="lang-bash">iotop                                       # top de I/O por proceso</code></pre>
+
+<h3>Métricas con stack moderno</h3>
+
+<ul>
+  <li><strong>Prometheus</strong> (recolección) + <strong>Grafana</strong> (visualización)</li>
+  <li><strong>node_exporter</strong> para métricas de sistema</li>
+  <li><strong>netdata</strong> — instalable, dashboard out-of-the-box</li>
+</ul>
+
+<h2>Mantenimiento de filesystem</h2>
+
+<pre><code class="lang-bash">sudo fsck /dev/sdb1                         # check (desmontado)
+sudo fsck -y /dev/sdb1                      # auto-fix
+sudo tune2fs -l /dev/sdb1                   # info ext
+sudo e2fsck -f /dev/sdb1                    # force check ext</code></pre>
+
+<h2>Espacio en disco — diagnóstico rápido</h2>
+
+<pre><code class="lang-bash">df -h                                        # ¿qué FS está lleno?
+du -sh /* 2&gt;/dev/null | sort -h             # qué carpeta de raíz pesa más
+sudo du -sh /var/* | sort -h
+sudo du -ah /var | sort -h | tail -20       # archivos más grandes
+ncdu /                                       # navegador interactivo
+
+# Limpieza rápida
+sudo journalctl --vacuum-time=2weeks
+sudo apt autoremove &amp;&amp; sudo apt clean
+docker system prune -a                       # si usás docker
+sudo find /var/log -name "*.gz" -mtime +30 -delete</code></pre>
+
+<h2>Carga del sistema</h2>
+
+<pre><code class="lang-bash">uptime                                       # load average
+# load = procesos en run-queue + waiting I/O, promediado
+# 1.0 en un sistema de 4 cores = 25% de uso</code></pre>
+
+<div class="rule"><strong>Regla</strong>: load &gt; nº de cores <strong>sostenido</strong> = sistema saturado.</div>
+
+<h2>Troubleshooting general — checklist</h2>
+
+<p>Cuando algo no anda:</p>
+
+<ol>
+  <li><code>systemctl status servicio</code> — ¿está corriendo?</li>
+  <li><code>journalctl -u servicio -n 100</code> — ¿hay errores recientes?</li>
+  <li><code>dmesg | tail</code> — ¿el kernel se quejó?</li>
+  <li><code>df -h</code> y <code>df -i</code> — ¿hay disco/inodos disponibles?</li>
+  <li><code>free -h</code> — ¿queda RAM?</li>
+  <li><code>top</code> / <code>htop</code> — ¿algún proceso está volado?</li>
+  <li><code>ss -tlnp</code> — ¿el puerto está escuchando?</li>
+  <li><code>tail -f /var/log/...</code> del servicio</li>
+  <li><code>strace -p PID</code> — ¿qué está haciendo el proceso?</li>
+</ol>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Crear un cron que corra un script de backup todos los domingos a las 03:00</li>
+  <li>Configurar logrotate para los logs de un servicio custom</li>
+  <li>Crear, montar y agregar a <code>/etc/fstab</code> un volumen LVM de 5GB</li>
+  <li>Encontrar los 10 archivos más grandes en <code>/var</code> con <code>du</code> y <code>sort</code></li>
+  <li>Investigar la causa de un alto <code>load average</code> simulando carga (<code>stress -c 4</code>)</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-11-seguridad/lecture.html">← Anterior: Seguridad</a>
+  <a href="../modulo-13-proyectos/lecture.html">Siguiente: Proyectos →</a>
+</nav>
+
+</div>
+</body>
+</html>

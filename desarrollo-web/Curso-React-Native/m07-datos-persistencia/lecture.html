@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — Datos & Persistencia · Curso de React Native</title>
+  <meta name="description" content="Fetch a APIs con el patrón loading/error/data, spinner con ActivityIndicator, y persistencia local con AsyncStorage: el localStorage del móvil, pero asíncrono.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React Native</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-React/index.html">⚛️ Curso de React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M05</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — Datos & Persistencia</h1>
+
+<p>Una app que no habla con el mundo es un cascarón. En este módulo tu app empieza a <strong>traer datos de internet</strong> (igual que en la web, con <code>fetch</code> y <code>async/await</code>) y a <strong>recordar cosas entre sesiones</strong> con AsyncStorage — el equivalente móvil de <code>localStorage</code>, pero con una diferencia clave que vamos a martillar hasta el cansancio: es <strong>asíncrono</strong>.</p>
+
+<h2>Traer datos de una API: es lo mismo que en la web</h2>
+
+<div class="concept">
+  <strong>💡 En React Native el fetch es idéntico al de la web.</strong> Misma función <code>fetch()</code>, mismo
+  <code>async/await</code>, mismo <code>response.json()</code>. No hay API nueva que aprender. Lo único que cambia es
+  <em>dónde mostrás</em> el resultado: en vez de un <code>&lt;div&gt;</code>, va en un <code>&lt;Text&gt;</code> o una <code>&lt;FlatList&gt;</code>.
+</div>
+
+<p>El patrón que vas a repetir en CADA pantalla que carga datos se llama <strong>"los 3 estados"</strong>: mientras cargás mostrás un spinner (<em>loading</em>), si algo se rompe mostrás un mensaje (<em>error</em>), y cuando llega todo bien mostrás el contenido (<em>data</em>). Se modela con <code>useState</code> + <code>useEffect</code>:</p>
+
+<pre><code class="lang-jsx">import { useState, useEffect } from 'react';
+import { View, Text, ActivityIndicator, StyleSheet } from 'react-native';
+
+export default function Perfil() {
+  const [data, setData] = useState(null);      // ⬅️ los datos cuando lleguen
+  const [cargando, setCargando] = useState(true); // ⬅️ true mientras esperamos
+  const [error, setError] = useState(null);     // ⬅️ mensaje si algo falla
+
+  useEffect(() =&gt; {
+    async function traer() {
+      try {
+        const res = await fetch('https://api.github.com/users/expo');
+        if (!res.ok) throw new Error('Respuesta ' + res.status);
+        const json = await res.json();
+        setData(json);
+      } catch (e) {
+        setError(e.message);
+      } finally {
+        setCargando(false);   // ⬅️ pase lo que pase, dejamos de cargar
+      }
+    }
+    traer();
+  }, []);   // ⬅️ [] = corre una sola vez, al montar
+
+  if (cargando) return &lt;ActivityIndicator size="large" /&gt;;
+  if (error) return &lt;Text style={styles.error}&gt;Ups: {error}&lt;/Text&gt;;
+
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Text style={styles.titulo}&gt;{data.name}&lt;/Text&gt;
+      &lt;Text&gt;{data.public_repos} repositorios públicos&lt;/Text&gt;
+    &lt;/View&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
+  titulo: { fontSize: 24, fontWeight: 'bold' },
+  error: { color: 'crimson', textAlign: 'center', marginTop: 40 },
+});</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Mirá lo que ya reconocés:</strong> <code>useState</code>, <code>useEffect</code> con array de dependencias vacío,
+  <code>try/catch/finally</code>, <code>await fetch</code>… es <em>exactamente</em> lo que hacías en el
+  <a href="../../Curso-React/index.html">Curso de React</a>. Lo único nuevo es <code>&lt;ActivityIndicator&gt;</code>, que es el spinner nativo.
+</div>
+
+<h2>El spinner: <code>&lt;ActivityIndicator&gt;</code></h2>
+
+<div class="info">
+  <strong><code>&lt;ActivityIndicator&gt;</code></strong> es la ruedita giratoria nativa de carga. No necesitás librerías ni GIFs:
+  ya viene en <code>react-native</code>. Acepta <code>size="small"</code> / <code>"large"</code> y <code>color="#..."</code>.
+  En iOS se ve como el spinner de Apple y en Android como el de Material — porque es <em>nativo</em> en cada plataforma.
+</div>
+
+<pre><code class="lang-jsx">&lt;ActivityIndicator size="large" color="#a78bfa" /&gt;</code></pre>
+
+<div class="rule">
+  <strong>📌 Siempre manejá los 3 estados.</strong> Una pantalla que solo contempla el caso "todo salió bien" se va a ver
+  congelada o en blanco cuando la red sea lenta o falle. <em>loading</em> + <em>error</em> + <em>data</em> no es opcional: es lo que
+  separa una app amateur de una profesional.
+</div>
+
+<h2>AsyncStorage: el "localStorage del móvil"</h2>
+
+<p>En la web guardabas cosas en <code>localStorage</code> para que sobrevivan al recargar la página. En el móvil el equivalente es <strong>AsyncStorage</strong>: un almacén clave→valor que persiste entre sesiones, aunque el usuario cierre la app.</p>
+
+<div class="step"><strong>1. Instalalo</strong> (no viene incluido en RN):</div>
+
+<pre><code class="lang-bash">npx expo install @react-native-async-storage/async-storage</code></pre>
+
+<div class="step"><strong>2. Importalo y usalo</strong> — pero con <code>await</code> en TODO:</div>
+
+<pre><code class="lang-jsx">import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Guardar un string
+await AsyncStorage.setItem('nombre', 'Alex');
+
+// Leer (devuelve el string, o null si no existe)
+const nombre = await AsyncStorage.getItem('nombre');
+
+// Borrar
+await AsyncStorage.removeItem('nombre');</code></pre>
+
+<div class="rule">
+  <strong>📌 La diferencia que lo cambia todo:</strong> en la web <code>localStorage</code> es <strong>sincrónico</strong>
+  (<code>localStorage.getItem('x')</code> te devuelve el valor en la misma línea). AsyncStorage es <strong>asíncrono</strong>:
+  cada operación devuelve una <em>promesa</em>, así que va con <code>await</code> (o <code>.then()</code>) y dentro de una función
+  <code>async</code>. Olvidarte del <code>await</code> es el error #1 con AsyncStorage.
+</div>
+
+<table>
+<thead><tr><th></th><th><code>localStorage</code> (web)</th><th>AsyncStorage (RN)</th></tr></thead>
+<tbody>
+<tr><td>¿Sincrónico?</td><td>Sí — valor inmediato</td><td><strong>No — devuelve promesa</strong></td></tr>
+<tr><td>Leer</td><td><code>localStorage.getItem('k')</code></td><td><code>await AsyncStorage.getItem('k')</code></td></tr>
+<tr><td>Guardar</td><td><code>localStorage.setItem('k', v)</code></td><td><code>await AsyncStorage.setItem('k', v)</code></td></tr>
+<tr><td>Borrar</td><td><code>localStorage.removeItem('k')</code></td><td><code>await AsyncStorage.removeItem('k')</code></td></tr>
+<tr><td>Solo guarda</td><td>strings</td><td>strings (¡igual!)</td></tr>
+</tbody>
+</table>
+
+<h2>Guardar objetos: <code>JSON.stringify</code> / <code>JSON.parse</code></h2>
+
+<p>Igual que <code>localStorage</code>, AsyncStorage <strong>solo guarda strings</strong>. Si querés guardar un objeto o un array, lo convertís a texto al guardar y lo reconstruís al leer:</p>
+
+<pre><code class="lang-jsx">const usuario = { nombre: 'Alex', edad: 28, favoritos: ['rn', 'expo'] };
+
+// Guardar: objeto → string
+await AsyncStorage.setItem('usuario', JSON.stringify(usuario));
+
+// Leer: string → objeto (ojo: puede ser null si nunca se guardó)
+const crudo = await AsyncStorage.getItem('usuario');
+const recuperado = crudo != null ? JSON.parse(crudo) : null;
+
+console.log(recuperado.favoritos[0]);  // 'rn'</code></pre>
+
+<div class="mistake">
+  <strong>Guardar un objeto sin <code>stringify</code>.</strong> <code>setItem('u', usuario)</code> termina guardando el string
+  <code>"[object Object]"</code> — un valor inútil. Siempre <code>JSON.stringify</code> al guardar y <code>JSON.parse</code> al leer.
+</div>
+
+<h2>Caché offline básico: leer local primero, luego refrescar de la red</h2>
+
+<div class="concept">
+  <strong>💡 La estrategia "stale-while-revalidate" en su forma más simple:</strong> al abrir la pantalla, mostrá <em>al instante</em>
+  lo último que guardaste en AsyncStorage (aunque sea viejo), y <em>en paralelo</em> pedí los datos frescos a la red. Cuando
+  lleguen, actualizás la pantalla y reguardás el caché. Resultado: la app se siente rápida y funciona aunque no haya señal.
+</div>
+
+<pre><code class="lang-jsx">import { useState, useEffect } from 'react';
+import { View, Text, ActivityIndicator, StyleSheet } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const CLAVE = 'cache_perfil';
+const URL = 'https://api.github.com/users/expo';
+
+export default function Perfil() {
+  const [data, setData] = useState(null);
+  const [cargando, setCargando] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    async function init() {
+      // 1. Mostrar el caché viejo al instante (si existe)
+      try {
+        const cache = await AsyncStorage.getItem(CLAVE);
+        if (cache != null) {
+          setData(JSON.parse(cache));
+          setCargando(false);   // ⬅️ ya hay algo en pantalla
+        }
+      } catch (e) { /* caché corrupto: lo ignoramos y vamos a la red */ }
+
+      // 2. Refrescar de la red en paralelo
+      try {
+        const res = await fetch(URL);
+        if (!res.ok) throw new Error('Respuesta ' + res.status);
+        const json = await res.json();
+        setData(json);
+        await AsyncStorage.setItem(CLAVE, JSON.stringify(json)); // reguardar
+      } catch (e) {
+        setError(e.message);   // si falla la red, igual quedó el caché viejo
+      } finally {
+        setCargando(false);
+      }
+    }
+    init();
+  }, []);
+
+  if (cargando &amp;&amp; data == null) return &lt;ActivityIndicator size="large" /&gt;;
+
+  return (
+    &lt;View style={styles.container}&gt;
+      {data &amp;&amp; &lt;Text style={styles.titulo}&gt;{data.name}&lt;/Text&gt;}
+      {error &amp;&amp; &lt;Text style={styles.error}&gt;Sin conexión — mostrando datos guardados&lt;/Text&gt;}
+    &lt;/View&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
+  titulo: { fontSize: 24, fontWeight: 'bold' },
+  error: { color: '#b45309', fontSize: 12 },
+});</code></pre>
+
+<div class="tip">
+  <strong>💡 Fijate el detalle:</strong> solo mostramos el spinner cuando <code>cargando &amp;&amp; data == null</code>. Si ya teníamos
+  caché, NO bloqueamos la pantalla con el spinner: el usuario ve contenido de inmediato y el refresco ocurre en silencio.
+</div>
+
+<h2>Un custom hook: <code>useAsyncStorage</code></h2>
+
+<p>Leer y escribir AsyncStorage en cada pantalla a mano es repetitivo. Como ya sabés de React, lo encapsulamos en un <strong>custom hook</strong> que expone el valor con estado y una función para actualizarlo:</p>
+
+<pre><code class="lang-jsx">import { useState, useEffect, useCallback } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Devuelve [valor, setValor, cargando] — como useState, pero persistido
+export function useAsyncStorage(clave, valorInicial) {
+  const [valor, setValor] = useState(valorInicial);
+  const [cargando, setCargando] = useState(true);
+
+  // Al montar: leer lo guardado
+  useEffect(() =&gt; {
+    (async () =&gt; {
+      try {
+        const crudo = await AsyncStorage.getItem(clave);
+        if (crudo != null) setValor(JSON.parse(crudo));
+      } catch (e) {
+        console.warn('useAsyncStorage leer:', e);
+      } finally {
+        setCargando(false);
+      }
+    })();
+  }, [clave]);
+
+  // Guardar: actualiza estado Y persiste
+  const guardar = useCallback(async (nuevo) =&gt; {
+    try {
+      setValor(nuevo);
+      await AsyncStorage.setItem(clave, JSON.stringify(nuevo));
+    } catch (e) {
+      console.warn('useAsyncStorage guardar:', e);
+    }
+  }, [clave]);
+
+  return [valor, guardar, cargando];
+}</code></pre>
+
+<p>Y se usa casi igual que <code>useState</code> — pero el valor sobrevive al cierre de la app:</p>
+
+<pre><code class="lang-jsx">function Ajustes() {
+  const [tema, setTema, cargando] = useAsyncStorage('tema', 'claro');
+
+  if (cargando) return &lt;ActivityIndicator /&gt;;
+
+  return (
+    &lt;Pressable onPress={() =&gt; setTema(tema === 'claro' ? 'oscuro' : 'claro')}&gt;
+      &lt;Text&gt;Tema actual: {tema} (tocá para cambiar)&lt;/Text&gt;
+    &lt;/Pressable&gt;
+  );
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔍 La regla de los 3 usos:</strong> no abstraés un hook "por si acaso". Pero cuando ves que estás copiando el mismo
+  bloque de <code>getItem</code>/<code>setItem</code> en tres pantallas, ahí sí: extraés <code>useAsyncStorage</code> y limpiás las tres.
+</div>
+
+<h2>Errores típicos con datos &amp; persistencia</h2>
+
+<div class="mistake">
+  <strong>Tratar AsyncStorage como sincrónico.</strong> <code>const v = AsyncStorage.getItem('x')</code> NO te da el valor:
+  te da una <em>promesa</em>. <code>v</code> va a ser un objeto Promise, no tu dato. Siempre <code>await</code> dentro de una función <code>async</code>.
+</div>
+<div class="mistake">
+  <strong>No manejar loading ni error.</strong> Si solo escribís el caso feliz, la pantalla queda en blanco mientras carga y
+  crashea (o se congela) cuando la red falla. Los 3 estados van siempre.
+</div>
+<div class="mistake">
+  <strong>Guardar objetos sin <code>JSON.stringify</code>.</strong> AsyncStorage solo guarda strings; un objeto crudo se
+  convierte en <code>"[object Object]"</code>. <code>stringify</code> al guardar, <code>parse</code> al leer.
+</div>
+<div class="warn">
+  <strong>⚠️ <code>getItem</code> puede devolver <code>null</code>.</strong> Si la clave nunca se guardó, obtenés <code>null</code>.
+  Hacer <code>JSON.parse(null)</code> da <code>null</code> (no rompe), pero leer una propiedad de eso sí. Chequeá <code>!= null</code> antes de usar.
+</div>
+<div class="danger">
+  <strong>🚫 AsyncStorage NO es para secretos.</strong> No guardes contraseñas ni tokens sensibles ahí: no está cifrado.
+  Para datos sensibles se usa <code>expo-secure-store</code> (lo vas a ver más adelante). AsyncStorage es para preferencias,
+  caché y estado de la UI.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿En qué se diferencia AsyncStorage de localStorage?</summary>
+<p>En que AsyncStorage es <strong>asíncrono</strong>: cada operación devuelve una promesa y se usa con <code>await</code> dentro de una función <code>async</code>. <code>localStorage</code> de la web es sincrónico (te devuelve el valor en la misma línea). En lo demás son parecidos: ambos guardan pares clave→valor como strings y persisten entre sesiones.</p></details>
+
+<details><summary>¿Cómo guardás un objeto en AsyncStorage y lo recuperás?</summary>
+<p>Al guardar: <code>await AsyncStorage.setItem('clave', JSON.stringify(objeto))</code>. Al leer: <code>const crudo = await AsyncStorage.getItem('clave')</code> y luego <code>const obj = crudo != null ? JSON.parse(crudo) : null</code>. AsyncStorage solo guarda strings, por eso hay que serializar/deserializar.</p></details>
+
+<details><summary>¿Qué es el patrón de los 3 estados y por qué importa?</summary>
+<p>Son <em>loading</em> (mostrás un <code>&lt;ActivityIndicator&gt;</code> mientras esperás), <em>error</em> (mostrás un mensaje si el fetch falla) y <em>data</em> (mostrás el contenido cuando llega). Importa porque sin él la pantalla queda en blanco con redes lentas y crashea cuando la API falla — es la diferencia entre una app robusta y una frágil.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí una pantalla que haga <code>fetch</code> a <code>https://api.github.com/users/expo</code> y muestre el nombre. Implementá los 3 estados: spinner mientras carga, mensaje si falla, datos cuando llega.</li>
+  <li>Apagá el WiFi y volvé a abrir la pantalla del ejercicio 1. Confirmá que aparece tu mensaje de error en vez de un crash o pantalla en blanco.</li>
+  <li>Instalá AsyncStorage y guardá un contador que sobreviva al cierre de la app: cada vez que tocás un botón sumás 1 y lo persistís. Al reabrir la app, el número debe seguir donde estaba.</li>
+  <li>Guardá un objeto <code>{ nombre, favoritos: [] }</code> con <code>JSON.stringify</code>, leelo con <code>JSON.parse</code> y mostrá <code>favoritos.length</code> en pantalla.</li>
+  <li>Combiná todo: cacheá el resultado del fetch del ejercicio 1 en AsyncStorage. Al abrir la pantalla, mostrá primero el caché y luego refrescá de la red (estrategia del ejemplo de caché offline).</li>
+</ol>
+
+<section class="quiz" id="quizRN07">
+  <style>
+    #quizRN07{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRN07 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRN07 .q{margin-bottom:1.5rem}
+    #quizRN07 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRN07 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRN07 .opt:hover{border-color:var(--accent)}
+    #quizRN07 .opt:disabled{cursor:default}
+    #quizRN07 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRN07 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRN07 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRN07 .exp.show{display:block}
+    #quizRN07 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Cuál es la diferencia clave entre AsyncStorage y el <code>localStorage</code> de la web?</p>
+    <button class="opt">AsyncStorage guarda números y objetos directamente, sin convertir</button>
+    <button class="opt">AsyncStorage es <strong>asíncrono</strong>: cada operación devuelve una promesa y se usa con <code>await</code></button>
+    <button class="opt">No hay diferencia, son la misma API</button>
+    <div class="exp">AsyncStorage es asíncrono — <code>getItem</code>/<code>setItem</code> devuelven promesas. Por eso van con <code>await</code> dentro de funciones <code>async</code>, a diferencia del <code>localStorage</code> sincrónico de la web.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Querés guardar el objeto <code>{ nombre: 'Alex' }</code> en AsyncStorage. ¿Qué hacés?</p>
+    <button class="opt"><code>await AsyncStorage.setItem('u', { nombre: 'Alex' })</code> directo</button>
+    <button class="opt">No se puede: AsyncStorage solo guarda números</button>
+    <button class="opt"><code>await AsyncStorage.setItem('u', JSON.stringify({ nombre: 'Alex' }))</code></button>
+    <div class="exp">AsyncStorage solo guarda strings. Hay que serializar con <code>JSON.stringify</code> al guardar y reconstruir con <code>JSON.parse</code> al leer. Guardar el objeto crudo termina como <code>"[object Object]"</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué describe el patrón "de los 3 estados" al cargar datos de una API?</p>
+    <button class="opt">Manejar <em>loading</em> (spinner), <em>error</em> (mensaje) y <em>data</em> (contenido) con <code>useState</code></button>
+    <button class="opt">Hacer el fetch tres veces para asegurar que llegue</button>
+    <button class="opt">Guardar los datos en tres claves distintas de AsyncStorage</button>
+    <div class="exp">Son los tres estados de una carga: mostrás <code>&lt;ActivityIndicator&gt;</code> mientras esperás, un mensaje si falla, y el contenido cuando llega. Cubrir los tres es lo que hace una pantalla robusta.</div>
+  </div>
+
+  <div class="score" id="scoreRN07"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRN07');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRN07').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M08.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m06-formularios/lecture.html">← M06: Formularios</a>
+  <a href="../m08-apis-dispositivo/lecture.html">M08: APIs del Dispositivo →</a>
+</nav>
+
+</div>
+</body>
+</html>

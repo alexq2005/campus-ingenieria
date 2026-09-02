@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 08 — Goroutines &amp; Channels · Curso de Go</title>
+  <meta name="description" content="Goroutines baratísimas, sincronización, channels tipados, unbuffered vs buffered, close + range, select y el modelo CSP de Go.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Go</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~60 min</span>
+  <span class="badge">🎯 Pre-req: M02</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Goroutines &amp; Channels</h1>
+
+<p>Llegamos a <strong>la feature que define a Go</strong>. Mientras otros lenguajes pegan la concurrencia con cinta (threads pesados, callbacks, async/await), Go la trae en el corazón del idioma: una palabra clave (<code>go</code>) lanza tareas concurrentes, y los <strong>channels</strong> las comunican de forma segura. En este módulo entendés cómo lanzar miles de tareas, cómo sincronizarlas y por qué el lema de Go es "compartí memoria comunicando".</p>
+
+<h2>Goroutines: concurrencia con una palabra</h2>
+
+<div class="concept">
+  <strong>💡 Una goroutine es una función que corre concurrentemente con el resto del programa.</strong> La lanzás poniendo <code>go</code> delante de la llamada. No es un thread del sistema operativo: es una unidad ligerísima que administra el runtime de Go. Podés tener <strong>decenas de miles</strong> sin transpirar.
+</div>
+
+<p>Así se lanza una:</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func hacerAlgo(nombre string) {
+    fmt.Println("trabajando:", nombre)
+}
+
+func main() {
+    go hacerAlgo("tarea A")   // corre concurrentemente
+    go hacerAlgo("tarea B")   // y esta también
+    time.Sleep(time.Second)   // hack temporal: esperar que terminen
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔗 Pensalo como un restaurante.</strong> Un thread del SO es contratar un cocinero completo (caro, lento de incorporar). Una goroutine es delegarle una orden a un mozo que ya está: el chef de cocina (el runtime) reparte miles de órdenes entre unos pocos cocineros reales (los threads). Vos pensás en "órdenes", no en "cocineros".
+</div>
+
+<h2>El problema: main no espera</h2>
+
+<p>En el ejemplo de arriba usamos <code>time.Sleep</code>, y eso es <strong>una trampa</strong>. La función <code>main</code> es ella misma una goroutine (la principal). Si <code>main</code> termina, <strong>el programa entero termina</strong> y se llevan puestas todas las goroutines que aún estaban corriendo, las hayan completado o no.</p>
+
+<div class="warn">
+  <strong>⚠️ Sin sincronización, no hay garantías.</strong> Si lanzás <code>go hacerAlgo()</code> y <code>main</code> sigue de largo hasta el final, puede que la goroutine <strong>nunca llegue a ejecutarse</strong>. <code>time.Sleep</code> "parece" arreglarlo pero es frágil: adiviná cuánto tarda la tarea y rezá. Necesitás una forma real de sincronizar — y la mejor es un <strong>channel</strong>.
+</div>
+
+<h2>Channels: tuberías tipadas</h2>
+
+<div class="concept">
+  <strong>💡 Un channel es una tubería tipada para comunicar goroutines.</strong> Una goroutine mete un valor por un extremo y otra lo saca por el otro. El channel se encarga de la sincronización: no hay <code>locks</code> manuales, no hay condiciones de carrera al pasar el dato.
+</div>
+
+<p>Se crea con <code>make</code> y tiene un tipo: un <code>chan int</code> solo transporta <code>int</code>. Las dos operaciones usan el operador <code>&lt;-</code> (una flecha que apunta hacia dónde va el dato):</p>
+
+<pre><code class="lang-go">ch := make(chan int)   // channel de enteros
+
+ch &lt;- 5                // ENVIAR: el 5 entra al channel (la flecha apunta AL channel)
+v := &lt;-ch              // RECIBIR: sacar un valor del channel (la flecha sale DEL channel)</code></pre>
+
+<div class="tip">
+  <strong>✅ Regla mnemotécnica de la flecha.</strong> El dato "viaja" en la dirección de <code>&lt;-</code>. En <code>ch &lt;- 5</code> el 5 va hacia <code>ch</code> (envío). En <code>v := &lt;-ch</code> el valor sale de <code>ch</code> hacia <code>v</code> (recepción). El channel siempre está del lado de la punta de flecha cuando recibís, y del lado contrario cuando enviás.
+</div>
+
+<h2>Unbuffered vs buffered</h2>
+
+<p>Hay dos sabores de channel, y la diferencia es crucial:</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Creación</th><th>Comportamiento</th></tr></thead>
+<tbody>
+<tr><td><strong>Unbuffered</strong></td><td><code>make(chan int)</code></td><td>El envío <strong>se bloquea</strong> hasta que alguien reciba. Sincroniza: emisor y receptor se "dan la mano".</td></tr>
+<tr><td><strong>Buffered</strong></td><td><code>make(chan int, 3)</code></td><td>Tiene capacidad (3). El envío solo se bloquea si el buffer está <strong>lleno</strong>; recibir solo se bloquea si está <strong>vacío</strong>.</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Un channel <strong>unbuffered</strong> es un punto de encuentro: <code>ch &lt;- v</code> queda esperando ahí parado hasta que otra goroutine haga <code>&lt;-ch</code>. Justo por eso sirve para sincronizar. Un channel <strong>buffered</strong> es más como una cola con casilleros: podés dejar hasta N valores sin que nadie los retire todavía.
+</div>
+
+<pre><code class="lang-go">// Unbuffered: este envío ESPERA a un receptor
+sync := make(chan int)
+
+// Buffered con capacidad 2: estos dos NO bloquean
+buf := make(chan string, 2)
+buf &lt;- "hola"
+buf &lt;- "mundo"
+// buf &lt;- "tercero"   // ESTO bloquearía: buffer lleno</code></pre>
+
+<h2>close y recibir con range</h2>
+
+<p>Cuando una goroutine termina de mandar valores, puede <strong>cerrar</strong> el channel con <code>close(ch)</code>. Eso le avisa al receptor que no vienen más datos. El receptor puede recorrer todos los valores cómodamente con <code>for ... range</code>:</p>
+
+<pre><code class="lang-go">func main() {
+    ch := make(chan int, 3)
+
+    ch &lt;- 10
+    ch &lt;- 20
+    ch &lt;- 30
+    close(ch)              // no se envían más valores
+
+    // range termina solo cuando el channel está cerrado y vacío
+    for v := range ch {
+        fmt.Println("recibí:", v)
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Reglas de close.</strong> Cierra <strong>el que envía</strong>, nunca el que recibe. Enviar a un channel cerrado provoca un <code>panic</code>. Recibir de un channel cerrado devuelve el valor cero del tipo (y un segundo valor booleano <code>false</code>: <code>v, ok := &lt;-ch</code>). Y <code>for range</code> sobre el channel se corta solo al cerrarse.
+</div>
+
+<h2>Ejemplo completo: varias goroutines reportando por un channel</h2>
+
+<p>Acá está el patrón que vas a usar mil veces: lanzás varias goroutines que calculan algo y mandan el resultado por un channel; <code>main</code> los recibe a medida que llegan.</p>
+
+<pre><code class="lang-go">package main
+
+import "fmt"
+
+// cada worker calcula el cuadrado y lo manda por el channel
+func worker(id int, resultados chan&lt;- int) {
+    resultados &lt;- id * id
+}
+
+func main() {
+    resultados := make(chan int)
+
+    // lanzamos 3 goroutines
+    go worker(2, resultados)
+    go worker(3, resultados)
+    go worker(4, resultados)
+
+    // main recibe los 3 valores (el orden NO está garantizado)
+    for i := 0; i &lt; 3; i++ {
+        v := &lt;-resultados
+        fmt.Println("resultado:", v)
+    }
+}</code></pre>
+
+<div class="info">
+  Fijate en el tipo del parámetro: <code>chan&lt;- int</code> es un channel <strong>solo de envío</strong> (la flecha pegada a <code>chan</code> indica la dirección permitida). Es una restricción que te da el compilador: dentro de <code>worker</code> no podés recibir por error. Su simétrico, <code>&lt;-chan int</code>, sería solo de recepción.
+</div>
+
+<h2>select: esperar en varios channels a la vez</h2>
+
+<div class="concept">
+  <strong>💡 <code>select</code> es como un <code>switch</code>, pero para channels.</strong> Espera hasta que <strong>una</strong> de varias operaciones de channel esté lista y ejecuta ese caso. Si varias están listas a la vez, elige una al azar. Es la herramienta para coordinar múltiples fuentes de datos.
+</div>
+
+<pre><code class="lang-go">func main() {
+    a := make(chan string)
+    b := make(chan string)
+
+    go func() { a &lt;- "desde A" }()
+    go func() { b &lt;- "desde B" }()
+
+    // esperamos 2 mensajes, vengan del channel que vengan
+    for i := 0; i &lt; 2; i++ {
+        select {
+        case msg := &lt;-a:
+            fmt.Println("recibí", msg)
+        case msg := &lt;-b:
+            fmt.Println("recibí", msg)
+        }
+    }
+}</code></pre>
+
+<p>Un <code>select</code> con un caso <code>default</code> no se bloquea: si ningún channel está listo, ejecuta el <code>default</code> y sigue. Combinado con <code>time.After</code>, <code>select</code> también sirve para implementar <strong>timeouts</strong>.</p>
+
+<h2>El modelo CSP de Go</h2>
+
+<div class="concept">
+  <strong>💡 El lema de Go: "No comuniques compartiendo memoria; compartí memoria comunicando."</strong> En vez de que dos goroutines toquen la misma variable protegida por <code>locks</code> (el modelo clásico, propenso a errores), una goroutine <strong>posee</strong> el dato y se lo <strong>pasa</strong> a otra por un channel. Quien tiene el dato es el único que lo toca. Este modelo se llama <strong>CSP</strong> (Communicating Sequential Processes).
+</div>
+
+<p>La idea es invertir el problema: en vez de pelearte con cerrojos para que dos hilos no pisen la misma memoria, hacés que el <strong>dato fluya</strong> de una goroutine a otra. El channel es el único punto de contacto, y Go garantiza que ese pasaje es seguro.</p>
+
+<h2>Tres errores clásicos</h2>
+
+<div class="mistake"><strong>Deadlock.</strong> Si enviás a un channel <strong>unbuffered</strong> y no hay nadie que reciba (ni lo habrá), tu goroutine queda bloqueada para siempre. Si todas las goroutines quedan bloqueadas, Go lo detecta y aborta: <code>fatal error: all goroutines are asleep - deadlock!</code>. Causa típica: hacer <code>ch &lt;- v</code> en <code>main</code> sin haber lanzado antes el receptor.</div>
+
+<div class="mistake"><strong>Goroutine leak.</strong> Lanzás una goroutine que se queda esperando en un channel del que nadie va a enviar/recibir nunca. No crashea, pero esa goroutine <strong>nunca termina</strong> y va acumulando memoria. Las fugas de goroutines son el "memory leak" de Go.</div>
+
+<div class="mistake"><strong>Race condition.</strong> Si varias goroutines tocan la <strong>misma variable</strong> sin sincronizar (sin channel ni <code>Mutex</code>), el resultado es impredecible y dependiente del scheduler. Justamente lo que CSP busca evitar. Lo vemos a fondo en M09 (y conocés <code>go run -race</code>, el detector de carreras).</div>
+
+<div class="danger">
+  <strong>🔥 Probá el detector de carreras.</strong> Go trae un detector incorporado: corré tu programa con <code>go run -race main.go</code> o testeá con <code>go test -race</code>. Te marca en runtime cualquier acceso concurrente sin sincronizar a la misma memoria. Es la primera herramienta a la que recurrís cuando un programa concurrente "a veces falla".
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>time.Sleep</code> es una mala forma de esperar a las goroutines?</summary>
+<p>Porque es adivinar cuánto van a tardar: si tardan más, <code>main</code> termina antes y las mata; si tardan menos, desperdiciás tiempo. No hay garantía real. Un channel (o un <code>sync.WaitGroup</code>) sincroniza de verdad: <code>main</code> espera exactamente hasta que la goroutine reportó.</p></details>
+
+<details><summary>¿Cuál es la diferencia entre un channel unbuffered y uno buffered?</summary>
+<p>El <strong>unbuffered</strong> (<code>make(chan int)</code>) sincroniza: el envío se bloquea hasta que alguien reciba — emisor y receptor se "dan la mano". El <strong>buffered</strong> (<code>make(chan int, 3)</code>) tiene capacidad: el envío solo se bloquea si el buffer está lleno, y recibir solo se bloquea si está vacío.</p></details>
+
+<details><summary>¿Qué hace <code>select</code> y para qué sirve?</summary>
+<p>Espera en <strong>varios channels a la vez</strong> y ejecuta el caso del primero que esté listo (si hay varios listos, elige al azar). Es como un <code>switch</code> para operaciones de channel. Con un caso <code>default</code> no se bloquea, y combinado con <code>time.After</code> implementa timeouts.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Lanzá una goroutine con <code>go</code> que imprima un mensaje, y comprobá que sin <code>time.Sleep</code> (o sin un channel) el mensaje a veces no aparece. Después arreglalo con un channel.</li>
+  <li>Creá un channel <code>chan int</code>, lanzá 3 goroutines que envíen su número al cuadrado, y recibilos en <code>main</code> con un bucle <code>for i := 0; i &lt; 3; i++</code>.</li>
+  <li>Llená un channel <strong>buffered</strong> de capacidad 4 con valores, hacé <code>close(ch)</code>, y recorré todo con <code>for v := range ch</code> imprimiendo cada valor.</li>
+  <li>Provocá un <strong>deadlock</strong> a propósito: hacé <code>ch &lt;- 1</code> en <code>main</code> sobre un channel unbuffered sin ningún receptor, y mirá el mensaje <code>fatal error: ... deadlock!</code>.</li>
+  <li>Escribí un <code>select</code> que reciba de dos channels distintos (cada uno alimentado por su propia goroutine) e imprima de cuál llegó cada mensaje.</li>
+</ol>
+
+<section class="quiz" id="quizGo08">
+  <style>
+    #quizGo08{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGo08 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGo08 .q{margin-bottom:1.5rem}
+    #quizGo08 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGo08 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGo08 .opt:hover{border-color:var(--accent)}
+    #quizGo08 .opt:disabled{cursor:default}
+    #quizGo08 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGo08 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGo08 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGo08 .exp.show{display:block}
+    #quizGo08 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué hace la palabra clave <code>go</code> delante de una llamada a función?</p>
+    <button class="opt">Importa la función desde otro paquete</button>
+    <button class="opt">Lanza esa función como una goroutine, que corre concurrentemente</button>
+    <button class="opt">Hace que la función devuelva un error si falla</button>
+    <div class="exp">Poner <code>go f()</code> arranca <code>f</code> en una goroutine: una unidad de ejecución ligerísima que corre concurrentemente con el resto. Podés tener miles.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. En un channel <strong>unbuffered</strong>, ¿qué pasa al hacer <code>ch &lt;- v</code> si nadie está recibiendo?</p>
+    <button class="opt">El valor se descarta silenciosamente</button>
+    <button class="opt">Se guarda en un buffer interno y sigue</button>
+    <button class="opt">El envío se bloquea hasta que otra goroutine reciba (y si nadie lo hará, hay deadlock)</button>
+    <div class="exp">Un channel unbuffered sincroniza: el envío espera a un receptor. Si en <code>main</code> enviás sin haber lanzado un receptor, Go aborta con <code>fatal error: ... deadlock!</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Qué resume mejor el modelo de concurrencia (CSP) de Go?</p>
+    <button class="opt">No comuniques compartiendo memoria; compartí memoria comunicando (vía channels)</button>
+    <button class="opt">Cada goroutine debe proteger toda variable global con un Mutex</button>
+    <button class="opt">La concurrencia se logra solo con async/await</button>
+    <div class="exp">El lema de Go invierte el modelo clásico de locks: en vez de compartir una variable protegida, una goroutine posee el dato y lo pasa por un channel. El channel es el único punto de contacto seguro.</div>
+  </div>
+
+  <div class="score" id="scoreGo08"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGo08');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGo08').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M09.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m07-errores/lecture.html">← M07: Errores</a>
+  <a href="../m09-concurrencia-avanzada/lecture.html">M09: Concurrencia Avanzada →</a>
+</nav>
+
+</div>
+</body>
+</html>

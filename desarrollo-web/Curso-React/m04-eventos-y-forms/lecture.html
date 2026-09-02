@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 04 — Eventos y Forms · Curso de React</title>
+<meta name="description" content="Synthetic events, inputs controlados, forms, useActionState de React 19.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 04</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 03</span>
+</div>
+
+<article>
+
+<h1>Módulo 04 — Eventos y Forms</h1>
+
+<blockquote>Sin eventos, una app React es solo una pantalla bonita. Sin forms, no podés capturar nada del usuario. Esta lección hace tu app <strong>interactiva</strong>.</blockquote>
+
+<h2>1. Manejar eventos</h2>
+<figure class="foto">
+  <img src="../assets/img/m04-boton.jpg" alt="Panel de botones de control">
+  <figcaption>Un panel de botones: los eventos (onClick, onChange) conectan las acciones del usuario con tu código. Foto: UCL Mathematical & Physical Sciences from London, UK, vía <a href="https://commons.wikimedia.org/wiki/File:Control_panel_%289423621776%29.jpg" target="_blank">Wikimedia Commons</a> (CC BY 2.0).</figcaption>
+</figure>
+
+
+<p>Los eventos en React son <strong>synthetic events</strong>: un wrapper sobre los nativos del DOM, cross-browser, con la misma API.</p>
+
+<pre><code class="lang-jsx">function Boton() {
+  function handleClick() {
+    alert('¡Click!');
+  }
+
+  return &lt;button onClick={handleClick}&gt;Apretame&lt;/button&gt;;
+}</code></pre>
+
+<div class="rule">
+Reglas:
+<ul>
+  <li>Atributos en camelCase: <code>onClick</code>, <code>onChange</code>, <code>onSubmit</code> (no <code>onclick</code>).</li>
+  <li>Pasás una FUNCIÓN, no una llamada: <code>onClick={handleClick}</code>, NO <code>onClick={handleClick()}</code>.</li>
+  <li>Inline arrow funciona pero crea nueva función en cada render: <code>onClick={() =&gt; setX(1)}</code>.</li>
+</ul>
+</div>
+
+<h2>2. Inline vs función separada</h2>
+
+<pre><code class="lang-jsx">// Inline — ok para handlers simples
+&lt;button onClick={() =&gt; setCount(count + 1)}&gt;+1&lt;/button&gt;
+
+// Función separada — preferida para lógica compleja
+function handleClick() {
+  setCount(count + 1);
+  console.log('Clickeado');
+  trackEvent('button_click');
+}
+&lt;button onClick={handleClick}&gt;+1&lt;/button&gt;</code></pre>
+
+<h2>3. Pasar argumentos al handler</h2>
+
+<pre><code class="lang-jsx">function Lista() {
+  function eliminar(id) {
+    console.log('Eliminando', id);
+  }
+
+  return (
+    &lt;&gt;
+      {items.map(item =&gt; (
+        // ⭐ Arrow function que recibe el id
+        &lt;button onClick={() =&gt; eliminar(item.id)}&gt;Borrar&lt;/button&gt;
+      ))}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="warn">NO escribas <code>onClick={eliminar(item.id)}</code> (sin arrow) — eso EJECUTA <code>eliminar</code> durante el render, no en el click.</div>
+
+<h2>4. El objeto event</h2>
+
+<pre><code class="lang-jsx">function Input() {
+  function handleChange(event) {
+    console.log(event.target.value);   // el valor del input
+    console.log(event.target.name);    // el name del input
+    console.log(event.target.checked); // para checkboxes
+    console.log(event.type);            // "change", "click", etc.
+  }
+
+  return &lt;input onChange={handleChange} /&gt;;
+}</code></pre>
+
+<h2>5. preventDefault y stopPropagation</h2>
+
+<pre><code class="lang-jsx">function Form() {
+  function handleSubmit(e) {
+    e.preventDefault();  // evita el reload de página default del form
+    console.log('Submit con JS');
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;button type="submit"&gt;Enviar&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}
+
+function Card({ onClick }) {
+  function handleButton(e) {
+    e.stopPropagation();  // evita que el click llegue al onClick del Card
+    console.log('Botón clickeado, NO la card');
+  }
+
+  return (
+    &lt;div onClick={onClick}&gt;
+      &lt;button onClick={handleButton}&gt;X&lt;/button&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h2>6. Inputs controlados (controlled)</h2>
+
+<p>Un input "controlado" tiene su valor en el estado de React. React es la fuente de verdad.</p>
+
+<pre><code class="lang-jsx">function FormControlado() {
+  const [nombre, setNombre] = useState('');
+
+  return (
+    &lt;&gt;
+      &lt;input
+        value={nombre}
+        onChange={(e) =&gt; setNombre(e.target.value)}
+      /&gt;
+      &lt;p&gt;Hola, {nombre}&lt;/p&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="rule">El patrón canónico de input controlado: <code>value={estado}</code> + <code>onChange={e =&gt; setEstado(e.target.value)}</code>. Lo vas a escribir 1000 veces en tu carrera.</div>
+
+<h2>7. Inputs uncontrolled (con ref)</h2>
+
+<p>Alternativa: dejar que el DOM maneje el valor, leerlo solo en submit:</p>
+
+<pre><code class="lang-jsx">import { useRef } from 'react';
+
+function FormUncontrolled() {
+  const inputRef = useRef(null);
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    console.log(inputRef.current.value);
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;input ref={inputRef} defaultValue="" /&gt;
+      &lt;button&gt;Enviar&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<table>
+<thead><tr><th>Cuándo usar</th><th>Controlado</th><th>Uncontrolled</th></tr></thead>
+<tbody>
+<tr><td>Validar en vivo</td><td>✅</td><td>❌</td></tr>
+<tr><td>Auto-formato (mayúscula, máscara)</td><td>✅</td><td>❌</td></tr>
+<tr><td>Disable submit hasta válido</td><td>✅</td><td>❌</td></tr>
+<tr><td>Forms muy grandes (perf)</td><td>🟡</td><td>✅</td></tr>
+<tr><td>File inputs</td><td>❌ (forzado uncontrolled)</td><td>✅</td></tr>
+</tbody>
+</table>
+
+<div class="tip">Default: controlado. Cambiá a uncontrolled (o usá React Hook Form) si el form es grande y los re-renders se notan.</div>
+
+<h2>8. Distintos tipos de inputs</h2>
+
+<pre><code class="lang-jsx">function FormCompleto() {
+  const [texto, setTexto] = useState('');
+  const [edad, setEdad] = useState(0);
+  const [acepta, setAcepta] = useState(false);
+  const [pais, setPais] = useState('AR');
+  const [color, setColor] = useState('#ff0000');
+
+  return (
+    &lt;form&gt;
+      {/* Texto */}
+      &lt;input value={texto} onChange={(e) =&gt; setTexto(e.target.value)} /&gt;
+
+      {/* Número */}
+      &lt;input
+        type="number"
+        value={edad}
+        onChange={(e) =&gt; setEdad(Number(e.target.value))}
+      /&gt;
+
+      {/* Checkbox */}
+      &lt;input
+        type="checkbox"
+        checked={acepta}
+        onChange={(e) =&gt; setAcepta(e.target.checked)}
+      /&gt;
+
+      {/* Select */}
+      &lt;select value={pais} onChange={(e) =&gt; setPais(e.target.value)}&gt;
+        &lt;option value="AR"&gt;Argentina&lt;/option&gt;
+        &lt;option value="UY"&gt;Uruguay&lt;/option&gt;
+      &lt;/select&gt;
+
+      {/* Color picker */}
+      &lt;input
+        type="color"
+        value={color}
+        onChange={(e) =&gt; setColor(e.target.value)}
+      /&gt;
+
+      {/* Textarea */}
+      &lt;textarea value={texto} onChange={(e) =&gt; setTexto(e.target.value)} /&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="info">En React, <code>&lt;textarea&gt;</code> usa <code>value</code> (no children como HTML normal) y <code>&lt;select&gt;</code> usa <code>value</code> en el select (no <code>selected</code> en cada option).</div>
+
+<h2>9. Form con un solo objeto de estado</h2>
+
+<pre><code class="lang-jsx">function FormUsuario() {
+  const [form, setForm] = useState({
+    nombre: '',
+    email: '',
+    edad: 0,
+  });
+
+  function actualizar(e) {
+    const { name, value } = e.target;
+    setForm(prev =&gt; ({ ...prev, [name]: value }));
+  }
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    console.log('Enviando:', form);
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;input name="nombre" value={form.nombre} onChange={actualizar} /&gt;
+      &lt;input name="email" type="email" value={form.email} onChange={actualizar} /&gt;
+      &lt;input name="edad" type="number" value={form.edad} onChange={actualizar} /&gt;
+      &lt;button&gt;Enviar&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="code-conn">Truco: usar <code>name</code> en el input + computed key <code>[name]</code> en el setState. Un solo handler para todos los inputs.</div>
+
+<h2>10. Validación básica</h2>
+
+<pre><code class="lang-jsx">function FormLogin() {
+  const [email, setEmail] = useState('');
+  const [pwd, setPwd] = useState('');
+
+  const emailValido = email.includes('@');
+  const pwdValido = pwd.length &gt;= 8;
+  const formValido = emailValido && pwdValido;
+
+  return (
+    &lt;form&gt;
+      &lt;input
+        type="email"
+        value={email}
+        onChange={(e) =&gt; setEmail(e.target.value)}
+      /&gt;
+      {email && !emailValido && &lt;p style={{color: 'red'}}&gt;Email inválido&lt;/p&gt;}
+
+      &lt;input
+        type="password"
+        value={pwd}
+        onChange={(e) =&gt; setPwd(e.target.value)}
+      /&gt;
+      {pwd && !pwdValido && &lt;p style={{color: 'red'}}&gt;Mín 8 caracteres&lt;/p&gt;}
+
+      &lt;button disabled={!formValido}&gt;Login&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="tip">Notar: los errores se DERIVAN del estado, no se guardan aparte. Esto es estado derivado correcto — no duplicás info.</div>
+
+<h2>11. React Hook Form (preview)</h2>
+
+<p>Para forms grandes con validación compleja, la librería estándar es <strong>React Hook Form</strong>:</p>
+
+<pre><code class="lang-jsx">import { useForm } from 'react-hook-form';
+
+function FormPro() {
+  const { register, handleSubmit, formState: { errors } } = useForm();
+
+  function onSubmit(data) {
+    console.log(data);
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit(onSubmit)}&gt;
+      &lt;input {...register('email', { required: 'Email requerido' })} /&gt;
+      {errors.email && &lt;p&gt;{errors.email.message}&lt;/p&gt;}
+      &lt;button&gt;Submit&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="info">React Hook Form usa inputs uncontrolled internamente → re-renders mínimos. Para forms con &gt; 5 campos o validación compleja, vale la pena. Lo profundizamos en M11.</div>
+
+<h2>12. useActionState — React 19</h2>
+
+<p>React 19 introdujo <code>useActionState</code> para forms con actions (server actions o async):</p>
+
+<pre><code class="lang-jsx">import { useActionState } from 'react';
+
+async function loginAction(prevState, formData) {
+  const email = formData.get('email');
+  const result = await fetch('/api/login', {
+    method: 'POST',
+    body: JSON.stringify({ email })
+  });
+  return result.ok ? { ok: true } : { error: 'Falló' };
+}
+
+function FormLogin() {
+  const [state, action, pending] = useActionState(loginAction, null);
+
+  return (
+    &lt;form action={action}&gt;
+      &lt;input name="email" type="email" /&gt;
+      &lt;button disabled={pending}&gt;
+        {pending ? 'Enviando...' : 'Login'}
+      &lt;/button&gt;
+      {state?.error && &lt;p&gt;{state.error}&lt;/p&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="rule">Funciona excelente combinado con Server Actions de Next.js 15. Lo profundizamos en M13.</div>
+
+<h2>13. Errores típicos</h2>
+
+<div class="mistake"><strong>Ejecutar el handler en lugar de pasarlo</strong>: <code>onClick={handleClick()}</code> ejecuta inmediatamente al render. Debe ser <code>onClick={handleClick}</code>.</div>
+
+<div class="mistake"><strong>Input controlado sin <code>onChange</code></strong>: <code>&lt;input value={x} /&gt;</code> sin onChange → input read-only. React te avisa por consola.</div>
+
+<div class="mistake"><strong>Olvidar <code>preventDefault</code> en form submit</strong>: la página se recarga, perdés estado.</div>
+
+<div class="mistake"><strong>Mutar el form state</strong>: <code>form.email = 'x'; setForm(form)</code> NO funciona. Usá <code>setForm({...form, email: 'x'})</code>.</div>
+
+<div class="mistake"><strong>Validar con regex en el render sin memoización</strong>: si la regex es cara, considerá <code>useMemo</code>. Para validaciones simples, no te preocupes.</div>
+
+<div class="mistake"><strong>Convertir Number en cada handler</strong>: <code>e.target.value</code> es siempre string. Para números: <code>Number(e.target.value)</code> o <code>parseInt</code>.</div>
+
+<h2>14. Ejercicios</h2>
+
+<ol>
+  <li>Login form con email + password, botón deshabilitado hasta que ambos sean válidos.</li>
+  <li>Registro con confirm password — mostrar error si no coinciden.</li>
+  <li>Contador con input: usuario escribe un número y se aplica al click.</li>
+  <li>To-do list: input + botón "Agregar" + Enter también funciona.</li>
+  <li>Form de tarjeta de crédito con auto-formato (espacios cada 4 dígitos).</li>
+  <li>Search con filtro en vivo sobre una lista local.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Diferencia entre <code>onClick={fn}</code> y <code>onClick={fn()}</code>?</summary>
+<p>El primero PASA la función como handler — React la llama al click. El segundo EJECUTA <code>fn()</code> ahora mismo durante el render y le pasa el resultado al onClick (probablemente undefined). Casi siempre querés el primero.</p></details>
+
+<details><summary>2. ¿Qué es un input controlado?</summary>
+<p>Un input cuyo valor está en el estado React (<code>value={estado}</code>) y se actualiza vía onChange. React es la fuente de verdad. Permite validación en vivo, formato automático, disable de submit por validación.</p></details>
+
+<details><summary>3. ¿Cuándo usar uncontrolled o React Hook Form?</summary>
+<p>Cuando los re-renders del controlado se notan (forms grandes, &gt; 10 inputs) o no necesitás validación en vivo (solo en submit). React Hook Form usa uncontrolled internamente con la mejor DX.</p></details>
+
+<details><summary>4. ¿Por qué <code>e.preventDefault()</code> en form submit?</summary>
+<p>Porque el comportamiento default del browser es recargar la página al submit del form. Eso destruye el estado React. preventDefault permite manejar el submit con JS.</p></details>
+
+<details><summary>5. ¿Qué hace este código? <code>setForm(prev =&gt; ({ ...prev, [name]: value }))</code></summary>
+<p>Crea un NUEVO objeto que copia todas las props del estado previo Y sobrescribe la propiedad con clave <code>[name]</code> (computed key — el nombre del input). Es el patrón canónico para form con un solo handler para múltiples inputs.</p></details>
+
+<details><summary>6. ¿Qué es useActionState y cuándo usarlo?</summary>
+<p>Hook de React 19 para forms con async actions (especialmente Server Actions de Next.js). Devuelve <code>[state, action, pending]</code>. Maneja el estado del submit, errores y loading sin escribir useState manual.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m03-estado-usestate/lecture.html">← Anterior: useState</a>
+  <a href="../m05-listas-y-keys/lecture.html">Siguiente: Listas y Keys →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 05 — Listas y Keys · Curso de React</title>
+<meta name="description" content="Renderizar arrays con map, keys estables, conditional rendering.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 05</span>
+  <span class="badge">⏱ ~45 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 03</span>
+</div>
+
+<article>
+
+<h1>Módulo 05 — Listas y Keys</h1>
+
+<blockquote>El 80% de las UI muestran listas: productos, tareas, comentarios, mensajes. React renderiza listas con <code>.map()</code> + una prop especial llamada <code>key</code>.</blockquote>
+
+<h2>1. Renderizar un array con <code>.map()</code></h2>
+<figure class="foto">
+  <img src="../assets/img/m05-catalogo.jpg" alt="Fichero de biblioteca con cajones">
+  <figcaption>Un fichero de biblioteca: al renderizar listas, cada elemento necesita una key única — el índice que React usa para identificarlo. Foto: TBurmeister (WMF), vía <a href="https://commons.wikimedia.org/wiki/File:Card_catalog_at_the_Indiana_State_Library_-_exterior_view_of_shelf.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+
+<pre><code class="lang-jsx">function ListaFrutas() {
+  const frutas = ['Manzana', 'Pera', 'Uva'];
+
+  return (
+    &lt;ul&gt;
+      {frutas.map(fruta =&gt; (
+        &lt;li key={fruta}&gt;{fruta}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="step"><strong>Cómo funciona</strong>:</div>
+<ol>
+  <li><code>frutas.map(...)</code> devuelve un array de JSX: <code>[&lt;li&gt;Manzana&lt;/li&gt;, &lt;li&gt;Pera&lt;/li&gt;, &lt;li&gt;Uva&lt;/li&gt;]</code>.</li>
+  <li>React acepta arrays de JSX como children — los renderiza en orden.</li>
+  <li>El atributo <code>key</code> es <strong>obligatorio</strong> en el elemento raíz devuelto por el callback.</li>
+</ol>
+
+<h2>2. ¿Qué son las keys y por qué importan?</h2>
+
+<div class="concept"><strong>Key</strong> es un identificador único por item que React usa para detectar qué cambió en la lista entre renders. Sin keys, React no puede mantener estado o reorganizar eficientemente.</div>
+
+<div class="rule">
+Reglas inquebrantables de keys:
+<ul>
+  <li>Deben ser <strong>únicas entre hermanos</strong> (no globalmente).</li>
+  <li>Deben ser <strong>estables</strong> (no cambian entre renders).</li>
+  <li>NUNCA usar el <strong>index del array</strong> si la lista puede reordenarse, agregar o quitar items.</li>
+</ul>
+</div>
+
+<h2>3. Buenas vs malas keys</h2>
+
+<table>
+<thead><tr><th>Mala key</th><th>Buena key</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><code>key={index}</code></td><td><code>key={item.id}</code></td><td>El index cambia al reordenar</td></tr>
+<tr><td><code>key={Math.random()}</code></td><td>id estable</td><td>Random cambia en cada render</td></tr>
+<tr><td><code>key={Date.now()}</code></td><td>id del item</td><td>Distinto en cada render</td></tr>
+<tr><td>(omitir key)</td><td><code>key={algo}</code></td><td>Warning + bugs sutiles</td></tr>
+</tbody>
+</table>
+
+<h2>4. ¿De dónde sale el id?</h2>
+
+<div class="step"><strong>Caso 1: Datos del backend</strong> — usás el id de la DB.</div>
+<pre><code class="lang-jsx">posts.map(post =&gt; &lt;Post key={post.id} {...post} /&gt;)</code></pre>
+
+<div class="step"><strong>Caso 2: Datos creados localmente</strong> — generás el id al crear.</div>
+<pre><code class="lang-jsx">function agregarTarea(texto) {
+  setTareas(prev =&gt; [...prev, {
+    id: crypto.randomUUID(),    // ⭐ moderno y disponible en browser
+    texto,
+    hecha: false
+  }]);
+}</code></pre>
+
+<div class="step"><strong>Caso 3: Lista estática y el texto es único</strong> — podés usar el valor.</div>
+<pre><code class="lang-jsx">const dias = ['Lunes', 'Martes', 'Miércoles'];
+dias.map(dia =&gt; &lt;li key={dia}&gt;{dia}&lt;/li&gt;)</code></pre>
+
+<div class="warn">Si los strings pueden repetirse, NO sirve usarlos como key. <code>['Foo', 'Foo']</code> con <code>key={item}</code> = warning de key duplicada.</div>
+
+<h2>5. ¿Por qué index es mala key?</h2>
+
+<div class="mini-ex">
+Imaginá una lista de inputs con estado local:
+<pre><code class="lang-jsx">{tareas.map((t, i) =&gt; (
+  &lt;li key={i}&gt;
+    &lt;input defaultValue={t.texto} /&gt;
+  &lt;/li&gt;
+))}</code></pre>
+
+Si tarea[0] se elimina:
+<ul>
+  <li>Tarea[1] (index 1) pasa a estar en index 0.</li>
+  <li>React ve "la key 0 sigue ahí" pero ahora con datos distintos.</li>
+  <li>El input no se "desmonta" — sigue mostrando el texto VIEJO.</li>
+</ul>
+
+Con <code>key={t.id}</code>, React sabe que el item con id-A se fue y el item con id-B sigue ahí. Reorganiza correctamente.
+</div>
+
+<h2>6. Listas filtradas y transformadas</h2>
+
+<pre><code class="lang-jsx">function ProductosDestacados({ productos }) {
+  return (
+    &lt;ul&gt;
+      {productos
+        .filter(p =&gt; p.destacado)
+        .sort((a, b) =&gt; b.rating - a.rating)
+        .map(p =&gt; (
+          &lt;li key={p.id}&gt;{p.nombre} ⭐ {p.rating}&lt;/li&gt;
+        ))
+      }
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="tip">Encadenar <code>filter</code> → <code>sort</code> → <code>map</code> es idiomático. No mutes el array original — los métodos como <code>sort</code> y <code>reverse</code> mutan. Si la lista viene de props, copiá primero: <code>[...productos].sort(...)</code>.</div>
+
+<h2>7. Listas vacías y estado de carga</h2>
+
+<pre><code class="lang-jsx">function Posts({ posts, cargando }) {
+  if (cargando) return &lt;p&gt;Cargando...&lt;/p&gt;;
+  if (posts.length === 0) return &lt;p&gt;No hay posts aún.&lt;/p&gt;;
+
+  return (
+    &lt;ul&gt;
+      {posts.map(p =&gt; &lt;li key={p.id}&gt;{p.titulo}&lt;/li&gt;)}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<h2>8. Conditional rendering</h2>
+
+<table>
+<thead><tr><th>Patrón</th><th>Cuándo usar</th></tr></thead>
+<tbody>
+<tr><td><code>{cond &amp;&amp; &lt;X /&gt;}</code></td><td>Mostrar o nada</td></tr>
+<tr><td><code>{cond ? &lt;X /&gt; : &lt;Y /&gt;}</code></td><td>Mostrar X o Y</td></tr>
+<tr><td><code>if (cond) return ...</code> al inicio</td><td>Early return (carga, error)</td></tr>
+<tr><td>Variable de JSX previa</td><td>Lógica compleja antes del return</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">// && — falsy values gotcha
+{usuarios.length &amp;&amp; &lt;p&gt;{usuarios.length} usuarios&lt;/p&gt;}
+// Si length=0, renderiza "0" (no nada). Usar comparación explícita:
+{usuarios.length &gt; 0 &amp;&amp; &lt;p&gt;{usuarios.length} usuarios&lt;/p&gt;}</code></pre>
+
+<div class="warn">Trampa clásica: <code>{count && ...}</code>. Si count es <code>0</code>, React renderiza "0" como texto. SIEMPRE compará: <code>{count &gt; 0 && ...}</code> o <code>{!!count && ...}</code>.</div>
+
+<h2>9. Componente por item</h2>
+
+<p>Cuando el JSX del item es complejo, extraé un componente:</p>
+
+<pre><code class="lang-jsx">function Tarea({ tarea, onToggle, onDelete }) {
+  return (
+    &lt;li className={tarea.hecha ? 'hecha' : ''}&gt;
+      &lt;input
+        type="checkbox"
+        checked={tarea.hecha}
+        onChange={() =&gt; onToggle(tarea.id)}
+      /&gt;
+      &lt;span&gt;{tarea.texto}&lt;/span&gt;
+      &lt;button onClick={() =&gt; onDelete(tarea.id)}&gt;❌&lt;/button&gt;
+    &lt;/li&gt;
+  );
+}
+
+function ListaTareas({ tareas, onToggle, onDelete }) {
+  return (
+    &lt;ul&gt;
+      {tareas.map(t =&gt; (
+        &lt;Tarea
+          key={t.id}
+          tarea={t}
+          onToggle={onToggle}
+          onDelete={onDelete}
+        /&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="rule">La <code>key</code> va en el ELEMENTO RAÍZ del callback, no dentro del componente Tarea. Lo aplica el padre.</div>
+
+<h2>10. Fragments con key</h2>
+
+<p>Si tu item es un fragment de varios elementos, necesitás usar <code>React.Fragment</code> explícito (con key):</p>
+
+<pre><code class="lang-jsx">{items.map(item =&gt; (
+  &lt;React.Fragment key={item.id}&gt;
+    &lt;dt&gt;{item.label}&lt;/dt&gt;
+    &lt;dd&gt;{item.value}&lt;/dd&gt;
+  &lt;/React.Fragment&gt;
+))}</code></pre>
+
+<p>El shorthand <code>&lt;&gt;...&lt;/&gt;</code> NO acepta key. Hay que usar el largo.</p>
+
+<h2>11. Listas anidadas</h2>
+
+<pre><code class="lang-jsx">function Categorias({ categorias }) {
+  return (
+    &lt;&gt;
+      {categorias.map(cat =&gt; (
+        &lt;div key={cat.id}&gt;
+          &lt;h2&gt;{cat.nombre}&lt;/h2&gt;
+          &lt;ul&gt;
+            {cat.productos.map(p =&gt; (
+              &lt;li key={p.id}&gt;{p.nombre}&lt;/li&gt;
+            ))}
+          &lt;/ul&gt;
+        &lt;/div&gt;
+      ))}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="tip">Las keys son únicas POR NIVEL. La key "p1" en una categoría es independiente de "p1" en otra. Solo deben ser únicas entre hermanos directos.</div>
+
+<h2>12. Reconciliation — cómo React usa las keys</h2>
+
+<p>Cuando una lista cambia, React:</p>
+<ol>
+  <li>Compara las keys de la lista nueva con las viejas.</li>
+  <li>Si una key existe en ambas → reutiliza el componente, actualiza props.</li>
+  <li>Si una key apareció → monta nuevo componente.</li>
+  <li>Si una key desapareció → desmonta.</li>
+</ol>
+
+<p>Por eso keys estables son cruciales: cambiar la key = "desmontar y montar" = perder estado interno, re-ejecutar effects, perder foco del input, perder scroll.</p>
+
+<h2>13. Mini-ejemplo: filtro de búsqueda</h2>
+
+<pre><code class="lang-jsx">function BuscadorProductos() {
+  const [busqueda, setBusqueda] = useState('');
+  const productos = [
+    { id: 1, nombre: 'iPhone 16' },
+    { id: 2, nombre: 'iPad Pro' },
+    { id: 3, nombre: 'MacBook Air' },
+    { id: 4, nombre: 'Watch Ultra' },
+  ];
+
+  const filtrados = productos.filter(p =&gt;
+    p.nombre.toLowerCase().includes(busqueda.toLowerCase())
+  );
+
+  return (
+    &lt;&gt;
+      &lt;input
+        placeholder="Buscar..."
+        value={busqueda}
+        onChange={(e) =&gt; setBusqueda(e.target.value)}
+      /&gt;
+      {filtrados.length === 0 ? (
+        &lt;p&gt;Sin resultados para "{busqueda}"&lt;/p&gt;
+      ) : (
+        &lt;ul&gt;
+          {filtrados.map(p =&gt; (
+            &lt;li key={p.id}&gt;{p.nombre}&lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h2>14. Errores típicos</h2>
+
+<div class="mistake"><strong>Key como index</strong>: <code>{items.map((item, i) =&gt; &lt;X key={i} ... /&gt;)}</code> en listas que se reordenan. Bugs sutiles con estado de inputs hijos.</div>
+
+<div class="mistake"><strong>Olvidar la key</strong>: warning "Each child in a list should have a unique 'key' prop". No es fatal pero indica problema de reconciliation.</div>
+
+<div class="mistake"><strong>Key en lugar incorrecto</strong>: <code>&lt;Componente&gt;&lt;div key=...&gt;...&lt;/div&gt;&lt;/Componente&gt;</code> — la key va en el ELEMENTO RAÍZ devuelto por el .map(), no dentro de un wrapper.</div>
+
+<div class="mistake"><strong>Mutar el array al ordenar</strong>: <code>productos.sort(...)</code> muta. Como vienen de props/estado, eso es bug. Usá <code>[...productos].sort(...)</code>.</div>
+
+<div class="mistake"><strong>Falsy values en <code>&amp;&amp;</code></strong>: <code>{count && ...}</code> renderiza "0" si count=0. Compará explícito: <code>{count &gt; 0 && ...}</code>.</div>
+
+<div class="mistake"><strong>Renderizar objeto directo</strong>: <code>{user}</code> falla. Hay que renderizar propiedades: <code>{user.nombre}</code>.</div>
+
+<h2>15. Ejercicios</h2>
+
+<ol>
+  <li>Renderizar una lista de 10 usuarios con id, nombre y email.</li>
+  <li>Toggle "mostrar/ocultar" cada item al click.</li>
+  <li>Filtro por nombre: input que filtra la lista.</li>
+  <li>Sort: 2 botones "ordenar por nombre" / "ordenar por edad" (sin mutar).</li>
+  <li>Paginación: mostrar 5 items por página con botones prev/next.</li>
+  <li>Lista anidada: categorías con productos adentro.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Por qué necesitamos keys en listas?</summary>
+<p>React usa keys para identificar qué items son los mismos entre renders consecutivos. Sin keys (o con keys malas), React no sabe si reusar o recrear componentes, lo que causa bugs con estado interno, focus, scroll, animaciones.</p></details>
+
+<details><summary>2. ¿Por qué NO usar el index como key?</summary>
+<p>Si la lista puede reordenarse, agregar items al principio o eliminar, los índices cambian para los mismos datos. React reusará componentes con datos viejos. Usar <code>id</code> estable es la única forma correcta cuando la lista muta.</p></details>
+
+<details><summary>3. ¿Dónde generar el id si no viene del backend?</summary>
+<p>Al CREAR el item, no al renderizar. Usá <code>crypto.randomUUID()</code> (disponible en browser moderno) o un contador. NUNCA <code>Math.random()</code> dentro del map — eso cambia en cada render.</p></details>
+
+<details><summary>4. ¿Qué bug típico causa <code>{count && &lt;X /&gt;}</code>?</summary>
+<p>Si count es 0 (falsy pero numérico), React renderiza "0" como texto en lugar de no renderizar nada. Solución: comparar explícito (<code>count &gt; 0 &amp;&amp;</code>) o convertir a boolean (<code>!!count &amp;&amp;</code>).</p></details>
+
+<details><summary>5. ¿Diferencia entre key duplicada y key faltante?</summary>
+<p>Faltante: warning, React igual renderiza pero sin optimizaciones. Duplicada: warning + bugs reales — React puede confundirse al reconciliar y mostrar contenido incorrecto. Ambos son problemas; key duplicada es peor.</p></details>
+
+<details><summary>6. ¿Qué pasa al cambiar la key de un elemento?</summary>
+<p>React lo trata como un componente nuevo: desmonta el viejo (perdiendo su estado interno, ejecutando cleanups) y monta el nuevo. Es un truco útil cuando QUERÉS resetear estado (ej: cambiar la key del form para limpiarlo).</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m04-eventos-y-forms/lecture.html">← Anterior: Eventos y Forms</a>
+  <a href="../m06-useeffect/lecture.html">Siguiente: useEffect →</a>
+</nav>
+
+</div>
+</body>
+</html>

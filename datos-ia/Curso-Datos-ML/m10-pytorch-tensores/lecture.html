@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 10 — PyTorch: Tensores & Autograd · Curso de Datos & ML</title>
+  <meta name="description" content="Qué es un Tensor de PyTorch, cómo crearlos y operarlos como NumPy, el puente con arrays, correr en GPU, y autograd: cómo backward() calcula todos los gradientes solo.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Datos & ML</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../lenguajes/Curso-Python/index.html">🐍 Curso de Python</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 10</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M01 NumPy</span>
+</div>
+
+<article>
+
+<h1>Módulo 10 — PyTorch: Tensores & Autograd</h1>
+
+<p>Hasta acá usaste <code>scikit-learn</code>, que te entrena modelos clásicos con un <code>.fit()</code>. Para <strong>deep learning</strong> (redes neuronales) necesitás algo de más bajo nivel y más potente: <strong>PyTorch</strong>. Y todo PyTorch empieza por una sola estructura, el <strong>Tensor</strong>. Si entendés el Tensor, entendés PyTorch.</p>
+
+<h2>¿Qué es un Tensor?</h2>
+
+<div class="concept">
+  <strong>💡 Un Tensor es un array de NumPy con dos superpoderes:</strong> (1) puede correr en la <strong>GPU</strong> (cientos de veces más rápido para matrices grandes), y (2) calcula <strong>gradientes automáticamente</strong> — el famoso <em>autograd</em>. Todo lo demás (forma, operaciones, indexado) es prácticamente igual a NumPy.
+</div>
+
+<p>"Tensor" es solo el nombre matemático de un array de N dimensiones: un número es un tensor de 0 dimensiones (un escalar), un vector es de 1, una matriz de 2, una imagen RGB de 3, un lote de imágenes de 4. PyTorch los maneja todos con la misma clase: <code>torch.Tensor</code>.</p>
+
+<h2>Crear tensores</h2>
+
+<pre><code class="lang-python">import torch
+
+# desde una lista de Python
+t = torch.tensor([[1, 2, 3],
+                  [4, 5, 6]])
+
+# llenos de 0 o de 1, dándole la forma
+ceros = torch.zeros(2, 3)        # matriz 2x3 de ceros
+unos  = torch.ones(3)            # vector de 3 unos
+
+# números aleatorios (distribución normal)
+r = torch.randn(2, 2)            # 2x2 con media 0, std 1
+
+print(t.shape)   # torch.Size([2, 3])  -&gt; filas, columnas
+print(t.dtype)   # torch.int64         -&gt; tipo de dato</code></pre>
+
+<div class="info">
+  <code>.shape</code> te dice las dimensiones (igual que en NumPy) y <code>.dtype</code> el tipo de dato. Ojo: si pasás enteros, el dtype es <code>int64</code>; si querés decimales y gradientes, usá floats: <code>torch.tensor([1.0, 2.0])</code> o <code>torch.randn(...)</code>.
+</div>
+
+<h2>Operaciones — igual que NumPy</h2>
+
+<p>Las operaciones se escriben exactamente como en NumPy: <code>+</code>, <code>*</code> son elemento a elemento, y <code>@</code> es el producto matricial.</p>
+
+<pre><code class="lang-python">a = torch.tensor([1.0, 2.0, 3.0])
+b = torch.tensor([10.0, 20.0, 30.0])
+
+a + b          # tensor([11., 22., 33.])   suma elemento a elemento
+a * b          # tensor([10., 40., 90.])   producto elemento a elemento
+a * 2          # tensor([2., 4., 6.])      broadcasting con un escalar
+
+M = torch.randn(2, 3)
+N = torch.randn(3, 4)
+M @ N          # producto matricial -&gt; forma (2, 4)</code></pre>
+
+<table>
+<thead><tr><th>Operación</th><th>NumPy</th><th>PyTorch</th></tr></thead>
+<tbody>
+<tr><td>Crear array</td><td><code>np.array([1,2])</code></td><td><code>torch.tensor([1,2])</code></td></tr>
+<tr><td>Ceros</td><td><code>np.zeros((2,3))</code></td><td><code>torch.zeros(2,3)</code></td></tr>
+<tr><td>Forma</td><td><code>arr.shape</code></td><td><code>t.shape</code></td></tr>
+<tr><td>Producto matricial</td><td><code>A @ B</code></td><td><code>A @ B</code></td></tr>
+<tr><td>Suma de todo</td><td><code>arr.sum()</code></td><td><code>t.sum()</code></td></tr>
+</tbody>
+</table>
+
+<h2>El puente con NumPy</h2>
+
+<p>Vas a tener datos en NumPy (vienen de pandas) y necesitás convertirlos a tensores, y al revés para graficar o reportar. El puente es directo:</p>
+
+<pre><code class="lang-python">import numpy as np
+
+arr = np.array([1.0, 2.0, 3.0])
+
+# NumPy  -&gt;  Tensor
+t = torch.from_numpy(arr)
+
+# Tensor  -&gt;  NumPy
+arr2 = t.numpy()</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Si sabés NumPy (M01), ya sabés operar tensores.</strong> El 90% de lo que aprendiste sobre arrays —forma, indexado, slicing, broadcasting, <code>sum</code>/<code>mean</code>— se traslada tal cual. PyTorch solo le agrega GPU y gradientes encima.
+</div>
+
+<div class="warn">
+  <code>from_numpy</code> y <code>.numpy()</code> <strong>comparten memoria</strong> (no copian): si modificás uno, cambia el otro. Es eficiente, pero si querés una copia independiente usá <code>torch.tensor(arr)</code> o <code>t.clone()</code>.
+</div>
+
+<h2>Correr en la GPU</h2>
+
+<p>Una GPU hace miles de multiplicaciones en paralelo, ideal para las matrices de una red neuronal. Mover un tensor a la GPU es <code>.to('cuda')</code>. Pero no todas las máquinas tienen GPU, así que se detecta el dispositivo de forma portable:</p>
+
+<pre><code class="lang-python"># elige GPU si hay, sino CPU — funciona en cualquier máquina
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+t = torch.randn(1000, 1000)
+t = t.to(device)        # mueve el tensor al device elegido
+print(t.device)         # cuda:0   ó   cpu</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de oro del device:</strong> todos los tensores que participan de una misma operación deben estar en el <strong>mismo</strong> dispositivo. No podés sumar un tensor de CPU con uno de GPU. En M11 vas a mover <em>los datos y el modelo</em> al mismo <code>device</code> antes de entrenar.
+</div>
+
+<h2>Autograd — el corazón de PyTorch</h2>
+
+<p>Acá está la magia. Para entrenar una red hay que calcular, en cada paso, cuánto influye cada parámetro en el error (el <strong>gradiente</strong>). PyTorch lo hace solo: si marcás un tensor con <code>requires_grad=True</code>, registra cada operación que hacés con él, y cuando llamás a <code>.backward()</code> calcula <strong>todos</strong> los gradientes de una.</p>
+
+<div class="step"><strong>El flujo de autograd es siempre el mismo:</strong></div>
+
+<ol>
+  <li>Marcás los tensores que querés derivar con <code>requires_grad=True</code>.</li>
+  <li>Hacés operaciones con ellos (forward pass). PyTorch arma un grafo por detrás.</li>
+  <li>Llamás <code>loss.backward()</code> sobre el resultado escalar final.</li>
+  <li>Leés los gradientes en <code>.grad</code> de cada tensor.</li>
+</ol>
+
+<h3>Ejemplo: verificá el gradiente vos mismo</h3>
+
+<p>Tomemos la función <code>y = x² + 3x</code> en <code>x = 2</code>. La derivada a mano es <code>dy/dx = 2x + 3</code>, que en <code>x = 2</code> da <code>2·2 + 3 = 7</code>. Veamos que PyTorch llega al mismo número solo:</p>
+
+<pre><code class="lang-python">import torch
+
+# 1. tensor que queremos derivar
+x = torch.tensor(2.0, requires_grad=True)
+
+# 2. forward pass: una operación simple
+y = x**2 + 3*x          # y = 2² + 3·2 = 10
+
+# 3. backward: calcula dy/dx automáticamente
+y.backward()
+
+# 4. leemos el gradiente
+print(x.grad)           # tensor(7.)   &lt;- coincide con 2x+3 = 7 ✓</code></pre>
+
+<div class="concept">
+  <strong>💡 Lo que escribiste a mano, PyTorch lo derivó solo.</strong> No le dijiste cuál era la derivada de <code>x²</code> ni de <code>3x</code>: registró las operaciones y aplicó la regla de la cadena por vos. Con miles de parámetros (una red real) es exactamente la misma llamada: <code>loss.backward()</code>.
+</div>
+
+<h2>Esto reemplaza el backprop a mano del proyecto P30</h2>
+
+<div class="info">
+  En el proyecto <a href="../../../proyectos/30-red-neuronal.html">P30 — Red Neuronal desde cero</a> derivás el gradiente <strong>vos</strong>: escribís a mano la regla de la cadena, capa por capa, para ajustar los pesos. Es el ejercicio perfecto para <em>entender</em> qué pasa por dentro. PyTorch hace exactamente eso, pero automático: cada derivada que ahí calculás a mano, <code>autograd</code> la deduce sola con <code>.backward()</code>. Hacer P30 primero y luego ver esto es el orden ideal: primero entendés el motor, después usás la herramienta.
+</div>
+
+<div class="rule">
+  <strong>📌 Por qué importa:</strong> una red real tiene millones de parámetros. Derivar la regla de la cadena a mano para todos sería imposible. Autograd te deja definir <em>cualquier</em> arquitectura y obtener todos los gradientes con una sola línea. Eso es lo que hace viable el deep learning moderno.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake"><strong>Olvidar <code>requires_grad=True</code>.</strong> Si el tensor no está marcado, PyTorch no registra sus operaciones y <code>.grad</code> queda en <code>None</code>. Después <code>.backward()</code> no tiene nada que calcular.</div>
+
+<div class="mistake"><strong>Mezclar tensores con <code>ndarray</code> sin convertir.</strong> No podés hacer <code>tensor + np.array(...)</code> directo en cualquier caso; convertí primero con <code>torch.from_numpy(arr)</code> (o el array a tensor) para que ambos sean del mismo tipo.</div>
+
+<div class="mistake"><strong>Olvidar mover datos y modelo al mismo <code>device</code>.</strong> Si el modelo está en <code>cuda</code> y los datos en <code>cpu</code> (o viceversa), PyTorch tira <em>RuntimeError: Expected all tensors to be on the same device</em>. Mové ambos con <code>.to(device)</code>.</div>
+
+<div class="danger"><strong>Llamar <code>.backward()</code> sobre un tensor que no es escalar</strong> sin pasarle un gradiente. <code>backward()</code> espera un único número (típicamente el <em>loss</em>). Si tu resultado es un vector, primero reducilo con <code>.sum()</code> o <code>.mean()</code>.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué dos superpoderes tiene un Tensor sobre un array de NumPy?</summary>
+<p>(1) Puede correr en GPU para acelerar operaciones con matrices grandes, y (2) calcula gradientes automáticamente (autograd) cuando lo marcás con <code>requires_grad=True</code>. Por lo demás, opera casi idéntico a NumPy.</p></details>
+
+<details><summary>¿Qué hace exactamente <code>loss.backward()</code>?</summary>
+<p>Recorre hacia atrás el grafo de operaciones que PyTorch fue registrando en el forward pass y, aplicando la regla de la cadena, calcula el gradiente de <code>loss</code> respecto a cada tensor marcado con <code>requires_grad=True</code>. Esos gradientes quedan disponibles en el atributo <code>.grad</code> de cada tensor.</p></details>
+
+<details><summary>¿Por qué autograd reemplaza el backpropagation a mano del proyecto P30?</summary>
+<p>En P30 derivás la regla de la cadena vos mismo, capa por capa, para conseguir los gradientes. Autograd hace eso automáticamente: registra las operaciones y deduce todas las derivadas solo. Con millones de parámetros, hacerlo a mano sería inviable; autograd lo resuelve con una sola línea.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un tensor 3x3 de números aleatorios con <code>torch.randn(3, 3)</code> e imprimí su <code>.shape</code> y su <code>.dtype</code>.</li>
+  <li>Creá dos tensores y verificá la diferencia entre <code>a * b</code> (elemento a elemento) y <code>a @ b</code> (producto matricial) con formas compatibles.</li>
+  <li>Partí de un <code>np.array([1.0, 2.0, 3.0])</code>, convertilo a tensor con <code>torch.from_numpy</code>, sumale 10, y volvé a NumPy con <code>.numpy()</code>.</li>
+  <li>Definí <code>device</code> con la línea portable (<code>'cuda' if torch.cuda.is_available() else 'cpu'</code>), mové un tensor con <code>.to(device)</code> e imprimí <code>.device</code>.</li>
+  <li>Repetí el ejemplo de autograd con <code>y = x**3</code> en <code>x = 2</code>. Calculá la derivada a mano (<code>3x² = 12</code>) y verificá que <code>x.grad</code> coincide tras <code>y.backward()</code>.</li>
+</ol>
+
+<section class="quiz" id="quizDML10">
+  <style>
+    #quizDML10{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDML10 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDML10 .q{margin-bottom:1.5rem}
+    #quizDML10 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDML10 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDML10 .opt:hover{border-color:var(--accent)}
+    #quizDML10 .opt:disabled{cursor:default}
+    #quizDML10 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDML10 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDML10 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDML10 .exp.show{display:block}
+    #quizDML10 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. ¿Qué dos cosas hace un Tensor que un array de NumPy no hace por sí solo?</p>
+    <button class="opt">Guardar archivos CSV y graficar</button>
+    <button class="opt">Ordenar datos y filtrar nulos</button>
+    <button class="opt">Correr en GPU y calcular gradientes (autograd)</button>
+    <div class="exp">Esos son los dos superpoderes del Tensor: aceleración por GPU y autograd. El resto de las operaciones son prácticamente idénticas a NumPy.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Definiste <code>x = torch.tensor(2.0, requires_grad=True)</code> y <code>y = x**2 + 3*x</code>. Tras <code>y.backward()</code>, ¿qué vale <code>x.grad</code>?</p>
+    <button class="opt">7.0 — porque la derivada es 2x+3, y en x=2 da 7</button>
+    <button class="opt">10.0 — porque es el valor de y</button>
+    <button class="opt">None — porque PyTorch no deriva solo</button>
+    <div class="exp">La derivada de x²+3x es 2x+3. En x=2: 2·2+3 = 7. Autograd llega a ese 7 solo, sin que le digas la fórmula de la derivada.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu modelo está en la GPU (<code>cuda</code>) pero tus datos quedaron en CPU. ¿Qué pasa al operarlos juntos?</p>
+    <button class="opt">PyTorch los mueve solo, no pasa nada</button>
+    <button class="opt">Error: los tensores deben estar en el mismo device; hay que mover ambos con .to(device)</button>
+    <button class="opt">Funciona pero más lento</button>
+    <div class="exp">PyTorch exige que todos los tensores de una operación estén en el mismo dispositivo. Hay que mover datos y modelo al mismo <code>device</code> con <code>.to(device)</code>.</div>
+  </div>
+
+  <div class="score" id="scoreDML10"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDML10');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDML10').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para entrenar una red en M11.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m09-validacion-overfitting/lecture.html">← M09: Validación</a>
+  <a href="../m11-entrenar-red/lecture.html">M11: Entrenar una Red →</a>
+</nav>
+
+</div>
+</body>
+</html>

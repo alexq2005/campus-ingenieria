@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 01 — Sintaxis &amp; Tipos · Curso de Rust</title>
+  <meta name="description" content="Variables inmutables y mut, shadowing, const, tipos escalares y compuestos, inferencia, funciones y conversión explícita con as.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../sistemas/Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 01</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M00</span>
+</div>
+
+<article>
+
+<h1>Módulo 01 — Sintaxis &amp; Tipos</h1>
+
+<p>Ya tenés Rust instalado y corriste tu primer <code>cargo run</code>. Ahora vamos al ladrillo de cualquier programa: las <strong>variables</strong> y los <strong>tipos</strong>. Rust tiene dos decisiones de diseño que lo distinguen de lo que conocés: las variables son <strong>inmutables por defecto</strong> y el tipado es <strong>estático y fuerte</strong> (sin conversiones implícitas). Entender esto temprano te ahorra la mitad de las peleas con el compilador.</p>
+
+<h2>let: variables inmutables por defecto</h2>
+
+<div class="concept">
+  <strong>💡 En Rust, "variable" no implica "cambia".</strong> Cuando escribís <code>let x = 5;</code>, estás creando un <em>binding</em> inmutable: el nombre <code>x</code> queda atado al valor <code>5</code> y no podés reasignarlo. Esto es al revés de Python o JavaScript, donde toda variable es mutable salvo que digas lo contrario. Rust invierte el default porque lo inmutable es más fácil de razonar y más seguro en concurrencia.
+</div>
+
+<pre><code class="lang-rust">fn main() {
+    let x = 5;
+    println!("x vale {x}");
+    x = 6; // ❌ ERROR: cannot assign twice to immutable variable
+}</code></pre>
+
+<p>El compilador no te deja compilar eso. Y el mensaje es clarísimo: te dice que <code>x</code> es inmutable y te sugiere agregar <code>mut</code>.</p>
+
+<h2>let mut: cuando sí querés mutar</h2>
+
+<p>Si necesitás cambiar el valor, declarás la variable con <code>mut</code> (de <em>mutable</em>):</p>
+
+<pre><code class="lang-rust">fn main() {
+    let mut x = 5;
+    println!("antes: {x}");
+    x = 6; // ✅ ahora sí: x es mutable
+    println!("después: {x}");
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla:</strong> usá <code>let</code> por defecto y agregá <code>mut</code> solo cuando realmente vayas a reasignar. Esto le comunica a quien lea tu código (y al compilador) qué cosas pueden cambiar y cuáles no. El linter <code>cargo clippy</code> incluso te avisa si declarás <code>mut</code> y nunca mutás.
+</div>
+
+<h2>Shadowing: redeclarar con let</h2>
+
+<p>Hay una tercera vía que no es ni reasignar ni <code>mut</code>: el <strong>shadowing</strong>. Consiste en declarar otra vez una variable con el mismo nombre usando <code>let</code>. La nueva "tapa" (shadow) a la anterior.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let x = 5;
+    let x = x + 1;      // nueva x = 6 (usa la x vieja)
+    let x = x * 2;      // nueva x = 12
+    println!("x = {x}"); // x = 12
+}</code></pre>
+
+<div class="info">
+  <strong>Shadowing ≠ mutación.</strong> Cada <code>let</code> crea una variable <em>nueva</em>. Por eso el shadowing puede incluso <strong>cambiar el tipo</strong>, algo que <code>mut</code> nunca permite: una variable <code>mut</code> conserva su tipo de por vida.
+</div>
+
+<pre><code class="lang-rust">fn main() {
+    let espacios = "   ";          // &amp;str (texto)
+    let espacios = espacios.len(); // ahora es usize (un número)
+    println!("hay {espacios} espacios");
+}</code></pre>
+
+<h2>const: constantes verdaderas</h2>
+
+<p>Una <code>const</code> es un valor que no cambia nunca y se conoce en tiempo de compilación. Se diferencia de <code>let</code> en tres cosas:</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th><code>let</code></th><th><code>const</code></th></tr></thead>
+<tbody>
+<tr><td>Mutabilidad</td><td>Inmutable (o <code>mut</code>)</td><td>Siempre inmutable</td></tr>
+<tr><td>Anotación de tipo</td><td>Opcional (inferida)</td><td>Obligatoria</td></tr>
+<tr><td>Convención de nombre</td><td><code>snake_case</code></td><td><code>MAYUSCULAS_CON_GUION</code></td></tr>
+<tr><td>Dónde se puede declarar</td><td>Dentro de funciones</td><td>También en scope global</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">const MAX_PUNTOS: u32 = 100_000;
+
+fn main() {
+    println!("máximo: {MAX_PUNTOS}");
+}</code></pre>
+
+<div class="tip">
+  <strong>El guion bajo en números es legible.</strong> <code>100_000</code> es lo mismo que <code>100000</code>; Rust ignora los <code>_</code> en literales numéricos. Usalos para agrupar miles y leer mejor.
+</div>
+
+<h2>Tipos escalares</h2>
+
+<p>Un tipo escalar representa <strong>un solo valor</strong>. Rust tiene cuatro familias:</p>
+
+<table>
+<thead><tr><th>Familia</th><th>Ejemplos</th><th>Qué guarda</th></tr></thead>
+<tbody>
+<tr><td>Enteros</td><td><code>i32</code>, <code>u32</code>, <code>i64</code>, <code>usize</code></td><td>Números enteros (con o sin signo)</td></tr>
+<tr><td>Flotantes</td><td><code>f64</code>, <code>f32</code></td><td>Números con decimales</td></tr>
+<tr><td>Booleanos</td><td><code>bool</code></td><td><code>true</code> / <code>false</code></td></tr>
+<tr><td>Caracteres</td><td><code>char</code></td><td>Un carácter Unicode (4 bytes)</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La <code>i</code> y la <code>u</code> dicen si hay signo.</strong> <code>i32</code> es un entero <em>con signo</em> (puede ser negativo), <code>u32</code> es <em>sin signo</em> (solo ≥ 0). El número es la cantidad de bits: <code>i32</code> va de -2.147.483.648 a 2.147.483.647. El tipo <code>usize</code> tiene el tamaño de un puntero de tu máquina (32 o 64 bits) y es el que usás para indexar colecciones.
+</div>
+
+<pre><code class="lang-rust">fn main() {
+    let entero: i32 = -42;
+    let positivo: u32 = 42;
+    let grande: i64 = 9_000_000_000;
+    let decimal: f64 = 3.14159;
+    let activo: bool = true;
+    let letra: char = 'R';
+    let emoji: char = '🦀'; // char es Unicode: cabe el cangrejo
+
+    println!("{entero} {positivo} {grande} {decimal} {activo} {letra} {emoji}");
+}</code></pre>
+
+<div class="tip">
+  <strong>Defaults útiles:</strong> si no anotás el tipo, Rust asume <code>i32</code> para enteros y <code>f64</code> para flotantes. Son las opciones más rápidas/seguras en la mayoría de las CPUs modernas.
+</div>
+
+<h2>Tipos compuestos: tuplas y arrays</h2>
+
+<p>Los tipos compuestos agrupan varios valores en uno solo. Rust tiene dos primitivos.</p>
+
+<h3>Tuplas</h3>
+
+<p>Una tupla agrupa valores que pueden ser de <strong>distinto tipo</strong>. Tiene tamaño fijo. Accedés a sus elementos con <code>.0</code>, <code>.1</code>, etc., o desestructurando.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let punto: (i32, f64, char) = (10, 2.5, 'P');
+
+    // Acceso por índice con punto:
+    let x = punto.0;
+    let y = punto.1;
+    println!("x = {x}, y = {y}");
+
+    // Desestructuración (destructuring):
+    let (a, b, c) = punto;
+    println!("{a} {b} {c}");
+}</code></pre>
+
+<h3>Arrays</h3>
+
+<p>Un array es una colección de elementos del <strong>mismo tipo</strong> y <strong>tamaño fijo</strong>. Su tipo se escribe <code>[T; N]</code>: el tipo de los elementos y la cantidad.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let dias: [&amp;str; 3] = ["lun", "mar", "mie"];
+    let ceros = [0; 5]; // [0, 0, 0, 0, 0] — repetir valor
+
+    println!("primer día: {}", dias[0]);
+    println!("hay {} ceros", ceros.len());
+}</code></pre>
+
+<div class="mistake">
+  <strong>Indexar fuera de rango no es un agujero de seguridad.</strong> Si hacés <code>dias[9]</code>, Rust no lee memoria basura como C: el programa hace <em>panic</em> y se detiene de forma controlada. Más adelante (M03) vas a conocer <code>Vec&lt;T&gt;</code>, la versión de tamaño variable.
+</div>
+
+<h2>Inferencia de tipos (pero estática)</h2>
+
+<p>Rust es de tipado <strong>estático</strong>: cada valor tiene un tipo conocido en compilación. Pero eso no significa que tengas que escribir el tipo en todos lados — el compilador lo <strong>infiere</strong> del contexto.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let x = 5;          // Rust infiere i32
+    let x: i32 = 5;     // lo mismo, pero explícito
+    let pi = 3.14;      // Rust infiere f64
+    let nombre = "Ana"; // Rust infiere &amp;str
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Pensalo como un detective.</strong> Vos no le decís a Rust "esto es un entero" en cada línea; él lo deduce mirando cómo usás el valor. Pero una vez que decidió el tipo, es <em>inamovible</em>: no podés meter un texto donde dedujo un número. La libertad de no anotar no es la libertad de cambiar de tipo en runtime (eso es Python, no Rust).
+</div>
+
+<div class="info">
+  <strong>¿Cuándo anotar a mano?</strong> Cuando Rust no puede inferir solo (ej: <code>let n: u64 = "42".parse().unwrap();</code> necesita saber a qué número parsear) o cuando querés ser explícito por claridad.
+</div>
+
+<h2>Funciones: sentencias vs expresiones</h2>
+
+<p>Las funciones se declaran con <code>fn</code>. Los parámetros <strong>siempre</strong> llevan tipo anotado, y el tipo de retorno va después de la flecha <code>-&gt;</code>.</p>
+
+<pre><code class="lang-rust">fn suma(a: i32, b: i32) -&gt; i32 {
+    a + b // sin punto y coma: ESTO es lo que retorna
+}
+
+fn main() {
+    let resultado = suma(3, 4);
+    println!("3 + 4 = {resultado}");
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 La distinción clave de Rust: sentencia vs expresión.</strong> Una <strong>sentencia</strong> hace algo pero no devuelve valor (y termina en <code>;</code>). Una <strong>expresión</strong> evalúa a un valor. En una función, <strong>la última expresión sin <code>;</code> es el valor de retorno</strong>. Si le ponés <code>;</code>, la convertís en sentencia y la función retornaría <code>()</code> (la "tupla vacía", el equivalente a "nada").
+</div>
+
+<pre><code class="lang-rust">fn doble(x: i32) -&gt; i32 {
+    x * 2   // ✅ expresión: retorna x*2
+}
+
+fn roto(x: i32) -&gt; i32 {
+    x * 2;  // ❌ con ; es sentencia: la función devuelve () pero promete i32
+}</code></pre>
+
+<p>También podés ser explícito con <code>return</code> (útil para salir temprano), pero el estilo idiomático en Rust es dejar la última expresión sin <code>;</code>.</p>
+
+<pre><code class="lang-rust">fn clasificar(n: i32) -&gt; &amp;'static str {
+    if n &lt; 0 {
+        return "negativo"; // salida temprana con return
+    }
+    if n == 0 { "cero" } else { "positivo" } // if también es expresión
+}</code></pre>
+
+<div class="info">
+  <strong>Hasta el <code>if</code> es una expresión.</strong> Fijate que arriba un <code>if/else</code> devuelve un valor directamente. Eso permite escribir <code>let estado = if n &gt; 0 { "ok" } else { "mal" };</code> sin variables intermedias.
+</div>
+
+<h2>Conversión explícita con as</h2>
+
+<p>Rust <strong>nunca</strong> convierte tipos numéricos por su cuenta. Si tenés un <code>i32</code> y una función espera un <code>f64</code>, no compila hasta que vos hagas la conversión explícita con la palabra clave <code>as</code>.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let entero: i32 = 10;
+    let flotante: f64 = entero as f64; // conversión explícita
+
+    let pi: f64 = 3.99;
+    let truncado: i32 = pi as i32; // 3 (corta los decimales, no redondea)
+
+    println!("{flotante} y {truncado}");
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Sin conversiones implícitas, a propósito.</strong> En C, mezclar <code>int</code> y <code>float</code> en una operación dispara conversiones automáticas que esconden bugs sutiles (pérdida de precisión, desbordamientos silenciosos). Rust te obliga a escribir <code>as</code> para que <em>vos</em> decidas y la conversión sea visible en el código.
+</div>
+
+<div class="warn">
+  <strong>⚠️ <code>as</code> puede perder datos sin avisar.</strong> Convertir <code>300 as u8</code> da <code>44</code> (porque <code>u8</code> solo llega a 255 y "da la vuelta"), y <code>3.99 as i32</code> trunca a <code>3</code>. <code>as</code> es la herramienta cruda; para conversiones seguras que avisan de overflow existen <code>TryFrom</code>/<code>try_into()</code> (más adelante).
+</div>
+
+<h2>Errores típicos al empezar</h2>
+
+<div class="mistake"><strong>Olvidar <code>mut</code> e intentar reasignar.</strong> <code>let x = 5; x = 6;</code> no compila. Si vas a cambiar el valor, declará <code>let mut x = 5;</code>. Si solo querés un nuevo valor con el mismo nombre, usá shadowing (<code>let x = 6;</code>).</div>
+<div class="mistake"><strong>Esperar conversión implícita de tipos.</strong> <code>let r: f64 = 5;</code> falla: <code>5</code> es <code>i32</code>, no <code>f64</code>. Escribí <code>5.0</code> o <code>5 as f64</code>. Rust nunca convierte solo.</div>
+<div class="mistake"><strong>Poner <code>;</code> donde querías devolver una expresión.</strong> Una función que termina en <code>x * 2;</code> devuelve <code>()</code>, no el número. Sacá el <code>;</code> de la última línea para que sea el valor de retorno.</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿En qué se diferencia el shadowing de declarar la variable con <code>mut</code>?</summary>
+<p>El shadowing crea una variable <em>nueva</em> con <code>let</code> y el mismo nombre, así que puede incluso cambiar de tipo. Una variable <code>mut</code> se reasigna pero conserva su tipo original de por vida.</p></details>
+
+<details><summary>Una función declara <code>-&gt; i32</code> y su última línea es <code>x + 1;</code>. ¿Compila?</summary>
+<p>No. Con el <code>;</code> esa línea es una sentencia y la función devuelve <code>()</code>, pero prometió devolver <code>i32</code>. Hay que quitar el punto y coma: <code>x + 1</code>.</p></details>
+
+<details><summary>¿Por qué <code>let total: f64 = 3 + 2;</code> no compila?</summary>
+<p>Porque <code>3</code> y <code>2</code> se infieren como <code>i32</code> y su suma es <code>i32</code>, pero anotaste <code>f64</code>. Rust no convierte implícitamente: usá <code>3.0 + 2.0</code> o <code>(3 + 2) as f64</code>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Declará <code>let x = 5;</code>, intentá <code>x = 10;</code> y leé el error. Después arreglalo con <code>mut</code>.</li>
+  <li>Usá shadowing para tomar un <code>&amp;str</code> como <code>"hola"</code> y reemplazarlo por su largo (<code>.len()</code>), cambiando de tipo en el camino.</li>
+  <li>Definí una <code>const</code> <code>VELOCIDAD_LUZ: u32 = 299_792_458;</code> y mostrala con <code>println!</code>.</li>
+  <li>Escribí una función <code>fn area(base: f64, altura: f64) -&gt; f64</code> que retorne el área de un triángulo <strong>por expresión</strong> (última línea sin <code>;</code>).</li>
+  <li>Tomá un <code>f64</code> como <code>9.99</code>, convertilo a <code>i32</code> con <code>as</code> y mostrá el resultado. Explicá por qué da <code>9</code> y no <code>10</code>.</li>
+</ol>
+
+<section class="quiz" id="quizRs01">
+  <style>
+    #quizRs01{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs01 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs01 .q{margin-bottom:1.5rem}
+    #quizRs01 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs01 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs01 .opt:hover{border-color:var(--accent)}
+    #quizRs01 .opt:disabled{cursor:default}
+    #quizRs01 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs01 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs01 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs01 .exp.show{display:block}
+    #quizRs01 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué diferencia al shadowing de <code>mut</code>?</p>
+    <button class="opt">No hay diferencia, son sinónimos</button>
+    <button class="opt">El shadowing crea una variable nueva con <code>let</code> y puede cambiar de tipo; <code>mut</code> reasigna conservando el tipo</button>
+    <button class="opt"><code>mut</code> puede cambiar de tipo y el shadowing no</button>
+    <div class="exp">El shadowing redeclara con <code>let</code> (variable nueva, puede cambiar de tipo). Una variable <code>mut</code> se reasigna pero mantiene su tipo.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Una función declara <code>-&gt; i32</code> y su última línea es <code>resultado;</code> (con punto y coma). ¿Qué pasa?</p>
+    <button class="opt">Retorna <code>resultado</code> normalmente</button>
+    <button class="opt">Retorna el doble de <code>resultado</code></button>
+    <button class="opt">No compila: con <code>;</code> es una sentencia y la función devuelve <code>()</code>, no <code>i32</code></button>
+    <div class="exp">La última expresión sin <code>;</code> es el valor de retorno. Con <code>;</code> se vuelve sentencia y la función devuelve <code>()</code>, que no coincide con <code>i32</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cómo convertís un <code>i32</code> a <code>f64</code> en Rust?</p>
+    <button class="opt">Con <code>as</code>: <code>entero as f64</code> (conversión explícita)</button>
+    <button class="opt">Automáticamente, Rust lo hace solo</button>
+    <button class="opt">Con <code>float(entero)</code></button>
+    <div class="exp">Rust no convierte tipos implícitamente. Tenés que escribir la conversión a mano con <code>as</code>, lo que la hace visible en el código.</div>
+  </div>
+
+  <div class="score" id="scoreRs01"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs01');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs01').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M02.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m00-introduccion/lecture.html">← M00: Introducción</a>
+  <a href="../m02-ownership/lecture.html">M02: Ownership →</a>
+</nav>
+
+</div>
+</body>
+</html>

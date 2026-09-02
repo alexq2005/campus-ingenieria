@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E05 — Sensores y Actuadores · Computación Física</title>
+<meta name="description" content="Leer el mundo (sensores) y moverlo (motores, servos, relés): la interfaz física completa.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E05</span>
+  <span class="badge">⏱ ~80 min</span>
+  <span class="badge">🎯 Pre-req: E00, E01, E03</span>
+  <span class="badge">Fase 2</span>
+</div>
+
+<article>
+
+<h1>E05 — Sensores y Actuadores</h1>
+
+<blockquote class="author">"Un sistema embebido sin sensores es ciego; sin actuadores, es paralítico. Con ambos, percibe y cambia el mundo." — la definición de computación física</blockquote>
+
+<blockquote>Acá se cierra el ciclo de la computación física: <strong>sensar</strong> (traducir el mundo a números) y <strong>actuar</strong> (traducir números a movimiento, luz, sonido). Es la membrana entre tu código y la realidad.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El loop completo:</strong> sensor → ADC (E03) → tu código decide → actuador. Es el ciclo <em>sensar-decidir-actuar</em> que viste en el proyecto del <a href="../../../proyectos/10-robot-obstaculos.html">robot</a>, y el espejo físico de "percepción → modelo → acción" de la IA (<a href="../../../../Curso ingenieria sistemas/area-08-inteligencia-y-datos/m39-machine-learning-clasico/lecture.html">M39</a>).
+</div>
+
+<h2>Parte 1 — Sensores: leer el mundo</h2>
+
+<h2>1. Tipos de sensores por su salida</h2>
+
+<table>
+<thead><tr><th>Tipo de salida</th><th>Cómo se lee</th><th>Ejemplos</th></tr></thead>
+<tbody>
+<tr><td><strong>Digital</strong> (HIGH/LOW)</td><td><code>digitalRead</code></td><td>Botón, PIR (movimiento), final de carrera</td></tr>
+<tr><td><strong>Analógico</strong> (voltaje variable)</td><td><code>analogRead</code> (ADC, E03)</td><td>Potenciómetro, LDR (luz), sensor de temp analógico</td></tr>
+<tr><td><strong>Digital por bus</strong> (I2C/SPI)</td><td>librería + protocolo (E03)</td><td>BME280, MPU6050 (acelerómetro), RTC</td></tr>
+<tr><td><strong>Por tiempo/pulso</strong></td><td><code>pulseIn</code> / timer (E04)</td><td>Ultrasónico HC-SR04, DHT22</td></tr>
+</tbody>
+</table>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> Cada categoría usa una técnica distinta que ya viste: digital simple (E03 GPIO), analógico (E03 ADC), bus (E03 I2C/SPI), pulso (E04 timers/input capture). E05 es donde APLICÁS todo lo anterior a componentes reales.
+</div>
+
+<h2>2. Acondicionamiento de señal</h2>
+
+<div class="concept">La señal cruda de un sensor casi nunca está lista para el ADC: puede ser muy débil, tener ruido, o estar fuera de rango. <strong>Acondicionar</strong> = adaptarla (amplificar, filtrar, escalar) antes de digitalizar.</div>
+
+<ul>
+  <li><strong>Divisor de voltaje</strong> (E01): para sensores resistivos (LDR, termistor).</li>
+  <li><strong>Amplificación</strong> (op-amp, E01): señales débiles (micrófono, célula de carga).</li>
+  <li><strong>Filtrado</strong> (capacitor, E01): quitar ruido de alta frecuencia.</li>
+  <li><strong>Filtro en software</strong>: promediar N lecturas, media móvil — el primer paso del DSP (E07).</li>
+</ul>
+
+<pre><code>// Filtro simple en software: media móvil
+float suavizar(float nueva) {
+  static float prom = 0;
+  prom = prom * 0.9 + nueva * 0.1;   // 90% histórico, 10% nuevo
+  return prom;
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> Ese filtro de media móvil es un <strong>filtro pasa-bajos digital</strong> — el caso más simple del DSP que profundiza E07, y conecta con cómo se preprocesan datos para ML (M39). Limpiar la señal ANTES de procesarla es universal: en hardware con un capacitor, en software con un promedio.
+</div>
+
+<h2>Parte 2 — Actuadores: cambiar el mundo</h2>
+
+<h2>3. LED y cargas pequeñas</h2>
+<div class="concept">Un LED o una carga &lt;20mA se controla directo desde un GPIO + resistencia (E00). Para tiras de LED, motores o relés, NO — necesitás un transistor (E01).</div>
+
+<h2>4. Motores DC</h2>
+<div class="concept">Giran al aplicar voltaje; la velocidad depende del voltaje (PWM) y la dirección de la polaridad. Piden cientos de mA → <strong>driver</strong> obligatorio (L298N, L9110, DRV8833).</div>
+
+<pre><code>// Driver L298N: IN1/IN2 dan dirección, ENA (PWM) da velocidad
+void motor(int velocidad, bool adelante) {
+  digitalWrite(IN1, adelante);
+  digitalWrite(IN2, !adelante);
+  analogWrite(ENA, velocidad);   // 0-255 PWM (E03)
+}</code></pre>
+
+<div class="warn">El motor es un inductor → genera picos al frenar/invertir. El driver incluye diodos flyback (E01), pero si armás tu propio circuito, NO los olvides o quemás todo.</div>
+
+<h2>5. Servomotores</h2>
+<div class="concept">Un <strong>servo</strong> se posiciona en un ángulo exacto (0-180°) según el ancho de un pulso PWM. Ideal para brazos robóticos, dirección, cámaras móviles.</div>
+
+<figure class="foto">
+  <img src="../assets/img/servo.jpg" alt="Micro servomotor SG90 azul con sus tres cables y brazos plásticos">
+  <figcaption>El micro servo SG90 (~$2): el actuador de posición más usado en proyectos. Los 3 cables son alimentación, GND y señal PWM. Foto: Suyash Dwivedi, vía <a href="https://commons.wikimedia.org/wiki/File:Tower_Pro_SG90_micro_servo_motor.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+<pre><code>#include &lt;ESP32Servo.h&gt;
+Servo s;
+void setup() { s.attach(13); }
+void loop() {
+  s.write(0);    delay(1000);   // posición 0°
+  s.write(90);   delay(1000);   // 90°
+  s.write(180);  delay(1000);   // 180°
+}</code></pre>
+
+<h2>6. Motores paso a paso (stepper)</h2>
+<div class="concept">Se mueven en "pasos" discretos exactos (ej 1.8°/paso = 200 pasos/vuelta). Posicionamiento preciso sin sensor de realimentación. Usados en impresoras 3D, CNC, cámaras.</div>
+
+<h2>7. Relés — controlar alta tensión</h2>
+<div class="concept">Un <strong>relé</strong> es un interruptor electromecánico: el MCU (señal de 3.3V) controla un circuito de ALTA potencia (220V, electrodomésticos) sin contacto eléctrico directo. Aislación = seguridad.</div>
+
+<div class="danger"><strong>⚠️ 220V mata.</strong> Trabajar con relés a tensión de red requiere conocimiento y precauciones reales. Para aprender, practicá con cargas de bajo voltaje (una lámpara LED de 5V). El 220V no es para experimentar sin supervisión.</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El relé es el límite de este curso-puente: del otro lado está la <strong>EE de potencia</strong> (máquinas eléctricas, alta tensión) que NO se anida con software y queda fuera de scope. Computación física llega hasta "controlar potencia con una señal lógica" — el resto es ingeniería eléctrica pura.
+</div>
+
+<h2>8. Otros actuadores</h2>
+<ul>
+  <li><strong>Buzzer / parlante</strong>: sonido vía PWM (frecuencia = tono).</li>
+  <li><strong>Pantallas</strong>: OLED (I2C), LCD, e-paper, tiras LED direccionables (WS2812/NeoPixel).</li>
+  <li><strong>Bombas, válvulas, electroimanes</strong>: cargas inductivas vía transistor/relé + diodo flyback.</li>
+</ul>
+
+<h2>9. El ciclo completo: ejemplo termostato</h2>
+
+<pre><code>void loop() {
+  float temp = leerSensor();              // SENSAR (E03 ADC + E05 sensor)
+  float suave = suavizar(temp);           // acondicionar (filtro software)
+
+  if (suave &lt; objetivo - 0.5) {           // DECIDIR
+    digitalWrite(RELE_CALEFACTOR, HIGH);  // ACTUAR (E05 relé)
+  } else if (suave > objetivo + 0.5) {
+    digitalWrite(RELE_CALEFACTOR, LOW);
+  }
+  // la histéresis (±0.5) evita que prenda/apague sin parar
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> La <strong>histéresis</strong> (banda muerta para evitar oscilación) es un concepto de control que profundiza E08 (PID). Acá lo ves en su forma más simple: sin ella, el relé haría "clic-clic-clic" infinito cerca del umbral. Es el preludio del control de lazo cerrado.
+</div>
+
+<h2>10. Práctica</h2>
+<ul>
+  <li><a href="https://wokwi.com" target="_blank">Wokwi</a> — sensores y servos simulados.</li>
+  <li><a href="https://www.tinkercad.com/circuits" target="_blank">Tinkercad</a> — motor con driver, potenciómetro, LDR.</li>
+  <li>Reto: termostato que lee temp y controla un LED (simulando calefactor) con histéresis.</li>
+</ul>
+
+<!-- ═══════════ SIMULADOR DE HISTÉRESIS ═══════════ -->
+<div class="hystsim">
+<style>
+.hystsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.hystsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.hystsim .hy-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.hystsim canvas{width:100%;height:210px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.hystsim .hy-ctrls{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.hystsim .hy-sl label{display:flex;justify-content:space-between;font-size:.83rem;color:#e8efe9;margin-bottom:4px}
+.hystsim .hy-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.hystsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.hystsim .hy-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.85rem;color:#8fa394}
+.hystsim .hy-stats b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.hystsim .hy-on{color:#3fb950} .hystsim .hy-off{color:#5a6b60}
+.hystsim .hy-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🌡️ Simulador de histéresis — el termostato</h4>
+  <div class="hy-sub">La temperatura (naranja) oscila cerca del objetivo. Con <b style="color:#f0883e">1 solo umbral</b> el calefactor prende/apaga sin parar (chattering). Subí la <b>banda de histéresis</b> (2 umbrales) y mirá los toggles desplomarse.</div>
+  <canvas id="hyCv" width="900" height="210"></canvas>
+  <div class="hy-ctrls">
+    <div class="hy-sl"><label>Banda de histéresis <b id="hyBv">0.0</b> °C</label><input type="range" id="hyB" min="0" max="4" step="0.2" value="0"></div>
+    <div class="hy-sl"><label>Ruido del sensor <b id="hyNv">0.4</b></label><input type="range" id="hyN" min="0" max="1.2" step="0.1" value="0.4"></div>
+  </div>
+  <div class="hy-stats">
+    <span>Calefactor: <b id="hyState" class="hy-off">OFF</b></span>
+    <span>Cambios (toggles): <b id="hyTog">0</b></span>
+    <span>en los últimos ~8s</span>
+  </div>
+  <div class="hy-hint" id="hyHint">Con banda 0 (un umbral), el ruido hace que el calefactor cambie de estado decenas de veces — desgasta el relé y consume. Subí la banda: con 2 umbrales separados, el estado solo cambia al cruzar el umbral lejano.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("hyCv"), ctx=cv.getContext("2d");
+  const SP=22, N=240; let band=0, noise=0.4, t=0, on=false, hist=[], togHist=[];
+  function temp(tt){return SP + Math.sin(tt*0.045)*2.0 + Math.sin(tt*1.9)*noise + Math.sin(tt*0.7)*noise*0.5;}
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const lo=SP-4,hi=SP+4; const Y=v=>h-(v-lo)/(hi-lo)*h;
+    // umbrales
+    const tHi=SP+band/2, tLo=SP-band/2;
+    ctx.fillStyle="rgba(63,185,80,.06)";ctx.fillRect(0,Y(tHi),w,Y(tLo)-Y(tHi));
+    ctx.strokeStyle="#58a6ff";ctx.setLineDash([5,4]);ctx.lineWidth=1;
+    [tHi,tLo].forEach(v=>{ctx.beginPath();ctx.moveTo(0,Y(v));ctx.lineTo(w,Y(v));ctx.stroke();});
+    ctx.setLineDash([]);
+    ctx.fillStyle="#58a6ff";ctx.font="10px monospace";
+    if(band>0.1){ctx.fillText("umbral alto "+tHi.toFixed(1),8,Y(tHi)-4);ctx.fillText("umbral bajo "+tLo.toFixed(1),8,Y(tLo)+12);}
+    else ctx.fillText("umbral "+SP,8,Y(SP)-4);
+    // banda inferior: estado del calefactor (verde=ON)
+    hist.forEach((p,i)=>{const x=i/(N-1)*w;ctx.fillStyle=p.on?"rgba(63,185,80,.5)":"rgba(90,107,96,.25)";ctx.fillRect(x,h-8,w/N+1,8);});
+    // curva temperatura
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2;ctx.beginPath();
+    hist.forEach((p,i)=>{const x=i/(N-1)*w,y=Y(p.v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  }
+  function loop(){
+    const v=temp(t), tHi=SP+band/2, tLo=SP-band/2, was=on;
+    if(v>tHi)on=false; else if(v<tLo)on=true;
+    if(on!==was)togHist.push(t);
+    hist.push({v,on}); if(hist.length>N)hist.shift();
+    togHist=togHist.filter(x=>x>t-160); // ventana ~8s
+    t++;
+    draw();
+    const se=$("hyState");se.textContent=on?"ON":"OFF";se.className=on?"hy-on":"hy-off";
+    $("hyTog").textContent=togHist.length;
+    if(band<0.3) $("hyHint").textContent="Banda ≈ 0 (un umbral): el ruido cruza el umbral constantemente → "+togHist.length+" cambios. Eso destruye relés y desperdicia energía.";
+    else if(band>=2.5) $("hyHint").textContent="Banda amplia: solo "+togHist.length+" cambios. El calefactor prende, deja subir bien la temp, y recién apaga arriba. Estable. (Esto es lo que hace tu termostato real.)";
+    else $("hyHint").textContent="Con histéresis los toggles bajan a "+togHist.length+". El estado solo cambia al cruzar el umbral LEJANO, no con cada vibración del ruido.";
+    requestAnimationFrame(loop);
+  }
+  $("hyB").addEventListener("input",e=>{band=+e.target.value;$("hyBv").textContent=band.toFixed(1);togHist=[];});
+  $("hyN").addEventListener("input",e=>{noise=+e.target.value;$("hyNv").textContent=noise.toFixed(1);});
+  loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR HISTÉRESIS ═══════════ -->
+
+<h2>11. Errores típicos</h2>
+<div class="mistake"><strong>Alimentar motor/servo desde el pin del MCU</strong>: piden más corriente de la que el pin da → quema el chip. Fuente separada + driver.</div>
+<div class="mistake"><strong>GND no común entre MCU y driver/fuente</strong>: sin tierra compartida (E00), las señales no se interpretan. Siempre unir los GND.</div>
+<div class="mistake"><strong>Leer un sensor analógico sin filtrar</strong>: ruido → lecturas saltarinas. Promediar o filtrar (hardware o software).</div>
+<div class="mistake"><strong>Control sin histéresis</strong>: el actuador oscila (prende/apaga) sin parar cerca del umbral. Agregá banda muerta.</div>
+<div class="mistake"><strong>Relé sin entender el voltaje de la carga</strong>: 220V es peligroso. Practicar con bajo voltaje primero.</div>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Cuáles son las 4 formas de leer un sensor y qué técnica usa cada una?</summary>
+<p>Digital (digitalRead/GPIO), analógico (analogRead/ADC), bus I2C-SPI (protocolo + librería), y por pulso/tiempo (pulseIn/timer). Cada una aplica algo de E03/E04.</p></details>
+
+<details><summary>2. ¿Qué es acondicionar una señal y por qué hace falta?</summary>
+<p>Adaptar la señal cruda del sensor (amplificar, filtrar, escalar) antes de digitalizarla, porque suele ser débil, ruidosa o fuera de rango. Se hace con divisores, op-amps, capacitores (E01) o filtros en software.</p></details>
+
+<details><summary>3. ¿Por qué un motor necesita driver y el LED no?</summary>
+<p>Porque el motor pide cientos de mA y el pin del MCU da ~20mA — conectarlo directo quema el chip. El driver usa una fuente separada y recibe solo la señal de control. El LED, al consumir poco, va directo con una resistencia.</p></details>
+
+<details><summary>4. ¿Cómo se controla la posición de un servo?</summary>
+<p>Con el ancho de un pulso PWM: distintos anchos corresponden a distintos ángulos (0-180°). La librería Servo abstrae esto en <code>s.write(angulo)</code>.</p></details>
+
+<details><summary>5. ¿Para qué sirve un relé y cuál es el riesgo?</summary>
+<p>Permite que una señal lógica de 3.3V controle un circuito de alta potencia (220V) con aislación eléctrica. El riesgo: la alta tensión es peligrosa; hay que practicar con bajo voltaje y tener precauciones reales con 220V.</p></details>
+
+<details><summary>6. ¿Qué es la histéresis y por qué importa en control?</summary>
+<p>Una banda muerta alrededor del umbral (ej ±0.5°) que evita que el actuador oscile prendiendo/apagando sin parar cuando la medición está cerca del objetivo. Es el preludio del control de lazo cerrado (E08/PID).</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e04-microcontroladores-2/lecture.html">← E04 Microcontroladores II</a>
+  <a href="../index.html">🏠 Volver al curso</a>
+</nav>
+
+</div>
+</body>
+</html>

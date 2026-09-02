@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — Gestión de Paquetes · Curso de Linux</title>
+  <meta name="description" content="apt, dnf, pacman, zypper, snap, flatpak, compilar desde fuente.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~70 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 06</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — Gestión de Paquetes</h1>
+
+<h2>Concepto</h2>
+<figure class="foto">
+  <img src="../assets/img/07-paquetes.jpg" alt="Almacén con cajas apiladas">
+  <figcaption>Un almacén con cajas: los gestores de paquetes (apt, dnf, pacman) instalan y versionan software como un depósito organizado. Foto: Federal Bureau of Investigation, vía <a href="https://commons.wikimedia.org/wiki/File:EFTA00002271_-_Warehouse_with_stacked_blue_and_gray_bins_cardboard_boxes_and_a_large_black_fan_in_the_center.jpg" target="_blank">Wikimedia Commons</a> (Public domain).</figcaption>
+</figure>
+
+
+<p>Un <strong>paquete</strong> es una unidad instalable: binarios + librerías + config + metadata + dependencias. El <strong>gestor de paquetes</strong> maneja:</p>
+
+<ul>
+  <li>Instalación, actualización, eliminación</li>
+  <li>Resolución de dependencias</li>
+  <li>Verificación de integridad</li>
+  <li>Repositorios (fuentes de paquetes)</li>
+</ul>
+
+<p>Cada familia de distros tiene el suyo:</p>
+
+<table>
+<thead><tr><th>Familia</th><th>Formato</th><th>Gestor de bajo nivel</th><th>Gestor de alto nivel</th></tr></thead>
+<tbody>
+<tr><td>Debian/Ubuntu</td><td><code>.deb</code></td><td><code>dpkg</code></td><td><code>apt</code>, <code>apt-get</code></td></tr>
+<tr><td>RHEL/Fedora</td><td><code>.rpm</code></td><td><code>rpm</code></td><td><code>dnf</code> (antes <code>yum</code>)</td></tr>
+<tr><td>Arch</td><td>tarball + PKGBUILD</td><td><code>pacman</code></td><td><code>pacman</code></td></tr>
+<tr><td>openSUSE</td><td><code>.rpm</code></td><td><code>rpm</code></td><td><code>zypper</code></td></tr>
+<tr><td>Alpine</td><td><code>.apk</code></td><td><code>apk</code></td><td><code>apk</code></td></tr>
+</tbody>
+</table>
+
+<h2>APT (Debian / Ubuntu)</h2>
+
+<h3>Comandos esenciales</h3>
+
+<pre><code class="lang-bash">sudo apt update                            # refresca lista de paquetes
+sudo apt upgrade                           # actualiza instalados
+sudo apt full-upgrade                      # con cambios estructurales
+sudo apt dist-upgrade                      # legacy, similar a full-upgrade
+
+sudo apt install paquete
+sudo apt install paquete1 paquete2
+sudo apt install ./local.deb               # archivo local (resuelve deps)
+
+sudo apt remove paquete                    # mantiene config
+sudo apt purge paquete                     # elimina también config
+sudo apt autoremove                        # quita deps huérfanas
+
+apt search palabra                         # buscar
+apt show paquete                           # info detallada
+apt list --installed
+apt list --upgradable
+apt-cache depends paquete                  # dependencias
+apt-cache rdepends paquete                 # quién depende de él</code></pre>
+
+<h3><code>apt</code> vs <code>apt-get</code></h3>
+<ul>
+  <li><code>apt</code> — interfaz moderna y amigable, recomendado para uso interactivo</li>
+  <li><code>apt-get</code> — más estable para scripts (output parseable)</li>
+</ul>
+
+<h3>Repositorios</h3>
+
+<pre><code>/etc/apt/sources.list                      # principal
+/etc/apt/sources.list.d/*.list             # adicionales</code></pre>
+
+<p>Agregar repositorio:</p>
+
+<pre><code class="lang-bash">sudo add-apt-repository ppa:user/ppa-name
+sudo apt update</code></pre>
+
+<h3><code>dpkg</code> — bajo nivel</h3>
+
+<pre><code class="lang-bash">sudo dpkg -i paquete.deb                  # instalar (NO resuelve deps)
+sudo dpkg -r paquete                      # remove
+sudo dpkg -P paquete                      # purge
+dpkg -l                                   # listar instalados
+dpkg -L paquete                           # archivos del paquete
+dpkg -S /ruta/archivo                     # ¿qué paquete instaló esto?
+dpkg --configure -a                       # reconfigurar paquetes rotos</code></pre>
+
+<h2>DNF (Fedora / RHEL / Rocky)</h2>
+
+<pre><code class="lang-bash">sudo dnf check-update
+sudo dnf upgrade
+sudo dnf install paquete
+sudo dnf remove paquete
+sudo dnf autoremove
+sudo dnf clean all
+
+dnf search palabra
+dnf info paquete
+dnf list installed
+dnf provides /ruta                         # qué paquete trae este archivo
+dnf history                                # historial (rollback posible!)
+sudo dnf history undo 12                   # rollback
+sudo dnf groupinstall "Development Tools"</code></pre>
+
+<h3>Repos (<code>.repo</code> files en <code>/etc/yum.repos.d/</code>)</h3>
+
+<pre><code class="lang-bash">sudo dnf config-manager --add-repo URL
+sudo dnf config-manager --enable repo-name</code></pre>
+
+<h2>Pacman (Arch)</h2>
+
+<pre><code class="lang-bash">sudo pacman -Syu                           # update + upgrade (rolling)
+sudo pacman -S paquete                     # install
+sudo pacman -R paquete                     # remove
+sudo pacman -Rs paquete                    # remove con deps no usadas
+sudo pacman -Rns paquete                   # también borra config
+sudo pacman -Ss palabra                    # buscar en repos
+sudo pacman -Qs palabra                    # buscar en instalados
+pacman -Qi paquete                         # info
+pacman -Ql paquete                         # archivos
+pacman -Qo /ruta                           # qué paquete trae el archivo
+sudo pacman -Sc                            # limpiar cache viejo
+sudo pacman -Scc                           # limpiar todo el cache</code></pre>
+
+<h3>AUR — Arch User Repository</h3>
+
+<p>Paquetes mantenidos por la comunidad. Helpers:</p>
+
+<pre><code class="lang-bash">yay -S paquete-aur
+paru -S paquete-aur</code></pre>
+
+<h2>Zypper (openSUSE)</h2>
+
+<pre><code class="lang-bash">sudo zypper refresh
+sudo zypper update
+sudo zypper install paquete
+sudo zypper remove paquete
+sudo zypper search palabra
+sudo zypper info paquete</code></pre>
+
+<h2>APK (Alpine)</h2>
+
+<pre><code class="lang-bash">sudo apk update
+sudo apk upgrade
+sudo apk add paquete
+sudo apk del paquete
+apk search palabra
+apk info paquete</code></pre>
+
+<h2>Snap (universal)</h2>
+
+<p>Paquetes containerizados, distros-agnósticos. Auto-actualizan.</p>
+
+<pre><code class="lang-bash">sudo snap install paquete
+sudo snap install --classic codigo         # acceso completo al sistema
+sudo snap remove paquete
+snap list
+snap find palabra
+sudo snap refresh</code></pre>
+
+<h2>Flatpak (universal, popular en desktop)</h2>
+
+<pre><code class="lang-bash">flatpak install flathub org.gimp.GIMP
+flatpak run org.gimp.GIMP
+flatpak update
+flatpak list
+flatpak remove org.gimp.GIMP</code></pre>
+
+<p>Setup inicial:</p>
+
+<pre><code class="lang-bash">flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo</code></pre>
+
+<h2>AppImage</h2>
+
+<p>Ejecutables portables, no requieren instalación:</p>
+
+<pre><code class="lang-bash">chmod +x app.AppImage
+./app.AppImage</code></pre>
+
+<h2>Compilar desde fuente</h2>
+
+<p>Cuando un paquete no está disponible o querés una versión específica:</p>
+
+<pre><code class="lang-bash">wget https://ejemplo.com/programa-1.0.tar.gz
+tar xzf programa-1.0.tar.gz
+cd programa-1.0/
+./configure --prefix=/usr/local
+make -j$(nproc)
+sudo make install</code></pre>
+
+<div class="warn"><strong>Riesgo</strong>: <code>make install</code> no es trackeado por el gestor de paquetes. Considera <code>checkinstall</code> (Debian) o crear un paquete propio.</div>
+
+<h2>Lenguajes de programación — gestores propios</h2>
+
+<p>Tienen su ecosistema separado del sistema:</p>
+
+<table>
+<thead><tr><th>Lenguaje</th><th>Gestor</th><th>Notas</th></tr></thead>
+<tbody>
+<tr><td>Python</td><td><code>pip</code>, <code>pipx</code>, <code>uv</code>, <code>poetry</code></td><td>Usá venv siempre</td></tr>
+<tr><td>Node</td><td><code>npm</code>, <code>yarn</code>, <code>pnpm</code></td><td><code>package.json</code></td></tr>
+<tr><td>Ruby</td><td><code>gem</code>, <code>bundler</code></td><td><code>Gemfile</code></td></tr>
+<tr><td>Rust</td><td><code>cargo</code></td><td><code>Cargo.toml</code></td></tr>
+<tr><td>Go</td><td><code>go mod</code></td><td><code>go.mod</code></td></tr>
+<tr><td>Java</td><td><code>maven</code>, <code>gradle</code></td><td></td></tr>
+</tbody>
+</table>
+
+<div class="rule"><strong>Regla</strong>: instalar dependencias de proyecto <strong>siempre dentro del proyecto</strong> (venv, node_modules, etc.), nunca globalmente.</div>
+
+<h2>Buenas prácticas</h2>
+
+<ol>
+  <li><strong><code>apt update</code> antes de instalar</strong> — siempre</li>
+  <li><strong>Leer qué se va a instalar</strong> antes de aceptar — <code>apt</code> lo muestra</li>
+  <li><strong>No mezclar fuentes</strong>: usar repos oficiales &gt; PPAs &gt; snap/flatpak &gt; compilar</li>
+  <li><strong>Limpiar cache periódicamente</strong>: <code>apt autoremove &amp;&amp; apt clean</code></li>
+  <li><strong>Hacer backup del listado</strong>: <code>dpkg --get-selections &gt; paquetes.txt</code> antes de cambios mayores</li>
+</ol>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instalar <code>htop</code> y <code>ncdu</code> en tu distro</li>
+  <li>Buscar qué paquete provee el comando <code>gcc</code></li>
+  <li>Listar las 10 dependencias del paquete <code>python3</code></li>
+  <li>Hacer una actualización completa del sistema</li>
+  <li>Buscar archivos huérfanos: <code>apt autoremove --dry-run</code> o equivalente</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-06-usuarios-grupos/lecture.html">← Anterior: Usuarios y Grupos</a>
+  <a href="../modulo-08-redes/lecture.html">Siguiente: Redes →</a>
+</nav>
+
+</div>
+</body>
+</html>

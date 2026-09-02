@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 11 — Concurrencia · Curso de Python</title>
+  <meta name="description" content="threading, multiprocessing, asyncio, GIL, concurrent.futures.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Python</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 11</span>
+  <span class="badge">⏱ ~75 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 10</span>
+</div>
+
+<article>
+
+<h1>Módulo 11 — Concurrencia y Paralelismo</h1>
+
+<h2>Conceptos</h2>
+<figure class="foto">
+  <img src="../assets/img/11-concurrencia.jpg" alt="Cruce de autopistas Spaghetti Junction">
+  <figcaption>El cruce 'Spaghetti Junction': la concurrencia coordina múltiples flujos de ejecución que avanzan a la vez sin chocar. Foto: Highways Agency, vía <a href="https://commons.wikimedia.org/wiki/File:Aerial_view_of_M6A38_Spaghetti_Junction.jpg" target="_blank">Wikimedia Commons</a> (CC BY 2.0).</figcaption>
+</figure>
+
+
+
+<table>
+<thead><tr><th>Término</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><strong>Concurrencia</strong></td><td>Múltiples tareas progresan, no necesariamente al mismo tiempo</td></tr>
+<tr><td><strong>Paralelismo</strong></td><td>Múltiples tareas ejecutan simultáneamente (requiere múltiples cores)</td></tr>
+<tr><td><strong>I/O-bound</strong></td><td>Tarea esperando red, disco, etc.</td></tr>
+<tr><td><strong>CPU-bound</strong></td><td>Tarea procesando intensivamente</td></tr>
+</tbody>
+</table>
+
+<h3>El GIL (Global Interpreter Lock)</h3>
+
+<p>CPython usa un lock global que <strong>impide ejecutar bytecode Python en paralelo</strong> dentro de un mismo proceso. Implicación práctica:</p>
+
+<table>
+<thead><tr><th>Tarea</th><th>Mejor herramienta</th></tr></thead>
+<tbody>
+<tr><td>I/O-bound (HTTP, DB, archivos)</td><td><code>threading</code> o <code>asyncio</code></td></tr>
+<tr><td>CPU-bound (cálculos pesados)</td><td><code>multiprocessing</code></td></tr>
+</tbody>
+</table>
+
+<blockquote>Python 3.13 introdujo un GIL opcional desactivable. En 3.11/3.12 sigue siendo el default.</blockquote>
+
+<h2><code>threading</code> — concurrencia para I/O</h2>
+
+<pre><code class="lang-python">import threading
+import time
+import requests
+
+URLS = ["https://example.com"] * 10
+
+def descargar(url):
+    response = requests.get(url)
+    print(f"{url}: {response.status_code}")
+
+# Secuencial
+inicio = time.time()
+for url in URLS:
+    descargar(url)
+print(f"Secuencial: {time.time()-inicio:.2f}s")
+
+# Concurrente
+inicio = time.time()
+threads = [threading.Thread(target=descargar, args=(url,)) for url in URLS]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"Threads: {time.time()-inicio:.2f}s")</code></pre>
+
+<h3>Sincronización</h3>
+
+<pre><code class="lang-python">contador = 0
+lock = threading.Lock()
+
+def incrementar():
+    global contador
+    with lock:
+        contador += 1     # protegido contra race conditions</code></pre>
+
+<h2><code>concurrent.futures</code> (alto nivel, recomendado)</h2>
+
+<pre><code class="lang-python">from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+# I/O-bound
+with ThreadPoolExecutor(max_workers=10) as ex:
+    resultados = list(ex.map(descargar, URLS))
+
+# CPU-bound
+def procesar(x):
+    return sum(i*i for i in range(x))
+
+with ProcessPoolExecutor() as ex:
+    resultados = list(ex.map(procesar, [10**6] * 8))</code></pre>
+
+<h3><code>submit</code> para control fino</h3>
+
+<pre><code class="lang-python">with ThreadPoolExecutor() as ex:
+    futures = [ex.submit(descargar, url) for url in URLS]
+    for f in futures:
+        try:
+            r = f.result(timeout=10)
+        except Exception as e:
+            print(f"Falló: {e}")</code></pre>
+
+<h2><code>multiprocessing</code> — paralelismo real</h2>
+
+<pre><code class="lang-python">import multiprocessing as mp
+
+def trabajo(x):
+    return x ** 2
+
+if __name__ == "__main__":
+    with mp.Pool(processes=4) as pool:
+        resultados = pool.map(trabajo, range(20))
+    print(resultados)</code></pre>
+
+<h3>Compartir datos</h3>
+
+<ul>
+  <li><strong>Queue</strong> y <strong>Pipe</strong> para mensajes</li>
+  <li><strong>Value</strong> y <strong>Array</strong> para memoria compartida</li>
+  <li><strong>Manager</strong> para objetos compartidos complejos</li>
+</ul>
+
+<pre><code class="lang-python">from multiprocessing import Process, Queue
+
+def productor(q):
+    for i in range(5):
+        q.put(i)
+    q.put(None)
+
+def consumidor(q):
+    while (item := q.get()) is not None:
+        print(item)
+
+if __name__ == "__main__":
+    q = Queue()
+    Process(target=productor, args=(q,)).start()
+    Process(target=consumidor, args=(q,)).start()</code></pre>
+
+<h2><code>asyncio</code> — concurrencia con un solo thread</h2>
+
+<p>Modelo de concurrencia cooperativa con <code>async/await</code>. Ideal para miles de conexiones I/O concurrentes.</p>
+
+<pre><code class="lang-python">import asyncio
+
+async def saludar(nombre, segundos):
+    print(f"Hola {nombre}")
+    await asyncio.sleep(segundos)
+    print(f"Adiós {nombre}")
+
+async def main():
+    await asyncio.gather(
+        saludar("Ana", 2),
+        saludar("Luis", 1),
+        saludar("Eva", 3),
+    )
+
+asyncio.run(main())</code></pre>
+
+<h3>Async HTTP con <code>aiohttp</code></h3>
+
+<pre><code class="lang-python">import aiohttp
+import asyncio
+
+async def fetch(session, url):
+    async with session.get(url) as response:
+        return await response.text()
+
+async def main(urls):
+    async with aiohttp.ClientSession() as session:
+        return await asyncio.gather(*(fetch(session, u) for u in urls))
+
+resultados = asyncio.run(main(URLS))</code></pre>
+
+<h3>Reglas del asyncio</h3>
+
+<ol>
+  <li>Solo podés usar <code>await</code> dentro de funciones <code>async def</code></li>
+  <li>Una corutina <strong>no se ejecuta</strong> hasta que la <code>await</code>-eás o la pasás a <code>asyncio.run</code></li>
+  <li><strong>Nunca uses I/O bloqueante</strong> dentro de async (rompe el loop)</li>
+  <li>Para CPU-bound dentro de async: <code>loop.run_in_executor()</code></li>
+</ol>
+
+<h2>Comparativa</h2>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Cuándo usar</th></tr></thead>
+<tbody>
+<tr><td><code>threading</code></td><td>I/O simple, código existente sincrónico</td></tr>
+<tr><td><code>concurrent.futures</code></td><td>API de alto nivel para I/O o CPU</td></tr>
+<tr><td><code>multiprocessing</code></td><td>CPU-bound real</td></tr>
+<tr><td><code>asyncio</code></td><td>Miles de conexiones I/O simultáneas, código nuevo</td></tr>
+</tbody>
+</table>
+
+<h2>Errores comunes</h2>
+
+<ol>
+  <li><strong>Race condition</strong>: dos threads modificando el mismo estado sin lock</li>
+  <li><strong>Deadlock</strong>: dos locks esperándose mutuamente</li>
+  <li><strong>Async dentro de sync</strong>: olvidar <code>await</code> → corutina nunca se ejecuta</li>
+  <li><strong>Llamar I/O bloqueante en asyncio</strong> → bloquea TODO el loop</li>
+</ol>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Descargar 50 URLs con <code>ThreadPoolExecutor</code> y comparar tiempo vs secuencial</li>
+  <li>Cálculo CPU-bound (factorial de 1M) con <code>ProcessPoolExecutor</code> vs un solo proceso</li>
+  <li>Web scraper async con <code>aiohttp</code> y <code>asyncio.gather</code></li>
+  <li>Productor-consumidor con <code>asyncio.Queue</code></li>
+  <li>Detectar race condition en código sin lock y arreglarla</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-10-programacion-funcional/lecture.html">← Anterior: Programación Funcional</a>
+  <a href="../modulo-12-biblioteca-estandar/lecture.html">Siguiente: Biblioteca Estándar →</a>
+</nav>
+
+</div>
+</body>
+</html>

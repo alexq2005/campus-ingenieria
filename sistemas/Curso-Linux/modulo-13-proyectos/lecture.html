@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 13 — Proyectos Integradores · Curso de Linux</title>
+  <meta name="description" content="Servidor Nginx con HTTPS · CLI sys-report · Despliegue de app Python.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">🎓 Módulo 13 · Final</span>
+  <span class="badge">⏱ Variable</span>
+  <span class="badge">🎯 Pre-req: Módulos 00-12</span>
+</div>
+
+<article>
+
+<h1>Módulo 13 — Proyectos Integradores</h1>
+
+<p>Tres proyectos prácticos que combinan los módulos anteriores. Cada uno simula un escenario real de sysadmin/devops.</p>
+
+<h2>Proyecto 1 — Servidor Web seguro con Nginx</h2>
+<figure class="foto">
+  <img src="../assets/img/13-proyectos.jpg" alt="Rack de servidores por detrás">
+  <figcaption>Un rack de servidores: los proyectos integran todo — desplegar nginx con HTTPS, monitorear y publicar una app real. Foto: Derrick Coetzee, vía <a href="https://commons.wikimedia.org/wiki/File:Rear_of_rack_at_NERSC_data_center_-_closeup.jpg" target="_blank">Wikimedia Commons</a> (CC0).</figcaption>
+</figure>
+
+
+<p><strong>Objetivo</strong>: levantar un servidor Nginx en una VM Ubuntu, con HTTPS, firewall, fail2ban y backups automatizados.</p>
+
+<h3>Pasos</h3>
+
+<ol>
+<li><strong>Preparar el sistema</strong>
+<pre><code class="lang-bash">sudo apt update &amp;&amp; sudo apt upgrade -y
+sudo apt install -y nginx ufw fail2ban certbot python3-certbot-nginx</code></pre>
+</li>
+
+<li><strong>Crear usuario de servicio sin shell</strong>
+<pre><code class="lang-bash">sudo useradd --system --no-create-home --shell /usr/sbin/nologin webadmin</code></pre>
+</li>
+
+<li><strong>Configurar firewall</strong>
+<pre><code class="lang-bash">sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow ssh
+sudo ufw allow 'Nginx Full'
+sudo ufw enable</code></pre>
+</li>
+
+<li><strong>Hardening de SSH</strong> (<code>/etc/ssh/sshd_config</code>):
+<pre><code>PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes</code></pre>
+</li>
+
+<li><strong>Sitio web básico</strong> (<code>/etc/nginx/sites-available/midominio</code>):
+<pre><code class="lang-nginx">server {
+    listen 80;
+    server_name midominio.com www.midominio.com;
+    root /var/www/midominio;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}</code></pre>
+<pre><code class="lang-bash">sudo ln -s /etc/nginx/sites-available/midominio /etc/nginx/sites-enabled/
+sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code></pre>
+</li>
+
+<li><strong>HTTPS con Let's Encrypt</strong>
+<pre><code class="lang-bash">sudo certbot --nginx -d midominio.com -d www.midominio.com</code></pre>
+</li>
+
+<li><strong>fail2ban para SSH y Nginx</strong>
+<pre><code class="lang-bash">sudo cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+# Habilitar [sshd] y [nginx-http-auth]
+sudo systemctl enable --now fail2ban</code></pre>
+</li>
+
+<li><strong>Backups con timer systemd</strong>
+<ul>
+  <li><code>/usr/local/bin/backup-www.sh</code> (script de tar)</li>
+  <li><code>/etc/systemd/system/backup-www.service</code> y <code>.timer</code></li>
+</ul>
+</li>
+</ol>
+
+<h3>Conceptos aplicados</h3>
+<ul>
+  <li>Módulos 04 (permisos), 06 (usuarios), 08 (redes/SSH)</li>
+  <li>Módulo 10 (systemd timers)</li>
+  <li>Módulo 11 (seguridad, TLS, firewall, fail2ban)</li>
+  <li>Módulo 12 (backup, logrotate)</li>
+</ul>
+
+<hr>
+
+<h2>Proyecto 2 — Herramienta CLI de administración</h2>
+
+<p><strong>Objetivo</strong>: script bash que reúne información del sistema en un reporte: usuarios, servicios, disco, red, top procesos.</p>
+
+<h3>Requisitos</h3>
+<ul>
+  <li>Output legible (con headers de sección)</li>
+  <li>Opciones <code>--all</code>, <code>--quick</code>, <code>--save FILE</code></li>
+  <li>Salida también disponible como JSON con <code>--json</code></li>
+  <li>Códigos de exit correctos</li>
+  <li>Compatible con bash 4+ y <code>set -euo pipefail</code></li>
+</ul>
+
+<h3>Esqueleto</h3>
+<p>Ver <code>scripts/sys-report.sh</code> por una implementación de referencia.</p>
+
+<h3>Conceptos aplicados</h3>
+<ul>
+  <li>Módulo 05 (procesos: ps, top)</li>
+  <li>Módulo 09 (bash scripting completo)</li>
+  <li>Módulo 12 (df, dmesg, journalctl)</li>
+</ul>
+
+<hr>
+
+<h2>Proyecto 3 — Despliegue de una app Python</h2>
+
+<p><strong>Objetivo</strong>: tomar una app Python (Flask/FastAPI) y desplegarla como un servicio systemd con reverse proxy Nginx, logs centralizados, y restart automático.</p>
+
+<h3>Pasos</h3>
+
+<ol>
+<li><strong>Crear usuario dedicado</strong>
+<pre><code class="lang-bash">sudo useradd --system --create-home --home-dir /opt/miapp --shell /usr/sbin/nologin miapp</code></pre>
+</li>
+
+<li><strong>Estructura de la app</strong>
+<pre><code>/opt/miapp/
+├── .venv/
+├── app.py
+└── requirements.txt</code></pre>
+</li>
+
+<li><strong>Instalar deps en venv</strong>
+<pre><code class="lang-bash">sudo -u miapp python3 -m venv /opt/miapp/.venv
+sudo -u miapp /opt/miapp/.venv/bin/pip install fastapi uvicorn</code></pre>
+</li>
+
+<li><strong>Service unit</strong> (<code>/etc/systemd/system/miapp.service</code>):
+<pre><code class="lang-ini">[Unit]
+Description=Mi App FastAPI
+After=network.target
+
+[Service]
+Type=simple
+User=miapp
+Group=miapp
+WorkingDirectory=/opt/miapp
+ExecStart=/opt/miapp/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/miapp/data
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+</li>
+
+<li><strong>Habilitar y verificar</strong>
+<pre><code class="lang-bash">sudo systemctl daemon-reload
+sudo systemctl enable --now miapp
+sudo systemctl status miapp
+journalctl -u miapp -f</code></pre>
+</li>
+
+<li><strong>Reverse proxy con Nginx</strong> (<code>/etc/nginx/sites-available/miapp</code>):
+<pre><code class="lang-nginx">server {
+    listen 80;
+    server_name miapp.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}</code></pre>
+</li>
+
+<li><strong>HTTPS</strong>
+<pre><code class="lang-bash">sudo certbot --nginx -d miapp.example.com</code></pre>
+</li>
+
+<li><strong>Verificación</strong>
+<ul>
+  <li>Tirar el proceso a propósito (<code>sudo systemctl kill miapp</code>) y confirmar que <code>Restart=on-failure</code> lo levanta</li>
+  <li>Ver logs: <code>journalctl -u miapp --since "5 min ago"</code></li>
+  <li><code>ss -tlnp | grep 8000</code> para verificar que escucha en localhost</li>
+</ul>
+</li>
+</ol>
+
+<h3>Conceptos aplicados</h3>
+<p>Todo el curso.</p>
+
+<hr>
+
+<h2>Próximos pasos — caminos de especialización</h2>
+
+<table>
+<thead><tr><th>Camino</th><th>Tecnologías</th></tr></thead>
+<tbody>
+<tr><td><strong>DevOps</strong></td><td>Docker, Kubernetes, Terraform, Ansible, CI/CD (GitLab, GitHub Actions)</td></tr>
+<tr><td><strong>SRE</strong></td><td>Prometheus, Grafana, ELK, OpenTelemetry, SLOs</td></tr>
+<tr><td><strong>Cloud</strong></td><td>AWS, GCP, Azure — sus consolas + CLIs</td></tr>
+<tr><td><strong>Seguridad</strong></td><td>OSCP, SELinux profundo, threat hunting, hardening avanzado</td></tr>
+<tr><td><strong>Networking</strong></td><td>BGP, VPN, MPLS, IPv6 a fondo</td></tr>
+<tr><td><strong>Storage</strong></td><td>Ceph, ZFS, NAS/SAN, distributed FS</td></tr>
+<tr><td><strong>Kernel</strong></td><td>Driver development, eBPF, performance tuning</td></tr>
+</tbody>
+</table>
+
+<h2>Recursos recomendados</h2>
+
+<ul>
+  <li><strong>Libro</strong>: <em>The Linux Command Line</em> — William Shotts (gratis online)</li>
+  <li><strong>Libro</strong>: <em>How Linux Works</em> — Brian Ward</li>
+  <li><strong>Libro</strong>: <em>UNIX and Linux System Administration Handbook</em> — Nemeth et al.</li>
+  <li><strong>Web</strong>: <a href="https://wiki.archlinux.org/" target="_blank">Arch Wiki</a> — referencia técnica de calidad</li>
+  <li><strong>Web</strong>: <a href="https://www.digitalocean.com/community/tutorials" target="_blank">DigitalOcean Tutorials</a></li>
+  <li><strong>Práctica</strong>: <a href="https://overthewire.org/wargames/bandit/" target="_blank">OverTheWire Bandit</a> — wargames CLI</li>
+  <li><strong>Práctica</strong>: <a href="https://linuxjourney.com/" target="_blank">Linux Journey</a></li>
+  <li><strong>Certificación</strong>: LFCS (Linux Foundation), RHCSA (Red Hat), LPIC</li>
+</ul>
+
+<h2>Filosofía final</h2>
+
+<blockquote>"Sé conservador en lo que hacés, liberal en lo que aceptás de los demás." — Postel's Law</blockquote>
+
+<blockquote>"La administración de sistemas es 90% prevenir desastres y 10% recuperarse de los que ocurrieron igual."</blockquote>
+
+<p>Tres principios para llevarte:</p>
+
+<ol>
+  <li><strong>Backups</strong>: si no probaste restaurarlo, no tenés backup</li>
+  <li><strong>Reproducibilidad</strong>: si no podés re-armarlo en una hora desde cero, sos rehén de tu servidor</li>
+  <li><strong>Documentación</strong>: tu yo del futuro va a olvidar todo. Escribí runbooks para cada cosa rara</li>
+</ol>
+
+<h2>🎓 Fin del curso</h2>
+
+<p>Si llegaste hasta acá: <strong>felicitaciones</strong>. Acabás de cubrir Linux desde el shell hasta administración profesional.</p>
+
+<p>El siguiente paso es <strong>practicar</strong>: levantá una VM, hacé los 3 proyectos sin copiar, rompé cosas a propósito, arreglalas. Ese ciclo es donde el conocimiento se vuelve experiencia.</p>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-12-administracion/lecture.html">← Anterior: Administración</a>
+  <a href="../index.html">🏠 Volver al curso</a>
+</nav>
+
+</div>
+</body>
+</html>

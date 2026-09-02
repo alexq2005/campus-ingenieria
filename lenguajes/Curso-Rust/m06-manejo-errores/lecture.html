@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 06 — Manejo de Errores · Curso de Rust</title>
+  <meta name="description" content="Errores recuperables con Result e irrecuperables con panic!, el operador ?, unwrap/expect, ok_or y Box dyn Error.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Rust</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../../sistemas/Curso-Computacion-Fisica/index.html">⚡ Computación Física</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 06</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M05</span>
+</div>
+
+<article>
+
+<h1>Módulo 06 — Manejo de Errores</h1>
+
+<p>En la mayoría de los lenguajes, cuando algo falla, se "lanza" una excepción que vuela hacia arriba hasta que alguien la atrapa. Rust hace algo distinto y, una vez que lo entendés, mucho más honesto: los errores son <strong>valores comunes</strong> que devolvés y manejás como cualquier otro dato. Nada de saltos invisibles en el flujo del programa.</p>
+
+<h2>Rust no tiene excepciones</h2>
+
+<div class="concept">
+  <strong>💡 Dos categorías de error, dos herramientas.</strong> Rust divide los problemas en dos: los <strong>recuperables</strong> (un archivo que no existe, una conexión que cae, una entrada inválida) que se modelan con el tipo <code>Result&lt;T, E&gt;</code>; y los <strong>irrecuperables</strong> (un bug genuino: un índice fuera de rango, una invariante rota) que disparan <code>panic!</code> y abortan. No hay <code>try/catch</code>: el manejo de errores es parte del <em>tipo</em> de retorno de cada función.
+</div>
+
+<p>La consecuencia es enorme: mirando la firma de una función ya sabés si puede fallar. Si devuelve <code>Result</code>, fallar es una posibilidad explícita que <strong>tenés que manejar</strong>. El compilador no te deja ignorarla por accidente.</p>
+
+<h2>El tipo <code>Result&lt;T, E&gt;</code></h2>
+
+<p><code>Result</code> es un <em>enum</em> (lo viste en M05) con dos variantes: <code>Ok(valor)</code> cuando todo salió bien, y <code>Err(error)</code> cuando algo falló. En la práctica es así de simple:</p>
+
+<pre><code class="lang-rust">enum Result&lt;T, E&gt; {
+    Ok(T),   // éxito, contiene el valor
+    Err(E),  // fallo, contiene el error
+}</code></pre>
+
+<p>Las funciones que pueden fallar declaran <code>Result</code> en su retorno. Por ejemplo, una función que parsea texto a número:</p>
+
+<pre><code class="lang-rust">fn parsear(texto: &amp;str) -&gt; Result&lt;i32, String&gt; {
+    match texto.trim().parse::&lt;i32&gt;() {
+        Ok(n) =&gt; Ok(n),
+        Err(_) =&gt; Err(format!("'{}' no es un número", texto)),
+    }
+}</code></pre>
+
+<div class="info">
+  <strong>El genérico se lee fácil:</strong> en <code>Result&lt;i32, String&gt;</code>, el <code>i32</code> es el tipo del valor de éxito y el <code>String</code> es el tipo del error. La <code>T</code> y la <code>E</code> de <code>Result&lt;T, E&gt;</code> son solo placeholders que cada función rellena.
+</div>
+
+<h2>Manejar un <code>Result</code></h2>
+
+<p>Hay tres formas principales de lidiar con un <code>Result</code>, de la más explícita a la más concisa.</p>
+
+<h3>1. Con <code>match</code> (lo más explícito)</h3>
+
+<p>Desarmás las dos variantes a mano. Es verboso pero clarísimo, y el compilador te obliga a cubrir ambos casos:</p>
+
+<pre><code class="lang-rust">match parsear("42") {
+    Ok(n) =&gt; println!("Número: {}", n),
+    Err(e) =&gt; println!("Error: {}", e),
+}</code></pre>
+
+<h3>2. Con <code>.unwrap()</code> / <code>.expect()</code> (atajos peligrosos)</h3>
+
+<p><code>.unwrap()</code> devuelve el valor si es <code>Ok</code>, pero hace <strong>panic</strong> si es <code>Err</code>. <code>.expect("mensaje")</code> es igual pero te deja personalizar el mensaje del panic:</p>
+
+<pre><code class="lang-rust">let n = parsear("42").unwrap();              // 42, o panic si falla
+let m = parsear("42").expect("debía parsear"); // igual, con mensaje propio</code></pre>
+
+<div class="warn">
+  <strong>⚠️ Solo para prototipos y tests.</strong> <code>.unwrap()</code> y <code>.expect()</code> convierten un error recuperable en un panic que tumba el programa. Están bien para un script rápido o un test donde un fallo <em>debe</em> abortar, pero en código de producción son una bomba de tiempo.
+</div>
+
+<h3>3. Con el operador <code>?</code> (el idiom)</h3>
+
+<p>El operador <code>?</code> es la joya del manejo de errores en Rust. Puesto detrás de una expresión que da <code>Result</code>: si es <code>Ok(v)</code>, extrae la <code>v</code> y sigue; si es <code>Err(e)</code>, <strong>retorna ese error inmediatamente</strong> desde la función actual. Propaga el error hacia arriba, sin escribir el <code>match</code> a mano:</p>
+
+<pre><code class="lang-rust">fn doble(texto: &amp;str) -&gt; Result&lt;i32, String&gt; {
+    let n = parsear(texto)?;  // si Err, retorna el Err acá mismo
+    Ok(n * 2)                 // si Ok, sigue con el valor
+}</code></pre>
+
+<div class="analogy">
+  <strong>🔗 El <code>?</code> es como un peaje con barrera.</strong> Si el valor que pasa es <code>Ok</code>, la barrera se abre y el valor sigue su camino. Si es <code>Err</code>, la barrera baja: el error da media vuelta y sale por donde entró (lo retorna la función). Vos no tenés que vigilar la barrera en cada línea — el <code>?</code> lo hace por vos.
+</div>
+
+<p>Solo podés usar <code>?</code> dentro de una función que devuelva <code>Result</code> (o <code>Option</code>), porque necesita "tener a dónde" retornar el error.</p>
+
+<h2>Errores irrecuperables: <code>panic!</code></h2>
+
+<p>Cuando el programa llega a un estado que <strong>no debería ser posible</strong> — un bug genuino, una invariante rota — la respuesta correcta es abortar con <code>panic!</code>. El programa imprime un mensaje, desenrolla la pila y termina:</p>
+
+<pre><code class="lang-rust">fn dividir(a: i32, b: i32) -&gt; i32 {
+    if b == 0 {
+        panic!("división por cero: esto es un bug del llamador");
+    }
+    a / b
+}</code></pre>
+
+<p>Acceder a un índice fuera de rango (<code>v[99]</code> en un vector de 3 elementos) también hace panic automáticamente: es un bug, no un error esperable.</p>
+
+<div class="rule">
+  <strong>📌 La regla de oro.</strong> Usá <code>Result</code> para lo <em>esperable</em> (puede fallar y querés que el llamador decida qué hacer). Usá <code>panic!</code> solo para <em>bugs</em> (estados imposibles que indican que el programa está roto). Y para propagar errores hacia arriba sin ruido, usá el operador <code>?</code>.
+</div>
+
+<h2>De <code>Option</code> a <code>Result</code>: <code>.ok_or()</code></h2>
+
+<p>A veces tenés un <code>Option</code> (M04) pero necesitás un <code>Result</code> — por ejemplo, para poder usar el operador <code>?</code>. El método <code>.ok_or()</code> convierte un <code>None</code> en <code>Err</code> y un <code>Some(v)</code> en <code>Ok(v)</code>:</p>
+
+<pre><code class="lang-rust">fn primero(v: &amp;[i32]) -&gt; Result&lt;i32, String&gt; {
+    let x = v.first().ok_or("la lista está vacía".to_string())?;
+    Ok(*x)
+}</code></pre>
+
+<div class="tip">
+  <strong>🧰 <code>Box&lt;dyn Error&gt;</code> para no casarte con un tipo de error.</strong> Cuando una función puede fallar de varias maneras distintas, escribir el tipo exacto de error se vuelve incómodo. El tipo <code>Box&lt;dyn Error&gt;</code> es un "error genérico" que acepta cualquier error: <code>fn cargar() -&gt; Result&lt;Datos, Box&lt;dyn Error&gt;&gt;</code>. Es muy común en <code>main</code> y en código de aplicación; lo verás más a fondo cuando manejes errores reales de librerías.
+</div>
+
+<h2>Errores comunes que vas a cometer</h2>
+
+<div class="mistake"><strong><code>.unwrap()</code> por todos lados en producción.</strong> Funciona en tu máquina con datos perfectos, pero el día que el input es inesperado, el programa hace panic y se cae en runtime. Reservá <code>unwrap</code> para prototipos y tests.</div>
+<div class="mistake"><strong>Usar <code>panic!</code> como manejo normal de errores.</strong> Panic es para bugs irrecuperables, no para "el usuario escribió mal el email". Si es algo que esperás que pase a veces, devolvé <code>Result</code> y dejá que el llamador decida.</div>
+<div class="mistake"><strong>Ignorar un <code>Result</code> que te devuelven.</strong> Rust marca <code>Result</code> con <code>#[must_use]</code>: si lo tirás sin usar, el compilador te avisa con un warning. No lo silencies — manejá el resultado o propagalo con <code>?</code>.</div>
+
+<div class="danger">
+  <strong>🚫 El panic no es gratis.</strong> Un <code>panic!</code> en producción tumba el hilo (o el programa entero). En un servidor web mal armado, un solo <code>.unwrap()</code> sobre datos del usuario puede tirar abajo el servicio para todos. Por eso el idiom es <code>Result</code> + <code>?</code>: el error se maneja, no explota.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia entre un error recuperable y uno irrecuperable en Rust?</summary>
+<p>Un error <strong>recuperable</strong> es algo esperable que puede fallar (archivo inexistente, input inválido) y se modela con <code>Result&lt;T, E&gt;</code> para que el llamador decida qué hacer. Uno <strong>irrecuperable</strong> es un bug genuino (índice fuera de rango, invariante rota) y se maneja con <code>panic!</code>, que aborta el programa.</p></details>
+
+<details><summary>¿Qué hace exactamente el operador <code>?</code>?</summary>
+<p>Puesto detrás de una expresión <code>Result</code>: si es <code>Ok(v)</code>, extrae <code>v</code> y el programa sigue; si es <code>Err(e)</code>, retorna ese <code>Err</code> inmediatamente desde la función actual, propagándolo hacia arriba. Solo se puede usar dentro de funciones que devuelven <code>Result</code> u <code>Option</code>.</p></details>
+
+<details><summary>¿Por qué <code>.unwrap()</code> es peligroso en producción?</summary>
+<p>Porque hace <code>panic!</code> (tumba el programa) en cuanto el <code>Result</code> es <code>Err</code>. Convierte un error recuperable en un crash. Está bien para prototipos y tests, pero en producción deberías manejar el error con <code>match</code> o propagarlo con <code>?</code>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí una función <code>fn parsear(texto: &amp;str) -&gt; Result&lt;i32, String&gt;</code> que devuelva <code>Ok</code> con el número o <code>Err</code> con un mensaje. Probala con un <code>match</code> sobre el resultado.</li>
+  <li>Agregá una función <code>fn doble(texto: &amp;str) -&gt; Result&lt;i32, String&gt;</code> que use el operador <code>?</code> para parsear y devuelva el número multiplicado por 2.</li>
+  <li>Tomá un <code>Option&lt;i32&gt;</code> y convertilo en <code>Result&lt;i32, String&gt;</code> usando <code>.ok_or()</code>; después usá <code>?</code> para extraer el valor.</li>
+  <li>Escribí una función que haga <code>panic!</code> ante una entrada imposible (por ejemplo, una edad negativa) y explicá por qué acá <code>panic</code> es lo correcto y no un <code>Result</code>.</li>
+  <li>Reemplazá un <code>.unwrap()</code> por un <code>match</code> que maneje el caso <code>Err</code> imprimiendo un mensaje, y comprobá que el programa ya no hace panic con input inválido.</li>
+</ol>
+
+<section class="quiz" id="quizRs06">
+  <style>
+    #quizRs06{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRs06 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRs06 .q{margin-bottom:1.5rem}
+    #quizRs06 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRs06 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRs06 .opt:hover{border-color:var(--accent)}
+    #quizRs06 .opt:disabled{cursor:default}
+    #quizRs06 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRs06 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRs06 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRs06 .exp.show{display:block}
+    #quizRs06 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué tipo usás para un error recuperable que el llamador debería manejar?</p>
+    <button class="opt">Una excepción con <code>throw</code></button>
+    <button class="opt"><code>Result&lt;T, E&gt;</code> con <code>Ok</code> / <code>Err</code></button>
+    <button class="opt">Siempre <code>panic!</code></button>
+    <div class="exp">Rust no tiene excepciones. Los errores recuperables se modelan con <code>Result&lt;T, E&gt;</code>: <code>Ok(valor)</code> en éxito, <code>Err(error)</code> en fallo.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Qué hace el operador <code>?</code> cuando la expresión da <code>Err</code>?</p>
+    <button class="opt">Hace panic y aborta el programa</button>
+    <button class="opt">Ignora el error y devuelve un valor por defecto</button>
+    <button class="opt">Retorna ese <code>Err</code> desde la función actual, propagándolo hacia arriba</button>
+    <div class="exp">El <code>?</code> propaga: si es <code>Ok(v)</code> extrae <code>v</code> y sigue; si es <code>Err(e)</code> retorna ese error inmediatamente desde la función (que debe devolver <code>Result</code> u <code>Option</code>).</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. ¿Cuándo es correcto usar <code>panic!</code>?</p>
+    <button class="opt">Para bugs irrecuperables: un estado imposible o una invariante rota</button>
+    <button class="opt">Para cualquier input inválido del usuario</button>
+    <button class="opt">Cada vez que una función puede fallar</button>
+    <div class="exp"><code>panic!</code> es para bugs verdaderamente irrecuperables (índice fuera de rango, invariante rota). Para lo esperable usá <code>Result</code> y dejá que el llamador decida.</div>
+  </div>
+
+  <div class="score" id="scoreRs06"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRs06');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRs06').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M07.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m05-pattern-matching/lecture.html">← M05: Pattern Matching</a>
+  <a href="../m07-colecciones-genericos/lecture.html">M07: Colecciones &amp; Genéricos →</a>
+</nav>
+
+</div>
+</body>
+</html>

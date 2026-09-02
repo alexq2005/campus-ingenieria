@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Módulo 06 — useEffect · Curso de React</title>
+<meta name="description" content="useEffect, cleanup, dependencies, sincronizar con sistemas externos.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 06</span>
+  <span class="badge">⏱ ~65 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 03</span>
+</div>
+
+<article>
+
+<h1>Módulo 06 — useEffect y Efectos Secundarios</h1>
+
+<blockquote>useEffect es el hook más mal usado de React. La mayoría de problemas con efectos vienen de usarlo cuando NO hace falta. Este módulo te enseña <strong>cuándo usarlo y cuándo evitarlo</strong>.</blockquote>
+
+<h2>1. ¿Qué es un "efecto secundario"?</h2>
+<figure class="foto">
+  <img src="../assets/img/m06-onda.jpg" alt="Onda producida por una gota de agua">
+  <figcaption>Una onda en el agua: useEffect ejecuta 'efectos secundarios' (fetch, suscripciones) en respuesta a cambios, como ondas tras una piedra. Foto: Amos777eligius, vía <a href="https://commons.wikimedia.org/wiki/File:Water_drop_ripple.jpg" target="_blank">Wikimedia Commons</a> (CC BY 4.0).</figcaption>
+</figure>
+
+
+<div class="concept">Un <strong>side effect</strong> es algo que pasa FUERA del flujo puro de render. Ejemplos: hacer fetch, suscribirse a un WebSocket, agregar un event listener al window, manipular el DOM directamente, setear localStorage, llamar a librerías externas (Stripe, mapas, charts).</div>
+
+<div class="rule">Render = describir UI a partir de estado. Efecto = sincronizar React con algún sistema externo (red, DOM, browser API).</div>
+
+<h2>2. La regla #1 de useEffect: a veces NO lo necesitás</h2>
+
+<div class="warn">React docs (2024) lo dicen explícitamente: "You might not need an Effect". Antes de escribir uno, preguntate si podés:
+<ul>
+  <li><strong>Derivar el valor</strong> en cada render (no guardar en estado).</li>
+  <li><strong>Calcular durante el render</strong> sin esperar.</li>
+  <li><strong>Ponerlo en un event handler</strong> que YA respondía al evento que dispara el efecto.</li>
+</ul>
+</div>
+
+<h3>Ejemplo: NO usar useEffect para esto</h3>
+
+<pre><code class="lang-jsx">// ❌ MAL — usar useEffect para derivar estado
+function FullName({ first, last }) {
+  const [full, setFull] = useState('');
+
+  useEffect(() =&gt; {
+    setFull(first + ' ' + last);
+  }, [first, last]);
+
+  return &lt;p&gt;{full}&lt;/p&gt;;
+}
+
+// ✅ BIEN — derivar en cada render
+function FullName({ first, last }) {
+  const full = first + ' ' + last;
+  return &lt;p&gt;{full}&lt;/p&gt;;
+}</code></pre>
+
+<h2>3. Cuándo SÍ usar useEffect</h2>
+
+<table>
+<thead><tr><th>Caso de uso</th><th>Por qué necesita Effect</th></tr></thead>
+<tbody>
+<tr><td>Fetch al montar (datos iniciales)</td><td>Side effect: pedir a red, esperar response</td></tr>
+<tr><td>Suscribirse a WebSocket / EventSource</td><td>Side effect: abrir/cerrar conexión</td></tr>
+<tr><td>Agregar listener a window/document</td><td>Side effect: tocar API global</td></tr>
+<tr><td>setInterval / setTimeout</td><td>Side effect: timer del browser</td></tr>
+<tr><td>Sincronizar con librería externa (Chart.js, Leaflet)</td><td>Side effect: instanciar / destruir</td></tr>
+<tr><td>Persistir en localStorage / cookie</td><td>Side effect: tocar storage</td></tr>
+<tr><td>Cambiar document.title o focusear input</td><td>Side effect: tocar DOM fuera del árbol React</td></tr>
+</tbody>
+</table>
+
+<h2>4. Anatomía de useEffect</h2>
+
+<pre><code class="lang-jsx">import { useEffect } from 'react';
+
+function Componente() {
+  useEffect(() =&gt; {
+    // Código del efecto: corre DESPUÉS del render
+    console.log('Efecto ejecutado');
+
+    return () =&gt; {
+      // Cleanup: corre ANTES del próximo efecto o al desmontar
+      console.log('Cleanup');
+    };
+  }, [/* dependencias */]);
+}</code></pre>
+
+<div class="step"><strong>Las 3 partes</strong>:</div>
+<ol>
+  <li><strong>Función del efecto</strong>: lo que hace.</li>
+  <li><strong>Cleanup (opcional, vía return)</strong>: cómo deshacer/limpiar.</li>
+  <li><strong>Array de dependencias</strong>: cuándo re-ejecutar.</li>
+</ol>
+
+<h2>5. El array de dependencias — 3 formas</h2>
+
+<table>
+<thead><tr><th>Forma</th><th>Cuándo corre el efecto</th></tr></thead>
+<tbody>
+<tr><td><code>useEffect(fn)</code></td><td>Después de CADA render (raro, casi nunca)</td></tr>
+<tr><td><code>useEffect(fn, [])</code></td><td>Solo después del primer mount</td></tr>
+<tr><td><code>useEffect(fn, [a, b])</code></td><td>Después del mount + cuando <code>a</code> o <code>b</code> cambian</td></tr>
+</tbody>
+</table>
+
+<h2>6. Ejemplo: fetch al montar</h2>
+
+<pre><code class="lang-jsx">function Posts() {
+  const [posts, setPosts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const res = await fetch('/api/posts');
+        const data = await res.json();
+        if (!cancelled) setPosts(data);
+      } catch (err) {
+        if (!cancelled) setError(err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+
+    return () =&gt; { cancelled = true; };  // race condition prevention
+  }, []);
+
+  if (loading) return &lt;p&gt;Cargando...&lt;/p&gt;;
+  if (error) return &lt;p&gt;Error: {error.message}&lt;/p&gt;;
+  return &lt;ul&gt;{posts.map(p =&gt; &lt;li key={p.id}&gt;{p.title}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<div class="warn">El patrón <code>cancelled</code> es para race conditions: si el componente se desmonta o se vuelve a montar antes de que llegue la response, NO setear estado. Sin esto, podés tener "memory leak" warnings o estado inconsistente.</div>
+
+<div class="tip">En 2026, para data fetching real usá <strong>TanStack Query</strong> (M10). useEffect+fetch funciona pero falta cache, retry, deduplicación, etc. Lo escribimos así para entender el primitivo.</div>
+
+<h2>7. Cleanup: el alma de useEffect</h2>
+
+<p>La función que devuelve el effect se ejecuta:</p>
+<ul>
+  <li>Antes del <strong>próximo</strong> efecto (cuando una dependencia cambia).</li>
+  <li>Al <strong>desmontar</strong> el componente.</li>
+</ul>
+
+<h3>Caso: suscripción a evento</h3>
+
+<pre><code class="lang-jsx">function MousePosition() {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+
+  useEffect(() =&gt; {
+    function handler(e) {
+      setPos({ x: e.clientX, y: e.clientY });
+    }
+
+    window.addEventListener('mousemove', handler);
+
+    return () =&gt; {
+      window.removeEventListener('mousemove', handler);  // ⭐ cleanup
+    };
+  }, []);
+
+  return &lt;p&gt;{pos.x}, {pos.y}&lt;/p&gt;;
+}</code></pre>
+
+<div class="rule">Sin cleanup, cada mount agrega OTRO listener. En SPAs con navegación, terminás con cientos de listeners zombies = memory leak.</div>
+
+<h3>Caso: timer</h3>
+
+<pre><code class="lang-jsx">function Clock() {
+  const [time, setTime] = useState(new Date());
+
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; setTime(new Date()), 1000);
+    return () =&gt; clearInterval(id);  // ⭐ obligatorio
+  }, []);
+
+  return &lt;p&gt;{time.toLocaleTimeString()}&lt;/p&gt;;
+}</code></pre>
+
+<h2>8. Dependencias: tienen que estar TODAS</h2>
+
+<p>Si tu efecto usa una variable que viene de props, estado o función, tiene que estar en el array de deps.</p>
+
+<pre><code class="lang-jsx">// ❌ MAL — userId NO está en deps; el efecto usa el viejo
+useEffect(() =&gt; {
+  fetch(`/api/users/${userId}`);
+}, []);
+
+// ✅ BIEN
+useEffect(() =&gt; {
+  fetch(`/api/users/${userId}`);
+}, [userId]);</code></pre>
+
+<div class="warn">El ESLint plugin <code>react-hooks/exhaustive-deps</code> te avisa de estas omisiones. Tomá la advertencia en serio — el 95% de las veces hay bug real.</div>
+
+<h2>9. Efectos en serie por dependencias</h2>
+
+<pre><code class="lang-jsx">function UserProfile({ userId }) {
+  const [user, setUser] = useState(null);
+
+  // Re-ejecuta cuando cambia userId (por ej, navegás a otro usuario)
+  useEffect(() =&gt; {
+    let cancelled = false;
+    fetch(`/api/users/${userId}`)
+      .then(r =&gt; r.json())
+      .then(u =&gt; { if (!cancelled) setUser(u); });
+    return () =&gt; { cancelled = true; };
+  }, [userId]);
+
+  if (!user) return &lt;p&gt;Cargando...&lt;/p&gt;;
+  return &lt;h2&gt;{user.nombre}&lt;/h2&gt;;
+}</code></pre>
+
+<h2>10. StrictMode y double-mount en dev</h2>
+
+<div class="info">En modo dev, React 18+ monta tus componentes 2 veces para que detectes efectos no-idempotentes. Si tu efecto loguea "Hola" 2 veces en dev, ES EL COMPORTAMIENTO ESPERADO. En producción solo corre 1 vez. Si te molesta, es porque tu efecto necesita cleanup correcto.</div>
+
+<h2>11. Anti-patrón: usar effect para reaccionar a evento</h2>
+
+<pre><code class="lang-jsx">// ❌ MAL — el efecto sigue al estado
+function Form() {
+  const [submitted, setSubmitted] = useState(false);
+
+  useEffect(() =&gt; {
+    if (submitted) {
+      analytics.track('form_submit');
+      router.push('/thanks');
+    }
+  }, [submitted]);
+
+  return &lt;button onClick={() =&gt; setSubmitted(true)}&gt;Submit&lt;/button&gt;;
+}
+
+// ✅ BIEN — el handler hace las dos cosas
+function Form() {
+  function handleSubmit() {
+    analytics.track('form_submit');
+    router.push('/thanks');
+  }
+
+  return &lt;button onClick={handleSubmit}&gt;Submit&lt;/button&gt;;
+}</code></pre>
+
+<div class="rule">Si la acción es respuesta a un EVENTO de usuario (click, submit, change), ponela en el HANDLER. useEffect es para sincronizar con sistemas externos, no para encadenar acciones tras eventos.</div>
+
+<h2>12. useEffect vs useLayoutEffect</h2>
+
+<table>
+<thead><tr><th>Hook</th><th>Cuándo corre</th><th>Cuándo usar</th></tr></thead>
+<tbody>
+<tr><td><code>useEffect</code></td><td>Después de pintar (browser ya mostró frame)</td><td>99% de casos — fetch, listeners, timers</td></tr>
+<tr><td><code>useLayoutEffect</code></td><td>Después del render, antes del paint (sincrónico)</td><td>Medir DOM, evitar flicker visual</td></tr>
+</tbody>
+</table>
+
+<div class="tip">Si dudás, usá <code>useEffect</code>. <code>useLayoutEffect</code> solo cuando ves "salto" visual al medir un elemento del DOM y aplicar el resultado.</div>
+
+<h2>13. Casos reales útiles</h2>
+
+<h3>Cambiar el título de la página</h3>
+<pre><code class="lang-jsx">useEffect(() =&gt; {
+  document.title = `Posts (${unread})`;
+  return () =&gt; { document.title = 'App'; };
+}, [unread]);</code></pre>
+
+<h3>Atajos de teclado</h3>
+<pre><code class="lang-jsx">useEffect(() =&gt; {
+  function onKey(e) {
+    if (e.key === 'Escape') onClose();
+  }
+  window.addEventListener('keydown', onKey);
+  return () =&gt; window.removeEventListener('keydown', onKey);
+}, [onClose]);</code></pre>
+
+<h3>Sincronizar con localStorage</h3>
+<pre><code class="lang-jsx">useEffect(() =&gt; {
+  localStorage.setItem('theme', theme);
+}, [theme]);</code></pre>
+
+<h2>14. Errores comunes con useEffect</h2>
+
+<div class="mistake"><strong>Dependencias incompletas</strong>: el efecto usa una variable que no está en deps. ESLint te avisa. Resolver: agregarla o refactorizar para que no dependa.</div>
+
+<div class="mistake"><strong>Loop infinito</strong>: efecto que cambia un estado del cual depende. <code>useEffect(() =&gt; setX(x+1), [x])</code> renderiza para siempre.</div>
+
+<div class="mistake"><strong>Sin cleanup en listeners/timers</strong>: cada mount agrega más listeners. Memory leak garantizado.</div>
+
+<div class="mistake"><strong>Usar useEffect para derivar estado</strong>: 90% del tiempo no hace falta. Calculá en cada render o derivá.</div>
+
+<div class="mistake"><strong>Async function como callback de useEffect</strong>: <code>useEffect(async () =&gt; ...)</code> es error — useEffect espera función que devuelve cleanup, no Promise. Definí async ADENTRO y llamala.</div>
+
+<div class="mistake"><strong>Setear estado en cada render</strong>: si tu efecto siempre llama setX sin condición, va a haber un re-render extra inútil. Solo setear cuando hay cambio real.</div>
+
+<h2>15. Ejercicios</h2>
+
+<ol>
+  <li>Mostrar el ancho del viewport en tiempo real (resize listener + cleanup).</li>
+  <li>Counter con auto-increment cada 1 seg (setInterval + cleanup).</li>
+  <li>Fetch de <code>https://jsonplaceholder.typicode.com/posts</code> al montar.</li>
+  <li>Cambiar el <code>document.title</code> cada vez que cambia un input.</li>
+  <li>Modal con cierre por tecla Escape.</li>
+  <li>Refactorizar un effect que solo deriva estado → moverlo a cálculo directo.</li>
+</ol>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Para qué sirve useEffect?</summary>
+<p>Sincronizar React con sistemas EXTERNOS (red, DOM, browser APIs, librerías). NO es para encadenar lógica React-interna — eso va en handlers o cálculos derivados.</p></details>
+
+<details><summary>2. ¿Qué hace el cleanup?</summary>
+<p>Se ejecuta antes del próximo efecto (cuando cambia una dependencia) y al desmontar el componente. Sirve para "deshacer" lo del efecto: remover listeners, cancelar timers, abortar fetches, cerrar WebSockets.</p></details>
+
+<details><summary>3. ¿Por qué el array de dependencias debe ser completo?</summary>
+<p>Porque si una variable usada dentro del efecto cambia y NO está en deps, el efecto NO se re-ejecuta — usa el valor viejo (stale closure). Causa bugs sutiles de sincronización. ESLint te avisa.</p></details>
+
+<details><summary>4. ¿Por qué los efectos corren 2 veces en dev (React 18)?</summary>
+<p>StrictMode monta tus componentes 2 veces a propósito para detectar efectos no-idempotentes (los que rompen si se ejecutan 2 veces). En producción solo corre 1 vez. La solución es asegurar cleanup correcto, no "evitar el comportamiento".</p></details>
+
+<details><summary>5. ¿Cuándo NO usar useEffect?</summary>
+<p>Para derivar estado (calculá durante el render), para responder a eventos de usuario (poné en handler), para transformar props (calculá en el render), para datos del backend en producción (usá TanStack Query / SWR).</p></details>
+
+<details><summary>6. ¿Diferencia entre useEffect y useLayoutEffect?</summary>
+<p>useEffect corre DESPUÉS del paint (el browser ya pintó el frame). useLayoutEffect corre antes del paint, sincrónico al render. Solo usar useLayoutEffect si necesitás medir el DOM y aplicar cambios sin flicker visual.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m05-listas-y-keys/lecture.html">← Anterior: Listas y Keys</a>
+  <a href="../m07-hooks-avanzados/lecture.html">Siguiente: Hooks Avanzados →</a>
+</nav>
+
+</div>
+</body>
+</html>

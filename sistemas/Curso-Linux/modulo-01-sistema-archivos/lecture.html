@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 01 — Sistema de Archivos · Curso de Linux</title>
+  <meta name="description" content="FHS, rutas absolutas/relativas, inodos, hardlinks, symlinks, mount.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 01</span>
+  <span class="badge">⏱ ~45 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 00</span>
+</div>
+
+<article>
+
+<h1>Módulo 01 — Sistema de Archivos</h1>
+
+<h2>Filosofía Unix: "todo es un archivo"</h2>
+<figure class="foto">
+  <img src="../assets/img/01-arbol.jpg" alt="Árbol banyan ramificado">
+  <figcaption>Un árbol que se ramifica: el sistema de archivos de Linux es un único árbol que nace en la raíz / y se divide en directorios. Foto: Unnikannan7, vía <a href="https://commons.wikimedia.org/wiki/File:Banyan_tree_2024.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+
+<p>En Linux, <strong>todo se representa como archivo</strong>: dispositivos, procesos, sockets, configuración del kernel. Esto unifica las APIs.</p>
+
+<p>Por ejemplo:</p>
+<ul>
+  <li><code>/dev/sda</code> — disco duro</li>
+  <li><code>/proc/cpuinfo</code> — info del CPU</li>
+  <li><code>/dev/null</code> — agujero negro (descarta lo que escribas)</li>
+  <li><code>/dev/random</code> — generador de números aleatorios</li>
+</ul>
+
+<h2>Filesystem Hierarchy Standard (FHS)</h2>
+
+<p>Todas las distros siguen un layout estándar a partir de <code>/</code> (raíz):</p>
+
+<table>
+<thead><tr><th>Directorio</th><th>Contenido</th></tr></thead>
+<tbody>
+<tr><td><code>/</code></td><td>Raíz del sistema</td></tr>
+<tr><td><code>/bin</code></td><td>Binarios esenciales (ls, cp, mv)</td></tr>
+<tr><td><code>/sbin</code></td><td>Binarios de administración (mount, fdisk)</td></tr>
+<tr><td><code>/etc</code></td><td>Archivos de <strong>configuración</strong> del sistema</td></tr>
+<tr><td><code>/home</code></td><td>Directorios personales (<code>/home/ana</code>)</td></tr>
+<tr><td><code>/root</code></td><td>Home del usuario root</td></tr>
+<tr><td><code>/var</code></td><td>Datos variables: logs, mail, caches (<code>/var/log</code>)</td></tr>
+<tr><td><code>/tmp</code></td><td>Temporales (se borra al reiniciar)</td></tr>
+<tr><td><code>/usr</code></td><td>Software instalado: <code>/usr/bin</code>, <code>/usr/lib</code>, <code>/usr/local</code></td></tr>
+<tr><td><code>/opt</code></td><td>Software opcional/de terceros</td></tr>
+<tr><td><code>/dev</code></td><td>Archivos de dispositivos</td></tr>
+<tr><td><code>/proc</code></td><td>Sistema de archivos virtual con info de procesos</td></tr>
+<tr><td><code>/sys</code></td><td>Sistema de archivos virtual con info del kernel</td></tr>
+<tr><td><code>/boot</code></td><td>Kernel + bootloader (GRUB)</td></tr>
+<tr><td><code>/lib</code>, <code>/lib64</code></td><td>Librerías compartidas</td></tr>
+<tr><td><code>/mnt</code>, <code>/media</code></td><td>Puntos de montaje (USBs, discos externos)</td></tr>
+<tr><td><code>/srv</code></td><td>Datos servidos por servicios (web, ftp)</td></tr>
+</tbody>
+</table>
+
+<h2>Rutas absolutas vs relativas</h2>
+
+<pre><code class="lang-bash">/home/ana/docs/notas.txt    # absoluta (empieza con /)
+docs/notas.txt              # relativa al directorio actual
+./docs/notas.txt            # idem (. = directorio actual)
+../otro/archivo             # sube un nivel (.. = padre)
+~/docs/notas.txt            # ~ = home del usuario actual (~/ = $HOME/)
+~ana/docs                   # home de usuario "ana"</code></pre>
+
+<h3>Casos especiales</h3>
+
+<table>
+<thead><tr><th>Símbolo</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>.</code></td><td>Directorio actual</td></tr>
+<tr><td><code>..</code></td><td>Directorio padre</td></tr>
+<tr><td><code>~</code></td><td>Home del usuario actual</td></tr>
+<tr><td><code>-</code></td><td>Directorio anterior (<code>cd -</code>)</td></tr>
+<tr><td><code>/</code></td><td>Separador de path</td></tr>
+</tbody>
+</table>
+
+<h2>Inodos</h2>
+
+<p>Cada archivo tiene un <strong>inodo</strong>: estructura que guarda metadatos (permisos, dueño, timestamps, ubicación de bloques). El nombre del archivo es solo una entrada en un directorio que apunta a un inodo.</p>
+
+<pre><code class="lang-bash">ls -i archivo.txt          # muestra el número de inodo
+stat archivo.txt           # info detallada del inodo</code></pre>
+
+<h2>Hard links vs symbolic links</h2>
+
+<h3>Hard link</h3>
+
+<p>Otra entrada en un directorio apuntando al <strong>mismo inodo</strong>:</p>
+
+<pre><code class="lang-bash">ln origen.txt hardlink.txt</code></pre>
+
+<ul>
+  <li>Mismo contenido, mismo inodo</li>
+  <li>Si borrás el original, el hard link sigue funcionando</li>
+  <li>No funcionan entre sistemas de archivos distintos</li>
+  <li>No se pueden hacer a directorios</li>
+</ul>
+
+<h3>Symbolic link (symlink, soft link)</h3>
+
+<p>"Acceso directo" — un archivo especial que <strong>apunta a otra ruta</strong>:</p>
+
+<pre><code class="lang-bash">ln -s /ruta/original.txt symlink.txt</code></pre>
+
+<ul>
+  <li>Si borrás el original, el symlink queda <strong>roto</strong></li>
+  <li>Funcionan entre sistemas de archivos</li>
+  <li>Se pueden hacer a directorios</li>
+  <li>Se ven con <code>ls -l</code>: <code>lrwxrwxrwx ... symlink.txt -&gt; /ruta/original.txt</code></li>
+</ul>
+
+<h2>Tipos de archivo</h2>
+
+<p><code>ls -l</code> muestra el tipo en el primer carácter:</p>
+
+<table>
+<thead><tr><th>Carácter</th><th>Tipo</th></tr></thead>
+<tbody>
+<tr><td><code>-</code></td><td>Archivo regular</td></tr>
+<tr><td><code>d</code></td><td>Directorio</td></tr>
+<tr><td><code>l</code></td><td>Symlink</td></tr>
+<tr><td><code>b</code></td><td>Block device (disco)</td></tr>
+<tr><td><code>c</code></td><td>Character device (teclado, terminal)</td></tr>
+<tr><td><code>p</code></td><td>Named pipe (FIFO)</td></tr>
+<tr><td><code>s</code></td><td>Socket</td></tr>
+</tbody>
+</table>
+
+<h2>Tamaños y unidades</h2>
+
+<pre><code class="lang-bash">ls -lh                     # human-readable: 4.5K, 2.3M, 1.2G
+du -sh /home/ana           # tamaño total del directorio
+du -h --max-depth=1        # subdirectorios
+df -h                      # uso de disco por filesystem
+ncdu                       # navegador interactivo de tamaños (instalable)</code></pre>
+
+<h2>Sistemas de archivos comunes</h2>
+
+<table>
+<thead><tr><th>FS</th><th>Notas</th></tr></thead>
+<tbody>
+<tr><td><code>ext4</code></td><td>Default en muchas distros; estable</td></tr>
+<tr><td><code>btrfs</code></td><td>Snapshots, compresión; default en Fedora</td></tr>
+<tr><td><code>xfs</code></td><td>Default en RHEL; bueno para archivos grandes</td></tr>
+<tr><td><code>zfs</code></td><td>Featureful pero requiere setup</td></tr>
+<tr><td><code>tmpfs</code></td><td>RAM (<code>/tmp</code> puede usarlo)</td></tr>
+<tr><td><code>vfat</code> / <code>exfat</code></td><td>Para USBs compatibles con Windows</td></tr>
+<tr><td><code>ntfs</code></td><td>Lectura nativa, escritura por <code>ntfs-3g</code></td></tr>
+</tbody>
+</table>
+
+<p>Ver tu filesystem:</p>
+
+<pre><code class="lang-bash">df -T
+mount | column -t</code></pre>
+
+<h2>Montar y desmontar</h2>
+
+<pre><code class="lang-bash">sudo mount /dev/sdb1 /mnt/usb
+sudo umount /mnt/usb
+lsblk                      # lista dispositivos en árbol</code></pre>
+
+<p>Para automatizar: <code>/etc/fstab</code>.</p>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Listar el contenido de <code>/etc</code> y descubrir qué archivos de configuración tenés</li>
+  <li>Crear un symlink en tu home apuntando a <code>/var/log/syslog</code></li>
+  <li>Comparar <code>du -sh ~</code> y ver qué carpetas ocupan más espacio</li>
+  <li>Encontrar el inodo de un archivo y crear un hard link, luego borrar el original — ¿qué pasa?</li>
+  <li>Ejecutar <code>cat /proc/cpuinfo</code> y leer la info del CPU</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-00-introduccion/lecture.html">← Anterior: Introducción</a>
+  <a href="../modulo-02-comandos-basicos/lecture.html">Siguiente: Comandos Básicos →</a>
+</nav>
+
+</div>
+</body>
+</html>

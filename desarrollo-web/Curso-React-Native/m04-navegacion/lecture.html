@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 04 — Navegación · Curso de React Native</title>
+  <meta name="description" content="Navegación entre pantallas con React Navigation: NavigationContainer, Stack Navigator, pasar params con route.params, Tabs y Drawer, y cómo anidar navegadores.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de React Native</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-React/index.html">⚛️ Curso de React</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 04</span>
+  <span class="badge">⏱ ~60 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+</div>
+
+<article>
+
+<h1>Módulo 04 — Navegación</h1>
+
+<p>Hasta acá tus apps eran <strong>una sola pantalla</strong>. Pero una app real tiene varias: una lista de productos que abre el detalle, un menú con secciones, pestañas abajo. En este módulo aprendés a moverte entre pantallas con <strong>React Navigation</strong>, la librería estándar del ecosistema.</p>
+
+<h2>¿Por qué una librería de navegación?</h2>
+
+<div class="info">
+  En la web el navegador te da la navegación gratis: URLs, el botón de "atrás", el historial. En móvil <strong>no existe nada de eso</strong> — no hay barra de direcciones ni botón universal de retroceso. Alguien tiene que manejar qué pantalla se muestra, cómo se anima la transición, y qué pasa cuando el usuario quiere volver. Esa es la tarea de <strong>React Navigation</strong>.
+</div>
+
+<p>React Navigation es <em>el</em> estándar de facto: lo usa la enorme mayoría de las apps RN y viene integrado con Expo. No tiene rival serio para la mayoría de los casos.</p>
+
+<h2>Instalación</h2>
+
+<p>Necesitás el paquete núcleo (<code>native</code>), un navegador concreto (acá el <em>stack</em> nativo) y las dependencias nativas que Expo gestiona por vos:</p>
+
+<pre><code class="lang-bash"># 1. Núcleo de React Navigation
+npm install @react-navigation/native
+
+# 2. El navegador que vamos a usar: stack nativo
+npm install @react-navigation/native-stack
+
+# 3. Dependencias nativas (Expo elige la versión compatible)
+npx expo install react-native-screens react-native-safe-area-context</code></pre>
+
+<div class="tip">
+  <strong>💡 Usá <code>npx expo install</code> (no <code>npm install</code>) para las dependencias nativas.</strong>
+  Expo conoce qué versión de cada paquete nativo es compatible con tu versión de Expo y la instala exacta. Con <code>npm install</code> podrías traer una versión que rompe el build nativo.
+</div>
+
+<h2>El contenedor raíz: <code>&lt;NavigationContainer&gt;</code></h2>
+
+<p>Todo el sistema de navegación vive dentro de un único <code>&lt;NavigationContainer&gt;</code>. Es el componente que mantiene el estado de navegación (qué pantalla está activa, el historial) y lo comparte con todos los navegadores que pongas adentro.</p>
+
+<div class="rule">
+  <strong>📌 Un solo <code>&lt;NavigationContainer&gt;</code> por app, en la raíz.</strong>
+  Lo envolvés <em>una vez</em>, arriba de todo. Adentro pueden anidar muchos navegadores, pero el contenedor es uno solo. Si usás Expo Router, el contenedor lo pone el framework por vos — pero conviene entender qué hace.
+</div>
+
+<h2>Stack Navigator — pantallas apiladas</h2>
+
+<p>El patrón más común. Imaginá una <strong>pila de cartas</strong>: cada pantalla nueva se apila <em>encima</em> de la anterior, y al volver, se saca la de arriba y reaparece la de abajo. Así funciona "entrar al detalle y volver".</p>
+
+<div class="analogy">
+  <strong>🔍 Es como el historial del navegador.</strong> Navegás de Lista a Detalle: Detalle queda arriba, Lista debajo. Tocás "atrás": se descarta Detalle y volvés a Lista — exactamente donde estabas, con el scroll y todo intacto.
+</div>
+
+<p>Se crea con <code>createNativeStackNavigator()</code>, que te da dos componentes: <code>&lt;Stack.Navigator&gt;</code> (el contenedor de la pila) y <code>&lt;Stack.Screen&gt;</code> (cada pantalla registrada):</p>
+
+<pre><code class="lang-jsx">import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+
+const Stack = createNativeStackNavigator();
+
+export default function App() {
+  return (
+    &lt;NavigationContainer&gt;
+      &lt;Stack.Navigator&gt;
+        &lt;Stack.Screen name="Lista" component={ListaScreen} /&gt;
+        &lt;Stack.Screen
+          name="Detalle"
+          component={DetalleScreen}
+          options={{ title: 'Detalle del ítem' }}
+        /&gt;
+      &lt;/Stack.Navigator&gt;
+    &lt;/NavigationContainer&gt;
+  );
+}</code></pre>
+
+<p>Cosas a notar:</p>
+
+<table>
+<thead><tr><th>Elemento</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>name="Lista"</code></td><td>El nombre con el que navegás a esa pantalla (es el "destino")</td></tr>
+<tr><td><code>component={ListaScreen}</code></td><td>El componente que se renderiza en esa pantalla</td></tr>
+<tr><td><code>options={{ title }}</code></td><td>Configura el <strong>header</strong> automático (título, botones, color)</td></tr>
+<tr><td>El header</td><td>El stack <strong>te dibuja la barra superior solo</strong>, con el botón "atrás" incluido</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El header es automático.</strong> Cuando navegás a una segunda pantalla, el stack agrega arriba una barra con el título y una flecha de "atrás" funcional. No tenés que dibujarla vos. La primera pantalla muestra su <code>name</code> como título salvo que lo cambies con <code>options</code>.
+</div>
+
+<h3>Cómo navegar: <code>navigation.navigate</code> y <code>goBack</code></h3>
+
+<p>Cada componente que registrás como <code>component</code> de un <code>&lt;Stack.Screen&gt;</code> recibe automáticamente una prop <strong><code>navigation</code></strong>. Con ella te movés:</p>
+
+<pre><code class="lang-jsx">import { View, Text, Pressable, StyleSheet } from 'react-native';
+
+function ListaScreen({ navigation }) {
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Text style={styles.titulo}&gt;Pantalla Lista&lt;/Text&gt;
+      &lt;Pressable
+        style={styles.boton}
+        onPress={() =&gt; navigation.navigate('Detalle')}
+      &gt;
+        &lt;Text style={styles.botonTexto}&gt;Ir al Detalle&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}
+
+function DetalleScreen({ navigation }) {
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Text style={styles.titulo}&gt;Pantalla Detalle&lt;/Text&gt;
+      &lt;Pressable style={styles.boton} onPress={() =&gt; navigation.goBack()}&gt;
+        &lt;Text style={styles.botonTexto}&gt;Volver&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<table>
+<thead><tr><th>Método</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><code>navigation.navigate('Detalle')</code></td><td>Va a la pantalla llamada <code>Detalle</code> (la apila encima)</td></tr>
+<tr><td><code>navigation.goBack()</code></td><td>Vuelve a la pantalla anterior (saca la de arriba)</td></tr>
+<tr><td><code>navigation.push('Detalle')</code></td><td>Apila <em>otra</em> instancia de Detalle, aunque ya estés en una</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Confundir <code>push</code> con <code>navigate</code>.</strong> <code>navigate('Detalle')</code> es inteligente: si ya estás en <code>Detalle</code>, <em>no</em> apila otra — se queda donde está (o solo actualiza los params). <code>push('Detalle')</code> siempre apila una nueva instancia encima. Para "ver el siguiente producto sin volver" querés <code>push</code>; para navegación normal querés <code>navigate</code>.
+</div>
+
+<h2>Pasar datos entre pantallas: params</h2>
+
+<p>Navegar está bueno, pero casi siempre querés <strong>llevarte datos</strong>: "abrí el detalle <em>del producto 42</em>". Eso se hace con un segundo argumento (un objeto) en <code>navigate</code>:</p>
+
+<pre><code class="lang-jsx">// En la Lista: navego y le paso el id
+navigation.navigate('Detalle', { id: 42, nombre: 'Teclado mecánico' });</code></pre>
+
+<p>Y en la pantalla destino los leés desde la prop <strong><code>route</code></strong>, en <code>route.params</code>:</p>
+
+<pre><code class="lang-jsx">function DetalleScreen({ route, navigation }) {
+  const { id, nombre } = route.params;   // ⬅️ acá llegan los datos
+
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Text style={styles.titulo}&gt;{nombre}&lt;/Text&gt;
+      &lt;Text&gt;ID del producto: {id}&lt;/Text&gt;
+      &lt;Pressable style={styles.boton} onPress={() =&gt; navigation.goBack()}&gt;
+        &lt;Text style={styles.botonTexto}&gt;Volver&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Dos props clave en cada pantalla:</strong> <code>navigation</code> (para moverte) y <code>route</code> (para leer <code>route.params</code>, los datos que te mandaron). Las dos llegan solas, no las pasás vos.
+</div>
+
+<div class="mistake">
+  <strong>Pasar funciones o estado complejo por params.</strong> Los params deberían ser datos serializables y livianos: un <code>id</code>, un texto, un número. Pasar una función (<code>{ onSave: miFuncion }</code>) o un objeto enorme genera warnings y rompe cosas como el guardado de estado. Si dos pantallas necesitan compartir lógica o estado grande, usá <strong>estado global</strong> (Context, Zustand, Redux) — no los params de navegación.
+</div>
+
+<h2>Ejemplo completo: Lista → Detalle</h2>
+
+<p>Juntemos todo en una app de dos pantallas. La lista muestra ítems; tocar uno abre el detalle pasándole su <code>id</code> y <code>nombre</code>:</p>
+
+<pre><code class="lang-jsx">import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { View, Text, Pressable, StyleSheet } from 'react-native';
+
+const Stack = createNativeStackNavigator();
+
+const PRODUCTOS = [
+  { id: 1, nombre: 'Teclado mecánico' },
+  { id: 2, nombre: 'Mouse inalámbrico' },
+  { id: 3, nombre: 'Monitor 27"' },
+];
+
+function ListaScreen({ navigation }) {
+  return (
+    &lt;View style={styles.container}&gt;
+      {PRODUCTOS.map((p) =&gt; (
+        &lt;Pressable
+          key={p.id}
+          style={styles.item}
+          onPress={() =&gt; navigation.navigate('Detalle', { id: p.id, nombre: p.nombre })}
+        &gt;
+          &lt;Text style={styles.itemTexto}&gt;{p.nombre}&lt;/Text&gt;
+        &lt;/Pressable&gt;
+      ))}
+    &lt;/View&gt;
+  );
+}
+
+function DetalleScreen({ route, navigation }) {
+  const { id, nombre } = route.params;
+  return (
+    &lt;View style={styles.container}&gt;
+      &lt;Text style={styles.titulo}&gt;{nombre}&lt;/Text&gt;
+      &lt;Text&gt;Producto #{id}&lt;/Text&gt;
+      &lt;Pressable style={styles.boton} onPress={() =&gt; navigation.goBack()}&gt;
+        &lt;Text style={styles.botonTexto}&gt;← Volver a la lista&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}
+
+export default function App() {
+  return (
+    &lt;NavigationContainer&gt;
+      &lt;Stack.Navigator&gt;
+        &lt;Stack.Screen name="Lista" component={ListaScreen} options={{ title: 'Productos' }} /&gt;
+        &lt;Stack.Screen name="Detalle" component={DetalleScreen} /&gt;
+      &lt;/Stack.Navigator&gt;
+    &lt;/NavigationContainer&gt;
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 14, padding: 20 },
+  titulo: { fontSize: 28, fontWeight: 'bold' },
+  item: { backgroundColor: '#ede9fe', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 10, width: '100%' },
+  itemTexto: { fontSize: 16, color: '#5b21b6' },
+  boton: { backgroundColor: '#a78bfa', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 10, marginTop: 16 },
+  botonTexto: { color: 'white', fontWeight: 'bold' },
+});</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Mirá lo que ya reconocés:</strong> el <code>.map()</code> sobre <code>PRODUCTOS</code> con su <code>key</code>, los componentes de función, las props… es React puro. Lo único nuevo es <code>navigation</code>/<code>route</code> y el registro de pantallas.
+</div>
+
+<h2>Otros navegadores: Tabs y Drawer</h2>
+
+<p>El stack es para "entrar y volver". Pero hay otros dos patrones de navegación muy comunes, y cada uno tiene su navegador:</p>
+
+<table>
+<thead><tr><th>Navegador</th><th>Cómo se ve</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><strong>Stack</strong><br><code>@react-navigation/native-stack</code></td><td>Pantallas apiladas con header y "atrás"</td><td>Flujos jerárquicos: lista → detalle → editar</td></tr>
+<tr><td><strong>Bottom Tabs</strong><br><code>@react-navigation/bottom-tabs</code></td><td>Barra de pestañas abajo (Inicio, Buscar, Perfil)</td><td>3–5 secciones <em>principales</em> entre las que se salta seguido</td></tr>
+<tr><td><strong>Drawer</strong><br><code>@react-navigation/drawer</code></td><td>Menú lateral que se desliza desde el borde</td><td>Muchas secciones secundarias / config; cuando no entran en tabs</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  La <strong>API es la misma</strong> para todos: cada uno te da un <code>createXNavigator()</code> que devuelve <code>&lt;X.Navigator&gt;</code> y <code>&lt;X.Screen&gt;</code>. Si entendiste el stack, entendiste los tres. Cambia el aspecto visual, no la forma de usarlo. <em>(Tabs y Drawer requieren instalar su paquete; el drawer además pide <code>react-native-gesture-handler</code> y <code>react-native-reanimated</code>.)</em>
+</div>
+
+<p>Ejemplo de tabs (mismo molde que el stack):</p>
+
+<pre><code class="lang-jsx">import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+
+const Tab = createBottomTabNavigator();
+
+function App() {
+  return (
+    &lt;NavigationContainer&gt;
+      &lt;Tab.Navigator&gt;
+        &lt;Tab.Screen name="Inicio" component={InicioScreen} /&gt;
+        &lt;Tab.Screen name="Perfil" component={PerfilScreen} /&gt;
+      &lt;/Tab.Navigator&gt;
+    &lt;/NavigationContainer&gt;
+  );
+}</code></pre>
+
+<h2>Anidar navegadores</h2>
+
+<p>Las apps reales <strong>combinan</strong> navegadores. El patrón clásico: <em>tabs abajo</em>, y dentro de cada tab, su propio <em>stack</em> para entrar al detalle sin perder la barra de pestañas.</p>
+
+<div class="concept">
+  <strong>💡 Anidar = poner un navegador como <code>component</code> de la pantalla de otro.</strong>
+  Una <code>&lt;Tab.Screen&gt;</code> puede tener como componente, en vez de una pantalla simple, <em>un Stack Navigator entero</em>. Así, dentro de la tab "Inicio" navegás de Lista a Detalle (con su header y "atrás") mientras las pestañas de abajo siguen visibles.
+</div>
+
+<pre><code class="lang-jsx">const Tab = createBottomTabNavigator();
+const Stack = createNativeStackNavigator();
+
+// Un stack: Lista → Detalle
+function InicioStack() {
+  return (
+    &lt;Stack.Navigator&gt;
+      &lt;Stack.Screen name="Lista" component={ListaScreen} /&gt;
+      &lt;Stack.Screen name="Detalle" component={DetalleScreen} /&gt;
+    &lt;/Stack.Navigator&gt;
+  );
+}
+
+export default function App() {
+  return (
+    &lt;NavigationContainer&gt;
+      &lt;Tab.Navigator&gt;
+        {/* La tab "Inicio" ES un stack entero */}
+        &lt;Tab.Screen name="Inicio" component={InicioStack} /&gt;
+        &lt;Tab.Screen name="Perfil" component={PerfilScreen} /&gt;
+      &lt;/Tab.Navigator&gt;
+    &lt;/NavigationContainer&gt;
+  );
+}</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>Olvidar envolver con <code>&lt;NavigationContainer&gt;</code>.</strong> Sin él, tirás un error tipo <em>"Couldn't find a navigation object"</em> apenas usás <code>navigation</code> o un <code>&lt;Stack.Screen&gt;</code>. El contenedor va en la raíz, una sola vez.
+</div>
+<div class="mistake">
+  <strong>Pasar funciones por params.</strong> <code>navigate('X', { onDone: fn })</code> parece práctico pero está desaconsejado: rompe la serialización del estado de navegación. Para compartir lógica entre pantallas, usá <strong>estado global</strong>, no params.
+</div>
+<div class="mistake">
+  <strong>Confundir <code>push</code> con <code>navigate</code>.</strong> <code>navigate</code> no apila si ya estás en esa pantalla; <code>push</code> siempre apila una nueva. Usar el equivocado te deja con pantallas duplicadas en el historial (o sin la nueva instancia que esperabas).
+</div>
+
+<div class="warn">
+  <strong>⚠️ Reiniciá el bundler tras instalar paquetes nativos.</strong> Después de instalar <code>react-native-screens</code> y compañía, cortá Expo (Ctrl+C) y volvé a correr <code>npx expo start -c</code> (el <code>-c</code> limpia la caché). Si no, podés ver errores raros de módulos nativos que "no existen".
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Para qué sirve <code>&lt;NavigationContainer&gt;</code> y cuántos necesitás?</summary>
+<p>Es el contenedor raíz que mantiene y comparte el estado de navegación (pantalla activa, historial). Necesitás <strong>uno solo</strong>, en la raíz de la app, envolviendo a todos los navegadores. Anidás navegadores adentro, pero el contenedor es único.</p></details>
+
+<details><summary>Estás en la Lista y querés abrir el Detalle del producto con <code>id: 7</code>. ¿Cómo navegás y cómo lo leés?</summary>
+<p>Navegás con <code>navigation.navigate('Detalle', { id: 7 })</code>. En <code>DetalleScreen</code> lo leés desde la prop <code>route</code>: <code>const { id } = route.params;</code>. Las props <code>navigation</code> y <code>route</code> llegan automáticamente a cada pantalla registrada en un <code>&lt;Stack.Screen&gt;</code>.</p></details>
+
+<details><summary>¿Cuándo usás un Tab Navigator y cuándo un Stack?</summary>
+<p><strong>Stack</strong> para flujos jerárquicos donde entrás y volvés (lista → detalle), con header y botón "atrás" automáticos. <strong>Tabs</strong> para 3–5 secciones principales entre las que el usuario salta seguido (Inicio, Buscar, Perfil). Y se combinan: tabs abajo, con un stack adentro de cada una.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instalá React Navigation (<code>@react-navigation/native</code>, <code>@react-navigation/native-stack</code> y las dependencias con <code>npx expo install</code>) y envolvé tu app con <code>&lt;NavigationContainer&gt;</code>.</li>
+  <li>Armá el ejemplo Lista → Detalle de dos pantallas. Verificá que el header aparece solo y que el botón "atrás" funciona.</li>
+  <li>En la Lista, pasá el <code>nombre</code> y un <code>precio</code> por params, y mostralos en el Detalle leyendo <code>route.params</code>.</li>
+  <li>Agregá una tercera pantalla "Editar" a la que se llega desde el Detalle. Probá <code>navigation.navigate('Editar')</code> y volvé con <code>goBack()</code>.</li>
+  <li>Convertí la app a un Bottom Tab Navigator con dos pestañas ("Productos" y "Perfil"), y poné el flujo Lista → Detalle como un Stack <em>dentro</em> de la pestaña "Productos".</li>
+</ol>
+
+<section class="quiz" id="quizRN04">
+  <style>
+    #quizRN04{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRN04 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRN04 .q{margin-bottom:1.5rem}
+    #quizRN04 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRN04 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRN04 .opt:hover{border-color:var(--accent)}
+    #quizRN04 .opt:disabled{cursor:default}
+    #quizRN04 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRN04 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRN04 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRN04 .exp.show{display:block}
+    #quizRN04 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. ¿Cuántos <code>&lt;NavigationContainer&gt;</code> debe tener una app y dónde va?</p>
+    <button class="opt">Uno por cada pantalla, dentro de cada <code>&lt;Screen&gt;</code></button>
+    <button class="opt">Uno por cada navegador (Stack, Tabs, Drawer)</button>
+    <button class="opt">Uno solo, en la raíz de la app, envolviendo a todos los navegadores</button>
+    <div class="exp">El <code>&lt;NavigationContainer&gt;</code> es único y va en la raíz. Mantiene el estado de navegación y lo comparte con todos los navegadores que anides adentro.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Navegaste con <code>navigation.navigate('Detalle', { id: 7 })</code>. ¿Cómo leés ese <code>id</code> en la pantalla Detalle?</p>
+    <button class="opt">Desde la prop <code>navigation</code>: <code>navigation.id</code></button>
+    <button class="opt">Desde la prop <code>route</code>: <code>route.params.id</code></button>
+    <button class="opt">Con un <code>useState</code> en el Detalle</button>
+    <div class="exp">Los datos pasados al navegar llegan en <code>route.params</code>. La prop <code>route</code> (igual que <code>navigation</code>) llega automáticamente a cada pantalla registrada.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Querés 4 secciones principales (Inicio, Buscar, Mensajes, Perfil) con una barra abajo para saltar entre ellas. ¿Qué navegador usás?</p>
+    <button class="opt">Bottom Tab Navigator</button>
+    <button class="opt">Stack Navigator</button>
+    <button class="opt">Ninguno: con varios <code>&lt;NavigationContainer&gt;</code> alcanza</button>
+    <div class="exp">Las tabs (bottom tabs) son ideales para 3–5 secciones principales entre las que se salta seguido. El stack es para flujos de entrar/volver (lista → detalle).</div>
+  </div>
+
+  <div class="score" id="scoreRN04"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRN04');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRN04').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M05.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m03-listas/lecture.html">← M03: Listas</a>
+  <a href="../m05-estado-hooks/lecture.html">M05: Estado &amp; Hooks →</a>
+</nav>
+
+</div>
+</body>
+</html>

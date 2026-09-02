@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 08 — Redes en Linux · Curso de Linux</title>
+  <meta name="description" content="ip, ss, dig, ssh, scp, rsync, ufw, tcpdump, certificados TLS.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Linux</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~90 min</span>
+  <span class="badge">🎯 Pre-req: Módulo 07</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Redes en Linux</h1>
+
+<h2>Información de interfaces</h2>
+<figure class="foto">
+  <img src="../assets/img/08-redes.jpg" alt="Switches Ethernet y patch panels">
+  <figcaption>Switches y patch panels: Linux corre la mayoría de los servidores de internet; dominar redes (ip, ss, ssh) es esencial. Foto: Dsimic, vía <a href="https://commons.wikimedia.org/wiki/File:19-inch_rackmount_Ethernet_switches_and_patch_panels.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+
+<h3>Comando moderno: <code>ip</code></h3>
+
+<pre><code class="lang-bash">ip addr                                    # alias: ip a
+ip addr show eth0
+ip link                                    # interfaces (up/down)
+ip route                                   # tabla de ruteo
+ip neigh                                   # tabla ARP
+ip -s link show eth0                       # estadísticas</code></pre>
+
+<h3>Comandos legacy (deprecated pero comunes)</h3>
+
+<pre><code class="lang-bash">ifconfig                                   # similar a ip addr
+route                                      # similar a ip route
+arp -a                                     # similar a ip neigh
+netstat -tulnp                             # ahora se prefiere ss</code></pre>
+
+<blockquote>En distros modernas, <code>ip</code> y <code>ss</code> reemplazan a <code>ifconfig</code>, <code>route</code>, <code>netstat</code>. Aprendé los nuevos.</blockquote>
+
+<h2>Configurar IP</h2>
+
+<h3>Manualmente (no persistente)</h3>
+
+<pre><code class="lang-bash">sudo ip addr add 192.168.1.50/24 dev eth0
+sudo ip link set eth0 up
+sudo ip route add default via 192.168.1.1</code></pre>
+
+<h3>Persistente</h3>
+
+<p>Depende de la distro:</p>
+
+<table>
+<thead><tr><th>Distro</th><th>Sistema</th></tr></thead>
+<tbody>
+<tr><td>Ubuntu desktop</td><td><code>NetworkManager</code> (<code>nmcli</code>, <code>nmtui</code>)</td></tr>
+<tr><td>Ubuntu server</td><td><code>netplan</code> (<code>/etc/netplan/*.yaml</code>)</td></tr>
+<tr><td>Debian</td><td><code>/etc/network/interfaces</code></td></tr>
+<tr><td>Fedora/RHEL</td><td><code>NetworkManager</code></td></tr>
+<tr><td>Arch</td><td><code>systemd-networkd</code> o <code>NetworkManager</code></td></tr>
+</tbody>
+</table>
+
+<h4>Netplan (Ubuntu Server)</h4>
+
+<pre><code class="lang-yaml"># /etc/netplan/01-netcfg.yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses: [192.168.1.50/24]
+      routes:
+        - to: default
+          via: 192.168.1.1
+      nameservers:
+        addresses: [1.1.1.1, 8.8.8.8]</code></pre>
+
+<pre><code class="lang-bash">sudo netplan try                           # prueba reversible
+sudo netplan apply</code></pre>
+
+<h4>NetworkManager (<code>nmcli</code>)</h4>
+
+<pre><code class="lang-bash">nmcli device                               # interfaces
+nmcli connection show                      # conexiones
+nmcli connection up "Mi WiFi"
+sudo nmcli device wifi connect "SSID" password "..."
+nmtui                                      # TUI interactiva</code></pre>
+
+<h2>Diagnóstico de conectividad</h2>
+
+<pre><code class="lang-bash">ping 8.8.8.8                               # ICMP
+ping -c 4 google.com                       # 4 paquetes
+ping6 ::1                                  # IPv6
+
+traceroute google.com                      # ruta de saltos
+mtr google.com                             # combina ping + traceroute (interactivo)</code></pre>
+
+<h2>DNS</h2>
+
+<pre><code class="lang-bash">dig google.com                             # consulta DNS detallada
+dig +short google.com
+dig MX gmail.com                           # tipo de registro
+dig @8.8.8.8 google.com                    # contra servidor específico
+
+nslookup google.com                        # alternativa
+host google.com                            # más simple
+resolvectl status                          # systemd-resolved</code></pre>
+
+<h3>Configuración DNS</h3>
+<ul>
+  <li><code>/etc/resolv.conf</code> — clásico (en muchas distros, generado, no editar a mano)</li>
+  <li><code>/etc/systemd/resolved.conf</code> — systemd-resolved</li>
+  <li><code>/etc/hosts</code> — overrides locales</li>
+</ul>
+
+<pre><code># /etc/hosts
+127.0.0.1       localhost
+192.168.1.10    server-dev</code></pre>
+
+<h2>Puertos y conexiones</h2>
+
+<h3><code>ss</code> — socket statistics</h3>
+
+<pre><code class="lang-bash">ss -tuln                                   # TCP/UDP, listening, numérico
+ss -tulnp                                  # con proceso (requiere sudo para todos)
+ss -t                                      # solo TCP
+ss -t state established                    # conexiones activas
+ss -tn dst :443                            # destino puerto 443</code></pre>
+
+<table>
+<thead><tr><th>Flag</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>-t</code></td><td>TCP</td></tr>
+<tr><td><code>-u</code></td><td>UDP</td></tr>
+<tr><td><code>-l</code></td><td>listening</td></tr>
+<tr><td><code>-n</code></td><td>numérico (sin DNS reverse)</td></tr>
+<tr><td><code>-p</code></td><td>con proceso</td></tr>
+<tr><td><code>-a</code></td><td>all</td></tr>
+<tr><td><code>-s</code></td><td>resumen</td></tr>
+</tbody>
+</table>
+
+<h3><code>netstat</code> (legacy)</h3>
+
+<pre><code class="lang-bash">netstat -tulnp                             # equivalente
+netstat -an</code></pre>
+
+<h2>Transferencia HTTP — <code>curl</code> y <code>wget</code></h2>
+
+<h3><code>curl</code> — Swiss army knife</h3>
+
+<pre><code class="lang-bash">curl https://example.com                   # GET
+curl -i URL                                # incluir headers
+curl -I URL                                # solo headers (HEAD)
+curl -L URL                                # seguir redirects
+curl -o salida.html URL                    # guardar
+curl -O URL                                # guardar con nombre original
+curl -s URL                                # silencioso
+curl -X POST -d "user=ana" URL             # POST con datos
+curl -H "Authorization: Bearer TOKEN" URL  # header custom
+curl -u user:pass URL                      # basic auth
+curl -F "file=@local.txt" URL              # upload multipart
+curl --resolve dominio:443:1.2.3.4 URL     # forzar resolución</code></pre>
+
+<h3><code>wget</code></h3>
+
+<pre><code class="lang-bash">wget URL
+wget -c URL                                # continuar descarga interrumpida
+wget -r URL                                # recursivo (mirror)
+wget -O salida URL
+wget --limit-rate=200k URL</code></pre>
+
+<h2>SSH — Secure Shell</h2>
+
+<p>Conexión remota cifrada. <strong>Herramienta crítica de Linux</strong>.</p>
+
+<pre><code class="lang-bash">ssh user@host
+ssh user@host -p 2222                      # puerto custom
+ssh user@host comando                      # ejecutar comando remoto
+ssh -i ~/.ssh/llave_custom user@host       # con llave específica
+ssh -L 8080:localhost:80 user@host         # tunnel local
+ssh -R 9090:localhost:3000 user@host       # tunnel remoto
+ssh -D 1080 user@host                      # SOCKS proxy
+ssh -X user@host                           # X11 forwarding
+ssh -A user@host                           # forward agent
+ssh -v user@host                           # verbose (debug)</code></pre>
+
+<h3>Llaves SSH</h3>
+
+<pre><code class="lang-bash">ssh-keygen -t ed25519 -C "mi-comentario"   # generar llave moderna
+ssh-keygen -t rsa -b 4096                  # alternativa
+ssh-copy-id user@host                       # copiar pública al server
+cat ~/.ssh/id_ed25519.pub | ssh user@host "cat &gt;&gt; ~/.ssh/authorized_keys"</code></pre>
+
+<h3>Config — <code>~/.ssh/config</code></h3>
+
+<pre><code>Host servidor
+    HostName 192.168.1.100
+    User ana
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519_servidor
+    ServerAliveInterval 60</code></pre>
+
+<p>Después: <code>ssh servidor</code> (en vez de <code>ssh -p 2222 -i ... ana@192.168.1.100</code>).</p>
+
+<h3>Permisos críticos</h3>
+
+<pre><code class="lang-bash">chmod 700 ~/.ssh
+chmod 600 ~/.ssh/id_*
+chmod 644 ~/.ssh/*.pub
+chmod 600 ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/config</code></pre>
+
+<h2>Transferencia de archivos</h2>
+
+<h3><code>scp</code> — sobre SSH</h3>
+
+<pre><code class="lang-bash">scp local.txt user@host:/destino/
+scp user@host:/origen/archivo.txt .
+scp -r carpeta/ user@host:/destino/
+scp -P 2222 archivo user@host:.            # puerto custom (P mayúscula!)</code></pre>
+
+<h3><code>rsync</code> — sincronización inteligente</h3>
+
+<pre><code class="lang-bash">rsync -avz origen/ destino/                # archive, verbose, gzip
+rsync -avz origen/ user@host:destino/      # remoto
+rsync -avz --delete origen/ destino/       # espejo (borra extras)
+rsync -avzP origen user@host:destino       # con barra de progreso
+rsync --dry-run -avz src/ dst/             # simular</code></pre>
+
+<blockquote>Diferencia clave: <code>origen/</code> (con barra) copia el contenido; <code>origen</code> (sin barra) copia la carpeta misma.</blockquote>
+
+<h3><code>sftp</code> — interactivo</h3>
+
+<pre><code class="lang-bash">sftp user@host
+&gt; ls
+&gt; get archivo
+&gt; put local.txt
+&gt; bye</code></pre>
+
+<h2>Firewall — <code>ufw</code> (Uncomplicated Firewall)</h2>
+
+<pre><code class="lang-bash">sudo ufw status
+sudo ufw enable
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp
+sudo ufw allow ssh                         # nombre de servicio
+sudo ufw allow from 192.168.1.0/24 to any port 22
+sudo ufw deny 8080
+sudo ufw delete allow 8080
+sudo ufw reset</code></pre>
+
+<p>Otros frontends: <code>firewalld</code> (Fedora/RHEL), <code>iptables</code>/<code>nftables</code> (bajo nivel).</p>
+
+<h2><code>tcpdump</code> — sniffer</h2>
+
+<pre><code class="lang-bash">sudo tcpdump -i eth0
+sudo tcpdump -i any port 80
+sudo tcpdump -i eth0 host 192.168.1.10
+sudo tcpdump -w captura.pcap
+sudo tcpdump -r captura.pcap
+sudo tcpdump -nn -i eth0 'tcp[tcpflags] &amp; (tcp-syn) != 0'   # SYN packets</code></pre>
+
+<blockquote>Para análisis profundo: <code>wireshark</code> (con GUI).</blockquote>
+
+<h2>Otros útiles</h2>
+
+<pre><code class="lang-bash">nc -zv host 22                             # netcat: testear puerto
+nc -l 9999                                 # escuchar puerto (chat simple)
+echo "hola" | nc localhost 9999
+
+iperf3 -s                                  # servidor (medir bandwidth)
+iperf3 -c host                             # cliente
+
+speedtest-cli                              # medir velocidad de internet</code></pre>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Encontrar tu IP pública: <code>curl ifconfig.me</code></li>
+  <li>Listar todos los puertos TCP escuchando con <code>ss -tlnp</code></li>
+  <li>Generar un par de llaves SSH ed25519 y copiarlo a una VM</li>
+  <li>Crear <code>~/.ssh/config</code> con un alias para una conexión SSH</li>
+  <li>Hacer un <code>rsync</code> con <code>--dry-run</code> para sincronizar dos directorios</li>
+</ol>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../modulo-07-paquetes/lecture.html">← Anterior: Paquetes</a>
+  <a href="../modulo-09-bash-scripting/lecture.html">Siguiente: Bash Scripting →</a>
+</nav>
+
+</div>
+</body>
+</html>

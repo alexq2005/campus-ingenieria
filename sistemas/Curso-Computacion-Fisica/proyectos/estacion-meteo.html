@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proyecto Puente — Estación Meteorológica IoT · Computación Física</title>
+<meta name="description" content="Proyecto que EXIGE software + electrónica: del sensor físico al dashboard con ML.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">🌉 Proyecto Puente</span>
+  <span class="badge">⏱ ~1-2 semanas</span>
+  <span class="badge">🎯 Integra todo el campus</span>
+</div>
+
+<article>
+
+<h1>Proyecto Puente — Estación Meteorológica IoT</h1>
+
+<blockquote>El proyecto que <strong>no podés terminar sabiendo solo software o solo electrónica</strong>. Atraviesa medio campus: del sensor físico al dashboard web con predicción ML. Esta es la complementariedad hecha proyecto.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🌉</span> <strong>Por qué es "puente":</strong> cada fase usa un módulo distinto del campus, alternando entre electrónica e informática. Si te falta cualquiera de los dos mundos, te trabás. Eso es exactamente el punto — te obliga a integrar.
+</div>
+
+<h2>Qué construís</h2>
+
+<p>Una estación que mide temperatura, humedad y presión, los manda por WiFi a un servidor, los guarda, los muestra en un dashboard web en vivo, y predice la temperatura de la próxima hora con un modelo simple.</p>
+
+<h2>El flujo completo — y qué módulo usa cada parte</h2>
+
+<table>
+<thead><tr><th>#</th><th>Fase</th><th>Mundo</th><th>Módulo del campus</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Circuito: ESP32 + sensor BME280, alimentación</td><td>🔌 Electrónica</td><td>E00 Fundamentos, E03 Micro</td></tr>
+<tr><td>2</td><td>Leer el sensor por I2C</td><td>🔌 Electrónica</td><td>E03 (buses I2C)</td></tr>
+<tr><td>3</td><td>Firmware en C/C++ en el ESP32</td><td>💻 Informática</td><td>M07 (C), M06 (lógica)</td></tr>
+<tr><td>4</td><td>Mandar datos por WiFi con MQTT</td><td>💻 Informática</td><td>M15 (redes), M37 (IoT)</td></tr>
+<tr><td>5</td><td>Backend que recibe y guarda</td><td>💻 Informática</td><td>M33 (Fullstack)</td></tr>
+<tr><td>6</td><td>Base de datos (series temporales)</td><td>💻 Informática</td><td>M19 (SQL), M21 (time-series)</td></tr>
+<tr><td>7</td><td>Dashboard web en vivo</td><td>💻 Informática</td><td>Curso-React (charts, fetching)</td></tr>
+<tr><td>8</td><td>Modelo que predice la próxima temp</td><td>💻 Informática</td><td>M39 (ML clásico)</td></tr>
+<tr><td>9</td><td>Optimizar consumo (batería)</td><td>🔌 Electrónica</td><td>E00 (potencia), E03 (sleep)</td></tr>
+</tbody>
+</table>
+
+<h2>Diagrama del sistema</h2>
+
+<pre><code>  ┌─────────────────── MUNDO FÍSICO (electrónica) ───────────────────┐
+  │                                                                   │
+  │   [Sensor BME280] ──I2C──► [ESP32] ──┐                            │
+  │    temp/hum/pres            (E03)     │ WiFi                       │
+  └───────────────────────────────────────┼───────────────────────────┘
+                                           │
+  ┌─────────────────── MUNDO DIGITAL (informática) ──────┼────────────┐
+  │                                        ▼                           │
+  │   [Broker MQTT] ──► [Backend API] ──► [Base de datos time-series]  │
+  │     (M37)            (M33)              (M19/M21)                   │
+  │                         │                  │                       │
+  │                         ▼                  ▼                       │
+  │                 [Modelo ML predicción]  [Dashboard React]          │
+  │                      (M39)               (Curso-React)             │
+  └───────────────────────────────────────────────────────────────────┘</code></pre>
+
+<h2>Fase por fase</h2>
+
+<h3>Fase 1-2 — El hardware (Electrónica)</h3>
+<div class="step">Conectá el sensor BME280 al ESP32 por I2C (4 cables: VCC, GND, SDA, SCL). Verificá con multímetro que el sensor recibe 3.3V. En el simulador <a href="https://wokwi.com" target="_blank">Wokwi</a> podés hacerlo sin hardware físico.</div>
+
+<pre><code class="lang-c">#include &lt;Wire.h&gt;
+#include &lt;Adafruit_BME280.h&gt;
+
+Adafruit_BME280 bme;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();              // inicia I2C (E03)
+  if (!bme.begin(0x76)) {
+    Serial.println("Sensor no encontrado!");
+  }
+}</code></pre>
+
+<h3>Fase 3-4 — Firmware + WiFi (Informática en el chip)</h3>
+<pre><code class="lang-c">#include &lt;WiFi.h&gt;
+#include &lt;PubSubClient.h&gt;   // MQTT
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+void loop() {
+  float temp = bme.readTemperature();   // ADC + I2C (E03)
+  float hum  = bme.readHumidity();
+
+  char payload[64];
+  snprintf(payload, sizeof(payload),
+           "{\"temp\":%.1f,\"hum\":%.1f}", temp, hum);
+
+  mqtt.publish("estacion/datos", payload);   // M15/M37
+  delay(60000);  // cada minuto (mejor: deep sleep — Fase 9)
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El <code>snprintf</code> y el manejo de buffers fijos vienen directo de <a href="../../../../Curso ingenieria sistemas/area-02-programacion-fundamentos/m07-programacion-bajo-nivel-c/lecture.html">M07</a>. El protocolo MQTT, de <a href="../../../../Curso ingenieria sistemas/area-07-desarrollo-aplicado/m37-desarrollo-embebido-iot/lecture.html">M37</a>.
+</div>
+
+<h3>Fase 5-7 — Backend, DB, Dashboard (Informática)</h3>
+<div class="step">Un backend (Next.js de M33 o Python/FastAPI) se suscribe al MQTT, guarda en Postgres con <code>TIMESTAMPTZ</code> (M19), y un dashboard React (Curso-React) con Recharts muestra los datos en vivo vía TanStack Query.</div>
+
+<h3>Fase 8 — Predicción ML (Informática)</h3>
+<div class="step">Con el histórico, entrená una regresión simple (M39) que prediga la temperatura de la próxima hora. Empezá con regresión lineal sobre las últimas N lecturas.</div>
+
+<h3>Fase 9 — Optimización de energía (Electrónica)</h3>
+<div class="step">Acá volvés al hardware: usar <code>deep sleep</code> del ESP32 entre lecturas baja el consumo de ~80mA a ~10µA. La diferencia entre "dura 1 día" y "dura 6 meses con la misma batería". Calculás la autonomía con la Ley de Ohm y la capacidad de la batería (E00).</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El bucle se cierra:</strong> empezaste en electrónica (sensor), pasaste todo por software, y volvés a electrónica (energía). Esa ida y vuelta es la complementariedad en acción — optimizar el sistema completo requiere pensar en watts Y en algoritmos a la vez.
+</div>
+
+<h2>Criterios de "terminado"</h2>
+
+<ul>
+  <li>☐ El sensor lee datos reales (o simulados en Wokwi).</li>
+  <li>☐ Los datos llegan al backend por WiFi/MQTT.</li>
+  <li>☐ Se guardan en una base de datos.</li>
+  <li>☐ El dashboard los muestra en vivo (se actualiza solo).</li>
+  <li>☐ Hay al menos una predicción simple funcionando.</li>
+  <li>☐ Documentaste el consumo de energía y una optimización.</li>
+  <li>☐ README con diagrama, fotos/screenshots y el flujo completo.</li>
+</ul>
+
+<h2>Variantes según tu interés</h2>
+
+<table>
+<thead><tr><th>Si te gusta...</th><th>Variante del proyecto</th></tr></thead>
+<tbody>
+<tr><td>Visión / IA</td><td>Cámara ESP32-CAM + detección de objetos en edge (conecta con M42)</td></tr>
+<tr><td>Audio / DSP</td><td>Micrófono + FFT en el chip + detección de palabras (conecta con E07 DSP)</td></tr>
+<tr><td>Robótica</td><td>Robot con motores + sensor de distancia + control PID (conecta con E08)</td></tr>
+<tr><td>Domótica</td><td>Control de luces/relés por voz o app + automatizaciones</td></tr>
+<tr><td>Agricultura</td><td>Riego automático según humedad de suelo + alertas</td></tr>
+</tbody>
+</table>
+
+<h2>Por qué este proyecto va al portfolio</h2>
+
+<div class="rule">Un dev que muestra una app web es uno más. Un dev que muestra un <strong>sistema físico que mide el mundo real, lo procesa en la nube, lo visualiza y lo predice</strong> demuestra que entiende el stack COMPLETO — del electrón al pixel. Eso es raro y muy valorado en IoT, robótica, hardware startups, automotriz y aeroespacial.</div>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e03-microcontroladores-1/lecture.html">← E03 Microcontroladores</a>
+  <a href="../index.html">🏠 Volver al curso</a>
+</nav>
+
+</div>
+</body>
+</html>

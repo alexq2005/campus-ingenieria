@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E03 — Microcontroladores I · Computación Física</title>
+<meta name="description" content="GPIO, registros, ADC/PWM, interrupciones: donde tu código C de M07 corre sobre silicio real.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E03</span>
+  <span class="badge">⏱ ~90 min</span>
+  <span class="badge">🎯 Pre-req: E00, E02 + M07 C</span>
+</div>
+
+<article>
+
+<h1>E03 — Microcontroladores I</h1>
+
+<blockquote class="author">"El microcontrolador es donde tu programa deja de ser texto y empieza a mover el mundo físico." — el corazón del puente</blockquote>
+
+<blockquote>Este es <strong>EL nodo donde software y hardware se tocan</strong>. Un microcontrolador (MCU) es una computadora completa en un chip: CPU + memoria + pines. Vos escribís código C (lo de <a href="../../../../Curso ingenieria sistemas/area-02-programacion-fundamentos/m07-programacion-bajo-nivel-c/lecture.html">M07</a>) y ese código lee sensores, enciende motores, manda datos por WiFi. Acá converge TODO el campus.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Triple conexión:</strong> este módulo integra
+  <a href="../../../../Curso ingenieria sistemas/area-02-programacion-fundamentos/m07-programacion-bajo-nivel-c/lecture.html">M07 (C, punteros)</a>,
+  <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m13-arquitectura-computadoras/lecture.html">M13 (arquitectura)</a> y
+  <a href="../../../../Curso ingenieria sistemas/area-07-desarrollo-aplicado/m37-desarrollo-embebido-iot/lecture.html">M37 (IoT)</a>. Si M37 te dio la vista de alto nivel del IoT, E03 te da la vista de bajo nivel: qué pasa DENTRO del chip.
+</div>
+
+<h2>1. ¿Qué es un microcontrolador?</h2>
+
+<div class="concept">Un <strong>MCU</strong> es una computadora completa en un solo chip: procesador + RAM + memoria flash (programa) + periféricos (pines, timers, ADC, comunicación). A diferencia de tu laptop, no tiene sistema operativo (o uno mínimo): tu código ES el sistema.</div>
+
+<table>
+<thead><tr><th></th><th>Tu laptop (M13/M14)</th><th>Microcontrolador</th></tr></thead>
+<tbody>
+<tr><td>CPU</td><td>GHz, multi-core</td><td>MHz, 1-2 cores</td></tr>
+<tr><td>RAM</td><td>8-32 GB</td><td>2 KB - 512 KB</td></tr>
+<tr><td>SO</td><td>Windows/Linux/macOS</td><td>Ninguno o RTOS mínimo</td></tr>
+<tr><td>Tu código</td><td>una app entre muchas</td><td>ES todo lo que corre</td></tr>
+<tr><td>Pines al mundo</td><td>USB, HDMI (abstracto)</td><td>GPIO directo a voltaje</td></tr>
+<tr><td>Consumo</td><td>15-100 W</td><td>µW - mW (años con batería)</td></tr>
+</tbody>
+</table>
+
+<h3>MCUs populares 2026</h3>
+<ul>
+  <li><strong>ESP32</strong>: WiFi+Bluetooth integrado, barato (~$5), ideal para IoT. <strong>Recomendado para empezar.</strong></li>
+  <li><strong>Arduino Uno (ATmega328)</strong>: el clásico educativo, simple, robusto.</li>
+  <li><strong>Raspberry Pi Pico (RP2040)</strong>: barato, potente, dual-core.</li>
+  <li><strong>STM32</strong>: familia profesional ARM Cortex-M, usado en industria.</li>
+</ul>
+
+<figure class="foto">
+  <img src="../assets/img/esp32.jpg" alt="Placa de desarrollo ESP32 con sus pines GPIO a los costados">
+  <figcaption>Una placa ESP32: una computadora completa de ~$5 con WiFi y Bluetooth. Los pines a los costados son los GPIO que tu código controla. Foto: Edwiyanto, vía <a href="https://commons.wikimedia.org/wiki/File:ESP32_Dev_Board.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Por qué KB y no GB de RAM importa:</strong> en M07 manejaste memoria con cuidado (malloc/free). En un MCU con 2KB de RAM eso es VIDA O MUERTE — no hay margen. Toda la disciplina de "código eficiente" de M07 y M12 (complejidad) se vuelve obligatoria, no opcional. Acá un memory leak no ralentiza: cuelga el dispositivo.
+</div>
+
+<h2>2. GPIO: el pin que es un bit físico</h2>
+
+<div class="concept"><strong>GPIO</strong> (General Purpose Input/Output) son los pines del chip. Cada uno puede ser:
+<ul>
+  <li><strong>Output</strong>: tu código pone el pin en HIGH (3.3V) o LOW (0V) → enciende un LED, activa un relé.</li>
+  <li><strong>Input</strong>: tu código LEE el voltaje del pin → detecta si un botón está presionado.</li>
+</ul>
+</div>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>El bit de M01 + el voltaje de E00, unidos:</strong> cuando hacés <code>digitalWrite(13, HIGH)</code>, estás poniendo el bit <code>1</code> (M01) como 3.3V real (E00) en un pin físico (E02). Las tres lecciones convergen en una línea de código.
+</div>
+
+<h2>3. Tu primer programa: Blink (el "Hello World" del hardware)</h2>
+
+<pre><code class="lang-c">// Arduino / ESP32 — hacer parpadear un LED
+void setup() {
+  pinMode(2, OUTPUT);        // pin 2 como salida
+}
+
+void loop() {
+  digitalWrite(2, HIGH);     // LED encendido (3.3V)
+  delay(500);                // esperar 500ms
+  digitalWrite(2, LOW);      // LED apagado (0V)
+  delay(500);
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Reconocés la estructura:</strong> <code>setup()</code> corre una vez, <code>loop()</code> corre para siempre. Es el <strong>game loop</strong> que viste en <a href="../../../../Curso ingenieria sistemas/area-07-desarrollo-aplicado/m35-game-development/lecture.html">M35 (Game Dev)</a>, y el event loop de Node/JS. Mismo patrón "inicializar + loop infinito", otro dominio.
+</div>
+
+<h2>4. Registros: escribir a una dirección ENCIENDE algo</h2>
+
+<div class="concept">Detrás de <code>digitalWrite()</code> hay un <strong>registro mapeado en memoria (MMIO)</strong>. Escribir un bit en una dirección de memoria específica cambia el voltaje de un pin físico.</div>
+
+<pre><code class="lang-c">// Lo que digitalWrite hace por dentro (ESP32 simplificado):
+// Escribir a una dirección de memoria controla el pin físico.
+*(volatile uint32_t*) 0x3FF44008 |= (1 << 2);   // pin 2 a HIGH
+
+// Comparalo con M07 — esto es un PUNTERO a una dirección fija,
+// pero esa dirección NO es RAM: es un registro de hardware.</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Acá explota tu conocimiento de M07:</strong> los punteros que parecían abstractos —<code>*(uint32_t*)0x3FF44008</code>— son LITERALMENTE un pin del chip. En M07 un puntero apuntaba a RAM; acá apunta a un registro que controla voltaje físico. <code>volatile</code> le dice al compilador "no optimices esto, el hardware puede cambiarlo". El bajo nivel de M07 deja de ser teórico.
+</div>
+
+<h2>5. Leer el mundo analógico: ADC</h2>
+
+<div class="concept">El mundo real es <strong>analógico</strong> (un sensor de temperatura da un voltaje continuo, ej 0.73V). El MCU es digital. El <strong>ADC</strong> (Analog-to-Digital Converter) traduce ese voltaje a un número.</div>
+
+<pre><code class="lang-c">int valor = analogRead(34);   // lee el ADC del pin 34
+// valor: 0 (0V) a 4095 (3.3V) en un ADC de 12 bits
+float voltaje = valor * 3.3 / 4095.0;</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Cuantización = el puente al DSP y la IA:</strong> convertir analógico a 4096 niveles discretos es "muestrear" — la base del DSP (E07) y de cómo una cámara alimenta a <a href="../../../../Curso ingenieria sistemas/area-08-inteligencia-y-datos/m42-vision-por-computadora/lecture.html">M42 (Visión)</a>. Cada píxel de una foto es un ADC midiendo luz. Los datos que tu modelo ML procesa EMPIEZAN en un ADC.
+</div>
+
+<h2>6. PWM: simular analógico desde digital</h2>
+
+<div class="concept"><strong>PWM</strong> (Pulse Width Modulation): prendés y apagás un pin muy rápido, variando cuánto tiempo está encendido. El promedio simula un voltaje intermedio. Sirve para dimmer de LED, velocidad de motor, sonido.</div>
+
+<pre><code class="lang-c">analogWrite(5, 128);  // 50% duty cycle → LED a media intensidad
+analogWrite(5, 255);  // 100% → máximo brillo</code></pre>
+
+<!-- ═══════════ SIMULADOR DE PWM ═══════════ -->
+<div class="pwmsim">
+<style>
+.pwmsim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.pwmsim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.pwmsim .pw-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.pwmsim .pw-top{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.pwmsim canvas{flex:1;min-width:280px;height:130px;background:#0a0f0b;border:1px solid #1c2620;border-radius:10px;display:block}
+.pwmsim .pw-led{text-align:center;min-width:90px}
+.pwmsim .pw-bulb{width:60px;height:60px;border-radius:50%;margin:0 auto 6px;background:#1a211b;border:2px solid #2d3a31;transition:.1s}
+.pwmsim .pw-led small{font-size:.72rem;color:#8fa394}
+.pwmsim .pw-sl{margin-top:14px}
+.pwmsim .pw-sl label{display:flex;justify-content:space-between;font-size:.85rem;color:#e8efe9;margin-bottom:4px}
+.pwmsim .pw-sl label b{color:#f0883e;font-variant-numeric:tabular-nums}
+.pwmsim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.pwmsim .pw-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.85rem;color:#8fa394}
+.pwmsim .pw-stats b{color:#e8efe9;font-variant-numeric:tabular-nums}
+.pwmsim .pw-hint{margin-top:10px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🔆 Simulador de PWM — analógico desde un pin digital</h4>
+  <div class="pw-sub">Un pin solo da 0 o 5V (digital). Pero prendiéndolo y apagándolo rápido, el <b style="color:#f0883e">duty cycle</b> (% encendido) controla el voltaje PROMEDIO → brillo de LED, velocidad de motor. <code>analogWrite(pin, 0-255)</code>.</div>
+  <div class="pw-top">
+    <canvas id="pwCv" width="600" height="130"></canvas>
+    <div class="pw-led"><div class="pw-bulb" id="pwBulb"></div><small>LED<br>(brillo = promedio)</small></div>
+  </div>
+  <div class="pw-sl"><label>Duty cycle <b id="pwDv">50</b>% &nbsp;·&nbsp; analogWrite = <b id="pwAw">128</b></label><input type="range" id="pwD" min="0" max="100" step="1" value="50"></div>
+  <div class="pw-stats">
+    <span>Voltaje promedio: <b id="pwVavg">2.50</b> V</span>
+    <span>de 5.0 V máx</span>
+  </div>
+  <div class="pw-hint" id="pwHint">El pin nunca da 2.5V de verdad — salta entre 0 y 5V. Pero como lo hace miles de veces por segundo, el LED (o un motor, o tu oído) "promedia" y ve 2.5V. Subí el duty cycle y mirá el LED brillar más.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  const cv=$("pwCv"), ctx=cv.getContext("2d");
+  let duty=50, phase=0;
+  function draw(){
+    const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    const hi=18,lo=h-18,VS=5;
+    // nivel promedio
+    const avgY=lo-(duty/100)*(lo-hi);
+    ctx.strokeStyle="#3fb95066";ctx.setLineDash([5,4]);ctx.beginPath();ctx.moveTo(0,avgY);ctx.lineTo(w,avgY);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle="#3fb950";ctx.font="10px monospace";ctx.fillText("promedio "+(duty/100*VS).toFixed(2)+"V",8,avgY-4);
+    // onda PWM (varios ciclos, animada)
+    const cycles=5, cw=w/cycles, onw=cw*duty/100;
+    ctx.strokeStyle="#f0883e";ctx.lineWidth=2.2;ctx.beginPath();
+    let x=-(phase%cw);ctx.moveTo(0,duty>0?(x< onw?hi:lo):lo);
+    for(let cyc=-1;cyc<=cycles+1;cyc++){const sx=cyc*cw - (phase%cw);
+      ctx.moveTo(sx,lo);if(duty>0){ctx.lineTo(sx,hi);ctx.lineTo(sx+onw,hi);ctx.lineTo(sx+onw,lo);}ctx.lineTo(sx+cw,lo);}
+    ctx.stroke();
+    ctx.fillStyle="#8fa394";ctx.fillText("5V",w-22,hi+4);ctx.fillText("0V",w-22,lo+2);
+  }
+  function update(){
+    $("pwDv").textContent=duty;$("pwAw").textContent=Math.round(duty/100*255);
+    $("pwVavg").textContent=(duty/100*5).toFixed(2);
+    const b=$("pwBulb"),g=duty/100;
+    b.style.background="rgba(240,200,80,"+g+")";
+    b.style.boxShadow=g>0.05?"0 0 "+(g*30)+"px rgba(240,200,80,"+g+")":"none";
+    b.style.borderColor=g>0.1?"#f0c850":"#2d3a31";
+    let h;
+    if(duty===0)h="Duty 0%: el pin siempre apagado → 0V promedio → LED apagado.";
+    else if(duty===100)h="Duty 100%: el pin siempre encendido → 5V → brillo máximo. Ya no es PWM, es DC.";
+    else h="Duty "+duty+"%: encendido "+duty+"% del tiempo → promedio "+(duty/100*5).toFixed(2)+"V. El LED ve ese promedio y brilla proporcional.";
+    $("pwHint").textContent=h;
+  }
+  function loop(){phase=(phase+2);draw();requestAnimationFrame(loop);}
+  $("pwD").addEventListener("input",e=>{duty=+e.target.value;update();});
+  update();loop();
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR PWM ═══════════ -->
+
+<h2>7. Interrupciones: el scheduler del hardware</h2>
+
+<div class="concept">Una <strong>interrupción</strong> pausa instantáneamente tu código cuando ocurre un evento (un pin cambió, un timer venció) para ejecutar una función especial (ISR), y luego retoma. Permite reaccionar sin estar chequeando constantemente (polling).</div>
+
+<pre><code class="lang-c">volatile bool presionado = false;
+
+void IRAM_ATTR onBoton() {   // ISR — se ejecuta al instante
+  presionado = true;
+}
+
+void setup() {
+  attachInterrupt(0, onBoton, RISING);  // dispara cuando el pin sube
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Es el preemption de M14, en silicio:</strong> en <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m14-sistemas-operativos/lecture.html">M14 (SO)</a> el scheduler interrumpe procesos para repartir la CPU. Una interrupción de hardware es eso mismo pero a nivel físico: el hardware FUERZA al CPU a saltar a la ISR. Notá el <code>volatile</code> otra vez — y la regla de "ISR cortas" es la misma que "no bloquees el event loop".
+</div>
+
+<h2>8. Comunicación: I2C, SPI, UART</h2>
+
+<p>Para hablar con sensores, pantallas y otros chips, hay 3 protocolos físicos estándar:</p>
+
+<table>
+<thead><tr><th>Protocolo</th><th>Cables</th><th>Velocidad</th><th>Uso típico</th></tr></thead>
+<tbody>
+<tr><td><strong>UART</strong></td><td>2 (TX, RX)</td><td>Baja-media</td><td>Serial, GPS, debug, módulos</td></tr>
+<tr><td><strong>I2C</strong></td><td>2 (SDA, SCL)</td><td>Media</td><td>Muchos sensores en 2 cables (bus)</td></tr>
+<tr><td><strong>SPI</strong></td><td>4 (MOSI, MISO, SCK, CS)</td><td>Alta</td><td>Pantallas, SD, sensores rápidos</td></tr>
+</tbody>
+</table>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>La capa física de M15 Redes:</strong> en <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m15-redes-de-computadoras/lecture.html">M15</a> estudiaste protocolos (TCP/IP, HTTP). I2C/SPI/UART son protocolos también, pero de la capa MÁS baja: voltajes en un cable, un clock que marca el ritmo, framing de bits. Es el "TCP/IP" de dos chips a 5cm de distancia. Mismo concepto de protocolo, otra escala.
+</div>
+
+<h2>9. El stack IoT completo (conectando con M37)</h2>
+
+<pre><code>Sensor físico (temperatura)
+   ↓ voltaje analógico
+ADC del MCU (E03)
+   ↓ número digital
+Tu código C en el ESP32 (M07)
+   ↓ WiFi + MQTT (M15, M37)
+Broker → Backend (M33 Fullstack)
+   ↓ guarda en
+Base de datos (M19 SQL)
+   ↓ consulta
+Dashboard React (Curso-React)
+   ↓ entrena
+Modelo ML que predice (M39)</code></pre>
+
+<div class="rule">Este flujo atraviesa <strong>medio campus</strong>. El sensor y el ADC son electrónica (E00-E03); de ahí para arriba es todo software que YA estudiaste. Un proyecto IoT real es la prueba viviente de que informática y electrónica se complementan — ninguna mitad funciona sola.</div>
+
+<h2>10. Práctica sin comprar nada</h2>
+
+<ul>
+  <li><a href="https://wokwi.com" target="_blank">Wokwi</a> — simula ESP32/Arduino con sensores, corre tu código C real en el browser. <strong>Empezá acá.</strong></li>
+  <li><a href="https://www.tinkercad.com/circuits" target="_blank">Tinkercad Circuits</a> — Arduino virtual + circuito.</li>
+  <li>Hardware real para después: un ESP32 (~$5-8) + protoboard + LEDs + sensores básicos (~$20 total).</li>
+</ul>
+
+<h2>11. Errores típicos del programador en su primer MCU</h2>
+
+<div class="mistake"><strong>Olvidar <code>volatile</code> en variables compartidas con ISR</strong>: el compilador optimiza la variable a un registro y nunca ve el cambio de la interrupción. Bug fantasma clásico.</div>
+
+<div class="mistake"><strong>ISR largas o con <code>delay()</code></strong>: una interrupción debe ser ultra-corta. Bloquearla cuelga todo. Igual que no bloquear el event loop.</div>
+
+<div class="mistake"><strong>Usar <code>delay()</code> para todo</strong>: <code>delay(1000)</code> congela el MCU 1 segundo. Para multitarea, usar <code>millis()</code> o un RTOS (E04).</div>
+
+<div class="mistake"><strong>Asumir RAM infinita</strong>: <code>String</code> que crecen, buffers grandes — en 2KB de RAM eso desborda y cuelga. La disciplina de M07/M12 es obligatoria.</div>
+
+<div class="mistake"><strong>Pin sin pull-up/pull-down</strong>: un botón sin resistencia de pull deja el pin flotante → lecturas aleatorias (lo viste en E02).</div>
+
+<div class="mistake"><strong>Alimentar un motor desde el pin del MCU</strong>: los pines dan ~20mA; un motor pide cientos de mA. Quema el chip. Hay que usar un driver/transistor (E05).</div>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Qué es un microcontrolador y en qué se diferencia de tu laptop?</summary>
+<p>Una computadora completa en un chip (CPU + RAM + flash + periféricos). Diferencias: MHz en vez de GHz, KB en vez de GB de RAM, sin SO (tu código es todo), pines directos al voltaje físico, consumo µW-mW (años con batería).</p></details>
+
+<details><summary>2. ¿Qué es GPIO y cómo conecta con M01/E00?</summary>
+<p>General Purpose Input/Output: pines que tu código pone en HIGH/LOW (output) o lee (input). Es el bit de M01 (1/0), como voltaje de E00 (3.3V/0V), en un pin físico. <code>digitalWrite(13, HIGH)</code> une las tres ideas.</p></details>
+
+<details><summary>3. ¿Cómo conecta el ADC con la IA/visión?</summary>
+<p>El ADC convierte un voltaje analógico (sensor) a un número discreto (cuantización/muestreo). Cada píxel de una cámara es un ADC midiendo luz. Los datos que un modelo ML (M39) o de visión (M42) procesa EMPIEZAN en un ADC — es el origen físico del dato.</p></details>
+
+<details><summary>4. ¿Por qué los punteros de M07 cobran sentido nuevo acá?</summary>
+<p>Porque un registro de hardware se accede como un puntero a una dirección fija (<code>*(uint32_t*)0x...</code>), pero esa dirección NO es RAM: controla un pin físico. Escribir ahí cambia un voltaje real. <code>volatile</code> evita que el compilador lo optimice.</p></details>
+
+<details><summary>5. ¿Cómo se relacionan las interrupciones con M14 (SO)?</summary>
+<p>Una interrupción de hardware pausa el CPU al instante para ejecutar una ISR, igual que el scheduler de M14 interrumpe procesos. Es el preemption a nivel físico — el hardware fuerza el salto. Por eso las ISR deben ser cortas (no bloquear), como no bloquear el event loop.</p></details>
+
+<details><summary>6. ¿Por qué un proyecto IoT prueba la complementariedad?</summary>
+<p>Porque su flujo atraviesa ambos mundos: sensor + ADC + MCU (electrónica) → WiFi/MQTT + backend + DB + dashboard + ML (software). Ninguna mitad funciona sola — el dato físico no sirve sin software que lo procese, y el software no tiene dato sin el sensor.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e02-electronica-digital/lecture.html">← E02 Electrónica Digital</a>
+  <a href="../proyectos/estacion-meteo.html">Proyecto puente: Estación Meteo →</a>
+</nav>
+
+</div>
+</body>
+</html>

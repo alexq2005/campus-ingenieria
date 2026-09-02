@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>E04 — Microcontroladores II · Computación Física</title>
+<meta name="description" content="Timers, DMA, RTOS, buses a fondo y power management: el SO de M14 en 4KB de RAM.">
+<link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Computación Física</a>
+  <a href="../mapa-complementariedad.html">🔗 Mapa</a>
+  <a href="../../../index.html">🏠 Campus</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">E04</span>
+  <span class="badge">⏱ ~90 min</span>
+  <span class="badge">🎯 Pre-req: E03 + M14 SO</span>
+  <span class="badge">Fase 2</span>
+</div>
+
+<article>
+
+<h1>E04 — Microcontroladores II</h1>
+
+<blockquote class="author">"Hacer parpadear un LED es fácil. Hacer parpadear un LED MIENTRAS leés un sensor, mandás WiFi y respondés a un botón — eso es ingeniería embebida." — el salto de E03 a E04</blockquote>
+
+<blockquote>En E03 controlaste pines de a uno. Acá aprendés a hacer que el MCU haga <strong>muchas cosas a la vez</strong> de forma eficiente: timers por hardware, DMA, un mini sistema operativo (RTOS), y cómo durar meses con una batería.</blockquote>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Todo M14 reaparece acá, en miniatura:</strong> los conceptos de <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m14-sistemas-operativos/lecture.html">M14 (SO)</a> y <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m18-concurrencia-y-paralelismo/lecture.html">M18 (Concurrencia)</a> — scheduler, tareas, prioridades, mutex, race conditions — son EXACTAMENTE lo de un RTOS. La diferencia: en M14 el SO tiene GB de RAM; acá lo hacés con 4-512 KB. La teoría se vuelve crítica, no académica.
+</div>
+
+<figure class="foto">
+  <img src="../assets/img/stm32.jpg" alt="Placa de desarrollo STM32 Nucleo, microcontrolador ARM Cortex-M profesional">
+  <figcaption>Una placa STM32 Nucleo (ARM Cortex-M): el MCU profesional típico de la industria, donde corre FreeRTOS y se exprime cada timer, DMA y modo de bajo consumo. Foto: Avandalen, vía <a href="https://commons.wikimedia.org/wiki/File:Nucleo-board.jpg" target="_blank">Wikimedia Commons</a> (CC BY-SA 4.0).</figcaption>
+</figure>
+
+<h2>1. El problema: delay() bloquea todo</h2>
+
+<div class="mistake">En E03 usaste <code>delay(1000)</code>. Pero <code>delay</code> CONGELA el chip — durante ese segundo no puede leer un botón, ni atender WiFi, ni nada. Para hacer varias cosas "a la vez" hay que abandonar <code>delay</code>.</div>
+
+<h3>Solución 1: millis() (cooperativo manual)</h3>
+<pre><code>unsigned long t1 = 0, t2 = 0;
+
+void loop() {
+  if (millis() - t1 >= 1000) { t1 = millis(); parpadearLED(); }
+  if (millis() - t2 >= 200)  { t2 = millis(); leerSensor(); }
+  // ambas "corren" sin bloquearse — multitarea cooperativa manual
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> Esto es <strong>cooperative scheduling</strong> — el mismo modelo del event loop de JavaScript (<a href="../../../desarrollo-web/Curso-React/m06-useeffect/lecture.html">React/Node</a>) y de los schedulers cooperativos que viste en M14. Cada tarea "cede" rápido para que las otras corran. Si una tarea bloquea, mata a todas.
+</div>
+
+<h2>2. Timers por hardware</h2>
+
+<div class="concept">Un <strong>timer</strong> es un contador en hardware que corre solo, independiente del CPU. Puede disparar una interrupción a intervalos exactos, generar PWM, o medir tiempo con precisión de microsegundos — sin que tu código tenga que "contar".</div>
+
+<ul>
+  <li><strong>Interrupción periódica</strong>: "ejecutá esta función cada 10ms exactos" — sin drift.</li>
+  <li><strong>PWM por hardware</strong>: la señal se genera sola, el CPU queda libre.</li>
+  <li><strong>Input capture</strong>: medir el ancho de un pulso (ej, el eco del sensor ultrasónico).</li>
+</ul>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El timer de hardware es como el <strong>tick del reloj del sistema</strong> que en M14 dispara el scheduler. Acá vos lo configurás directamente. Es también el "clock" de E02 (electrónica digital) expuesto como recurso programable.
+</div>
+
+<!-- ═══════════ SIMULADOR delay() vs millis() ═══════════ -->
+<div class="blocksim">
+<style>
+.blocksim{background:linear-gradient(180deg,#141a15,#0d120e);border:1px solid #2d3a31;border-radius:14px;padding:18px;margin:22px 0;font-family:inherit}
+.blocksim h4{margin:0 0 4px;color:#f0883e;font-size:1.05rem}
+.blocksim .bs-sub{color:#8fa394;font-size:.85rem;margin-bottom:14px}
+.blocksim .bs-modes{display:flex;gap:8px;margin-bottom:14px}
+.blocksim .bs-mode{flex:1;background:#1a211b;border:1px solid #2d3a31;border-radius:8px;padding:9px;cursor:pointer;color:#8fa394;font-size:.84rem;font-family:inherit;transition:.15s}
+.blocksim .bs-mode.act{border-color:#f0883e;color:#f0883e;background:rgba(240,136,62,.1)}
+.blocksim .bs-stage{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap;padding:10px 0}
+.blocksim .bs-led{text-align:center}
+.blocksim .bs-bulb{width:54px;height:54px;border-radius:50%;margin:0 auto 6px;background:#1a211b;border:2px solid #2d3a31;transition:.05s}
+.blocksim .bs-bulb.on{background:radial-gradient(#f0c850,#f0883e);border-color:#f0c850;box-shadow:0 0 20px #f0883eaa}
+.blocksim .bs-led small{font-size:.74rem;color:#8fa394}
+.blocksim .bs-cpu{text-align:center;padding:8px 14px;border-radius:8px;font-size:.82rem;font-weight:600;min-width:160px}
+.blocksim .bs-cpu.free{background:rgba(63,185,80,.12);color:#3fb950}
+.blocksim .bs-cpu.busy{background:rgba(239,68,68,.12);color:#ef4444}
+.blocksim .bs-sl label{display:flex;justify-content:space-between;font-size:.8rem;color:#8fa394;margin:8px 0 3px}
+.blocksim input[type=range]{width:100%;accent-color:#f0883e;cursor:pointer}
+.blocksim .bs-hint{margin-top:12px;padding:9px 12px;border-radius:8px;background:#1a211b;border-left:3px solid #f0883e;font-size:.83rem;color:#c9d4cc}
+</style>
+  <h4>🚦 delay() vs millis() — por qué delay() bloquea todo</h4>
+  <div class="bs-sub">Dos LEDs que deberían parpadear a ritmos distintos. Con <code>delay()</code> la CPU queda atascada y el segundo LED no puede parpadear. Con <code>millis()</code> (no bloqueante) los dos corren libres.</div>
+  <div class="bs-modes">
+    <button class="bs-mode act" id="bsMd" data-m="delay">😴 con delay() (bloqueante)</button>
+    <button class="bs-mode" id="bsMm" data-m="millis">⚡ con millis() (no bloqueante)</button>
+  </div>
+  <div class="bs-stage">
+    <div class="bs-led"><div class="bs-bulb" id="bsL1"></div><small>LED 1</small></div>
+    <div class="bs-cpu free" id="bsCpu">CPU libre ✓</div>
+    <div class="bs-led"><div class="bs-bulb" id="bsL2"></div><small>LED 2</small></div>
+  </div>
+  <div class="bs-sl"><label>Intervalo LED 1 <b id="bsP1v">600</b> ms</label><input type="range" id="bsP1" min="200" max="1200" step="100" value="600"></div>
+  <div class="bs-sl"><label>Intervalo LED 2 <b id="bsP2v">300</b> ms</label><input type="range" id="bsP2" min="200" max="1200" step="100" value="300"></div>
+  <div class="bs-hint" id="bsHint">En modo delay(): mirá cómo el LED 2 parpadea irregular o se congela mientras la CPU está "dormida" en el delay() del LED 1. Cambiá a millis() y los dos parpadean perfectos a su ritmo.</div>
+<script>
+(function(){
+  const $=id=>document.getElementById(id);
+  let mode="delay", p1=600, p2=300, vt=0, last=0;
+  // estado modo delay (programa secuencial): fase del "loop" bloqueante
+  let dPhase=0, dTimer=0, l1=false, cpuBusy=false;
+  function setBulb(el,on){el.classList.toggle("on",on);}
+  function tick(now){
+    const dt=Math.min(50, now-last); last=now; vt+=dt;
+    if(mode==="millis"){
+      // no bloqueante: cada LED toggle independiente
+      setBulb($("bsL1"), (vt%(2*p1))<p1);
+      setBulb($("bsL2"), (vt%(2*p2))<p2);
+      const c=$("bsCpu");c.className="bs-cpu free";c.textContent="CPU libre ✓";
+    } else {
+      // bloqueante: programa secuencial loop(){ led1=HIGH; delay(p1); led1=LOW; delay(p1); led2 toggle... }
+      // la CPU pasa casi todo el tiempo en delay() → LED2 sólo cambia en su breve turno
+      dTimer-=dt;
+      if(dTimer<=0){
+        dPhase=(dPhase+1)%4;
+        if(dPhase===0){l1=true;dTimer=p1;}
+        else if(dPhase===1){l1=false;dTimer=p1;}
+        else if(dPhase===2){/* breve turno LED2 */ $("bsL2").classList.toggle("on");dTimer=20;}
+        else {dTimer=20;}
+      }
+      setBulb($("bsL1"),l1);
+      cpuBusy = dPhase<2;
+      const c=$("bsCpu");
+      if(cpuBusy){c.className="bs-cpu busy";c.textContent="CPU bloqueada en delay()";}
+      else {c.className="bs-cpu free";c.textContent="...turno del LED2";}
+    }
+    requestAnimationFrame(tick);
+  }
+  function setMode(m){mode=m;vt=0;dPhase=0;dTimer=0;l1=false;
+    $("bsMd").classList.toggle("act",m==="delay");$("bsMm").classList.toggle("act",m==="millis");
+    $("bsHint").textContent=m==="delay"?"Modo delay(): la CPU pasa casi todo el tiempo DORMIDA en el delay() del LED 1. El LED 2 sólo logra cambiar en breves turnos → parpadeo irregular. Este es el bug #1 del principiante.":"Modo millis(): en vez de dormir, el código revisa el reloj y actúa cuando toca. La CPU nunca se bloquea → ambos LEDs parpadean perfectos a su ritmo, en paralelo.";}
+  $("bsMd").addEventListener("click",()=>setMode("delay"));
+  $("bsMm").addEventListener("click",()=>setMode("millis"));
+  $("bsP1").addEventListener("input",e=>{p1=+e.target.value;$("bsP1v").textContent=p1;});
+  $("bsP2").addEventListener("input",e=>{p2=+e.target.value;$("bsP2v").textContent=p2;});
+  requestAnimationFrame(tick);
+})();
+</script>
+</div>
+<!-- ═══════════ /SIMULADOR delay vs millis ═══════════ -->
+
+<h2>3. DMA — mover datos sin el CPU</h2>
+
+<div class="concept"><strong>DMA</strong> (Direct Memory Access): un periférico que copia datos entre memoria y periféricos SIN involucrar al CPU. El CPU pide "copiá estos 1000 bytes del ADC a este buffer" y se va a hacer otra cosa; el DMA avisa cuando terminó.</div>
+
+<div class="tip">DMA es clave para audio, captura de cámara, comunicación rápida — cualquier flujo grande de datos. Sin DMA, el CPU se la pasaría copiando bytes en vez de procesar. Es "delegá el trabajo mecánico al hardware".</div>
+
+<h2>4. RTOS — el sistema operativo de tiempo real</h2>
+
+<div class="concept">Un <strong>RTOS</strong> (Real-Time Operating System) como <strong>FreeRTOS</strong> te deja escribir tareas independientes y un scheduler las reparte — igual que el SO de tu laptop, pero determinista y en KB de RAM. El ESP32 trae FreeRTOS incluido.</div>
+
+<pre><code>// FreeRTOS en ESP32 — dos tareas verdaderamente concurrentes
+void tareaLED(void *p) {
+  for (;;) {
+    digitalWrite(2, !digitalRead(2));
+    vTaskDelay(500 / portTICK_PERIOD_MS);  // cede el CPU (no bloquea)
+  }
+}
+
+void tareaSensor(void *p) {
+  for (;;) {
+    Serial.println(analogRead(34));
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup() {
+  xTaskCreate(tareaLED, "LED", 2048, NULL, 1, NULL);
+  xTaskCreate(tareaSensor, "Sensor", 2048, NULL, 1, NULL);
+  // el scheduler de FreeRTOS las corre "a la vez"
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>M14 y M18 en estado puro:</strong> <code>xTaskCreate</code> = crear un thread. <code>vTaskDelay</code> = ceder el CPU (yield). Las prioridades, los mutex para proteger recursos compartidos, las race conditions — TODO lo de <a href="../../../../Curso ingenieria sistemas/area-03-sistemas-y-arquitectura/m18-concurrencia-y-paralelismo/lecture.html">M18</a> aplica idéntico. Si dos tareas tocan la misma variable sin mutex, tenés el mismo bug de race condition que en un servidor.
+</div>
+
+<h2>5. Mutex y colas en RTOS</h2>
+
+<pre><code>SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+
+void tareaA(void *p) {
+  for (;;) {
+    xSemaphoreTake(mutex, portMAX_DELAY);   // lock
+    // ... acceso seguro al recurso compartido ...
+    xSemaphoreGive(mutex);                  // unlock
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El <code>mutex</code> de FreeRTOS es el MISMO concepto que el lock de M18: solo una tarea entra a la región crítica a la vez. Las <strong>colas</strong> de FreeRTOS (queues) son el patrón producer-consumer que conecta con sistemas distribuidos (M17). Mismo problema de concurrencia, escala microscópica.
+</div>
+
+<h2>6. Power management — durar con batería</h2>
+
+<div class="concept">Un dispositivo a batería que está despierto 100% del tiempo dura horas. Uno que duerme entre tareas dura <strong>meses o años</strong>. El power management es la diferencia entre un producto viable y uno inútil.</div>
+
+<table>
+<thead><tr><th>Modo</th><th>Consumo (ESP32 aprox)</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td>Activo (WiFi)</td><td>~160-260 mA</td><td>Transmitiendo</td></tr>
+<tr><td>Activo (sin radio)</td><td>~20-40 mA</td><td>Procesando</td></tr>
+<tr><td>Light sleep</td><td>~0.8 mA</td><td>Pausas cortas</td></tr>
+<tr><td>Deep sleep</td><td>~10 µA</td><td>Esperar mucho entre lecturas</td></tr>
+</tbody>
+</table>
+
+<pre><code>// Deep sleep: dormir 60 segundos y despertar
+esp_sleep_enable_timer_wakeup(60 * 1000000);  // microsegundos
+esp_deep_sleep_start();  // el chip casi se apaga; al despertar reinicia desde setup()</code></pre>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> <strong>Conecta con E00 (potencia):</strong> calculás la autonomía con la capacidad de la batería (mAh) y el consumo promedio. Una batería de 2000mAh con un dispositivo que promedia 0.05mA (gracias al deep sleep) dura ~40000 horas (años). El mismo dispositivo siempre activo a 100mA: 20 horas. <strong>El código define la vida útil física</strong> — la complementariedad más concreta que existe.
+</div>
+
+<h2>7. Bootloader, flash y OTA</h2>
+
+<ul>
+  <li><strong>Bootloader</strong>: el primer código que corre al encender; decide qué programa cargar.</li>
+  <li><strong>Particiones de flash</strong>: el programa, los datos, el sistema de archivos conviven en la flash.</li>
+  <li><strong>OTA</strong> (Over The Air): actualizar el firmware por WiFi sin cable — esencial en IoT desplegado.</li>
+</ul>
+
+<div class="bridge">
+  <span class="bridge-icon">🔗</span> El bootloader es el primo embebido del proceso de boot de M14 (BIOS/UEFI → bootloader → kernel). OTA es "deploy continuo" (M27 DevOps/CICD) pero para hardware en el campo.
+</div>
+
+<h2>8. Práctica</h2>
+<ul>
+  <li><a href="https://wokwi.com" target="_blank">Wokwi</a> — soporta FreeRTOS en ESP32 simulado.</li>
+  <li>Tutorial oficial de <a href="https://www.freertos.org/" target="_blank">FreeRTOS</a>.</li>
+  <li>Reto: corré 3 tareas (LED, sensor, log) concurrentes con FreeRTOS y medí si se interfieren.</li>
+</ul>
+
+<h2>9. Errores típicos</h2>
+<div class="mistake"><strong>delay() dentro de una tarea RTOS</strong>: usá <code>vTaskDelay</code> que cede el CPU. <code>delay()</code> bloquea el core.</div>
+<div class="mistake"><strong>Variable compartida entre tareas sin mutex</strong>: race condition — el mismo bug que en un servidor multi-thread (M18).</div>
+<div class="mistake"><strong>Stack de tarea muy chico</strong>: <code>xTaskCreate</code> reserva un stack; si es insuficiente, stack overflow → crash. Dimensionalo.</div>
+<div class="mistake"><strong>Hacer trabajo pesado en una ISR</strong>: la ISR debe ser ultra corta; delegá a una tarea vía cola (deferred interrupt).</div>
+<div class="mistake"><strong>Olvidar el deep sleep en proyectos a batería</strong>: el dispositivo dura horas en vez de meses. El consumo se diseña, no se improvisa.</div>
+
+<h2>✅ Checkpoint</h2>
+
+<details><summary>1. ¿Por qué hay que abandonar delay() para multitarea?</summary>
+<p>Porque <code>delay()</code> congela el CPU durante toda su duración — no puede atender otras tareas, botones ni comunicación. Se reemplaza por <code>millis()</code> (cooperativo) o <code>vTaskDelay()</code> (RTOS), que ceden el procesador.</p></details>
+
+<details><summary>2. ¿Qué es un RTOS y cómo se relaciona con M14?</summary>
+<p>Un sistema operativo de tiempo real (ej FreeRTOS) que reparte el CPU entre tareas, igual que el scheduler de M14, pero determinista y en KB de RAM. Tiene tareas (threads), prioridades, mutex y colas — los mismos conceptos de M14/M18.</p></details>
+
+<details><summary>3. ¿Para qué sirve un timer por hardware?</summary>
+<p>Es un contador independiente del CPU que dispara interrupciones a intervalos exactos, genera PWM o mide pulsos — sin que el código tenga que "contar". Libera al CPU y da precisión de microsegundos.</p></details>
+
+<details><summary>4. ¿Qué hace el DMA?</summary>
+<p>Copia datos entre memoria y periféricos sin involucrar al CPU. El CPU delega el trabajo mecánico de mover bytes y queda libre para procesar. Clave para audio, cámara y comunicación de alto volumen.</p></details>
+
+<details><summary>5. ¿Cómo el código define la vida útil física del dispositivo?</summary>
+<p>Vía power management: un MCU siempre activo (~100mA) agota una batería en horas; usando deep sleep (~10µA) entre lecturas, la misma batería dura meses o años. El software decide el consumo, y el consumo decide la autonomía (cálculo de E00).</p></details>
+
+<details><summary>6. ¿Por qué un mutex en RTOS es lo mismo que en M18?</summary>
+<p>Porque resuelve el mismo problema: proteger un recurso compartido para que solo una tarea lo toque a la vez, evitando race conditions. Si dos tareas FreeRTOS modifican una variable sin mutex, tenés exactamente el bug de concurrencia de M18, en escala microscópica.</p></details>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../e03-microcontroladores-1/lecture.html">← E03 Microcontroladores I</a>
+  <a href="../e05-sensores-actuadores/lecture.html">Siguiente: E05 Sensores y Actuadores →</a>
+</nav>
+
+</div>
+</body>
+</html>
