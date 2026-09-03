@@ -305,6 +305,73 @@ if __name__ == "__main__":
 </tbody>
 </table>
 
+<h2>Errores típicos con la stdlib</h2>
+
+<div class="mistake">
+  <strong>Escribir regex sin <code>r"..."</code>.</strong> El string se interpreta dos veces: primero Python resuelve los escapes y después la regex intenta interpretar lo que quedó. <code>"\d"</code> zafa de casualidad (con <code>SyntaxWarning</code>), pero <code>"\b"</code> se convierte en un backspace real y tu patrón deja de matchear sin avisarte.
+<pre><code class="lang-python"># ❌ mal
+re.findall("\d+", texto)            # SyntaxWarning: invalid escape sequence '\d'
+re.search("\bcasa\b", "una casa")   # None — "\b" es el carácter backspace
+
+# ✅ bien — raw string siempre
+re.findall(r"\d+", texto)
+re.search(r"\bcasa\b", "una casa")  # &lt;re.Match object...&gt;</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Mezclar datetimes naive y aware.</strong> <code>datetime.now()</code> no lleva zona horaria; <code>datetime.now(timezone.utc)</code> sí. Restarlos o compararlos es <code>TypeError</code>, y guardar naive en la DB te deja sin saber a qué huso pertenece cada registro.
+<pre><code class="lang-python"># ❌ mal
+inicio = datetime.now()                # naive
+fin = datetime.now(timezone.utc)       # aware
+fin - inicio
+# TypeError: can't subtract offset-naive and offset-aware datetimes
+
+# ✅ bien — elegí uno y usá el mismo en todo el programa
+inicio = datetime.now(timezone.utc)
+fin = datetime.now(timezone.utc)
+duracion = fin - inicio</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Consultar un <code>defaultdict</code> como si fuera un <code>dict</code>.</strong> Acceder a una clave que no existe <strong>la crea</strong> con el valor por defecto. Un chequeo inocente te infla el diccionario con entradas vacías que después aparecen en el reporte.
+<pre><code class="lang-python"># ❌ mal
+grupos = defaultdict(list)
+if grupos["frutas"]:      # ¡acaba de crear grupos["frutas"] = []!
+    procesar(grupos["frutas"])
+len(grupos)               # 1, aunque nunca agregaste nada
+
+# ✅ bien — para consultar sin crear, usá in o get
+if "frutas" in grupos:
+    procesar(grupos["frutas"])
+len(grupos)               # 0</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Loguear la excepción con <code>log.error(e)</code>.</strong> Guardás el mensaje pero perdés el traceback: en el log queda <em>"division by zero"</em> y cero pistas de en qué archivo y en qué línea pasó. Dentro de un <code>except</code>, <code>log.exception</code> agrega la pila completa.
+<pre><code class="lang-python"># ❌ mal
+try:
+    procesar()
+except Exception as e:
+    log.error(e)          # "division by zero" y nada más
+
+# ✅ bien
+try:
+    procesar()
+except Exception:
+    log.exception("falló procesar()")   # mensaje + traceback completo</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué conviene guardar los timestamps en UTC y convertir a hora local recién al mostrarlos?</summary>
+<p>Porque UTC es un eje de tiempo continuo y sin ambigüedades, y la hora local no: con el horario de verano hay una hora que <strong>ocurre dos veces</strong> por año (¿el registro de las 02:30 es antes o después del cambio?) y otra que no existe nunca. Además, si tus usuarios están en husos distintos, ordenar por una columna de hora local mezcla eventos que pasaron en otro orden. Guardando en UTC, restar dos fechas siempre da la duración real, y la conversión a "hora del que mira la pantalla" queda como un problema de presentación, que es donde corresponde.</p></details>
+
+<details><summary>Si al final los dos escriben texto, ¿qué te da <code>logging</code> que <code>print</code> no?</summary>
+<p>Tres cosas que en producción son la diferencia entre debuggear y adivinar. <strong>Niveles</strong>: subís a <code>DEBUG</code> el día que hay un problema y bajás a <code>WARNING</code> el resto del tiempo, sin tocar una sola línea de código. <strong>Destinos</strong>: el mismo mensaje puede ir a consola, a un archivo con rotación y a un servicio remoto, decidido en la configuración y no en cada llamada. <strong>Contexto automático</strong>: timestamp, nivel, nombre del módulo y, con <code>log.exception</code>, el traceback entero. Un <code>print</code> desnudo es una línea sin fecha ni origen en un stdout que nadie está mirando.</p></details>
+
+<details><summary>Si un <code>dict</code> común ya hace el trabajo, ¿por qué existen <code>Counter</code> y <code>defaultdict</code>?</summary>
+<p>Para sacarte de encima el <em>ritual</em> de "si la clave no existe, inicializala": ese <code>if clave not in d: d[clave] = 0</code> que se repite en todos lados es ruido donde se esconden bugs. <code>defaultdict</code> mueve esa decisión a un solo lugar (la fábrica que le pasás al construirlo) y <code>Counter</code> ya viene con la operación entera resuelta, más extras como <code>most_common()</code> y poder sumar y restar contadores. El código termina expresando la intención ("contar", "agrupar") en vez del mecanismo, y de paso el bucle corre en C en vez de en Python.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

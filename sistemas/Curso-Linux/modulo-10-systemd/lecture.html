@@ -299,6 +299,46 @@ systemctl show miapp                       # propiedades calculadas
 
 systemd-cgtop                              # top de cgroups</code></pre>
 
+<h2>Errores típicos que se ven recién al reiniciar</h2>
+
+<div class="mistake"><strong>Editar la unit y no correr <code>daemon-reload</code>.</strong> systemd tiene las units cacheadas en memoria: tu <code>restart</code> vuelve a levantar <strong>la versión vieja</strong> y te volvés loco buscando por qué el cambio no hace nada.
+<pre><code class="lang-bash">sudo nano /etc/systemd/system/miapp.service
+sudo systemctl restart miapp           # ❌ arranca con la config anterior
+# ✅
+sudo systemctl daemon-reload
+sudo systemctl restart miapp
+systemctl cat miapp                    # 🔎 confirmá qué está leyendo de verdad</code></pre></div>
+
+<div class="danger"><strong><code>start</code> sin <code>enable</code>.</strong> El servicio queda andando y todo parece bien... hasta que el server se reinicia a las 3 AM y no vuelve, porque nunca se creó el enlace en el target de arranque.
+<pre><code class="lang-bash">sudo systemctl start miapp             # ❌ solo ahora; no sobrevive al reboot
+sudo systemctl enable --now miapp      # ✅ arranca ahora Y en cada arranque
+systemctl is-enabled miapp             # 🔎 tiene que responder: enabled</code></pre></div>
+
+<div class="mistake"><strong>Editar el <code>.service</code> que instaló el paquete.</strong> Los archivos de <code>/usr/lib/systemd/system/</code> son del paquete: la próxima actualización los pisa y tu cambio desaparece sin aviso.
+<pre><code class="lang-bash">sudo nano /usr/lib/systemd/system/nginx.service   # ❌ lo pisa el próximo upgrade
+sudo systemctl edit nginx                        # ✅ drop-in en /etc, que siempre gana
+systemctl cat nginx                              # 🔎 muestra el original + los overrides</code></pre></div>
+
+<div class="warn"><strong><code>Restart=always</code> tapando un bug de arranque.</strong> Si el servicio muere apenas arranca (falta una variable, la base todavía no está lista), systemd lo relanza para siempre: el journal se llena, el CPU sube y el estado nunca queda en <code>failed</code>, así que ninguna alerta salta.
+<pre><code class="lang-ini">Restart=always                         # ❌ loop infinito silencioso
+# ✅ en [Service]:
+Restart=on-failure
+RestartSec=5s
+# ✅ y en [Unit], para que se rinda y quede en failed:
+StartLimitIntervalSec=300
+StartLimitBurst=5</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué conviene <code>systemctl edit</code> en vez de abrir el <code>.service</code> original con el editor?</summary>
+<p>Porque <code>systemctl edit</code> no toca el archivo del paquete: crea un <strong>drop-in</strong> en <code>/etc/systemd/system/miapp.service.d/override.conf</code> con solo las líneas que querés cambiar, y lo que está en <code>/etc</code> siempre le gana a lo que está en <code>/usr/lib</code>. La ventaja es doble: la actualización del paquete no te pisa nada, y tu cambio queda aislado y fácil de revertir (borrás el drop-in y listo). Para ver el resultado final combinado está <code>systemctl cat miapp</code>.</p></details>
+
+<details><summary>¿Qué diferencia hay entre <code>Type=simple</code> y <code>Type=forking</code>, y qué pasa si elegís mal?</summary>
+<p>Con <code>simple</code>, systemd da el servicio por arrancado apenas lanza el proceso de <code>ExecStart</code>, y ese proceso <strong>tiene que quedarse en primer plano</strong>. Con <code>forking</code>, systemd espera que el proceso inicial se duplique y termine, y después sigue al hijo. Si declarás <code>simple</code> un daemon que se demoniza, systemd ve morir al padre y cree que el servicio se cayó (lo reinicia en loop o lo marca failed); al revés, un <code>forking</code> mal puesto deja a systemd esperando un fork que nunca ocurre, hasta el timeout. Regla práctica: si el programa tiene una opción tipo <code>--foreground</code>, usala y quedate con <code>simple</code>.</p></details>
+
+<details><summary>¿Cuándo usás <code>reload</code> y cuándo <code>restart</code>, y por qué importa en un server con tráfico?</summary>
+<p><code>reload</code> le manda una señal al proceso <em>que ya está corriendo</em> para que relea su configuración: no se cae, no pierde las conexiones abiertas y no hay ventana de downtime. <code>restart</code> mata el proceso y levanta uno nuevo: se cortan las conexiones en curso y hay unos segundos sin servicio. El detalle importante es que <strong>no todos los servicios saben recargarse</strong> (depende de que la unit tenga <code>ExecReload=</code>); para esos casos existe <code>reload-or-restart</code>, que usa el método suave si puede y el bruto si no.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

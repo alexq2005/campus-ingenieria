@@ -227,6 +227,61 @@ strace -p 1234              # adjuntar a proceso
 strace -e openat ls         # solo syscalls específicas
 ltrace comando              # llamadas a librerías</code></pre>
 
+<h2>Errores típicos con procesos y señales</h2>
+
+<div class="danger"><strong>1. Arrancar directamente con <code>kill -9</code>.</strong> <code>SIGKILL</code> no le llega al programa: lo ejecuta el kernel de una. El proceso no cierra archivos, no vacía buffers, no borra sus locks ni avisa a sus hijos. En una base de datos eso es corrupción; en un servicio, un <code>.pid</code> huérfano que impide volver a arrancarlo.</div>
+
+<pre><code class="lang-bash"># ❌ mal — primer intento y ya con la escopeta
+kill -9 1234
+
+# ✅ bien — pedí primero, esperá, y solo si no responde insistí
+kill 1234                    # SIGTERM: le da la chance de cerrar prolijo
+sleep 5
+ps -p 1234 || echo "ya cerró"
+kill -9 1234                 # último recurso, si sigue vivo</code></pre>
+
+<div class="danger"><strong>2. <code>pkill -f</code> con un patrón demasiado ancho.</strong> <code>-f</code> matchea contra la línea de comando completa, así que <code>pkill -f python</code> se lleva puesto tu script... y el servicio del sistema escrito en Python, y el instalador que estaba corriendo.</div>
+
+<pre><code class="lang-bash"># ❌ mal — a saber qué se llevó puesto
+pkill -f python
+
+# ✅ bien — mirá SIEMPRE la lista antes de matarla
+pgrep -af "python.*mi_script.py"     # muestra PID + línea de comando completa
+pkill -f "python.*mi_script.py"</code></pre>
+
+<div class="mistake"><strong>3. Lanzar un proceso largo por SSH y cerrar la sesión.</strong> Cuando se cae la conexión, la shell les manda <code>SIGHUP</code> a sus hijos: tu migración de 3 horas muere en el minuto 40, a mitad de camino. El <code>&amp;</code> solo no te salva: manda a background, pero el proceso sigue colgando de esa sesión.</div>
+
+<pre><code class="lang-bash"># ❌ mal — se muere cuando se corta el SSH
+./migracion.sh &amp;
+
+# ✅ bien — inmune al SIGHUP y con la salida guardada
+nohup ./migracion.sh &gt; migracion.log 2&gt;&amp;1 &amp;
+
+# ✅ mejor — sesión persistente a la que podés volver a entrar
+tmux new -s migracion
+# lanzás el script, Ctrl+B d para hacer detach, y mañana: tmux attach -t migracion</code></pre>
+
+<div class="warn"><strong>4. Intentar matar un zombie.</strong> Un proceso en estado <code>Z</code> ya está muerto: lo único que queda es su entrada en la tabla, esperando que el padre lea su código de salida. Mandarle señales no hace absolutamente nada, ni con <code>-9</code>. Si se acumulan, el problema está en el padre.</div>
+
+<pre><code class="lang-bash"># ❌ mal — a un zombie no se lo puede matar dos veces
+kill -9 4321
+
+# ✅ bien — buscá al padre (PPID) y ocupate de él
+ps -o pid,ppid,stat,cmd -p 4321
+kill -CHLD 999               # avisale al padre que recoja a sus hijos
+# si el padre está roto y no reacciona, hay que reiniciarlo a él</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué diferencia hay entre <code>comando &amp;</code>, <code>nohup comando &amp;</code> y lanzarlo dentro de <code>tmux</code>?</summary>
+<p><code>&amp;</code> lo manda a <strong>background</strong>: te devuelve el prompt, pero el proceso sigue siendo hijo de esa shell y muere con el <code>SIGHUP</code> de la desconexión. <code>nohup</code> lo hace <strong>ignorar ese SIGHUP</strong> y le redirige la salida a un archivo, así que sobrevive — pero ya no lo ves interactuando, solo leés su log. <code>tmux</code> es otra cosa: el proceso corre dentro de una <strong>sesión que vive en el servidor</strong>, independiente de tu conexión, y podés volver a entrar (<code>tmux attach</code>) y seguir viendo la pantalla tal como la dejaste. Para algo que hay que supervisar, tmux; para algo que solo tiene que terminar, <code>nohup</code>.</p></details>
+
+<details><summary>¿Por qué hay procesos que no mueren ni con <code>kill -9</code>?</summary>
+<p>Porque están en estado <strong><code>D</code></strong> (sleep no interrumpible): esperando una operación de I/O del kernel — un disco que no responde, un NFS caído. Las señales se le entregan a un proceso cuando vuelve del kernel al espacio de usuario, y ese nunca vuelve, así que el <code>SIGKILL</code> queda encolado sin efecto. No es que "ignore" la señal: no llega a procesarla. La solución no es insistir con <code>kill</code> sino arreglar el I/O de abajo (remontar el recurso, recuperar el disco). El otro caso de "inmatable" es el zombie, que ya está muerto.</p></details>
+
+<details><summary>En <code>ps aux</code>, ¿qué diferencia hay entre <code>VSZ</code> y <code>RSS</code>?</summary>
+<p><code>VSZ</code> es la memoria <strong>virtual</strong> que el proceso tiene reservada: todo lo que mapeó, incluidas las librerías compartidas y la memoria pedida pero nunca tocada. <code>RSS</code> es la memoria <strong>física</strong> que está ocupando en RAM en este momento. Por eso ves procesos con VSZ gigante y RSS chico sin que nada esté roto. Además, el RSS <strong>cuenta dos veces</strong> las páginas compartidas: si sumás el RSS de todos los procesos te da más RAM de la que tenés. Para saber cuánto liberás realmente al matar uno, mirá el <code>PSS</code> en <code>/proc/&lt;pid&gt;/smaps_rollup</code>.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

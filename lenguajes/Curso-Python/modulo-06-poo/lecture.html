@@ -274,6 +274,65 @@ class Circulo(Forma):
 # Forma()  # TypeError: no se puede instanciar abstracta
 Circulo(5).area()</code></pre>
 
+<h2>Errores típicos con clases</h2>
+
+<div class="mistake">
+<strong>1. Olvidar <code>self</code> en la firma del método</strong> — Python le pasa la instancia como primer argumento igual, la hayas declarado o no.
+<pre><code class="lang-python">class Persona:
+    def saludar():            # ❌ falta self
+        return "Hola"
+
+Persona().saludar()
+# TypeError: saludar() takes 0 positional arguments but 1 was given
+
+class Persona:
+    def saludar(self):        # ✅ self es la instancia y va siempre primero
+        return "Hola"</code></pre>
+</div>
+
+<div class="mistake">
+<strong>2. Usar un atributo de clase mutable como si fuera de instancia</strong> — lo estás compartiendo entre <em>todos</em> los objetos.
+<pre><code class="lang-python">class Perro:
+    amigos = []              # ❌ una sola lista para toda la especie
+
+a, b = Perro(), Perro()
+a.amigos.append("Lupita")
+b.amigos                     # ['Lupita'] — ¡pero no era amiga de b!
+
+class Perro:
+    def __init__(self):
+        self.amigos = []     # ✅ una lista nueva por instancia</code></pre>
+</div>
+
+<div class="mistake">
+<strong>3. Poner un default mutable en una <code>@dataclass</code></strong> — acá Python te frena antes: ni siquiera te deja definir la clase.
+<pre><code class="lang-python">@dataclass
+class Producto:
+    tags: list[str] = []                            # ❌ ValueError: mutable default
+
+@dataclass
+class Producto:
+    tags: list[str] = field(default_factory=list)   # ✅ una lista por instancia</code></pre>
+</div>
+
+<div class="warn">
+<strong>4. Definir solo <code>__str__</code> y no entender por qué la lista muestra basura</strong> — <code>print(obj)</code> usa <code>__str__</code>, pero al imprimir una colección Python le pide <code>__repr__</code> a cada elemento.
+<pre><code class="lang-python">print(v1)      # (1, 2)                                ← usa __str__
+print([v1])    # [&lt;__main__.Vector object at 0x7f...&gt;]  ← ❌ usa __repr__</code></pre>
+Definí siempre <code>__repr__</code> (es el que te salva en el debugging) y agregá <code>__str__</code> solo si querés una versión distinta para el usuario final.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si Python tiene <em>duck typing</em>, ¿para qué sirve entonces la herencia?</summary>
+<p>Para el polimorfismo puro no hace falta: <code>hacer_hablar(animal)</code> funciona con cualquier objeto que tenga <code>.hablar()</code>, herede de <code>Animal</code> o no. Lo que aporta la herencia es <strong>reutilizar implementación</strong> (el <code>__init__</code> de <code>Animal</code>, sus métodos comunes) y <strong>declarar una intención</strong> de diseño, que después se puede verificar con <code>isinstance</code> o directamente forzar con <code>ABC</code>. Con duck typing ganás flexibilidad, porque no atás tu función a una jerarquía; perdés la red de seguridad, porque el error recién aparece en runtime, cuando llega un objeto sin el método esperado.</p></details>
+
+<details><summary>¿Por qué <code>@classmethod</code> recibe <code>cls</code> y <code>@staticmethod</code> no recibe nada?</summary>
+<p>Porque resuelven problemas distintos. Un <code>classmethod</code> necesita saber <em>sobre qué clase</em> lo llamaron: por eso <code>Fecha.desde_string</code> puede terminar en <code>return cls(d, m, a)</code> y seguir funcionando en una subclase, construyendo objetos de la subclase y no de <code>Fecha</code>. Un <code>staticmethod</code> no toca ni la instancia ni la clase: es una función suelta que vive ahí por organización y que podría estar fuera de la clase sin que nada cambie.</p></details>
+
+<details><summary>Si <code>_saldo</code> y <code>__pin</code> se pueden leer igual desde afuera, ¿para qué se usan?</summary>
+<p>Porque en Python la encapsulación es un <strong>contrato, no una cerradura</strong>. El <code>_</code> es un mensaje al resto del equipo: "esto es interno, puede cambiar sin aviso, no dependas de ello", y las herramientas lo respetan (no aparece en el autocompletado ni se exporta con <code>import *</code>). El doble <code>__</code> agrega <em>name mangling</em>: el atributo pasa a llamarse <code>_Clase__pin</code>, lo que no impide el acceso deliberado pero sí evita colisiones accidentales cuando una subclase define un atributo con el mismo nombre. La filosofía de fondo es la del Zen: acá somos todos adultos.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

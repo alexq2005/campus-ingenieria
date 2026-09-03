@@ -244,6 +244,64 @@ xargs                      # convierte stdin en argumentos
 ls *.txt | xargs rm        # elimina todos los .txt
 echo "1 2 3" | xargs -n 1  # uno por línea</code></pre>
 
+<h2>Errores típicos con redirección, globs y borrado</h2>
+
+<div class="danger"><strong>1. Redirigir un archivo sobre sí mismo.</strong> El shell prepara las redirecciones <strong>antes</strong> de ejecutar el comando: <code>&gt;</code> trunca el archivo a cero y recién ahí arranca <code>sort</code>, que se encuentra con un archivo vacío. Perdés los datos enteros, sin aviso.</div>
+
+<pre><code class="lang-bash"># ❌ mal — datos.txt queda VACÍO
+sort datos.txt &gt; datos.txt
+
+# ✅ bien — sort tiene su propia opción de salida
+sort datos.txt -o datos.txt
+
+# ✅ o pasá por un archivo temporal
+sort datos.txt &gt; datos.tmp &amp;&amp; mv datos.tmp datos.txt</code></pre>
+
+<div class="mistake"><strong>2. Escribir <code>&gt;</code> donde iba <code>&gt;&gt;</code>.</strong> Un solo signo <strong>pisa</strong> el archivo entero; dos <strong>agregan</strong> al final. Es la forma más rápida de borrar un log que venías juntando hace semanas.</div>
+
+<pre><code class="lang-bash"># ❌ mal — cada corrida borra todo lo anterior
+./backup.sh &gt; backup.log
+
+# ✅ bien — agrega al final
+./backup.sh &gt;&gt; backup.log
+
+# Y si querés también los errores en el mismo log:
+./backup.sh &gt;&gt; backup.log 2&gt;&amp;1</code></pre>
+
+<div class="danger"><strong>3. <code>rm -rf</code> con una variable sin comillas.</strong> Si la variable viene vacía (typo en el nombre, un paso anterior que falló), <code>rm -rf $DIR/*</code> se expande a <code>rm -rf /*</code>. Y si el valor tiene un espacio, borrás dos cosas en vez de una.</div>
+
+<pre><code class="lang-bash"># ❌ mal — si DIR está vacía, esto es rm -rf /*
+rm -rf $DIR/*
+
+# ✅ bien — comillas SIEMPRE, y cortá si la variable no está definida
+rm -rf "${DIR:?DIR no está definida}"/*
+
+# ✅ y antes de borrar, mirá qué vas a borrar
+echo "${DIR:?}"/*</code></pre>
+
+<div class="mistake"><strong>4. Pasarle un glob a <code>find</code> sin comillas.</strong> Sin comillas, el patrón lo expande el <strong>shell</strong> antes de que <code>find</code> lo vea: si en el directorio actual hay un solo <code>.log</code>, terminás buscando ese nombre exacto; si hay varios, <code>find</code> tira error. Las comillas hacen que el patrón le llegue intacto.</div>
+
+<pre><code class="lang-bash"># ❌ mal — el shell lo expande antes
+find /var/log -name *.log
+
+# ✅ bien — el patrón viaja tal cual hasta find
+find /var/log -name "*.log"
+
+# Y antes de un -delete: primero mirá la lista, después borrá
+find /var/log -name "*.log" -mtime +30
+find /var/log -name "*.log" -mtime +30 -delete</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué diferencia hay entre <code>2&gt;</code>, <code>&amp;&gt;</code> y <code>2&gt;&amp;1</code>?</summary>
+<p>Todo comando tiene dos salidas separadas: <strong>stdout</strong> (canal 1, el resultado) y <strong>stderr</strong> (canal 2, los errores). <code>2&gt; err.log</code> manda solo los errores a un archivo. <code>&amp;&gt; todo.log</code> manda las dos al mismo archivo. <code>2&gt;&amp;1</code> significa "mandá el canal 2 adonde ya está yendo el 1", y por eso el orden importa: en <code>cmd &gt; out.log 2&gt;&amp;1</code> terminan las dos en el archivo, pero <code>cmd 2&gt;&amp;1 &gt; out.log</code> deja los errores en pantalla. Están separados justamente para que puedas pipear el resultado sin que los errores te ensucien los datos.</p></details>
+
+<details><summary>¿Por qué <code>ps aux | grep python</code> casi siempre muestra una línea de más?</summary>
+<p>Porque un pipe <strong>lanza los dos procesos a la vez</strong>, no uno después del otro. Cuando <code>ps</code> saca la foto de la tabla de procesos, el propio <code>grep python</code> ya está corriendo y aparece en la lista. De ahí el clásico <code>ps aux | grep python | grep -v grep</code>, o mejor <code>pgrep -af python</code>, que consulta directamente y no se encuentra a sí mismo.</p></details>
+
+<details><summary>¿Qué pasa si le pasás a <code>xargs</code> nombres de archivo con espacios?</summary>
+<p>Se rompe: <code>xargs</code> separa por espacios y saltos de línea, así que <code>mi archivo.txt</code> le llega como <strong>dos</strong> argumentos, <code>mi</code> y <code>archivo.txt</code>. Con un <code>rm</code> del otro lado, eso significa borrar cosas que no querías. La solución es usar el separador nulo, que ningún nombre de archivo puede contener: <code>find . -name "*.tmp" -print0 | xargs -0 rm</code>. O directamente <code>-delete</code> / <code>-exec</code> de <code>find</code>, que no pasan por el shell.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

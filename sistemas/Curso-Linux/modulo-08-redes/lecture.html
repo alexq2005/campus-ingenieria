@@ -288,6 +288,42 @@ iperf3 -c host                             # cliente
 
 speedtest-cli                              # medir velocidad de internet</code></pre>
 
+<h2>Errores típicos que te dejan afuera del servidor</h2>
+
+<div class="danger"><strong>Activar el firewall antes de permitir SSH.</strong> Con <code>default deny incoming</code> y el firewall arriba, la regla que falta es justo la que te mantiene conectado: la sesión actual sigue viva, pero <strong>no vas a poder volver a entrar</strong>.
+<pre><code class="lang-bash">sudo ufw default deny incoming
+sudo ufw enable                        # ❌ te cerraste la puerta desde adentro
+# ✅ el orden correcto:
+sudo ufw allow OpenSSH                 # o: sudo ufw allow 22/tcp
+sudo ufw enable
+sudo ufw status verbose                # verificá ANTES de cerrar la sesión</code></pre></div>
+
+<div class="danger"><strong>Escuchar en <code>0.0.0.0</code> "para probar".</strong> Eso no es "todas las IP de mi red": es <em>todas las interfaces</em>, incluida la pública. Bases de datos y caches abiertas así son de las formas más comunes de perder datos en un VPS.
+<pre><code class="lang-bash">redis-server --bind 0.0.0.0            # ❌ expuesto a internet
+ss -tlnp | grep 0.0.0.0                # 🔎 revisá qué quedó escuchando en todas lados
+redis-server --bind 127.0.0.1          # ✅ solo local
+ssh -L 6379:127.0.0.1:6379 user@host   # ✅ acceso remoto por túnel, sin abrir el puerto</code></pre></div>
+
+<div class="mistake"><strong>Cambiar la red por SSH sin red de seguridad.</strong> Un typo en el YAML de netplan y perdés la sesión con el server a mitad del cambio, sin consola física para arreglarlo.
+<pre><code class="lang-bash">sudo netplan apply                     # ❌ si la config está mal, chau conexión
+sudo netplan try                       # ✅ aplica y revierte solo a los 120 s si no confirmás</code></pre></div>
+
+<div class="danger"><strong><code>rsync --delete</code> con el origen equivocado.</strong> <code>--delete</code> borra en el destino todo lo que no esté en el origen. Si invertís los argumentos, el "espejo" te vacía los datos buenos en lugar de respaldarlos.
+<pre><code class="lang-bash">rsync -avz --delete /backup/ /datos/             # ❌ invertido: destruís los datos
+rsync -avz --delete --dry-run /datos/ /backup/   # ✅ simulá y leé la salida completa
+rsync -avz --delete /datos/ /backup/             # ✅ recién ahí, en serio</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el firewall ya bloquea el puerto, ¿por qué igual conviene que el servicio escuche en <code>127.0.0.1</code> y no en <code>0.0.0.0</code>?</summary>
+<p>Por <strong>defensa en capas</strong>. El firewall es una sola config que alguien puede desactivar, resetear o dejar mal después de un reinicio. Si además el proceso solo bindea el loopback, el puerto <em>no existe</em> en la interfaz pública: aunque el firewall se caiga o aparezca una interfaz nueva (una VPN, una IP flotante, un contenedor), nadie de afuera llega. Escuchar en <code>0.0.0.0</code> significa "todas las interfaces, las de hoy y las que aparezcan mañana".</p></details>
+
+<details><summary>¿Qué diferencia hay entre <code>ssh -L</code> y <code>ssh -R</code>? ¿Cuál usás para llegar a una base que solo escucha en el localhost del servidor?</summary>
+<p>Cambia <strong>dónde se abre el puerto y hacia dónde viaja el tráfico</strong>. Con <code>-L</code> (local) el puerto se abre en <em>tu</em> máquina y lo que le mandes sale por el túnel y lo entrega el servidor: es el que usás para la base remota (<code>ssh -L 5432:127.0.0.1:5432 user@host</code> y después te conectás a <code>localhost:5432</code>). Con <code>-R</code> (remoto) es al revés: el puerto se abre <em>en el servidor</em> y el tráfico entra hacia tu máquina, útil para exponer algo tuyo que está detrás de un NAT.</p></details>
+
+<details><summary>El <code>ping</code> al servidor no responde pero la web anda igual. ¿Cómo puede ser?</summary>
+<p>Porque <code>ping</code> usa <strong>ICMP</strong>, un protocolo distinto del que usa tu servicio. Muchísimos firewalls y proveedores cloud bloquean ICMP por defecto sin tocar TCP, así que "no pinguea" no significa "está caído". Para probar un servicio hay que probar <em>ese</em> puerto: <code>nc -zv host 443</code>, <code>curl -I</code> contra la URL, o <code>ss -tlnp</code> desde el propio server. Al revés también pasa: el ping puede responder porque el kernel está vivo aunque el servicio esté muerto.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

@@ -350,6 +350,43 @@ sudo find /var/log -name "*.gz" -mtime +30 -delete</code></pre>
   <li><code>strace -p PID</code> — ¿qué está haciendo el proceso?</li>
 </ol>
 
+<h2>Errores típicos de mantenimiento</h2>
+
+<div class="mistake"><strong>El <code>%</code> sin escapar en el crontab.</strong> Para cron, un <code>%</code> significa "acá termina el comando, lo que sigue es entrada estándar". Tu <code>date +%F</code> anda perfecto en la terminal y en cron te genera un archivo sin fecha, o directamente falla.
+<pre><code class="lang-bash">30 2 * * * tar -czf /backup/b-$(date +%F).tar.gz /datos    # ❌ el % corta la línea
+30 2 * * * tar -czf /backup/b-$(date +\%F).tar.gz /datos   # ✅ escapado con \
+30 2 * * * /usr/local/bin/backup.sh                        # ✅ mejor: todo dentro de un script</code></pre></div>
+
+<div class="danger"><strong><code>crontab -r</code> en vez de <code>-e</code>.</strong> Las teclas están al lado y <code>-r</code> <strong>borra el crontab entero sin preguntar</strong> ni dejar copia.
+<pre><code class="lang-bash">crontab -r                              # ❌ adiós a todas las tareas, sin confirmación
+crontab -l &gt; ~/crontab.$(date +%F).bak  # ✅ backup antes de tocar nada
+crontab -e                              # ✅ editar</code></pre></div>
+
+<div class="danger"><strong>Una línea mal en <code>/etc/fstab</code>.</strong> Si el dispositivo no existe al arrancar, systemd espera el montaje, falla y te deja en <em>emergency mode</em>: el server no bootea y necesitás consola física para salir.
+<pre><code class="lang-bash">sudo reboot                            # ❌ "probar" el fstab reiniciando
+# ✅
+sudo mount -a                          # montá ahora todo lo del fstab y mirá si da error
+sudo findmnt --verify                  # 🔎 valida el archivo
+# y en discos no críticos, agregá nofail y x-systemd.device-timeout=10 a las opciones</code></pre></div>
+
+<div class="mistake"><strong>Borrar un log con <code>rm</code> mientras el proceso lo tiene abierto.</strong> El espacio <strong>no se libera</strong>: el archivo desaparece del directorio pero el inodo sigue vivo mientras haya un descriptor abierto. Es el clásico "<code>df</code> dice 100% lleno y <code>du</code> no encuentra nada".
+<pre><code class="lang-bash">sudo rm /var/log/miapp/app.log              # ❌ el disco sigue lleno y la app deja de loguear
+# ✅
+sudo truncate -s 0 /var/log/miapp/app.log  # vacía el archivo sin romper el descriptor
+sudo lsof +L1                              # 🔎 lista archivos borrados que siguen abiertos
+# y de fondo: configurá logrotate para que no vuelva a pasar</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary><code>df</code> dice que la partición está al 100% pero <code>du</code> no encuentra los archivos. ¿Qué está pasando?</summary>
+<p>Las dos causas típicas son: <strong>(1)</strong> alguien borró un archivo grande que un proceso todavía tiene abierto — el nombre ya no está en el directorio, así que <code>du</code> no lo ve, pero el inodo y sus bloques siguen ocupados hasta que ese proceso cierre el descriptor o se reinicie (lo cazás con <code>lsof +L1</code>); y <strong>(2)</strong> que no falte espacio sino <strong>inodos</strong>, típico con millones de archivitos de cache o sesión: ahí <code>df -h</code> te confunde y el que canta la verdad es <code>df -i</code>. Hay una tercera, menos frecuente: un filesystem montado encima de un directorio que ya tenía datos debajo, que quedan ocultos pero siguen ocupando la partición de abajo.</p></details>
+
+<details><summary>¿Cuándo conviene un timer de systemd y cuándo un cron de toda la vida?</summary>
+<p>El <strong>timer</strong> gana cuando la tarea importa: los logs van al journal y los leés con <code>journalctl -u tarea.service</code>, podés declarar dependencias (esperar la red, esperar la base), recuperar la corrida perdida con <code>Persistent=true</code>, dispersar la carga con <code>RandomizedDelaySec</code> y aplicarle el mismo hardening que a cualquier servicio (<code>User=</code>, <code>PrivateTmp=</code>). El <strong>cron</strong> gana en simplicidad y portabilidad: una sola línea, está en cualquier UNIX y no necesitás dos archivos. Regla práctica: tarea personal y trivial, cron; tarea de producción que alguien va a tener que depurar de madrugada, timer.</p></details>
+
+<details><summary>¿Por qué se dice que un backup que nunca restauraste no es un backup?</summary>
+<p>Porque hasta que no lo probás, lo único que verificaste es que <em>el comando de copia no dio error</em>. En el medio pueden estar pasando cosas que solo aparecen al restaurar: el <code>tar</code> excluía justo el directorio que importaba, la base se copió mientras escribía y quedó inconsistente, el repo está cifrado con una passphrase que nadie anotó, o el destino se llenó hace tres semanas y la tarea viene fallando en silencio. Por eso el backup se <strong>ensaya</strong>: restauración periódica a un directorio o a una VM de prueba, verificación de integridad (<code>borg check</code>, <code>sha256sum -c</code>) y una alerta que avise si la tarea no corrió.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

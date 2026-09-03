@@ -235,6 +235,63 @@ def saludar():
   <li><strong>Docstrings</strong> en funciones públicas</li>
 </ol>
 
+<h2>Errores típicos con funciones</h2>
+
+<div class="mistake">
+<strong>1. Olvidar el <code>return</code></strong> — la función corre, calcula... y devuelve <code>None</code>.
+<pre><code class="lang-python">def doble(x):
+    x * 2            # ❌ calcula y tira el resultado
+
+doble(5)             # None
+
+def doble(x):
+    return x * 2     # ✅</code></pre>
+El síntoma aparece más adelante y confunde: <code>TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'</code>.
+</div>
+
+<div class="mistake">
+<strong>2. Mutar el argumento que te pasaron</strong> — las listas y los dicts llegan por referencia, así que los modificás también para quien te llamó.
+<pre><code class="lang-python">def agregar_iva(precios):
+    for i, p in enumerate(precios):
+        precios[i] = p * 1.21            # ❌ le arruinaste la lista original
+    return precios
+
+def agregar_iva(precios):
+    return [p * 1.21 for p in precios]   # ✅ devolvés una lista nueva</code></pre>
+</div>
+
+<div class="mistake">
+<strong>3. Asignarle a una variable global sin declararla</strong> — leerla alcanza sin más, pero apenas le asignás, Python la trata como local en <em>toda</em> la función.
+<pre><code class="lang-python">total = 0
+
+def sumar(x):
+    total = total + x    # ❌ UnboundLocalError: local variable 'total' referenced before assignment
+
+def sumar(x):
+    global total         # ✅ funciona (aunque suele ser mejor devolver el valor y asignar afuera)
+    total = total + x</code></pre>
+</div>
+
+<div class="warn">
+<strong>4. Crear lambdas dentro de un bucle</strong> — la lambda no guarda el <em>valor</em> de la variable, guarda la variable: todas terminan viendo el último.
+<pre><code class="lang-python">fs = [lambda: i for i in range(3)]
+[f() for f in fs]                 # ❌ [2, 2, 2]
+
+fs = [lambda i=i: i for i in range(3)]
+[f() for f in fs]                 # ✅ [0, 1, 2] — el default congela el valor</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si <code>crear_contador()</code> ya terminó de ejecutarse, ¿por qué la función que devolvió sigue recordando <code>n</code>?</summary>
+<p>Porque <code>incrementar</code> es un <strong>closure</strong>: al definirse adentro de <code>crear_contador</code> se quedó con una referencia viva al entorno donde nació. Mientras exista la función interna, Python no puede descartar ese <code>n</code> — y no es una copia del valor, es la misma celda de memoria. De ahí salen dos consecuencias: cada llamada a <code>crear_contador()</code> devuelve un contador con su propio <code>n</code> independiente, y hace falta <code>nonlocal</code> para escribirle, porque sin esa palabra <code>n += 1</code> crearía una variable local nueva.</p></details>
+
+<details><summary>¿Qué diferencia hay entre <code>global</code> y <code>nonlocal</code>?</summary>
+<p><code>global</code> dice "esta variable vive en el módulo, en el nivel más externo". <code>nonlocal</code> dice "vive en la función que me encierra, que no es el nivel global" — es el que usan los closures. Si en <code>crear_contador</code> escribieras <code>global n</code>, Python iría a buscar un <code>n</code> de módulo y no encontraría el del closure. Los dos existen por el mismo motivo: asignarle a un nombre lo vuelve local por defecto, así que cuando querés escribir "hacia afuera" tenés que declararlo explícitamente.</p></details>
+
+<details><summary>¿Por qué el <code>wrapper</code> de un decorador casi siempre se escribe como <code>wrapper(*args, **kwargs)</code>?</summary>
+<p>Porque el decorador no sabe (ni debería saber) qué firma tiene la función que va a envolver. Con <code>*args, **kwargs</code> el wrapper acepta <em>cualquier</em> combinación de argumentos y se los reenvía tal cual a la función original. Si le pusieras parámetros fijos, ese decorador serviría solo para funciones con esa firma exacta y rompería con cualquier otra. Es justamente la diferencia entre un decorador reutilizable y uno atado a un único caso.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

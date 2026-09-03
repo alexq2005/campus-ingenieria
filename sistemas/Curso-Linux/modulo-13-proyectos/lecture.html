@@ -263,6 +263,48 @@ journalctl -u miapp -f</code></pre>
 <p>El siguiente paso es <strong>practicar</strong>: levantá una VM, hacé los 3 proyectos sin copiar, rompé cosas a propósito, arreglalas. Ese ciclo es donde el conocimiento se vuelve experiencia.</p>
 
 
+<h2>Errores típicos al desplegar</h2>
+
+<div class="mistake"><strong>Correr <code>certbot</code> con el puerto 80 cerrado o el DNS sin propagar.</strong> El desafío HTTP-01 necesita que Let's Encrypt llegue <em>desde internet</em> a tu server por el puerto 80, con el dominio ya apuntando a esa IP. Si no, falla por timeout y encima gastás intentos del rate limit.
+<pre><code class="lang-bash">sudo certbot --nginx -d midominio.com   # ❌ si ufw bloquea el 80 o el DNS no resuelve
+# ✅ verificá primero:
+dig +short midominio.com                # ¿apunta a la IP de esta VM?
+sudo ufw allow 'Nginx Full'             # 80 y 443 abiertos
+curl -I http://midominio.com            # ¿responde desde afuera?
+sudo certbot --nginx -d midominio.com --dry-run   # ensayo sin consumir el límite</code></pre></div>
+
+<div class="mistake"><strong>Symlink relativo en <code>sites-enabled</code>.</strong> <code>ln -s</code> guarda el destino tal cual se lo escribís: con una ruta relativa hecha desde otro directorio, el enlace queda roto, nginx ignora el sitio y el <code>ls</code> a secas no te lo muestra.
+<pre><code class="lang-bash">sudo ln -s ../sites-available/midominio /etc/nginx/sites-enabled/          # ❌ frágil
+sudo ln -s /etc/nginx/sites-available/midominio /etc/nginx/sites-enabled/ # ✅ ruta absoluta
+ls -l /etc/nginx/sites-enabled/         # 🔎 un enlace roto apunta a la nada
+sudo nginx -t</code></pre></div>
+
+<div class="danger"><strong><code>ExecStart</code> con <code>activate</code> o rutas relativas.</strong> systemd <strong>no ejecuta un shell</strong>: no hay <code>source</code>, ni <code>~</code>, ni el <code>PATH</code> de tu usuario, ni encadenado con <code>&amp;&amp;</code>. Si el arranque depende de activar el venv, el servicio ni levanta.
+<pre><code class="lang-ini">ExecStart=source .venv/bin/activate &amp;&amp; uvicorn app:app    # ❌ no existe para systemd
+# ✅ binario absoluto del venv:
+ExecStart=/opt/miapp/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
+WorkingDirectory=/opt/miapp</code></pre></div>
+
+<div class="danger"><strong>Secretos legibles por todo el sistema.</strong> Un <code>.env</code> con la contraseña de la base creado con los permisos por defecto queda en 644: lo lee cualquier usuario de la máquina, incluido el proceso comprometido de al lado.
+<pre><code class="lang-bash">echo "DB_PASSWORD=..." &gt; /opt/miapp/.env   # ❌ queda 644: lo lee todo el mundo
+# ✅ dueño root, grupo del servicio, 640:
+sudo install -o root -g miapp -m 640 /dev/null /etc/miapp/env
+sudo nano /etc/miapp/env
+# y en la unit: EnvironmentFile=/etc/miapp/env
+# nunca la clave en ExecStart: los argumentos se ven en ps y en systemctl show</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué el reverse proxy y la app son dos procesos separados y no uno solo?</summary>
+<p>Porque hacen cosas distintas y conviene poder cambiar una sin tocar la otra. Nginx se ocupa de lo caro y delicado de hacer bien: terminar TLS, servir estáticos, timeouts, límites de tamaño, buffering de clientes lentos, rate limiting y repartir tráfico. La app se ocupa solo de la lógica y escucha en el loopback. La ganancia práctica: renovás el certificado o cambiás la config del proxy sin tocar la app, reiniciás la app sin que quede expuesta a internet mientras arranca, y el día que necesites escalar levantás tres instancias detrás del mismo <code>server</code> block.</p></details>
+
+<details><summary>El server se reinicia solo a las 3 AM. ¿Qué tiene que estar configurado para que a las 3:01 esté todo funcionando?</summary>
+<p>Todo lo que hiciste "a mano" tiene que estar declarado en algún lado persistente: los servicios con <code>systemctl enable</code> y no solo <code>start</code> (nginx, miapp, fail2ban); los timers de backup y de renovación del certificado, también con <code>enable</code>; los discos de datos en <code>/etc/fstab</code> con <code>nofail</code> y no montados a mano; las reglas de firewall persistidas (<code>ufw enable</code> las guarda, <code>iptables</code> a secas no); y el orden de arranque resuelto con <code>After=</code> o <code>Requires=</code> si la app necesita la red o la base listas. La única prueba que vale es hacerlo: reiniciá vos a propósito y verificá con <code>systemctl --failed</code> y un <code>curl</code> al sitio.</p></details>
+
+<details><summary>¿Qué te dice <code>ss -tlnp</code> que <code>systemctl status</code> no puede decirte?</summary>
+<p><code>systemctl status</code> te dice qué opina <strong>systemd</strong> del proceso: que lo lanzó y que sigue vivo. Eso no prueba que el servicio esté <em>escuchando</em>: un proceso puede quedar <code>active (running)</code> sin haber bindeado ningún socket (se colgó antes de llegar ahí), o haberlo bindeado en el puerto o la interfaz equivocados — que es justo el bug que te deja la app expuesta en <code>0.0.0.0</code> o inalcanzable para el proxy. <code>ss -tlnp</code> te muestra el estado real del kernel: qué puerto, en qué dirección y de qué PID. Es la diferencia entre "quedó configurado así" y "está haciendo eso".</p></details>
+
+
 <section class="quiz" id="quizLx13">
 
 <style>

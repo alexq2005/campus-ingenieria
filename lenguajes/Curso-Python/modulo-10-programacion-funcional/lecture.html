@@ -205,6 +205,77 @@ resultado = pipeline(
 )
 # 'hola_mundo'</code></pre>
 
+<h2>Errores típicos con lambdas, generadores y cache</h2>
+
+<div class="mistake">
+  <strong>Las lambdas de un bucle capturan la variable, no su valor.</strong> Es el famoso <em>late binding</em>: las tres lambdas comparten la misma <code>i</code>, y cuando por fin las llamás el bucle ya terminó, así que todas ven el último valor.
+<pre><code class="lang-python"># ❌ mal
+fns = [lambda: i for i in range(3)]
+[f() for f in fns]           # [2, 2, 2]  — no [0, 1, 2]
+
+# ✅ bien — congelás el valor en un argumento por defecto
+fns = [lambda i=i: i for i in range(3)]
+[f() for f in fns]           # [0, 1, 2]</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Recorrer dos veces un generador.</strong> Un generador es de <strong>un solo uso</strong>: cuando se agota queda vacío para siempre. Y el segundo recorrido no falla, simplemente no produce nada, así que el bug se te escapa hasta producción.
+<pre><code class="lang-python"># ❌ mal
+pares = (x for x in range(10) if x % 2 == 0)
+total = sum(pares)             # 20
+cantidad = len(list(pares))    # 0 — ya estaba agotado
+
+# ✅ bien — materializá si necesitás recorrerlo más de una vez
+pares = [x for x in range(10) if x % 2 == 0]
+total, cantidad = sum(pares), len(pares)</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Tratar a <code>map</code> y <code>filter</code> como si devolvieran listas.</strong> En Python 3 devuelven <strong>iteradores perezosos</strong>: no tienen <code>len()</code>, no se indexan y se agotan igual que un generador.
+<pre><code class="lang-python"># ❌ mal
+r = map(str.upper, ["a", "b"])
+len(r)      # TypeError: object of type 'map' has no len()
+r[0]        # TypeError: 'map' object is not subscriptable
+print(r)    # &lt;map object at 0x7f3c...&gt;
+
+# ✅ bien
+r = list(map(str.upper, ["a", "b"]))
+# o directamente la comprehension, más pythónica:
+r = [s.upper() for s in ["a", "b"]]</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Cachear una función que no es pura (o con argumentos mutables).</strong> <code>@cache</code> indexa por los argumentos, así que necesita que sean <strong>hasheables</strong>, y da por sentado que la misma entrada devuelve siempre la misma salida. Si adentro leés un archivo, la DB o la hora, te comés el primer resultado para siempre.
+<pre><code class="lang-python"># ❌ mal
+@cache
+def promedio(numeros):
+    return sum(numeros) / len(numeros)
+
+promedio([1, 2, 3])      # TypeError: unhashable type: 'list'
+
+@cache
+def config():
+    return json.loads(Path("config.json").read_text())   # nunca ve los cambios
+
+# ✅ bien — argumentos inmutables y funciones puras
+@cache
+def promedio(numeros: tuple[int, ...]):
+    return sum(numeros) / len(numeros)
+
+promedio((1, 2, 3))      # 2.0</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>En <code>sorted(palabras, key=len)</code>, ¿por qué <code>len</code> va sin paréntesis?</summary>
+<p>Porque no querés <em>llamar</em> a <code>len</code>, querés <strong>pasarle la función</strong> a <code>sorted</code> para que la llame él, una vez por cada elemento. En Python las funciones son objetos como cualquier otro: <code>len</code> es la función y <code>len()</code> es el resultado de ejecutarla. Si escribís <code>key=len()</code> te da <code>TypeError</code> porque estás invocando <code>len</code> sin argumentos ahí mismo. Es la misma idea detrás de <code>map(fn, iterable)</code> y de los decoradores.</p></details>
+
+<details><summary>¿Qué significa que una función sea "pura" y por qué es la condición para poder cachearla?</summary>
+<p>Pura = su resultado depende <strong>solo</strong> de sus argumentos y no cambia nada fuera de ella (no escribe archivos, no toca variables globales, no manda mails). Cachear es sustituir la llamada por un resultado guardado, así que solo es correcto si la llamada era intercambiable con su valor: si la función leía la DB, el cache congela una foto vieja; si mandaba un mail, el segundo mail nunca sale. Además, una función pura es la más fácil de testear, porque no necesita preparar ningún entorno.</p></details>
+
+<details><summary>¿Por qué una lista se puede recorrer las veces que quieras y un generador no?</summary>
+<p>Porque son cosas distintas: la lista <strong>guarda</strong> todos los elementos, así que iterarla es leer de nuevo lo que ya está en memoria. El generador no guarda nada; es una <em>receta</em> con un puntero de ejecución que avanza y no vuelve atrás. Cuando llegó al final, la función terminó y no queda estado que recorrer. Ese es justamente el trato: pagás no poder repetir ni indexar, a cambio de memoria O(1) y de poder representar secuencias infinitas. Si necesitás las dos cosas, guardá el resultado en una lista o volvé a crear el generador.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

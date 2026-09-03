@@ -242,6 +242,83 @@ try:
 except Exception:
     log.exception("Falló la operación")    # incluye traceback automáticamente</code></pre>
 
+<h2>Errores típicos con excepciones</h2>
+
+<div class="mistake">
+  <strong>Cerrar en <code>finally</code> algo que quizás nunca se abrió.</strong> Si <code>open()</code> falla, la variable <code>archivo</code> <em>nunca llegó a crearse</em>: el <code>finally</code> corre igual y explota con <code>NameError</code>, tapando la excepción original.
+<pre><code class="lang-python"># ❌ mal
+try:
+    archivo = open("datos.txt")
+except FileNotFoundError:
+    print("No existe")
+finally:
+    archivo.close()      # NameError: name 'archivo' is not defined
+
+# ✅ bien — el with cierra solo si llegó a abrir
+try:
+    with open("datos.txt", encoding="utf-8") as archivo:
+        procesar(archivo)
+except FileNotFoundError:
+    print("No existe")</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Poner el <code>except</code> general antes que el específico.</strong> Python prueba los <code>except</code> <strong>en orden</strong> y se queda con el primero que matchea. Si <code>Exception</code> va arriba, todo lo de abajo es código muerto que nunca se ejecuta.
+<pre><code class="lang-python"># ❌ mal — el except ValueError es inalcanzable
+try:
+    numero = int(dato)
+except Exception:
+    print("error genérico")
+except ValueError:
+    print("no es un número")     # nunca corre
+
+# ✅ bien — de la más específica a la más general
+try:
+    numero = int(dato)
+except ValueError:
+    print("no es un número")
+except Exception:
+    log.exception("error inesperado")
+    raise</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Pisar una excepción built-in con una propia.</strong> Si llamás <code>PermissionError</code> a tu excepción de app, tapás la de Python en todo ese módulo: a partir de ahí <code>except PermissionError</code> deja de capturar el error real del sistema de archivos y nadie se entera. Lo mismo con <code>ConnectionError</code>, <code>TimeoutError</code> o <code>LookupError</code>.
+<pre><code class="lang-python"># ❌ mal — ese nombre ya existe en Python
+class PermissionError(MiAppError): pass
+
+# ✅ bien — nombrá desde el dominio de tu app
+class PermisoDenegadoError(MiAppError): pass</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Convertir la excepción en string y perder el traceback.</strong> <code>raise RuntimeError(str(e))</code> tira a la basura el tipo original y toda la pila. Encadená la causa con <code>from e</code> y logueá con <code>log.exception</code>, que incluye el traceback completo.
+<pre><code class="lang-python"># ❌ mal — queda "falló: division by zero" y ninguna línea de código
+try:
+    proceso_complejo()
+except ValueError as e:
+    log.error(f"falló: {e}")
+    raise RuntimeError(str(e))
+
+# ✅ bien — causa encadenada y traceback en el log
+try:
+    proceso_complejo()
+except ValueError as e:
+    log.exception("falló el proceso")
+    raise RuntimeError("Falló el proceso") from e</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Qué cambia entre <code>raise RuntimeError("x")</code> y <code>raise RuntimeError("x") from e</code> adentro de un <code>except</code>?</summary>
+<p>Las dos muestran las dos excepciones, pero se leen distinto. Sin <code>from</code>, Python dice <em>"During handling of the above exception, another exception occurred"</em>: parece que se te escapó un segundo error mientras manejabas el primero. Con <code>from e</code> dice <em>"The above exception was the direct cause"</em>: sos vos declarando que una causó la otra. Es documentación para el que lea el traceback a las 3 AM.</p></details>
+
+<details><summary>¿Por qué conviene que todas las excepciones de tu app hereden de una base común como <code>MiAppError</code>?</summary>
+<p>Porque le da a quien usa tu código un punto único para atrapar "todo lo que puede fallar por culpa de esta librería" con un solo <code>except MiAppError</code>, sin enumerar cada clase ni caer en <code>except Exception</code> (que además atraparía bugs de programación ajenos a tu dominio). Adentro de tu propio código seguís capturando lo específico.</p></details>
+
+<details><summary>¿Qué pasa si validás el input de un usuario con <code>assert</code> y el programa corre con <code>python -O</code>?</summary>
+<p>Las assertions se eliminan del bytecode y la validación <strong>desaparece</strong>: el dato inválido pasa como si nada, y encima solo en producción. Por eso <code>assert</code> sirve únicamente para invariantes internas ("esto no puede pasar nunca si mi código está bien"); todo lo que venga de afuera se valida con un <code>if</code> + <code>raise</code>.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

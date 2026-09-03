@@ -237,6 +237,39 @@ sudo make install</code></pre>
   <li><strong>Hacer backup del listado</strong>: <code>dpkg --get-selections &gt; paquetes.txt</code> antes de cambios mayores</li>
 </ol>
 
+<h2>Errores típicos que rompen el sistema</h2>
+
+<div class="mistake"><strong>Instalar con el índice viejo.</strong> Si no corrés <code>apt update</code> antes, apt intenta bajar versiones que el mirror ya borró y te tira un <code>404 Not Found</code> a mitad de la instalación, dejando paquetes a medio configurar.
+<pre><code class="lang-bash">sudo apt install nginx                       # ❌ índice desactualizado, puede dar 404
+sudo apt update &amp;&amp; sudo apt install nginx    # ✅ refrescás y recién ahí instalás</code></pre></div>
+
+<div class="danger"><strong><code>dpkg -i</code> a mano, sin dependencias.</strong> <code>dpkg</code> es de bajo nivel: instala el <code>.deb</code> aunque le falten librerías y deja el sistema en estado "roto", bloqueando cualquier <code>apt</code> posterior hasta que lo arregles.
+<pre><code class="lang-bash">sudo dpkg -i app.deb                   # ❌ no resuelve dependencias
+sudo apt install ./app.deb             # ✅ apt baja del repo lo que falte
+sudo apt install -f                    # 🔧 rescate si ya quedó a medio instalar</code></pre></div>
+
+<div class="danger"><strong><code>-y</code> sin leer qué va a pasar.</strong> Ante un conflicto de dependencias, apt puede proponer <strong>eliminar</strong> el kernel, el entorno gráfico o la base de datos. Con <code>-y</code> le estás diciendo que sí a todo eso sin verlo.
+<pre><code class="lang-bash">sudo apt upgrade -y                    # ❌ en un server, a ciegas
+sudo apt -s upgrade                    # ✅ -s = simular: leé la lista completa
+sudo apt upgrade                       # ✅ y confirmá a mano</code></pre></div>
+
+<div class="mistake"><strong><code>sudo pip install</code> global.</strong> Pisás paquetes de Python que instaló el gestor del sistema, y en Debian/Ubuntu varias herramientas del SO están escritas en Python. Una librería incompatible te puede dejar sin gestor de paquetes.
+<pre><code class="lang-bash">sudo pip install requests              # ❌ dos gestores escribiendo en /usr/lib
+python3 -m venv .venv                  # ✅ un entorno por proyecto
+.venv/bin/pip install requests
+pipx install httpie                    # ✅ para herramientas CLI globales</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>dpkg -i</code> puede dejar el sistema roto y <code>apt install ./archivo.deb</code> no?</summary>
+<p><code>dpkg</code> trabaja con un archivo suelto: <strong>no conoce los repositorios</strong>, así que instala el paquete aunque le falten dependencias y lo deja marcado como "no configurado". <code>apt</code> es la capa de arriba: lee el <code>.deb</code>, calcula qué le falta, lo busca en los repos y lo instala todo junto. Por eso la regla es usar siempre el gestor de alto nivel, incluso para archivos locales.</p></details>
+
+<details><summary>¿Qué diferencia hay, en librerías y actualizaciones, entre un paquete del repo oficial y uno de snap o flatpak?</summary>
+<p>El paquete del repo <strong>comparte</strong> las librerías del sistema: ocupa poco, se actualiza junto con todo lo demás y el mantenedor de la distro garantiza que las versiones encajen. Snap y flatpak traen su propio runtime <strong>empaquetado y aislado</strong>: pesan mucho más y pueden usar una versión de una librería distinta a la del sistema, pero a cambio corren igual en cualquier distro, suelen traer versiones más nuevas y se actualizan solos. Por eso el orden recomendado es repos oficiales primero y universales después.</p></details>
+
+<details><summary>¿Por qué instalar librerías de Python con <code>sudo pip</code> a nivel de sistema es peligroso?</summary>
+<p>Porque quedan <strong>dos gestores escribiendo en el mismo lugar</strong>: <code>apt</code> o <code>dnf</code> por un lado y <code>pip</code> por el otro, sin que ninguno sepa lo que hizo el otro. Si pip pisa una versión que el sistema necesitaba, se rompen herramientas del SO escritas en Python (en Debian, hasta el propio <code>apt</code>). La solución es el aislamiento: <code>venv</code> por proyecto y <code>pipx</code> para las CLIs que sí querés globales.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

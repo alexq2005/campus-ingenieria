@@ -218,6 +218,17 @@ resultados = asyncio.run(main(URLS))</code></pre>
   <li><strong>Llamar I/O bloqueante en asyncio</strong> → bloquea TODO el loop</li>
 </ol>
 
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el GIL impide ejecutar bytecode en paralelo, ¿por qué <code>threading</code> igual acelera una tarea I/O-bound?</summary>
+<p>Porque durante la espera de red o de disco <strong>no se está ejecutando bytecode Python</strong>: el thread queda bloqueado dentro de una llamada al sistema operativo y, antes de dormirse, <strong>suelta el GIL</strong>. Otro thread lo agarra y sigue trabajando. Con 10 descargas, los 10 threads pasan casi todo el tiempo esperando en paralelo y solo se turnan para los milisegundos de parsear la respuesta. En una tarea CPU-bound no hay ninguna espera: todos quieren el GIL todo el tiempo, se pelean por él y no ganás nada (a veces incluso perdés por el costo de cambiar de contexto).</p></details>
+
+<details><summary>¿Qué diferencia hay entre concurrencia y paralelismo? ¿Puede haber una sin la otra?</summary>
+<p><strong>Concurrencia</strong> es una propiedad del diseño: varias tareas <em>en progreso</em> a la vez, aunque el procesador se las vaya turnando. <strong>Paralelismo</strong> es una propiedad de la ejecución: varias tareas corriendo <em>literalmente</em> en el mismo instante, lo que exige varios cores. <code>asyncio</code> es el ejemplo perfecto de concurrencia sin paralelismo: miles de conexiones abiertas sobre un solo thread. Al revés también existe: sumar dos mitades de un array en dos cores es paralelismo sin nada que coordinar. Rob Pike lo resume como que la concurrencia es <em>lidiar</em> con muchas cosas y el paralelismo es <em>hacer</em> muchas cosas.</p></details>
+
+<details><summary>¿Por qué el código que arranca procesos con <code>multiprocessing</code> tiene que ir adentro de <code>if __name__ == "__main__":</code>?</summary>
+<p>Porque en Windows y macOS los procesos hijos se crean con <em>spawn</em>: el hijo arranca un intérprete nuevo y <strong>vuelve a importar tu módulo</strong> para reconstruir la función que va a ejecutar. Si el código que crea el <code>Pool</code> está suelto en el nivel superior, ese import lo ejecuta otra vez, cada hijo crea sus propios hijos y tenés una bomba de procesos (Python lo detecta y te tira <code>RuntimeError</code>). Con la guarda, al importarse <code>__name__</code> vale el nombre del módulo, no <code>"__main__"</code>, y el bloque no corre. La misma razón explica que la función que le pasás al pool tenga que estar definida a nivel de módulo: el hijo necesita poder importarla por nombre.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

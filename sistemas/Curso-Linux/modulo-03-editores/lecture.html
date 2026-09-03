@@ -226,6 +226,53 @@ set tabstospaces
 set autoindent
 include "/usr/share/nano/*.nanorc"   # syntax highlighting</code></pre>
 
+<h2>Errores típicos al editar</h2>
+
+<div class="danger"><strong>1. Editar <code>/etc/sudoers</code> con un editor común.</strong> Si guardás una línea con un error de sintaxis, <code>sudo</code> deja de funcionar <strong>para todo el sistema</strong> — y no podés usar <code>sudo</code> para arreglarlo. <code>visudo</code> valida antes de escribir y no te deja guardar una barbaridad.</div>
+
+<pre><code class="lang-bash"># ❌ mal — un typo acá y te quedás sin sudo
+sudo nano /etc/sudoers
+
+# ✅ bien — valida la sintaxis antes de guardar
+sudo visudo
+sudo visudo -f /etc/sudoers.d/mi-regla     # para los archivos modulares</code></pre>
+
+<div class="mistake"><strong>2. Abrir un archivo de sistema sin privilegios y darte cuenta al guardar.</strong> Vim te deja editar tranquilo y recién con <code>:w</code> te avisa <code>E45: 'readonly' option is set</code>. Con 40 líneas escritas, eso duele.</div>
+
+<pre><code class="lang-bash"># ❌ mal
+vim /etc/nginx/nginx.conf        # editás 20 minutos y al guardar: readonly
+
+# ✅ bien — abrilo con privilegios desde el principio
+sudoedit /etc/nginx/nginx.conf   # (= sudo -e) editás una copia y se instala al guardar</code></pre>
+
+<p>Si ya te pasó, guardá sin perder los cambios desde adentro de vim:</p>
+
+<pre><code class="lang-vim">:w !sudo tee % &gt; /dev/null</code></pre>
+
+<div class="mistake"><strong>3. Pegar código indentado en vim estando en modo Insert.</strong> El autoindent trata cada línea pegada como si la escribieras vos y le suma la sangría de la anterior: te queda una escalera. Es el motivo número uno de "vim me rompió el YAML".</div>
+
+<pre><code class="lang-vim">:set paste
+" recién ahora entrás en Insert y pegás
+:set nopaste</code></pre>
+
+<div class="warn"><strong>4. Matar la terminal con vim abierto.</strong> Vim deja un archivo de swap (<code>.archivo.swp</code>) con los cambios no guardados. La próxima vez que abras aparece el cartel de <em>swap file found</em>: si le das <em>Delete</em> por reflejo, tirás a la basura el único lugar donde estaba tu trabajo.</div>
+
+<pre><code class="lang-bash"># ✅ recuperá lo que quedó en el swap
+vim -r archivo.conf              # abre la versión recuperada
+# guardala con otro nombre, comparala, y recién ahí borrás el .swp
+diff archivo.conf archivo.conf.recuperado</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué vim tiene modos, si ningún editor gráfico los tiene?</summary>
+<p>Porque separa <strong>escribir texto</strong> de <strong>operar sobre el texto</strong>. En un editor común las teclas siempre insertan, así que cada acción necesita un atajo con Ctrl o Alt. En vim, como en modo Normal las letras están libres, cada una puede ser un verbo (<code>d</code> borrar, <code>c</code> cambiar, <code>y</code> copiar) que se combina con un movimiento (<code>w</code> palabra, <code>$</code> fin de línea): <code>d$</code> es "borrá hasta el final de la línea". Aprendés un puñado de verbos y de movimientos y se multiplican entre sí. El costo es el que ya conocés: si te olvidás de apretar <code>i</code>, tu texto se ejecuta como comandos.</p></details>
+
+<details><summary>¿Cuándo conviene <code>sed -i</code> y cuándo abrir el editor?</summary>
+<p>El editor es para cambios que necesitás <strong>ver</strong> mientras los hacés: un archivo, decisiones caso por caso. <code>sed -i</code> es para cambios <strong>mecánicos y repetibles</strong>: el mismo reemplazo en 200 archivos, o un paso dentro de un script que corre solo, sin nadie mirando. Regla práctica: si lo hacés una vez, editor; si lo hacés muchas veces o dentro de un script, <code>sed</code> — y con backup (<code>sed -i.bak</code>), porque <code>sed</code> no tiene una tecla <code>u</code> para deshacer.</p></details>
+
+<details><summary>Corrés <code>:%s/log/registro/g</code> en un archivo grande. ¿Qué puede salir mal y cómo lo arreglás?</summary>
+<p>Que reemplaza <strong>todas</strong> las ocurrencias de todas las líneas, incluidas las que no querías: <code>login</code> se convierte en <code>registroin</code> y <code>/var/log</code> en <code>/var/registro</code>. La <code>g</code> significa "todas las de cada línea" y el <code>%</code> "todas las líneas del archivo": juntos no perdonan nada. Si todavía no guardaste, <code>u</code> deshace el reemplazo completo de una vez. Para no llegar a eso: <code>:%s/log/registro/gc</code> te pregunta una por una, y acotar el patrón a palabra entera (<code>\&lt;log\&gt;</code>) te salva de los <code>login</code>.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

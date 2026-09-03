@@ -179,6 +179,63 @@ lsblk                      # lista dispositivos en árbol</code></pre>
 
 <p>Para automatizar: <code>/etc/fstab</code>.</p>
 
+<h2>Errores típicos con enlaces y montajes</h2>
+
+<div class="danger"><strong>1. Borrar un symlink a directorio con la barra final.</strong> <code>rm -rf enlace/</code> no borra el enlace: entra por él y borra el <strong>contenido del directorio real</strong> al que apunta. Un carácter de diferencia.</div>
+
+<pre><code class="lang-bash"># ❌ mal — vacía el directorio destino
+rm -rf backups/
+
+# ✅ bien — borra solo el enlace; el destino queda intacto
+rm backups
+
+# Antes de borrar, mirá siempre a dónde apunta:
+ls -l backups        # backups -&gt; /mnt/discos/backups-2026</code></pre>
+
+<div class="warn"><strong>2. Montar sobre un directorio que ya tenía archivos.</strong> El montaje no borra nada, pero <strong>tapa</strong> lo que había: parece que se perdió, y todo lo que escribas ahí va al disco nuevo. Al desmontar, los viejos "reaparecen" y los nuevos desaparecen.</div>
+
+<pre><code class="lang-bash"># ❌ mal — /mnt/datos ya tenía cosas adentro
+sudo mount /dev/sdb1 /mnt/datos
+
+# ✅ bien — verificá que el punto de montaje esté vacío
+ls -A /mnt/datos            # sin salida = vacío
+sudo mount /dev/sdb1 /mnt/datos
+findmnt /mnt/datos          # confirmá qué quedó montado</code></pre>
+
+<div class="danger"><strong>3. Tocar <code>/etc/fstab</code> y reiniciar sin probar.</strong> Una línea mal escrita ahí deja el sistema sin bootear (arranca en modo emergencia). Y ojo: <code>/dev/sdb1</code> puede cambiar de nombre entre arranques según el orden en que aparezcan los discos — usá el <strong>UUID</strong>, que no cambia.</div>
+
+<pre><code class="lang-bash"># ❌ mal — editar fstab con /dev/sdb1 y reiniciar a ciegas
+
+# ✅ bien
+sudo cp /etc/fstab /etc/fstab.bak     # backup primero
+blkid /dev/sdb1                       # de acá sacás el UUID
+sudo nano /etc/fstab                  # UUID=xxxx-xxxx /mnt/datos ext4 defaults,nofail 0 2
+sudo mount -a                         # PROBÁ acá: si no tira error, recién ahí reiniciás</code></pre>
+
+<div class="mistake"><strong>4. Sacar el pendrive sin desmontar.</strong> Linux cachea las escrituras: el archivo puede figurar como copiado y todavía no estar físicamente en el disco. Si tirás del USB en ese momento, lo perdés.</div>
+
+<pre><code class="lang-bash"># ❌ mal — copiar y sacar el pendrive
+cp -r ~/tesis /mnt/usb/
+
+# ✅ bien
+cp -r ~/tesis /mnt/usb/
+sync                        # fuerza el volcado de la caché a disco
+sudo umount /mnt/usb
+
+# Si dice "target is busy", averiguá quién lo está usando (no lo fuerces a ciegas):
+lsof +f -- /mnt/usb</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un hard link no puede cruzar de partición ni apuntar a un directorio, y un symlink sí?</summary>
+<p>Porque son cosas distintas. El <strong>hard link</strong> es otra entrada de directorio que apunta a un <strong>número de inodo</strong>, y los inodos se numeran <em>dentro</em> de cada sistema de archivos: el inodo 1234 de una partición no tiene nada que ver con el 1234 de otra. Además, permitir hard links a directorios habilitaría ciclos que dejarían dando vueltas a <code>find</code> o a <code>rm -r</code>. El <strong>symlink</strong> no guarda un inodo sino una <strong>ruta de texto</strong>, y una ruta se puede escribir apuntando a cualquier lado — por eso cruza filesystems y apunta a directorios, al precio de quedar roto si el destino desaparece.</p></details>
+
+<details><summary>¿Por qué <code>du</code> y <code>df</code> pueden darte números distintos del mismo disco?</summary>
+<p>Porque miden cosas distintas. <code>du</code> recorre el <strong>árbol de directorios</strong> y suma lo que encuentra; <code>df</code> le pregunta al <strong>filesystem</strong> cuántos bloques le quedan libres. Se separan cuando algo ocupa bloques pero no aparece en el árbol: archivos borrados que un proceso todavía tiene abiertos, archivos tapados por un montaje encima, o el ~5% de bloques que ext4 reserva para root. Si <code>df</code> dice "lleno" y <code>du</code> no encuentra a quién culpar, casi siempre es el primer caso.</p></details>
+
+<details><summary>¿Qué pasa si borrás un archivo que un proceso está usando?</summary>
+<p><code>rm</code> saca el <strong>nombre</strong> del directorio, no el contenido. Mientras haya un proceso con ese archivo abierto, el inodo sigue vivo y <strong>el espacio no se libera</strong>: el archivo ya no aparece en <code>ls</code>, pero el disco sigue igual de lleno. Se libera recién cuando ese proceso cierra el descriptor o termina. Es el caso típico de "borré los logs y el disco sigue al 100%": faltaba reiniciar el servicio que los tenía abiertos.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

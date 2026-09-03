@@ -212,6 +212,68 @@ build-backend = "setuptools.build_meta"</code></pre>
 uv pip install requests    # instala
 uv pip compile reqs.in -o reqs.txt</code></pre>
 
+<h2>Errores típicos con imports y entornos</h2>
+
+<div class="mistake">
+  <strong>Imports circulares.</strong> <code>a.py</code> importa <code>b</code> y <code>b</code> importa <code>a</code>. Cuando Python está a mitad de ejecutar <code>a</code>, el módulo ya existe en <code>sys.modules</code> pero todavía está <em>vacío</em>, así que el import de la vuelta falla. Casi siempre es señal de que hay una tercera pieza común esperando salir.
+<pre><code class="lang-python"># ❌ mal
+# usuarios.py
+from pedidos import calcular_total
+
+# pedidos.py
+from usuarios import Usuario
+# ImportError: cannot import name 'Usuario' from partially initialized
+# module 'usuarios' (most likely due to a circular import)
+
+# ✅ bien — extraé lo compartido a un tercer módulo
+# modelos.py   -&gt; define Usuario y Pedido
+# usuarios.py  -&gt; from modelos import Usuario
+# pedidos.py   -&gt; from modelos import Usuario, Pedido</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Llamar a tu archivo igual que un módulo del stdlib.</strong> El directorio del script va <strong>primero</strong> en <code>sys.path</code>, así que tu <code>random.py</code> le gana al de Python — y no solo para vos: también para cualquier librería que por adentro haga <code>import random</code>. Los clásicos que rompen todo: <code>json.py</code>, <code>email.py</code>, <code>types.py</code>, <code>test.py</code>, <code>logging.py</code>.
+<pre><code class="lang-python"># ❌ mal — tenés un archivo random.py al lado del script
+import random
+random.randint(1, 6)
+# AttributeError: module 'random' has no attribute 'randint'
+
+# ✅ bien — nombrá desde tu dominio
+# sorteo.py, dados.py, utils_random.py ...</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Correr con <code>python archivo.py</code> un módulo que usa imports relativos.</strong> Ejecutado así, el archivo pasa a ser <code>__main__</code> y <strong>no tiene paquete padre</strong>: el <code>.</code> del import no apunta a ningún lado.
+<pre><code class="lang-bash"># ❌ mal
+python mi_paquete/cli.py
+# ImportError: attempted relative import with no known parent package
+
+# ✅ bien — corré el paquete, no el archivo suelto
+python -m mi_paquete.cli</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Instalar con el venv desactivado.</strong> El paquete cae en el Python global y después, ya con el entorno activo, aparece el clásico <code>ModuleNotFoundError</code> de algo que "ya instalaste". Confirmá siempre <em>en qué</em> Python estás parado antes de instalar.
+<pre><code class="lang-bash"># ❌ mal
+pip install requests          # ¿en qué intérprete? nadie sabe
+
+# ✅ bien — activar, instalar con python -m pip, verificar
+source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+python -m pip install requests
+python -c "import sys; print(sys.prefix)"   # debe apuntar al .venv</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tres archivos distintos hacen <code>import config</code>. ¿Cuántas veces se ejecuta el código de nivel superior de <code>config.py</code>?</summary>
+<p><strong>Una sola.</strong> La primera vez Python ejecuta el módulo y guarda el objeto resultante en <code>sys.modules</code>; los imports siguientes solo devuelven esa misma instancia ya construida. Por eso un módulo funciona de hecho como un singleton (una constante definida ahí arriba es la misma para todos), y también por eso un <code>print()</code> suelto en un módulo solo aparece una vez por más que lo importes veinte veces.</p></details>
+
+<details><summary>¿Por qué un <code>__init__.py</code> que re-exporta medio paquete puede volverse un problema?</summary>
+<p>Porque convierte al <code>__init__.py</code> en una dependencia invisible: alguien escribe <code>from mi_paquete import Cosa</code> sin saber de qué archivo sale <code>Cosa</code>. El día que borrás o renombrás ese archivo, un grep por <code>from mi_paquete.modulo_x import</code> no encuentra nada y parece que no lo usa nadie... hasta que rompés a todos los que importaban desde el paquete. Además, todo lo que el <code>__init__.py</code> importa se ejecuta apenas tocás <em>cualquier</em> parte del paquete, lo que encarece el arranque y multiplica las chances de import circular.</p></details>
+
+<details><summary>¿Por qué cada proyecto necesita su propio venv en vez de instalar todo en el Python del sistema?</summary>
+<p>Porque las dependencias entran en conflicto: el proyecto A necesita <code>pandas 1.5</code> y el B <code>pandas 2.1</code>, y en un único entorno global solo puede ganar uno. El venv le da a cada proyecto su propio <code>site-packages</code>, con lo cual además podés congelar versiones exactas con <code>pip freeze</code> y que otra persona reproduzca <em>tu</em> entorno, no una mezcla imposible de repetir. Beneficio extra: si algo se pudre, borrás la carpeta <code>.venv</code> y volvés a empezar sin tocar el Python del sistema.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

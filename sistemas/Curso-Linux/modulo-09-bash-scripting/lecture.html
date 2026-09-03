@@ -395,6 +395,37 @@ set +x                           # desactivar</code></pre>
 
 <div class="tip">Usá <code>shellcheck</code> siempre. Detecta bugs sutiles antes de que rompan en producción.</div>
 
+<h2>Errores típicos que borran datos</h2>
+
+<div class="danger"><strong>Variable sin comillas en un <code>rm -rf</code>.</strong> Si <code>$DIR</code> está vacía o tiene un typo en el nombre, <code>rm -rf $DIR/</code> se expande literalmente a <code>rm -rf /</code>. Es el clásico que borró producción en más de una empresa.
+<pre><code class="lang-bash">rm -rf $DIR/                           # ❌ con DIR vacía, esto es: rm -rf /
+rm -rf "${DIR:?falta definir DIR}"/    # ✅ aborta el script si DIR está vacía o no existe</code></pre></div>
+
+<div class="danger"><strong><code>cd</code> sin comprobar que funcionó.</strong> Si el directorio no existe, el <code>cd</code> falla, el script sigue parado donde estaba y el comando siguiente se ejecuta <strong>donde no debía</strong>.
+<pre><code class="lang-bash">cd /opt/deploy/build; rm -rf *         # ❌ si el cd falla, vaciás el directorio actual
+cd /opt/deploy/build || exit 1         # ✅ cortá si no pudiste entrar
+rm -rf ./*</code></pre></div>
+
+<div class="mistake"><strong>Paths sin comillas.</strong> Sin comillas, bash hace <em>word splitting</em>: un archivo llamado <code>informe final.pdf</code> llega al comando como <strong>dos argumentos</strong>. Con <code>mv</code> o <code>rm</code>, el resultado va de un "no such file" inofensivo a tocar el archivo equivocado.
+<pre><code class="lang-bash">cp $archivo /backup                    # ❌ "informe final.pdf" se parte en 2 argumentos
+cp -- "$archivo" /backup/              # ✅ un solo argumento, y -- corta el parseo de flags</code></pre></div>
+
+<div class="mistake"><strong>Iterar la salida de <code>ls</code>.</strong> <code>for f in $(ls)</code> parte los nombres por espacios y saltos de línea, y encima vuelve a expandir los <code>*</code> que haya dentro de un nombre. Nunca parsees <code>ls</code> en un script.
+<pre><code class="lang-bash">for f in $(ls *.txt); do rm "$f"; done                        # ❌ se rompe con espacios
+for f in *.txt; do [ -e "$f" ] || continue; rm -- "$f"; done  # ✅ glob directo
+find . -name '*.txt' -print0 | xargs -0 rm --                 # ✅ para árboles grandes</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>"$@"</code> y <code>"$*"</code> no son lo mismo al reenviar los argumentos a otro comando?</summary>
+<p><code>"$@"</code> se expande a <strong>una palabra por argumento</strong>, respetando los que tienen espacios: si te pasaron <code>mi archivo.txt</code> entre comillas, sigue siendo un solo argumento del otro lado. <code>"$*"</code> junta todo en <strong>un único string</strong> separado por el primer carácter de <code>IFS</code>, así que el comando destino recibe un solo parámetro gigante. Para reenviar argumentos, siempre <code>"$@"</code> con comillas; <code>"$*"</code> sirve para mostrar o loguear.</p></details>
+
+<details><summary>¿Qué hace <code>set -u</code> y por qué te salva justo de un <code>rm -rf</code>?</summary>
+<p>Hace que el script <strong>aborte cuando usás una variable que no está definida</strong>, en vez de expandirla en silencio a la cadena vacía. Ese vacío silencioso es exactamente lo que convierte <code>rm -rf $DIR/</code> en <code>rm -rf /</code> cuando escribiste mal el nombre de la variable o el <code>export</code> nunca corrió. Con <code>set -u</code> (o con la forma <code>${DIR:?}</code>) el script muere antes de tocar el disco. Es la <code>u</code> de <code>set -euo pipefail</code>.</p></details>
+
+<details><summary>Con una variable vacía y sin comillas, ¿por qué <code>[ $x = "y" ]</code> revienta y <code>[[ $x == "y" ]]</code> no?</summary>
+<p>Porque son cosas distintas. <code>[ ]</code> es un <strong>comando</strong> que recibe argumentos ya expandidos por el shell: con <code>$x</code> vacía le llegan solo <code>=</code> e <code>y</code>, y protesta por sintaxis. <code>[[ ]]</code> es <strong>sintaxis del propio bash</strong>: no hace word splitting ni expansión de globs sobre sus operandos, por eso tolera la variable vacía y además te habilita <code>=~</code> y los patrones. Igual, la conclusión práctica es la misma: poné las comillas siempre, y usá <code>[[ ]]</code> cuando ya sabés que el script corre en bash.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

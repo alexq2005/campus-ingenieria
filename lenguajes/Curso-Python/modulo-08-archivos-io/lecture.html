@@ -228,6 +228,73 @@ parser.add_argument("--verbose", "-v", action="store_true")
 args = parser.parse_args()
 print(args.input, args.output, args.verbose)</code></pre>
 
+<h2>Errores típicos con archivos</h2>
+
+<div class="mistake">
+  <strong>Usar el archivo fuera del <code>with</code>.</strong> Al salir del bloque el handle ya está cerrado: cualquier lectura posterior revienta. El <code>with</code> tiene que envolver <em>todo</em> el uso, no solo el <code>open</code>.
+<pre><code class="lang-python"># ❌ mal
+with open("datos.txt", encoding="utf-8") as f:
+    pass
+for linea in f:                    # ValueError: I/O operation on closed file
+    print(linea)
+
+# ✅ bien
+with open("datos.txt", encoding="utf-8") as f:
+    for linea in f:
+        print(linea.rstrip())</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Leer dos veces el mismo handle.</strong> Un archivo abierto tiene un <strong>cursor</strong>. Después de un <code>read()</code> quedó al final, así que la segunda lectura devuelve vacío — <em>y no lanza ningún error</em>, que es lo peor de todo.
+<pre><code class="lang-python"># ❌ mal
+with open("datos.txt", encoding="utf-8") as f:
+    contenido = f.read()
+    lineas = f.readlines()    # [] — el cursor ya está en el final
+
+# ✅ bien — volvé al principio, o leé una sola vez y trabajá en memoria
+with open("datos.txt", encoding="utf-8") as f:
+    contenido = f.read()
+    f.seek(0)
+    lineas = f.readlines()</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Confundir <code>dump</code> con <code>dumps</code> (y <code>load</code> con <code>loads</code>).</strong> Las versiones con <code>s</code> trabajan con <strong>strings</strong>; las que no, con un <strong>archivo abierto</strong>. Pasarle una ruta a <code>json.dump</code> falla con <code>AttributeError: 'str' object has no attribute 'write'</code>.
+<pre><code class="lang-python"># ❌ mal
+json.dump(datos, "usuario.json")          # espera un file object, no una ruta
+config = json.loads(open("cfg.json"))     # loads espera un string, no un archivo
+
+# ✅ bien
+with open("usuario.json", "w", encoding="utf-8") as f:
+    json.dump(datos, f, indent=2, ensure_ascii=False)
+
+with open("cfg.json", encoding="utf-8") as f:
+    config = json.load(f)</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Armar rutas concatenando strings.</strong> Se rompe al cambiar de sistema operativo, duplica barras y no expande <code>~</code> (para <code>open()</code> la virgulilla es un carácter común: solo el shell la traduce). <code>pathlib</code> resuelve las tres cosas.
+<pre><code class="lang-python"># ❌ mal
+ruta = "datos" + "/" + "archivos" + "/input.txt"
+config = open("~/config.json")     # FileNotFoundError: '~/config.json'
+
+# ✅ bien
+from pathlib import Path
+ruta = Path("datos") / "archivos" / "input.txt"
+config = (Path.home() / "config.json").read_text(encoding="utf-8")</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué iterar con <code>for linea in f:</code> es mejor que <code>f.readlines()</code> en un archivo de varios GB?</summary>
+<p>Porque <code>readlines()</code> arma una <strong>lista con todas las líneas en memoria</strong> antes de que puedas tocar la primera: un archivo de 4 GB necesita 4 GB de RAM (más overhead) y probablemente te tire <code>MemoryError</code>. Iterando el archivo directamente, Python lee de a un buffer y descarta cada línea cuando terminás con ella: memoria constante sin importar el tamaño.</p></details>
+
+<details><summary>Si en tu máquina funciona igual sin ponerlo, ¿por qué pasar <code>encoding="utf-8"</code> explícito?</summary>
+<p>Porque sin el parámetro Python usa el encoding <em>por defecto del sistema</em>, y ese default cambia de máquina en máquina: en Windows suele ser cp1252, en Linux/macOS UTF-8. El mismo script te anda perfecto y en la compu del de al lado explota con <code>UnicodeDecodeError</code> ante la primera "ñ" o el primer emoji. Ponerlo explícito hace que el comportamiento sea el mismo en todos lados.</p></details>
+
+<details><summary>Guardás una tupla en un JSON y al leerla vuelve como lista. ¿Por qué?</summary>
+<p>Porque JSON es un formato de intercambio entre lenguajes y su vocabulario es chico: objetos, arrays, strings, números, booleanos y null. <strong>No existe el concepto de tupla</strong>, así que <code>json.dump</code> la serializa como array y <code>json.load</code> la trae de vuelta como <code>list</code>, que es lo más parecido en Python. Lo mismo pasa con <code>set</code>, <code>datetime</code> o tus clases propias: si necesitás conservarlos, tenés que convertirlos vos (con <code>default=</code> al escribir y reconstruirlos al leer).</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

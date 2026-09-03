@@ -224,6 +224,57 @@ sudo -u ana comando</code></pre>
 
 <p>Editar <code>/etc/sudoers</code> con <code>visudo</code>.</p>
 
+<h2>Errores típicos con permisos</h2>
+
+<div class="danger"><strong>1. <code>chmod 777</code> como "solución" a un Permission denied.</strong> Funciona, sí — igual que sacar la puerta soluciona el problema de la llave. <code>777</code> le da lectura, escritura y ejecución a <strong>cualquier usuario del sistema</strong>, incluido el proceso comprometido de mañana. En un directorio web es la receta para que te suban un script y lo ejecuten.</div>
+
+<pre><code class="lang-bash"># ❌ mal
+sudo chmod -R 777 /var/www/html
+
+# ✅ bien — el problema casi nunca es el permiso, es el dueño
+sudo chown -R www-data:www-data /var/www/html
+sudo find /var/www/html -type d -exec chmod 755 {} \;
+sudo find /var/www/html -type f -exec chmod 644 {} \;</code></pre>
+
+<div class="danger"><strong>2. <code>chmod -R 644</code> sobre un directorio.</strong> Les saca el <code>x</code> a los directorios, y sin <code>x</code> no se puede entrar: <code>cd</code> falla, <code>ls</code> falla y todo lo de adentro queda inaccesible aunque los archivos estén perfectos. Para eso existe la <code>X</code> mayúscula: aplica el <code>x</code> <strong>solo</strong> a directorios (y a lo que ya era ejecutable).</div>
+
+<pre><code class="lang-bash"># ❌ mal — te dejás afuera de tus propias carpetas
+chmod -R 644 proyecto/
+
+# ✅ bien — 644 a los archivos y 755 a los directorios, en un solo comando
+chmod -R u=rwX,go=rX proyecto/</code></pre>
+
+<div class="warn"><strong>3. <code>chmod -R</code> sobre tu home.</strong> Barre con los permisos restrictivos que algunos programas <strong>exigen</strong>: SSH rechaza una clave privada que sea legible por otros, y GnuPG hace lo mismo con su directorio. Después el error dice "UNPROTECTED PRIVATE KEY FILE" y no "vos hiciste chmod -R".</div>
+
+<pre><code class="lang-bash"># ❌ mal
+chmod -R 755 ~
+
+# ✅ bien — dejá que esas carpetas conserven sus permisos propios
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+chmod 600 ~/.ssh/authorized_keys</code></pre>
+
+<div class="mistake"><strong>4. Ponerle setuid a un script propio.</strong> <code>chmod u+s mi-script.sh</code> no hace nada: Linux <strong>ignora el bit setuid en scripts</strong> a propósito, porque entre que el kernel lee el <code>#!</code> y el intérprete abre el archivo hay una ventana explotable. El bit queda puesto, dando la falsa sensación de que algo se configuró.</div>
+
+<pre><code class="lang-bash"># ❌ mal — el bit se pone, pero el script NO corre como root
+sudo chmod u+s /usr/local/bin/deploy.sh
+
+# ✅ bien — permiso explícito y acotado vía sudoers (editado con visudo)
+# ana  ALL=(root) NOPASSWD: /usr/local/bin/deploy.sh
+sudo visudo -f /etc/sudoers.d/deploy</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué podés borrar un archivo sobre el que no tenés permiso de escritura?</summary>
+<p>Porque borrar no es modificar el archivo: es <strong>sacar su nombre de la lista del directorio</strong>. Lo que manda entonces son los permisos del <strong>directorio que lo contiene</strong> (<code>w</code> para modificar esa lista y <code>x</code> para atravesarlo), no los del archivo. Por eso, en una carpeta tuya, podés borrar un archivo de root que dice <code>r--r--r--</code>. Y por eso <code>/tmp</code>, donde todos escriben, necesita el <strong>sticky bit</strong>: sin él, cualquiera podría borrar los temporales de cualquiera.</p></details>
+
+<details><summary>¿Qué diferencia hay entre <code>chmod 644</code> y <code>umask 022</code>?</summary>
+<p><code>chmod</code> <strong>fija</strong> los permisos de algo que ya existe. <code>umask</code> es una <strong>máscara que resta</strong> permisos en el momento de crear algo nuevo, y no toca nada de lo existente. Con <code>umask 022</code>, un archivo que nacería <code>666</code> queda en <code>644</code> y un directorio que nacería <code>777</code> queda en <code>755</code>. Fijate que los archivos nunca nacen ejecutables: ese <code>x</code> se lo ponés vos a mano con <code>chmod +x</code>, la umask no lo puede agregar porque solo sabe quitar.</p></details>
+
+<details><summary>Si vos no podés leer <code>/etc/shadow</code>, ¿cómo hace <code>passwd</code> para cambiar tu contraseña ahí adentro?</summary>
+<p>Con <strong>setuid</strong>. <code>/usr/bin/passwd</code> tiene el bit <code>s</code> en el dueño (<code>-rwsr-xr-x root root</code>), así que cuando vos lo ejecutás el proceso corre con los privilegios de <strong>root</strong>, no con los tuyos. Es la manera de darle a un usuario común una capacidad puntual sin darle root entero: el programa hace exactamente una cosa y la hace con cuidado. Por eso los binarios setuid son un objetivo clásico de ataque — cualquier bug adentro se ejecuta como root. Listá los que tenés con <code>find /usr/bin -perm -4000</code>.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

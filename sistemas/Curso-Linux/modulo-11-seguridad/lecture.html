@@ -300,6 +300,51 @@ sudo journalctl -u sshd</code></pre>
   <li>☐ Usuarios sin shell para servicios (<code>/usr/sbin/nologin</code>)</li>
 </ul>
 
+<h2>Errores típicos que te dejan sin acceso (o sin seguridad)</h2>
+
+<div class="danger"><strong>Recargar sshd sin validar la config.</strong> Un typo en <code>sshd_config</code> y el daemon no vuelve a levantar. Si ya cerraste la sesión y no tenés consola física ni panel del proveedor, el servidor queda inaccesible.
+<pre><code class="lang-bash">sudo systemctl restart sshd            # ❌ a ciegas y con una sola sesión abierta
+# ✅ el ritual completo:
+sudo sshd -t                           # 1. validar la sintaxis
+sudo systemctl reload sshd             # 2. recargar (reload, no restart)
+ssh user@host                          # 3. probar desde OTRA terminal
+# 4. recién ahí cerrás la sesión original</code></pre></div>
+
+<div class="danger"><strong>Apagar la contraseña antes de subir la llave.</strong> Con <code>PasswordAuthentication no</code> y sin tu pública en <code>authorized_keys</code>, no queda ninguna forma de entrar al servidor.
+<pre><code class="lang-bash"># ✅ el orden importa:
+ssh-copy-id user@host                  # 1. subir la llave pública
+ssh user@host                          # 2. confirmar que entrás SIN contraseña
+# 3. recién ahí poner PasswordAuthentication no en sshd_config
+sudo sshd -t &amp;&amp; sudo systemctl reload sshd</code></pre></div>
+
+<div class="danger"><strong><code>chmod 777</code> como "solución" a un permiso denegado.</strong> Le das escritura a <em>cualquier</em> usuario o proceso de la máquina: si el server web tiene una vulnerabilidad, ahora puede reescribir tu sitio. Y encima, en RHEL/Fedora muchas veces el bloqueo no era de permisos sino de <strong>contexto SELinux</strong>, así que el 777 ni siquiera arregla el problema.
+<pre><code class="lang-bash">sudo chmod -R 777 /var/www/html        # ❌ el sistema entero con permiso de escritura
+# ✅ dueño correcto + permisos mínimos:
+sudo chown -R root:www-data /var/www/html
+sudo find /var/www/html -type d -exec chmod 750 {} +
+sudo find /var/www/html -type f -exec chmod 640 {} +
+sudo ausearch -m avc -ts recent        # 🔎 si es RHEL, fijate si el que bloqueó fue SELinux
+sudo restorecon -Rv /var/www/html</code></pre></div>
+
+<div class="mistake"><strong>Desactivar SELinux o el firewall "para probar" y dejarlo así.</strong> Es la forma más rápida de que algo funcione y la más rápida de quedar expuesto: nadie vuelve a prenderlo, y el problema real sigue ahí sin diagnosticar.
+<pre><code class="lang-bash">sudo setenforce 0                      # ❌ queda permissive y nadie lo revierte
+sudo systemctl stop firewalld          # ❌ ídem
+# ✅ averiguá qué bloqueó y arreglá eso:
+sudo ausearch -m avc -ts recent
+sudo setsebool -P httpd_can_network_connect 1
+sudo setenforce 1 &amp;&amp; getenforce        # volvé a Enforcing y verificalo</code></pre></div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Mover SSH del puerto 22 al 2222, ¿es seguridad? ¿Qué sí lo es?</summary>
+<p>No es seguridad, es <strong>reducción de ruido</strong>. Los bots que escanean internet golpean el 22 en masa; correrlo a otro puerto te limpia el <code>auth.log</code>, pero cualquier escaneo con <code>nmap</code> lo encuentra en segundos, así que no frena a nadie que te apunte a vos en particular. Lo que protege de verdad es lo que no depende de que el puerto sea un secreto: solo llaves (<code>PasswordAuthentication no</code>), <code>PermitRootLogin no</code>, <code>AllowUsers</code> o <code>AllowGroups</code>, <code>MaxAuthTries</code>, el firewall filtrando por red de origen y fail2ban. El puerto alto es una comodidad, no una defensa.</p></details>
+
+<details><summary>Si los permisos UGO ya están bien puestos, ¿qué agregan SELinux o AppArmor?</summary>
+<p>Los permisos clásicos son <strong>discrecionales</strong> (DAC): el dueño de un archivo puede aflojarlos cuando quiera, y un proceso que corre como root los ignora a todos. SELinux y AppArmor son <strong>obligatorios</strong> (MAC): las reglas las impone el kernel según el contexto o el perfil del proceso, y ni el dueño ni root las relajan sobre la marcha. El valor real se ve cuando algo se compromete: aunque el atacante logre ejecutar código dentro de nginx, el perfil solo le permite tocar lo que nginx necesita, no <code>/etc/shadow</code> ni el directorio de tu base de datos.</p></details>
+
+<details><summary>¿Por qué el checklist dice usar <code>sudo</code> en lugar de <code>su -</code>?</summary>
+<p>Por tres razones. <strong>Trazabilidad</strong>: cada comando con sudo queda registrado junto al usuario que lo ejecutó en <code>/var/log/auth.log</code> o en el journal, mientras que con <code>su -</code> todo lo hizo "root" y en un incidente no sabés quién fue. <strong>Granularidad</strong>: en <code>sudoers</code> podés autorizar comandos puntuales a una persona en vez de entregarle el sistema entero. Y <strong>secretos</strong>: con sudo cada uno usa su propia contraseña, así que no hay una password de root compartida por el equipo que haya que rotar cada vez que alguien se va. Como bonus, el privilegio dura un comando y no toda la terminal.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

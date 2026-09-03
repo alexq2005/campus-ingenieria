@@ -229,6 +229,67 @@ quota -u ana                               # ver</code></pre>
   <li><strong>Bloquear cuentas inactivas</strong>: <code>chage -E</code> para expiración</li>
 </ol>
 
+<h2>Errores típicos administrando usuarios</h2>
+
+<div class="danger"><strong>1. Borrar un usuario y dejarle los archivos.</strong> <code>userdel ana</code> sin <code>-r</code> deja su home y todo lo que tuviera repartido por el sistema con el <strong>UID huérfano</strong>. El próximo usuario que crees va a reusar ese UID… y hereda automáticamente todos esos archivos, incluidas sus claves SSH.</div>
+
+<pre><code class="lang-bash"># ❌ mal — el home queda, y el UID 1001 queda libre para el que venga
+sudo userdel ana
+
+# ✅ bien — respaldá primero y después borrá también sus datos
+sudo tar -czf /respaldos/ana-$(date +%F).tar.gz /home/ana
+sudo userdel -r ana
+
+# Buscá lo que haya quedado suelto por el resto del sistema:
+sudo find / -xdev -nouser 2&gt;/dev/null</code></pre>
+
+<div class="mistake"><strong>2. Agregarte a un grupo y esperar que funcione en la misma terminal.</strong> Los grupos se leen <strong>al iniciar sesión</strong>: tu shell actual sigue con la lista vieja. El caso clásico es sumarse a <code>docker</code> y que <code>docker ps</code> siga tirando permission denied.</div>
+
+<pre><code class="lang-bash">sudo usermod -aG docker ana
+groups                        # ❌ docker todavía NO aparece
+
+# ✅ cerrá sesión y volvé a entrar; o, para la terminal actual:
+newgrp docker
+id -nG                        # ahora sí</code></pre>
+
+<div class="danger"><strong>3. Regalar <code>NOPASSWD: ALL</code> "para no andar poniendo la contraseña".</strong> Eso es root permanente y sin fricción para esa cuenta: quien le robe la sesión, se queda con el equipo. Y ojo, tampoco alcanza con acotar el comando si ese comando puede abrir una shell: <code>vi</code>, <code>find</code>, <code>less</code> o <code>awk</code> con sudo son root disfrazado.</div>
+
+<pre><code class="lang-bash"># ❌ mal — root sin contraseña, para siempre
+# ana ALL=(ALL) NOPASSWD: ALL
+
+# ❌ también mal — desde vi se abre una shell root con :!bash
+# ana ALL=(root) NOPASSWD: /usr/bin/vi
+
+# ✅ bien — un comando concreto, con ruta absoluta y argumentos fijos
+# ana ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+sudo visudo -f /etc/sudoers.d/ana-nginx
+sudo -l                       # verificá qué quedó realmente habilitado</code></pre>
+
+<div class="warn"><strong>4. Editar <code>/etc/passwd</code> o <code>/etc/shadow</code> a mano con un editor común.</strong> Si otro proceso (un <code>useradd</code>, un <code>passwd</code>) escribe al mismo tiempo, se pisan y el archivo queda inconsistente: nadie puede loguearse. <code>vipw</code> y <code>vipw -s</code> toman el lock y validan al salir.</div>
+
+<pre><code class="lang-bash"># ❌ mal
+sudo nano /etc/passwd
+
+# ✅ bien — con lock y validación
+sudo vipw          # /etc/passwd
+sudo vipw -s       # /etc/shadow
+sudo vigr          # /etc/group
+
+# Chequeo de consistencia después de tocar algo:
+sudo pwck -r
+sudo grpck -r</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>sudo</code> te pide TU contraseña y no la de root?</summary>
+<p>Porque <code>sudo</code> no te convierte en root pidiéndote el secreto de root: verifica que <strong>vos sos vos</strong> y después consulta en <code>/etc/sudoers</code> qué te dejaron hacer. Eso trae tres ventajas sobre <code>su -</code>: la contraseña de root no la conoce nadie (en muchas distros la cuenta viene directamente bloqueada), cada usuario puede tener permisos distintos, y todo queda <strong>auditado a tu nombre</strong> en <code>/var/log/auth.log</code>. Con un <code>su -</code> compartido, el log solo dice "alguien fue root" y no sabés quién.</p></details>
+
+<details><summary>¿Qué diferencia hay entre <code>su ana</code> y <code>su - ana</code>?</summary>
+<p>El guion pide una <strong>login shell</strong>. Sin él cambiás de usuario pero te quedás con el entorno anterior: seguís parado en el mismo directorio y con el <code>PATH</code>, el <code>HOME</code> y las variables del usuario de antes, así que un script puede escribir en el home equivocado o no encontrar un binario de <code>/sbin</code>. Con <code>su - ana</code> el entorno se arma de cero como en un login real: se leen los <code>.profile</code>/<code>.bashrc</code> de ana y quedás en su home. La misma diferencia hay entre <code>sudo -s</code> y <code>sudo -i</code>.</p></details>
+
+<details><summary>¿Por qué muchos usuarios de <code>/etc/passwd</code> tienen <code>/usr/sbin/nologin</code> como shell?</summary>
+<p>Porque son <strong>usuarios de sistema</strong> (UID por debajo de 1000): existen para que un servicio corra con identidad propia y permisos acotados — <code>www-data</code> para el servidor web, <code>postgres</code> para la base — no para que alguien se loguee con ellos. Poner <code>nologin</code> (o <code>/bin/false</code>) hace que cualquier intento de abrir una sesión con esa cuenta se rechace. Es contención de daño: si mañana alguien explota el servidor web, se encuentra parado en una cuenta sin shell, sin home útil y sin sudo, en vez de en root.</p></details>
+
 <h2>Ejercicios</h2>
 
 <ol>

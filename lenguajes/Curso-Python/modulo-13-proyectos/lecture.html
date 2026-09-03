@@ -215,6 +215,75 @@ def obtener(id: int):
 <p>El siguiente paso es <strong>practicar</strong>: elegí UNO de los 3 proyectos y construilo de cero, sin copiar. Cuando termines, hacé otro. Ahí es donde el conocimiento se convierte en habilidad.</p>
 
 
+<h2>Errores típicos al construir estos proyectos</h2>
+
+<div class="mistake">
+  <strong>Escribir <code>"~/.tareas.json"</code> y esperar que Python expanda el <code>~</code>.</strong> Para <code>open()</code> la virgulilla es un carácter común: te termina creando una carpeta llamada literalmente <code>~</code> dentro del directorio actual. Solo el shell la traduce.
+<pre><code class="lang-python"># ❌ mal
+with open("~/.tareas.json", encoding="utf-8") as f:    # FileNotFoundError
+    tareas = json.load(f)
+
+# ✅ bien
+from pathlib import Path
+RUTA = Path.home() / ".tareas.json"
+tareas = json.loads(RUTA.read_text(encoding="utf-8"))</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Escribir el JSON directo sobre el archivo bueno.</strong> <code>open(ruta, "w")</code> <strong>trunca antes de escribir</strong>: si el proceso muere a mitad (Ctrl+C, disco lleno, un <code>TypeError</code> serializando un <code>datetime</code>), el usuario pierde todas sus tareas. Escribí a un temporal y reemplazá de una sola vez.
+<pre><code class="lang-python"># ❌ mal — si revienta acá, el archivo queda a medias
+with open(RUTA, "w", encoding="utf-8") as f:
+    json.dump(tareas, f, indent=2)
+
+# ✅ bien — escritura atómica: primero el temporal, después el reemplazo
+import os
+tmp = RUTA.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(tareas, indent=2, ensure_ascii=False), encoding="utf-8")
+os.replace(tmp, RUTA)          # os.replace es atómico: o el viejo o el nuevo</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Llamar a <code>asyncio.gather</code> sin <code>return_exceptions=True</code>.</strong> Por defecto, la primera corutina que falla propaga su excepción y perdés los resultados de las otras 49 URLs que sí andaban. Un scraper tiene que sobrevivir a un 500 o a un DNS caído.
+<pre><code class="lang-python"># ❌ mal — una URL rota tumba el batch entero
+resultados = await asyncio.gather(*(scrape(session, u) for u in urls))
+
+# ✅ bien — cada fallo vuelve como objeto excepción y lo filtrás
+resultados = await asyncio.gather(
+    *(scrape(session, u) for u in urls), return_exceptions=True
+)
+ok = [r for r in resultados if not isinstance(r, Exception)]
+for r in resultados:
+    if isinstance(r, Exception):
+        log.warning("falló una URL: %r", r)</code></pre>
+</div>
+
+<div class="mistake">
+  <strong>Dejar el <code>dict</code> en memoria como base de datos definitiva.</strong> El <code>productos: dict[int, Producto]</code> del ejemplo es un andamio para arrancar rápido: se borra en cada reinicio y, con <code>uvicorn --workers 4</code>, cada worker tiene el suyo — el <code>POST</code> cae en un proceso y el <code>GET</code> en otro, así que el producto "desaparece" una de cada cuatro veces. Por eso el requisito del proyecto es SQLite. El <code>max(...) + 1</code> para generar ids tiene el mismo problema: reusa el id de una fila borrada.
+<pre><code class="lang-python"># ❌ mal en producción — estado por proceso, ids reciclados
+productos: dict[int, Producto] = {}
+nuevo_id = max(productos.keys(), default=0) + 1
+
+# ✅ bien — estado compartido, persistente, con ids que no se repiten
+import sqlite3
+con = sqlite3.connect("productos.db", check_same_thread=False)
+con.execute(
+    "CREATE TABLE IF NOT EXISTS productos ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "nombre TEXT NOT NULL, precio REAL NOT NULL, stock INTEGER DEFAULT 0)"
+)</code></pre>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el gestor de tareas es una app chiquita, ¿por qué separar <code>almacenamiento.py</code> de <code>cli.py</code>?</summary>
+<p>Porque son dos responsabilidades con ritmos distintos. <code>almacenamiento.py</code> sabe de JSON y de disco; <code>cli.py</code> sabe de argumentos y de imprimir en pantalla. Separados podés testear el guardado pasándole una ruta temporal, sin simular ningún comando; podés cambiar JSON por SQLite tocando un solo archivo; y el día que quieras agregarle una interfaz web, la lógica ya está lista para reusar. Mezclados, cada test necesita levantar el CLI entero y cualquier cambio de formato te obliga a revisar todo. El tamaño de la app no cambia el argumento: cambia cuánto te duele haberlo ignorado.</p></details>
+
+<details><summary>¿Qué gana el Proyecto 1 usando <code>@dataclass Tarea</code> en vez de un <code>dict</code> por tarea?</summary>
+<p>Gana un <strong>contrato explícito</strong>. Con un dict, <code>tarea["descripcion"]</code> mal escrito es un <code>KeyError</code> en runtime y <code>tarea["hecha"]</code> vs <code>tarea["completada"]</code> conviven felices hasta que algo falla raro; nadie sabe qué campos existen sin ir a leer dónde se creó el dict. La dataclass declara los campos y sus tipos en un solo lugar, te regala <code>__init__</code>, <code>__repr__</code> y <code>__eq__</code>, el editor te autocompleta y mypy te avisa antes de correr. El costo de convertir a JSON es mínimo: <code>dataclasses.asdict()</code> para escribir y <code>Tarea(**fila)</code> para leer.</p></details>
+
+<details><summary>Si el código de referencia ya está escrito, ¿por qué te pedimos construir el proyecto de cero sin copiar?</summary>
+<p>Porque leer código activa el <em>reconocimiento</em> ("claro, tiene sentido") y escribirlo activa el <em>recuerdo</em>, que es lo único que después vas a tener disponible en una pantalla en blanco. Al copiar te salteás justo las decisiones que forman el criterio: dónde cortar los módulos, qué excepción lanzar, qué hacer si el JSON está corrupto. Y sobre todo te salteás el error, que es donde de verdad se aprende: hasta que no viste tu propio <code>FileNotFoundError</code> por el <code>~</code>, esa trampa no es tuya. La referencia sirve para comparar <em>después</em> de intentarlo, no para arrancar.</p></details>
+
 <section class="quiz" id="quizPy13">
 
 <style>
