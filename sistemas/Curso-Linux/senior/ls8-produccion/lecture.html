@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS8 — Producción: automatización, HA y runbooks · Linux Senior</title>
+  <meta name="description" content="Infraestructura como código con Ansible e idempotencia, testeo de infraestructura, drift, alta disponibilidad real, backups medidos por tiempo de restauración, actualizaciones sin downtime, observabilidad del host, runbooks y capacity planning.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS8</span>
+  <span class="badge">⏱ 40–110 min</span>
+  <span class="badge">🎯 Pre-req: LS1–LS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>LS8 — Producción: automatización, HA y runbooks</h1>
+
+<h2>LS8.0 Por qué este módulo</h2>
+
+<p>Los siete módulos anteriores te dieron el mapa interno de Linux: procesos y scheduler (LS1), memoria y presión (LS2), namespaces y cgroups (LS3), almacenamiento (LS4), red (LS5), eBPF (LS6) y systemd (LS7). Sabés diagnosticar. Este módulo es sobre lo otro: <strong>operar</strong>. Y operar bien tiene una definición incómodamente simple.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La diferencia entre un sysadmin y un SRE no es cuánto sabe de Linux: es que el segundo <strong>no toca servidores a mano</strong>. Cada cambio manual es un dato que existe en un solo lugar —la memoria de quien lo hizo— y que nadie puede revisar, revertir ni reproducir. La automatización no es comodidad: es la única forma conocida de que un sistema sea <em>auditable</em> y <em>recreable</em>.
+</div>
+
+<p>Esto no es ideología. Es una consecuencia aritmética: administrar 3 servidores a mano es viable, 30 es doloroso y 300 es imposible. Pero el punto importante es que <strong>el umbral real es 1</strong>, porque el problema no aparece cuando tenés muchos servidores: aparece el día que tenés que <em>volver a construir uno</em> y nadie se acuerda de qué le hicieron durante tres años.</p>
+
+<h2>LS8.1 Mascotas y ganado: el servidor que nadie se anima a tocar</h2>
+
+<p>La metáfora es vieja y sigue siendo la mejor que hay:</p>
+
+<div class="analogy">
+  <strong>🐕 Una mascota</strong> tiene nombre propio (<code>zeus</code>, <code>atenea</code>), es única, la cuidás cuando se enferma y si se muere es un drama. <strong>🐄 El ganado</strong> tiene número (<code>web-07</code>), es intercambiable, y si uno falla lo reemplazás sin ceremonia. La pregunta de diagnóstico es: <em>si este servidor se prende fuego ahora, ¿cuánto tardás en tener otro idéntico?</em> Si la respuesta es "no sé" o "días", tenés una mascota.
+</div>
+
+<p>El servidor mascota se construye solo, sin que nadie lo decida. Alguien instala un paquete "para probar" y queda. Alguien edita un <code>/etc/</code> a las tres de la mañana durante un incidente y no lo documenta. Alguien agrega una entrada al cron. Tres años después el servidor funciona por razones que nadie puede enumerar completas, y eso convierte cualquier cambio en un acto de fe.</p>
+
+<div class="danger">
+  <strong>⚠️ El costo real no es el desorden: es la parálisis.</strong> Un servidor cuyo estado nadie puede reproducir se vuelve intocable. No se actualiza (¿y si se rompe?), no se migra, no se clona para hacer staging. Y como no se actualiza, acumula CVEs. La deuda técnica de infraestructura se paga siempre, y casi siempre se paga en el peor momento: durante una caída, o durante una auditoría de seguridad.
+</div>
+
+<h3>Infraestructura inmutable</h3>
+
+<p>La respuesta moderna es dejar de <em>modificar</em> servidores y pasar a <strong>reemplazarlos</strong>. En un esquema inmutable, un servidor se construye una vez desde una definición versionada y después <strong>nadie le hace SSH para cambiarle nada</strong>: si hay que cambiar algo, se cambia la definición, se construye una máquina nueva y se descarta la vieja.</p>
+
+<table>
+<thead><tr><th>Modelo</th><th>Cómo se cambia algo</th><th>Qué garantiza</th></tr></thead>
+<tbody>
+<tr><td><strong>Mutable manual</strong></td><td>SSH + editar</td><td>Nada. El estado real es desconocido</td></tr>
+<tr><td><strong>Mutable declarativo</strong> (Ansible, Puppet)</td><td>Cambiar el código, re-aplicar</td><td>Convergencia: el servidor <em>tiende</em> al estado declarado</td></tr>
+<tr><td><strong>Inmutable</strong> (imagen, contenedor)</td><td>Construir imagen nueva, reemplazar</td><td>Identidad: dos servidores de la misma imagen <em>son</em> iguales</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Inmutable no significa "sin estado". Los datos siguen viviendo en algún lado —una base, un volumen, un bucket— y ese lado sí es mutable y sí necesita backups. Lo que se vuelve inmutable es el <strong>sistema operativo y la aplicación</strong>: la parte que se puede reconstruir desde código.
+</div>
+
+<h2>LS8.2 Infraestructura como código: Ansible y la idempotencia</h2>
+
+<p>Ansible corre por SSH, no necesita agente en el destino y se escribe en YAML. Esa combinación explica su adopción: el primer playbook útil sale en una tarde. Pero lo que hay que entender no es la sintaxis, es <strong>el cambio de mentalidad de imperativo a declarativo</strong>.</p>
+
+<h3>El inventario: quién es quién</h3>
+
+<pre><code class="lang-ini"># inventory/prod.ini — la flota, agrupada por rol
+[web]
+web-01.prod.internal
+web-02.prod.internal
+web-03.prod.internal
+
+[db]
+db-01.prod.internal  postgres_role=primary
+db-02.prod.internal  postgres_role=replica
+
+[lb]
+lb-01.prod.internal
+
+[prod:children]
+web
+db
+lb
+
+[prod:vars]
+ansible_user=deploy
+ansible_python_interpreter=/usr/bin/python3</code></pre>
+
+<h3>El playbook: qué es cada grupo</h3>
+
+<pre><code class="lang-yaml"># site.yml — la definición completa de la plataforma
+- name: Servidores web
+  hosts: web
+  become: true
+  vars:
+    app_user: appsvc
+    app_port: 8080
+  roles:
+    - base        # usuarios, sshd, ntp, sysctl, auditd
+    - nginx
+    - app
+
+- name: Base de datos
+  hosts: db
+  become: true
+  roles:
+    - base
+    - postgres</code></pre>
+
+<h3>El rol: la unidad reutilizable</h3>
+
+<p>Un rol es un directorio con una estructura fija. Ansible sabe dónde buscar cada cosa, así que no hay que configurar nada:</p>
+
+<pre><code class="lang-bash">roles/nginx/
+├── tasks/main.yml        # qué hacer
+├── handlers/main.yml     # qué correr SOLO si algo cambió
+├── templates/            # archivos Jinja2 (.j2)
+├── files/                # archivos que se copian tal cual
+├── defaults/main.yml     # variables con la prioridad más BAJA (las sobreescribís fácil)
+├── vars/main.yml         # variables con prioridad ALTA (constantes del rol)
+└── meta/main.yml         # dependencias con otros roles</code></pre>
+
+<pre><code class="lang-yaml"># roles/nginx/tasks/main.yml
+- name: Paquete nginx instalado
+  ansible.builtin.apt:
+    name: nginx
+    state: present            # ESTADO deseado, no acción: "que esté", no "instalalo"
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Usuario de servicio existe
+  ansible.builtin.user:
+    name: "{{ app_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Configuración de nginx desplegada
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "nginx -t -c %s"   # si el template genera basura, NO se escribe el archivo
+  notify: recargar nginx         # dispara el handler SOLO si este task cambió algo
+
+- name: Sitio por defecto ausente
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: recargar nginx
+
+- name: Servicio nginx activo y habilitado al boot
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true</code></pre>
+
+<pre><code class="lang-yaml"># roles/nginx/handlers/main.yml
+- name: recargar nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded      # reload, NO restart: no corta las conexiones vivas</code></pre>
+
+<h3>Idempotencia: el concepto que separa todo lo demás</h3>
+
+<div class="rule">
+  <strong>📌 Una operación es idempotente si aplicarla N veces deja el sistema igual que aplicarla una vez.</strong> No significa "no hace nada la segunda vez": significa que el <em>resultado</em> es el mismo. Es la propiedad que te permite correr el playbook completo un martes cualquiera, sin miedo, y usarlo como verificación además de como despliegue.
+</div>
+
+<p>Un script bash no la tiene, y el ejemplo es brutalmente concreto:</p>
+
+<pre><code class="lang-bash">#!/usr/bin/env bash
+# setup.sh — NO es idempotente. Corré esto dos veces y mirá qué pasa.
+apt-get install -y nginx
+echo "worker_processes 4;" &gt;&gt; /etc/nginx/nginx.conf   # se AGREGA otra vez en cada corrida
+useradd appsvc                                          # falla la 2da vez: "user already exists"
+sed -i 's/80/8080/' /etc/nginx/nginx.conf               # ya no hay 80 que cambiar... ¿o cambió otro 80?
+systemctl restart nginx                                 # corta conexiones aunque NADA haya cambiado</code></pre>
+
+<p>Se puede escribir bash idempotente. El punto es cuánto cuesta, y que ese costo se paga en <strong>cada línea</strong>:</p>
+
+<pre><code class="lang-bash"># La versión idempotente del mismo script: el triple de código y todavía frágil
+dpkg -s nginx &gt;/dev/null 2&gt;&amp;1 || apt-get install -y nginx
+
+grep -q '^worker_processes' /etc/nginx/nginx.conf \
+  || echo "worker_processes 4;" &gt;&gt; /etc/nginx/nginx.conf
+
+id -u appsvc &gt;/dev/null 2&gt;&amp;1 || useradd -r -s /usr/sbin/nologin appsvc
+
+# ¿Y el restart? Habría que detectar si el archivo cambió realmente:
+cksum_antes=$(cksum /etc/nginx/nginx.conf)
+# ... escribir config ...
+[ "$cksum_antes" != "$(cksum /etc/nginx/nginx.conf)" ] &amp;&amp; systemctl reload nginx</code></pre>
+
+<div class="mistake">
+  <strong>El error conceptual más común:</strong> pensar que Ansible es "bash con YAML". Los módulos de Ansible <em>ya vienen escritos con toda esa lógica adentro</em>: el módulo <code>apt</code> chequea si el paquete está, el módulo <code>template</code> compara el contenido antes de escribir, el módulo <code>user</code> compara UID, shell y grupos. Por eso cada task reporta <code>ok</code> (ya estaba) o <code>changed</code> (lo modifiqué). <strong>Si usás el módulo <code>command</code> o <code>shell</code> para todo, perdiste la idempotencia y estás escribiendo bash con más pasos.</strong>
+</div>
+
+<pre><code class="lang-yaml"># Cuando NO queda otra que usar command, se le agrega la condición a mano:
+- name: Inicializar el cluster de la base
+  ansible.builtin.command: /usr/lib/postgresql/16/bin/initdb -D /var/lib/postgresql/16/main
+  args:
+    creates: /var/lib/postgresql/16/main/PG_VERSION   # si ese archivo existe, no corre
+
+- name: Regenerar el índice solo si el catálogo cambió
+  ansible.builtin.command: /opt/app/bin/reindex
+  register: reindex
+  changed_when: "'reindexed' in reindex.stdout"       # vos definís qué significa "cambió"
+  failed_when: reindex.rc not in [0, 2]               # y qué significa "falló"</code></pre>
+
+<h2>LS8.3 Bash, Ansible, imagen o contenedor: cuándo cada uno</h2>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Idempotente</th><th>Costo de arranque</th><th>Usala cuando…</th></tr></thead>
+<tbody>
+<tr><td><strong>Script bash</strong></td><td>❌ Solo si la escribís vos, línea por línea</td><td>Mínimo</td><td>Es una tarea puntual, de una sola máquina, que corrés una vez (un diagnóstico, una migración de datos)</td></tr>
+<tr><td><strong>Ansible / Puppet / Salt</strong></td><td>✅ Por diseño</td><td>Bajo: SSH y YAML</td><td>Tenés servidores de larga vida que hay que mantener convergidos: bases de datos, appliances, on-prem, hardware</td></tr>
+<tr><td><strong>Imagen inmutable</strong> (Packer + AMI/qcow2)</td><td>✅ Total: no hay estado que converger</td><td>Medio: pipeline de build</td><td>Escalás horizontalmente en la nube y querés arranques rápidos y 100% idénticos</td></tr>
+<tr><td><strong>Contenedor</strong> (OCI)</td><td>✅ Total, y además portable</td><td>Medio-alto: hay que orquestar</td><td>La app es el artefacto, no la máquina; querés densidad, despliegues rápidos y rollback trivial</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  En la práctica se <strong>combinan por capas</strong>: Packer construye la imagen base usando Ansible como <em>provisioner</em>; la imagen se levanta con Terraform; los contenedores corren encima. Ansible no compite con los contenedores — sigue siendo lo que configura el host que los aloja, el bastión, el servidor de base de datos y todo lo que no se puede tirar y rehacer cada quince minutos.
+</div>
+
+<h2>LS8.4 La infraestructura también se testea</h2>
+
+<p>Escribir el playbook no es la parte difícil. La difícil es tener confianza para aplicarlo en producción un viernes. Esa confianza se construye con tres niveles de prueba, exactamente como con el código.</p>
+
+<h3>Nivel 1 — Dry run: <code>--check --diff</code></h3>
+
+<pre><code class="lang-bash"># --check: no cambia nada, reporta qué HARÍA. --diff: muestra el diff de cada archivo.
+ansible-playbook -i inventory/prod.ini site.yml --check --diff --limit web-01.prod.internal
+
+# Salida esperada en un servidor ya convergido:
+# web-01.prod.internal : ok=24  changed=0  unreachable=0  failed=0  skipped=3</code></pre>
+
+<div class="warn">
+  <strong><code>--check</code> no es infalible</strong> y hay que saber por qué. Los tasks que usan <code>command</code>/<code>shell</code> se saltean (Ansible no puede saber qué harían), y cualquier task que dependa del resultado de otro que no corrió va a reportar mal. Un <code>--check</code> limpio es evidencia fuerte, no una demostración. Para eso está el nivel 2.
+</div>
+
+<h3>Nivel 2 — Molecule: probar el rol en un entorno descartable</h3>
+
+<pre><code class="lang-bash">pip install "molecule[docker]" molecule-plugins ansible-lint
+cd roles/nginx
+molecule init scenario -d docker
+
+# El ciclo completo, en una VM/contenedor limpio:
+molecule test
+#  1. create      -&gt; levanta el contenedor/VM
+#  2. converge    -&gt; aplica el rol
+#  3. idempotence -&gt; lo aplica OTRA VEZ y FALLA si algún task reporta "changed"
+#  4. verify      -&gt; corre los tests de estado
+#  5. destroy     -&gt; limpia todo
+
+molecule converge   # aplicar sin destruir, para iterar rápido
+molecule login      # entrar al contenedor a mirar qué quedó mal</code></pre>
+
+<div class="rule">
+  <strong>📌 El paso <code>idempotence</code> es el que vale oro.</strong> Corre el rol dos veces y falla si la segunda corrida reporta cualquier <code>changed</code>. Es una prueba automática de la propiedad de LS8.2, y detecta al instante los <code>shell:</code> sin <code>creates:</code>, los <code>lineinfile</code> mal anclados y los templates con timestamps adentro.
+</div>
+
+<h3>Nivel 3 — testinfra: aserciones sobre el estado final</h3>
+
+<pre><code class="lang-python"># molecule/default/tests/test_nginx.py — se ejecuta DENTRO del host de prueba
+def test_paquete_instalado(host):
+    assert host.package("nginx").is_installed
+
+def test_servicio_corriendo_y_habilitado(host):
+    svc = host.service("nginx")
+    assert svc.is_running
+    assert svc.is_enabled
+
+def test_escucha_en_el_puerto(host):
+    assert host.socket("tcp://0.0.0.0:8080").is_listening
+
+def test_config_es_valida(host):
+    assert host.run("nginx -t").rc == 0
+
+def test_permisos_de_la_config(host):
+    f = host.file("/etc/nginx/nginx.conf")
+    assert f.user == "root" and f.mode == 0o644
+
+def test_no_corre_como_root(host):
+    # regresión: en 2024 un cambio de template hizo que el worker corriera como root
+    assert "appsvc" in host.check_output("ps -o user= -C nginx | sort -u")</code></pre>
+
+<div class="info">
+  Fijate en el último test: es un <strong>test de regresión de infraestructura</strong>. Cada incidente que resolvés debería dejar uno igual. Es la misma disciplina que en software — el bug que ya pasó una vez es exactamente el que más barato sale prevenir.
+</div>
+
+<h2>LS8.5 Drift: cuando el servidor deja de parecerse al código</h2>
+
+<p>El <em>drift de configuración</em> es la divergencia entre lo que el código declara y lo que el servidor realmente tiene. Aparece siempre, porque siempre hay una madrugada en la que alguien arregla algo a mano y se olvida de subirlo al repo.</p>
+
+<p>La buena noticia: si tus playbooks son idempotentes, <strong>ya tenés el detector de drift escrito</strong>. Es <code>--check --diff</code> corriendo solo, todos los días:</p>
+
+<pre><code class="lang-bash">#!/usr/bin/env bash
+# /usr/local/bin/drift-check.sh — lo dispara un systemd timer (ver LS7)
+set -euo pipefail
+SALIDA=$(mktemp)
+
+ansible-playbook -i /opt/iac/inventory/prod.ini /opt/iac/site.yml \
+  --check --diff &gt; "$SALIDA" 2&gt;&amp;1 || true
+
+# Cualquier "changed=" distinto de 0 es un servidor que se desvió
+if grep -qE 'changed=[1-9]' "$SALIDA"; then
+    grep -E 'changed=[1-9]' "$SALIDA" | logger -t drift -p daemon.warning
+    /usr/local/bin/notificar-sre "DRIFT detectado" &lt; "$SALIDA"
+    exit 1
+fi
+logger -t drift -p daemon.info "flota convergida: 0 desvíos"</code></pre>
+
+<p>Complementalo con las herramientas del propio gestor de paquetes, que te dicen qué archivos del sistema fueron modificados respecto de lo que instaló el paquete:</p>
+
+<pre><code class="lang-bash"># Debian/Ubuntu: qué archivos NO coinciden con el checksum del paquete
+apt-get install -y debsums
+debsums -ac          # -a incluye configs, -c solo lista los que cambiaron
+
+# RHEL/Rocky/Fedora: lo mismo, nativo
+rpm -Va --nomtime | grep '^..5'     # la columna 5 es "checksum distinto"
+
+# Qué unidades habilitó alguien fuera del playbook (ver LS7)
+systemctl list-unit-files --state=enabled --no-pager
+
+# Qué se agregó al cron o a los timers
+ls -la /etc/cron.d/ /etc/systemd/system/*.timer 2&gt;/dev/null</code></pre>
+
+<div class="mistake">
+  <strong>El anti-patrón:</strong> detectar drift y <em>corregirlo automáticamente</em> pisando el servidor sin mirar. Ese cambio manual puede ser el fix de un incidente en curso, y revertirlo a ciegas a las 4 AM convierte un problema en dos. Lo correcto es <strong>alertar</strong>, mirar el diff y decidir: o el cambio sube al código (era legítimo), o se revierte (era un descuido). El drift es información, no un enemigo.
+</div>
+
+<h2>LS8.6 Alta disponibilidad de verdad</h2>
+
+<p>"Alta disponibilidad" se usa como sinónimo de "tenemos dos servidores". No es eso. HA es la propiedad de <strong>seguir dando servicio cuando un componente falla</strong>, y se diseña componente por componente preguntando lo mismo: <em>si esto muere ahora, ¿qué pasa?</em></p>
+
+<h3>El mito de los nueves</h3>
+
+<table>
+<thead><tr><th>Disponibilidad</th><th>Downtime al año</th><th>Downtime al mes</th><th>Qué implica de verdad</th></tr></thead>
+<tbody>
+<tr><td>99%</td><td>3 d 15 h</td><td>7 h 18 m</td><td>Un servidor bien cuidado</td></tr>
+<tr><td>99,9% ("tres nueves")</td><td>8 h 45 m</td><td>43 m</td><td>Redundancia + guardias</td></tr>
+<tr><td>99,95%</td><td>4 h 22 m</td><td>21 m</td><td>Failover automático probado</td></tr>
+<tr><td>99,99% ("cuatro nueves")</td><td>52 m 35 s</td><td>4 m 23 s</td><td>Multi-zona, despliegues sin downtime, on-call 24/7</td></tr>
+<tr><td>99,999%</td><td>5 m 15 s</td><td>26 s</td><td>Muy poca gente lo necesita y menos gente lo logra</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Leé la fila de 99,99% otra vez: 52 minutos al año, para TODO.</strong> Ahí adentro entran los reinicios por kernel, los despliegues fallidos, los errores de configuración y la caída del proveedor de nube. Un solo incidente mal manejado te consume el presupuesto anual entero. Por eso prometer cuatro nueves sin haber medido nunca los tres es la forma más rápida de firmar un SLA que no vas a cumplir. <strong>Primero medí lo que tenés, después prometé.</strong>
+</div>
+
+<h3>Puntos únicos de falla (SPOF)</h3>
+
+<p>El ejercicio es aburrido y por eso casi nadie lo hace: listar cada componente y tacharlo mentalmente. La lista típica de SPOFs que sobreviven en sistemas "redundantes":</p>
+
+<div class="step"><strong>El balanceador.</strong> Dos servidores web detrás de un solo nginx. Si cae el nginx, cayó todo. Se resuelve con VRRP (keepalived) o un balanceador gestionado.</div>
+<div class="step"><strong>La base de datos.</strong> Casi siempre. Una réplica que nunca se promovió no es HA: es un backup caliente. HA de verdad exige failover <em>probado</em>.</div>
+<div class="step"><strong>El DNS y los certificados.</strong> Un certificado vencido tira abajo un sistema perfectamente redundante. Es la causa de caída más ridícula y una de las más frecuentes.</div>
+<div class="step"><strong>La zona de disponibilidad.</strong> Tres servidores en el mismo rack, el mismo switch o el mismo datacenter comparten destino.</div>
+<div class="step"><strong>La persona.</strong> Si una sola persona sabe cómo hacer el failover, esa persona es el SPOF. Por eso existen los runbooks (LS8.10).</div>
+
+<h3>Health checks: el detalle que decide si el failover funciona</h3>
+
+<pre><code class="lang-nginx"># /etc/nginx/conf.d/upstream.conf
+upstream app {
+    least_conn;                       # al menos-conexiones, mejor que round-robin si las requests duran distinto
+    server web-01:8080 max_fails=3 fail_timeout=10s;
+    server web-02:8080 max_fails=3 fail_timeout=10s;
+    server web-03:8080 max_fails=3 fail_timeout=10s backup;   # solo entra si los otros caen
+    keepalive 32;
+}
+
+server {
+    location /healthz { proxy_pass http://app; proxy_next_upstream error timeout http_502 http_503; }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Un health check que solo devuelve <code>200 OK</code> desde el proceso web no sirve.</strong> El proceso puede estar vivo y la app completamente rota porque perdió la conexión a la base. Distinguí dos endpoints: <strong>liveness</strong> ("el proceso responde, no lo mates") y <strong>readiness</strong> ("puedo atender tráfico: la base contesta, la cola contesta, la caché contesta"). El balanceador consulta <em>readiness</em>; el supervisor consulta <em>liveness</em>. Confundirlos produce el peor de los mundos: un nodo roto que sigue recibiendo tráfico, o un nodo sano que se reinicia en loop porque la base tardó dos segundos de más.
+</div>
+
+<div class="warn">
+  <strong>Split brain.</strong> Si dos nodos pierden contacto entre sí pero ambos siguen vivos, los dos pueden creerse el primario y aceptar escrituras. El resultado son dos bases divergentes, y reconciliarlas a mano es una de las peores tardes que existen. La defensa es el <strong>quórum</strong>: se necesita mayoría estricta para actuar, por eso los clusters se arman con número impar de nodos (3, 5), y por eso un cluster de 2 nodos <em>no puede</em> tener quórum sin un tercer testigo.
+</div>
+
+<div class="mistake">
+  <strong>HA sin backups probados es una ilusión.</strong> La replicación copia todo, incluido el <code>DROP TABLE</code> y el ransomware — en milisegundos, a todos los nodos. La redundancia te protege de fallas de <em>hardware</em>; los backups te protegen de fallas de <em>software y de personas</em>, que son la mayoría. Son defensas contra amenazas distintas y una nunca reemplaza a la otra.
+</div>
+
+<h2>LS8.7 Backups: la única métrica que importa es el tiempo de restauración</h2>
+
+<div class="concept">
+  <strong>💡 La regla 3-2-1.</strong> <strong>3</strong> copias de los datos, en <strong>2</strong> medios o tecnologías distintas, con <strong>1</strong> fuera del sitio. La variante moderna es <strong>3-2-1-1-0</strong>: una copia <em>inmutable</em> o air-gapped (contra ransomware, que ahora borra los backups primero) y <strong>0</strong> errores en la última verificación de restauración.
+</div>
+
+<h3>Los dos números que definen tu política</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué mide</th><th>La determina</th></tr></thead>
+<tbody>
+<tr><td><strong>RPO</strong> (Recovery Point Objective)</td><td>Cuántos datos podés perder</td><td>La <em>frecuencia</em> del backup. Backup diario ⇒ RPO de 24 h</td></tr>
+<tr><td><strong>RTO</strong> (Recovery Time Objective)</td><td>Cuánto podés estar caído</td><td>La <em>velocidad de restauración</em>, medida — no estimada</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># restic: deduplicado, cifrado y con snapshots. borg es el equivalente clásico.
+export RESTIC_REPOSITORY="s3:https://s3.amazonaws.com/backups-prod"
+export RESTIC_PASSWORD_FILE=/etc/restic/pass
+
+# Backup incremental: solo sube los bloques nuevos, pero cada snapshot es COMPLETO al restaurar
+restic backup /srv/data /etc --tag nightly --exclude-file=/etc/restic/excludes
+
+# Retención: sin esto el repo crece para siempre
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --keep-yearly 3 --prune
+
+# Verificar la INTEGRIDAD del repo (metadatos + una muestra de datos reales)
+restic check --read-data-subset=5%</code></pre>
+
+<div class="rule">
+  <strong>📌 Un backup que nunca se restauró no es un backup: es una carpeta grande con esperanza adentro.</strong> El número que hay que publicar en el dashboard no es "último backup: hace 2 h" — eso solo prueba que el script corrió. Es <strong>"última restauración exitosa: hace 6 días, tardó 41 minutos, checksum OK"</strong>. Ese sí es un dato sobre tu capacidad de recuperarte.
+</div>
+
+<pre><code class="lang-bash">#!/usr/bin/env bash
+# restore-drill.sh — simulacro automático de restauración. Semanal, en hardware de prueba.
+set -euo pipefail
+INICIO=$(date +%s)
+DESTINO=/restore-test/$(date +%F)
+
+restic restore latest --target "$DESTINO" --path /srv/data
+
+# Verificación funcional: que los bytes estén NO alcanza, la app tiene que arrancar
+sudo -u postgres pg_restore -d verificacion "$DESTINO/srv/data/dump.pgc"
+psql -d verificacion -c 'SELECT count(*) FROM pedidos;' | tee /tmp/filas.txt
+
+RTO=$(( $(date +%s) - INICIO ))
+echo "restore_test_duration_seconds $RTO" &gt; /var/lib/node_exporter/textfile/restore.prom
+echo "restore_test_success 1"           &gt;&gt; /var/lib/node_exporter/textfile/restore.prom
+echo "✅ RTO medido: ${RTO}s"</code></pre>
+
+<div class="tip">
+  Ese <code>textfile</code> del final es el truco: el resultado del simulacro entra como <strong>métrica de Prometheus</strong> vía el <em>textfile collector</em> del node_exporter (LS8.9). Así podés alertar por "hace más de 10 días que no se prueba una restauración" — que es el único tipo de alerta de backup que previene desastres reales.
+</div>
+
+<div class="info">
+  La detección y respuesta ante el incidente que te obliga a restaurar —incluido el caso de ransomware, donde el orden de las operaciones es crítico— está desarrollada en <a href="../../../Curso-Ciberseguridad/m10-deteccion-respuesta/lecture.html">M10 del curso de Ciberseguridad: detección y respuesta</a>. Los backups son la última línea de esa cadena, y el M10 explica qué hacer <em>antes</em> de tocarlos: preservar evidencia, identificar el punto de compromiso y no restaurar sobre un sistema todavía comprometido.
+</div>
+
+<h2>LS8.8 Actualizar sin cortar el servicio</h2>
+
+<h3>Rolling update: de a uno, con verificación</h3>
+
+<pre><code class="lang-yaml"># rolling.yml — actualiza la flota sin ventana de mantenimiento
+- name: Rolling update de los web
+  hosts: web
+  become: true
+  serial: 1                    # de a un host; "25%" o [1, 2, 4] para tandas crecientes
+  max_fail_percentage: 0       # si UNO falla, se frena todo el rollout
+
+  pre_tasks:
+    - name: Sacar el nodo del balanceador (drenar)
+      ansible.builtin.uri:
+        url: "http://lb-01.prod.internal/api/drain/{{ inventory_hostname }}"
+        method: POST
+      delegate_to: localhost
+
+    - name: Esperar a que terminen las requests en vuelo
+      ansible.builtin.wait_for:
+        timeout: 30            # más que el timeout más largo de la app
+
+  roles:
+    - app
+
+  post_tasks:
+    - name: Health check propio ANTES de reponerlo
+      ansible.builtin.uri:
+        url: "http://{{ inventory_hostname }}:8080/readyz"
+        status_code: 200
+      retries: 10
+      delay: 3
+      register: salud
+      until: salud.status == 200
+
+    - name: Devolver el nodo al balanceador
+      ansible.builtin.uri:
+        url: "http://lb-01.prod.internal/api/enable/{{ inventory_hostname }}"
+        method: POST
+      delegate_to: localhost</code></pre>
+
+<div class="rule">
+  <strong>📌 Drenar no es apagar.</strong> Sacar el nodo del balanceador y matar el proceso en el mismo segundo corta las requests que estaban a mitad de camino. El orden correcto es: <strong>(1)</strong> dejar de recibir tráfico nuevo, <strong>(2)</strong> esperar a que terminen las que están en vuelo, <strong>(3)</strong> recién ahí <code>systemctl stop</code>. En systemd eso se configura con <code>KillSignal=SIGTERM</code> y un <code>TimeoutStopSec</code> mayor a la request más lenta (LS7), y en la app con un handler de SIGTERM que cierre el listener y espere.
+</div>
+
+<h3><code>unattended-upgrades</code> bien configurado</h3>
+
+<pre><code class="lang-ini">// /etc/apt/apt.conf.d/50unattended-upgrades
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";     // SOLO seguridad, nada más
+};
+Unattended-Upgrade::Package-Blacklist {
+    "postgresql-16";                                 // lo que se actualiza coordinado, a mano
+    "nginx";
+};
+Unattended-Upgrade::Automatic-Reboot "false";        // el reboot lo decidís vos, en ventana
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Mail "sre@ejemplo.com";
+Unattended-Upgrade::MailReport "on-change";</code></pre>
+
+<pre><code class="lang-bash"># Verificar que realmente está activo (runtime, no config: LS7)
+systemctl status unattended-upgrades.service
+unattended-upgrade --dry-run --debug | tail -20
+
+# ¿Qué servicios siguen usando librerías viejas y necesitan reinicio?
+apt-get install -y needrestart
+needrestart -b        # salida parseable: NEEDRESTART-SVC=...
+
+# ¿Hace falta reboot? (kernel o libc nuevos)
+[ -f /var/run/reboot-required ] &amp;&amp; cat /var/run/reboot-required.pkgs</code></pre>
+
+<div class="warn">
+  <strong>Actualizar la librería no reinicia lo que la usaba.</strong> Después de un parche de OpenSSL, los procesos ya arrancados siguen con la versión vulnerable mapeada en memoria hasta que se reinician. <code>needrestart</code> existe exactamente para eso, y es la razón por la que "ya apliqué el parche" y "ya no soy vulnerable" son afirmaciones distintas.
+</div>
+
+<h3>Kernel livepatch</h3>
+
+<pre><code class="lang-bash"># Canonical Livepatch (Ubuntu Pro) o kpatch (RHEL): parchea CVEs del kernel EN CALIENTE
+sudo pro attach &lt;token&gt;
+sudo pro enable livepatch
+canonical-livepatch status --verbose
+
+uname -r                          # sigue mostrando el kernel viejo: es correcto
+cat /proc/sys/kernel/livepatch/*  # los parches aplicados en memoria</code></pre>
+
+<div class="info">
+  Livepatch <strong>pospone</strong> el reboot, no lo elimina. Solo cubre un subconjunto de CVEs (los que se pueden parchear sin cambiar estructuras de datos del kernel) y no te lleva a una versión nueva. Sirve para ganar tiempo hasta la ventana de mantenimiento, no para no reiniciar nunca — un uptime de 800 días es un dato preocupante, no un logro.
+</div>
+
+<h2>LS8.9 Observabilidad del host</h2>
+
+<pre><code class="lang-bash"># node_exporter: expone las métricas del host en :9100/metrics
+useradd -rs /bin/false node_exporter
+/usr/local/bin/node_exporter \
+  --collector.systemd \
+  --collector.processes \
+  --collector.textfile.directory=/var/lib/node_exporter/textfile
+
+curl -s localhost:9100/metrics | grep -E '^node_(load1|memory_MemAvailable|filesystem_avail)' | head</code></pre>
+
+<h3>Qué métricas mirar (método USE)</h3>
+
+<table>
+<thead><tr><th>Recurso</th><th>Utilización</th><th>Saturación (la que avisa antes)</th><th>Errores</th></tr></thead>
+<tbody>
+<tr><td>CPU</td><td><code>node_cpu_seconds_total</code></td><td><code>node_pressure_cpu_waiting</code>, runqueue</td><td><code>node_vmstat_pgmajfault</code></td></tr>
+<tr><td>Memoria</td><td><code>MemAvailable</code> (no "used")</td><td><code>node_pressure_memory_stalled</code>, swap-in</td><td>OOM kills en <code>dmesg</code></td></tr>
+<tr><td>Disco</td><td><code>node_disk_io_time_seconds</code></td><td><code>node_pressure_io_stalled</code>, cola</td><td><code>node_disk_io_errors</code>, SMART</td></tr>
+<tr><td>Red</td><td>bytes/s por interfaz</td><td>drops en la cola de TX/RX</td><td><code>node_network_receive_errs</code>, retransmisiones</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 PSI es la señal temprana.</strong> Las métricas de utilización mienten: una CPU al 100% puede estar perfecta (batch) y una al 60% puede estar ahogando a todos (contención). <a href="../ls2-memoria/lecture.html">Pressure Stall Information (LS2)</a> mide otra cosa: <strong>cuánto tiempo hubo tareas totalmente frenadas esperando un recurso</strong>. Eso correlaciona con la latencia que sufre el usuario mucho mejor que cualquier porcentaje de uso, y sube <em>antes</em> de que el sistema colapse.
+</div>
+
+<pre><code class="lang-bash"># PSI crudo en el host (LS2), y expuesto por node_exporter
+cat /proc/pressure/io
+# some avg10=18.42 avg60=12.03 avg300=6.77 total=98234123
+# full avg10=9.11  avg60=5.44  avg300=2.10 total=41230011
+#  some = al menos una tarea frenada · full = TODAS frenadas (el sistema no avanza)
+
+curl -s localhost:9100/metrics | grep '^node_pressure'</code></pre>
+
+<pre><code class="lang-yaml"># alerts.yml — alertas basadas en saturación, no en porcentajes de uso
+groups:
+  - name: host
+    rules:
+      - alert: SaturacionIO
+        expr: rate(node_pressure_io_stalled_seconds_total[5m]) &gt; 0.20
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "20% del tiempo hay tareas frenadas por I/O en {{ $labels.instance }}"
+          runbook_url: "https://runbooks.internal/saturacion-io"
+
+      - alert: DiscoSeLlenaEn4Dias
+        expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 4*24*3600) &lt; 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "A este ritmo, / se llena en menos de 4 días en {{ $labels.instance }}"
+          runbook_url: "https://runbooks.internal/disco-lleno"
+
+      - alert: RestauracionNoProbada
+        expr: time() - restore_test_last_success_timestamp_seconds &gt; 10 * 86400
+        labels: {severity: critical}
+        annotations:
+          summary: "Hace más de 10 días que no se verifica una restauración"</code></pre>
+
+<div class="mistake">
+  <strong>Alertar sobre causas en vez de síntomas.</strong> "CPU al 90%" despierta gente a las 3 AM por un batch nocturno perfectamente sano. "La latencia p99 del checkout superó 2 s durante 5 minutos" describe algo que le está pasando a un usuario real. Regla práctica: <strong>si una alerta no requiere que un humano actúe ahora, no es una alerta — es un gráfico.</strong> Cada alerta ruidosa que dejás viva entrena al equipo a ignorar las alertas.
+</div>
+
+<h2>LS8.10 Runbooks y post-mortems sin culpa</h2>
+
+<p>Un <strong>runbook</strong> es el procedimiento escrito para una situación específica. Su público objetivo no sos vos hoy: es la persona con menos contexto del equipo, a las tres de la mañana, con adrenalina y medio dormida. Todo lo que un runbook debe optimizar sale de ahí.</p>
+
+<table>
+<thead><tr><th>Un runbook malo</th><th>Un runbook bueno</th></tr></thead>
+<tbody>
+<tr><td>"Reiniciar el servicio si hace falta"</td><td>El comando exacto, copiable, con el host y las flags</td></tr>
+<tr><td>Explica la arquitectura completa</td><td>Un párrafo de contexto y va directo a los pasos</td></tr>
+<tr><td>Asume que sabés dónde están los logs</td><td>Da la ruta y el comando de consulta ya armado</td></tr>
+<tr><td>No dice cómo verificar</td><td>Cada paso dice qué salida esperar y qué hacer si no aparece</td></tr>
+<tr><td>No tiene salida de emergencia</td><td>Dice cuándo abandonar y a quién escalar, con el criterio explícito</td></tr>
+<tr><td>Se escribió una vez</td><td>Se actualiza en cada uso; el link está en la alerta (<code>runbook_url</code>)</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El test del runbook:</strong> dáselo a alguien que no construyó el sistema y pedile que lo ejecute en staging <em>sin preguntar nada</em>. Cada vez que tenga que preguntar algo, ahí hay un agujero. Si nadie puede seguirlo sin vos, el runbook no existe: vos sos el runbook, y sos un SPOF (LS8.6).
+</div>
+
+<h3>Post-mortem sin culpa</h3>
+
+<p>Después de cada incidente serio se escribe un post-mortem. <strong>Sin culpa</strong> (<em>blameless</em>) no significa que no se analicen los errores humanos: significa que se parte de la premisa de que <strong>toda persona actuó razonablemente con la información que tenía en ese momento</strong>, y que si una acción individual pudo tirar abajo el sistema, el problema es del sistema.</p>
+
+<div class="step"><strong>Línea de tiempo con horarios y evidencia.</strong> Qué pasó, cuándo se detectó, cuándo se mitigó, cuándo se resolvió. Con links a los gráficos y los logs, no de memoria.</div>
+<div class="step"><strong>Impacto medido.</strong> Cuántos usuarios, cuánto tiempo, qué operaciones fallaron, cuánto presupuesto de error consumió. Números, no adjetivos.</div>
+<div class="step"><strong>Causa raíz, en plural.</strong> Casi nunca hay una sola. Preguntá "¿por qué?" hasta llegar a algo estructural, y frená antes de llegar a "porque Juan se equivocó" — eso no es una causa raíz, es dónde se detuvo el análisis.</div>
+<div class="step"><strong>Qué funcionó.</strong> No solo lo que falló: la alerta que sí disparó, el runbook que sí sirvió. Eso es lo que hay que replicar.</div>
+<div class="step"><strong>Acciones con dueño y fecha.</strong> Cada una en el backlog, priorizada. Un post-mortem sin acciones cerradas es un documento de terapia, no de ingeniería.</div>
+
+<div class="danger">
+  <strong>⚠️ Por qué "sin culpa" no es amabilidad, es estrategia.</strong> Si señalás a la persona, la próxima vez la gente esconde los errores, tarda en avisar y no cuenta lo que hizo. Perdés exactamente la información que necesitás para arreglar el sistema. El equipo que puede decir "borré la tabla equivocada" sin miedo se recupera en minutos; el que no puede decirlo se recupera en horas y vuelve a fallar igual.
+</div>
+
+<h2>LS8.11 Capacity planning: saber antes de quedarte corto</h2>
+
+<p>Capacity planning es responder "¿cuándo me quedo sin recurso?" con una fecha, no con una sensación. Con métricas históricas la versión básica alcanza para el 90% de los casos:</p>
+
+<pre><code class="lang-bash"># Extrapolación lineal directa en PromQL
+predict_linear(node_filesystem_avail_bytes{mountpoint="/var"}[7d], 30*86400)
+#  -&gt; bytes libres previstos en 30 días. Si da negativo, ya tenés la fecha.
+
+# Cuánto creció el uso de disco en el último mes, en %
+100 * (1 - node_filesystem_avail_bytes offset 30d / node_filesystem_avail_bytes)
+
+# Headroom real: qué margen te queda si perdés un nodo de N
+(sum(node_memory_MemTotal_bytes) - max(node_memory_MemTotal_bytes))
+  &gt; sum(container_memory_working_set_bytes)</code></pre>
+
+<div class="rule">
+  <strong>📌 Planificá para N+1, no para N.</strong> Si tres nodos aguantan el pico justo, dos no aguantan nada — y algún día vas a tener dos, porque uno se va a caer o vas a tener que actualizarlo (LS8.8). La capacidad se dimensiona con <strong>un nodo menos que los que tenés</strong>, en el pico, no en el promedio. El promedio no te tira el sistema abajo; el pico sí.
+</div>
+
+<div class="warn">
+  <strong>El crecimiento rara vez es lineal, y los saltos no se ven venir.</strong> Una campaña de marketing, un cliente grande que entra, un feature viral. La extrapolación lineal sirve para lo previsible (logs, base de datos, archivos); para lo demás la defensa no es predecir mejor, es <strong>poder escalar rápido</strong> — que es, otra vez, el mismo argumento de LS8.1: si construir un servidor nuevo lleva 20 minutos y no dos días, la predicción importa mucho menos.
+</div>
+
+<h2>🧑‍🎓 Worked Example — de servidor mascota a playbook reproducible</h2>
+
+<blockquote><code>web-07</code> lleva cuatro años en producción. Lo instaló alguien que ya no está en la empresa. Funciona. Nadie sabe exactamente qué tiene adentro, nadie lo reinició desde 2023 y ya hay dos CVEs de kernel sin parchear. Hay que convertirlo en algo reproducible <strong>sin cortar el servicio</strong>.</blockquote>
+
+<p><strong>Paso 1 — Inventario forense: qué tiene este servidor que no tiene una instalación limpia.</strong> No se trata de leer todo <code>/etc</code>: se trata de encontrar el <em>delta</em> contra la imagen base.</p>
+
+<pre><code class="lang-bash"># En una VM LIMPIA de la misma versión, sacar la línea de base:
+dpkg-query -W -f='${Package}\n' | sort &gt; /tmp/base-packages.txt
+
+# En web-07, el delta de paquetes: lo que alguien instaló a mano
+dpkg-query -W -f='${Package}\n' | sort &gt; /tmp/web07-packages.txt
+comm -13 /tmp/base-packages.txt /tmp/web07-packages.txt
+
+# Qué archivos de configuración fueron modificados respecto del paquete original
+debsums -ac 2&gt;/dev/null        # cada línea es una decisión que hay que declarar
+
+# Qué unidades habilitó alguien (LS7)
+systemctl list-unit-files --state=enabled --no-pager | sort
+
+# Qué escucha, con qué proceso y qué usuario (LS5)
+ss -lntup
+
+# Qué corre por cron o timer
+ls -la /etc/cron.d/ /etc/cron.daily/ /etc/systemd/system/*.timer 2&gt;/dev/null
+crontab -l -u root; crontab -l -u appsvc
+
+# Qué se tocó a mano recientemente en /etc (pista, no prueba)
+find /etc -type f -newer /etc/hostname -printf '%T+ %p\n' 2&gt;/dev/null | sort -r | head -40
+
+# Usuarios y claves SSH que no deberían estar
+awk -F: '$3 &gt;= 1000 {print $1, $6, $7}' /etc/passwd
+find /home /root -name authorized_keys -exec ls -la {} +</code></pre>
+
+<div class="tip">
+  Guardá toda esa salida en un archivo del repo, con fecha. Es la <strong>evidencia</strong> de que el playbook cubre lo que había, y en seis meses va a ser la única forma de responder "¿esto lo declaramos porque hacía falta o porque estaba?".
+</div>
+
+<p><strong>Paso 2 — Escribir el playbook a partir del delta, no a partir de la imaginación.</strong> Cada línea del inventario forense se convierte en un task declarativo. Nada más: si no apareció en el delta, no va.</p>
+
+<p><strong>Paso 3 — Usar <code>--check --diff</code> contra el servidor real como oráculo.</strong> Este es el paso que hace que todo el ejercicio sea seguro: el diff te dice exactamente qué te falta declarar, sin tocar nada.</p>
+
+<pre><code class="lang-bash">ansible-playbook -i inventory/prod.ini site.yml --limit web-07 --check --diff
+
+# Primera corrida: changed=31  -&gt; 31 diferencias entre tu código y la realidad.
+# Por cada una hay que decidir:
+#   (a) el servidor tiene algo legítimo que el playbook no declara -&gt; agregarlo al playbook
+#   (b) el playbook declara algo que el servidor no tiene          -&gt; ¿es una mejora o un error tuyo?
+# Iterar hasta:
+# web-07 : ok=58  changed=0  unreachable=0  failed=0</code></pre>
+
+<div class="rule">
+  <strong>📌 Llegar a <code>changed=0</code> en <code>--check</code> es el momento en que el servidor deja de ser una mascota.</strong> A partir de ahí, el código y la máquina dicen lo mismo, y ese código es la respuesta a "¿qué tiene este servidor?". Todavía no probaste que podés <em>recrearlo</em> — eso es el paso 4 — pero ya podés auditarlo y revisarlo en un pull request.
+</div>
+
+<p><strong>Paso 4 — Probarlo sin arriesgar producción: construir el gemelo.</strong> El <code>--check</code> prueba convergencia sobre lo que ya existe. La prueba de verdad es construir <code>web-08</code> desde cero con el mismo playbook y comparar el estado observable de los dos:</p>
+
+<pre><code class="lang-bash"># 1) Rol probado aisladamente antes de tocar nada
+cd roles/app &amp;&amp; molecule test        # incluye el paso de idempotencia (LS8.4)
+
+# 2) Construir el gemelo desde cero
+ansible-playbook -i inventory/prod.ini site.yml --limit web-08
+
+# 3) Comparar el estado OBSERVABLE de los dos servidores
+for h in web-07 web-08; do
+  ssh "$h" 'dpkg-query -W -f="${Package} ${Version}\n" | sort'          &gt; "/tmp/pkgs.$h"
+  ssh "$h" 'systemctl list-unit-files --state=enabled --no-pager|sort'  &gt; "/tmp/units.$h"
+  ssh "$h" 'ss -lntup | sort'                                          &gt; "/tmp/ports.$h"
+  ssh "$h" 'sysctl -a 2&gt;/dev/null | sort'                              &gt; "/tmp/sysctl.$h"
+done
+diff -u /tmp/pkgs.web-07  /tmp/pkgs.web-08
+diff -u /tmp/units.web-07 /tmp/units.web-08
+diff -u /tmp/ports.web-07 /tmp/ports.web-08
+
+# 4) Prueba funcional real: mandarle tráfico de verdad antes de confiar
+ab -n 5000 -c 50 http://web-08:8080/healthz
+curl -fsS http://web-08:8080/readyz</code></pre>
+
+<div class="warn">
+  Vas a encontrar diferencias que <strong>no</strong> hay que replicar: versiones de paquetes que avanzaron, un log rotado, un módulo cargado por hardware distinto. El criterio es: <em>¿esta diferencia afecta el comportamiento del servicio?</em> Si no, se documenta y se ignora. Si sí, o va al playbook o hay que entender por qué el gemelo la necesita y el original no.
+</div>
+
+<p><strong>Paso 5 — El corte.</strong> Con <code>web-08</code> validado, se drena <code>web-07</code> del balanceador (LS8.8), se lo saca del inventario activo y se lo deja <strong>apagado pero sin destruir</strong> durante una semana. Es el rollback más barato que existe.</p>
+
+<p><strong>Paso 6 — El runbook resultante,</strong> que es el verdadero entregable del ejercicio. Sin esto, el playbook es un archivo que solo vos sabés cuándo y cómo correr:</p>
+
+<pre><code class="lang-markdown"># Runbook: recrear un servidor web desde cero
+
+**Cuándo usar este runbook:** web-NN no responde y no se recupera con reinicio, o hay que
+reemplazarlo por hardware/actualización mayor.
+**Duración esperada:** 25 minutos.  **Requiere:** acceso a Vault + rol `deploy`.
+**Impacto durante el procedimiento:** ninguno si quedan ≥ 2 nodos sanos (verificar en el paso 0).
+
+## 0. Antes de empezar (2 min)
+    curl -s http://lb-01.prod.internal/api/status | jq '.nodes[] | select(.healthy)'
+Esperado: al menos 2 nodos healthy. Si hay 1 o 0 -&gt; NO recrear, ESCALAR (ver "Escalamiento").
+
+## 1. Sacar el nodo dañado del balanceador (1 min)
+    curl -X POST http://lb-01.prod.internal/api/drain/web-NN
+Esperado: `{"status":"draining"}`. Verificar que el tráfico cayó a 0 en el dashboard
+"Fleet / per-node RPS" antes de seguir.
+
+## 2. Aprovisionar la máquina nueva (10 min)
+    cd /opt/iac &amp;&amp; terraform apply -target=module.web["web-NN"]
+Esperado: la IP aparece en la salida. Anotarla.
+
+## 3. Configurarla (8 min)
+    ansible-playbook -i inventory/prod.ini site.yml --limit web-NN --diff
+Esperado: `failed=0`. Si algún task falla -&gt; NO continuar, ver "Fallas conocidas".
+
+## 4. Verificar ANTES de darle tráfico (3 min)
+    ansible-playbook -i inventory/prod.ini site.yml --limit web-NN --check   # -&gt; changed=0
+    curl -fsS http://web-NN:8080/readyz                                      # -&gt; 200
+    ssh web-NN 'systemctl is-system-running'                                 # -&gt; running
+
+## 5. Reponerlo en el balanceador (1 min)
+    curl -X POST http://lb-01.prod.internal/api/enable/web-NN
+Esperado: RPS del nodo sube en 60 s. Si no sube -&gt; revisar readyz otra vez.
+
+## Fallas conocidas
+- `apt: 404 Not Found` -&gt; el mirror interno está caído. Fallback: `-e apt_mirror=deb.debian.org`.
+- El playbook queda colgado en "Esperar a la base" -&gt; el firewall de la VM nueva no tiene la
+  regla de salida al puerto 5432. Ver ticket INF-2214.
+
+## Escalamiento
+Si a los 30 min el nodo no está sirviendo tráfico: avisar en #sre-oncall y llamar al
+on-call secundario. NO seguir intentando solo.
+
+## Última revisión
+2026-09-03 — se ejecutó en el incidente INC-4471, funcionó, se corrigió el paso 4
+(faltaba el chequeo de `is-system-running`).</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá Ansible".</strong> Es que la reproducibilidad se construye <strong>desde la realidad hacia el código</strong> —midiendo lo que hay, no imaginándolo— y que solo se puede afirmar que un servidor es reproducible el día que lo <em>reprodujiste y comparaste</em>. Igual que un backup no existe hasta que lo restauraste. Todo lo demás es documentación optimista.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un script bash "que funciona" no reemplaza a un playbook de Ansible?</summary>
+<p>Porque no es idempotente por defecto. El script describe <em>acciones</em> ("instalá", "agregá esta línea") y por eso su resultado depende del estado en el que encuentre la máquina: corrido dos veces duplica líneas de configuración, falla al crear un usuario que ya existe y reinicia servicios aunque nada haya cambiado. Un playbook describe <em>estado deseado</em> ("que el paquete esté", "que el archivo tenga este contenido"), y los módulos ya traen adentro la lógica de comparar antes de actuar. Esa propiedad es la que te habilita a correrlo cuando quieras — y por lo tanto a usarlo como detector de drift y como documentación ejecutable, no solo como instalador.</p></details>
+
+<details><summary>Tenés tres réplicas de la base con failover automático. ¿Estás protegido contra la pérdida de datos?</summary>
+<p>No, y confundir esas dos cosas es uno de los errores más caros que existen. La replicación te protege contra fallas de <strong>hardware</strong>: si un nodo muere, otro sigue. No te protege contra fallas de <strong>software o de personas</strong>, que son la mayoría de los incidentes: un <code>DELETE</code> sin <code>WHERE</code>, una migración con bug o un ransomware se replican a los tres nodos en milisegundos, porque el sistema de replicación no tiene forma de saber que esa escritura era indeseada. Para eso hacen falta backups con retención (poder volver a <em>ayer</em>), copias inmutables (que el atacante no pueda borrar) y —sobre todo— una restauración probada con su tiempo medido. HA y backups defienden contra amenazas distintas y ninguna reemplaza a la otra.</p></details>
+
+<details><summary>¿Por qué la métrica que importa de un backup es el tiempo de restauración y no el de backup?</summary>
+<p>Porque el tiempo de backup solo prueba que el script corrió; no prueba que los datos sean legibles, que estén completos ni que la aplicación pueda arrancar con ellos. Durante un incidente, la pregunta real es "¿en cuánto vuelvo a estar en línea?", y eso es el RTO: descargar decenas de gigabytes, descomprimir, restaurar la base, reconstruir índices y verificar consistencia. Es habitual descubrir que ese número es diez veces peor de lo que todos suponían — y descubrirlo durante la caída es lo peor que puede pasar. Por eso el simulacro de restauración se automatiza, se mide y su resultado se expone como métrica: para poder alertar cuando hace demasiado tiempo que no se verifica.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Mascota vs ganado:</strong> el umbral no es la cantidad de servidores, es si podés <em>recrear</em> uno. Un servidor con historia manual es deuda impagable e intocable.</li>
+  <li><strong>Idempotencia</strong> es la propiedad central: aplicar N veces = aplicar una vez. Los módulos de Ansible la traen; bash no, y escribirla a mano cuesta el triple de código en cada línea.</li>
+  <li>Bash para lo puntual; <strong>Ansible</strong> para servidores de larga vida; <strong>imágenes</strong> y <strong>contenedores</strong> cuando podés reemplazar en vez de modificar. Se combinan por capas.</li>
+  <li>La infraestructura se testea: <code>--check --diff</code> (dry run), <strong>Molecule</strong> (incluye el test de idempotencia) y <strong>testinfra</strong> (aserciones sobre el estado final).</li>
+  <li>El <strong>drift</strong> se detecta con el mismo playbook corriendo en <code>--check</code> todos los días. Se <em>alerta</em>, no se corrige a ciegas: el cambio manual puede ser el fix de un incidente en curso.</li>
+  <li><strong>HA</strong> es sobrevivir a la falla de un componente, no tener dos servidores. 99,99% son 52 minutos al año para todo. Distinguí <em>liveness</em> de <em>readiness</em>, cuidá el quórum y buscá los SPOF — incluida la persona que es la única que sabe hacer el failover.</li>
+  <li><strong>3-2-1</strong> (y 3-2-1-1-0). El número que se publica no es "último backup", es <strong>"última restauración exitosa y cuánto tardó"</strong>. Un backup sin restaurar no es un backup.</li>
+  <li>Actualizar sin downtime: <code>serial</code>, drenar antes de apagar, <code>unattended-upgrades</code> solo de seguridad y sin reboot automático, <code>needrestart</code> porque el parche no reinicia lo que usaba la librería, y livepatch para posponer —no eliminar— el reboot.</li>
+  <li>Observabilidad: método USE, y <strong>PSI</strong> como señal temprana porque mide tiempo frenado, no porcentaje de uso. Alertá sobre síntomas del usuario, no sobre causas.</li>
+  <li><strong>Runbooks</strong> escritos para las 3 AM: comandos exactos, salida esperada y criterio de escalamiento. <strong>Post-mortems sin culpa</strong>, porque señalar personas hace que la próxima vez te escondan la información que necesitás.</li>
+  <li><strong>Capacity planning</strong>: extrapolá con datos, dimensioná N+1 sobre el pico, y recordá que poder escalar rápido vale más que predecir bien.</li>
+</ul>
+
+<h2>🎓 Cierre del track — qué estudiar después</h2>
+
+<p>Terminaste Linux Senior. Desde LS1 hasta acá recorriste el sistema desde el scheduler hasta el runbook, y en el camino quedó claro el patrón: <strong>casi todo lo que parece magia en Linux es un mecanismo simple que podés inspeccionar</strong>. Esa es la habilidad que se lleva a cualquier stack. Lo que sigue, en orden de rendimiento por hora invertida:</p>
+
+<div class="step"><strong>1. Kubernetes.</strong> Es la continuación natural de LS3 (namespaces y cgroups) y LS7 (systemd): los mismos mecanismos del kernel, orquestados en cluster. Aprendelo <em>después</em> de esto y no antes, porque entender qué hace un contenedor por dentro convierte a K8s en algo comprensible en vez de un oráculo de YAML.</div>
+
+<div class="step"><strong>2. Terraform / OpenTofu.</strong> Ansible configura lo que ya existe; Terraform <em>crea</em> la infraestructura (redes, VMs, DNS, buckets). Juntos cierran el ciclo completo del paso 2 del worked example.</div>
+
+<div class="step"><strong>3. La disciplina SRE.</strong> SLI, SLO y presupuesto de error; eliminación de toil; ingeniería del caos. Los libros de SRE de Google son gratis y son el material canónico de este módulo llevado a escala.</div>
+
+<div class="step"><strong>4. Certificaciones, si te sirven para el CV.</strong> <strong>LFCS</strong> y <strong>RHCSA</strong> validan administración práctica (RHCSA es examen 100% práctico y tiene buen peso en el mercado); <strong>CKA</strong> es la de Kubernetes. Ninguna te enseña lo que ya aprendiste acá, pero abren puertas donde el filtro es automático.</div>
+
+<div class="step"><strong>5. Profundizar en lo que más te sirvió.</strong> Si te enganchó LS6, seguí con eBPF y observabilidad continua (bpftrace, Cilium, Pixie). Si te enganchó LS5, seguí con redes y service mesh. Si te enganchó LS4, seguí con sistemas de archivos distribuidos y bases de datos.</div>
+
+<div class="concept">
+  <strong>💡 Lo único que no se aprende leyendo.</strong> Armate un laboratorio propio —tres VMs alcanzan— y practicá <em>romper y recuperar</em>: llenale el disco, matale la red, corrompé un backup a propósito, apagá el primario y hacé el failover con cronómetro. La confianza en producción no viene de saber la teoría: viene de haber estado ahí antes, cuando no importaba.
+</div>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá una VM que hayas configurado a mano y hacele el inventario forense del paso 1 del worked example. Escribí el playbook que la reproduce e iterá con <code>--check --diff</code> hasta llegar a <code>changed=0</code>. Anotá cuántas cosas encontraste que no recordabas haber hecho.</li>
+  <li>Escribí un script bash y un rol de Ansible que hagan exactamente lo mismo (instalar nginx, desplegar una config, crear un usuario). Corré ambos <strong>dos veces</strong> y documentá cada diferencia observable en el sistema después de la segunda corrida.</li>
+  <li>Configurá Molecule sobre uno de tus roles y hacé que el paso <code>idempotence</code> falle a propósito (usá un <code>shell:</code> sin <code>creates:</code>). Después arreglalo y explicá qué reportaba Ansible en cada caso.</li>
+  <li>Armá el <code>drift-check.sh</code> con un systemd timer (LS7). Cambiá algo a mano en un servidor y verificá que la alerta lo detecta. Medí cuánto tarda desde el cambio hasta la notificación.</li>
+  <li>Hacé un backup con <code>restic</code> o <code>borg</code>, borrá los datos originales y <strong>cronometrá la restauración completa</strong>, incluyendo que la aplicación arranque y los datos sean consistentes. Compará tu RTO medido con el que hubieras estimado antes de hacerlo.</li>
+  <li>Levantá dos nodos detrás de un nginx con health checks. Escribí un endpoint <code>/readyz</code> que dependa de una base de datos, apagá la base y observá qué hace el balanceador. Después repetí con un <code>/healthz</code> que solo devuelva 200 y explicá por qué el resultado es peor.</li>
+  <li>Escribí el runbook de una operación que hagas seguido y pasáselo a alguien que no la haya hecho nunca. Contá cuántas veces tuvo que preguntarte algo: ese número es la deuda del runbook. Corregilo y repetí.</li>
+  <li>Elegí un incidente real que hayas vivido (o uno público bien documentado) y escribí el post-mortem sin culpa completo: línea de tiempo, impacto medido, causas en plural, qué funcionó y acciones con dueño y fecha.</li>
+</ol>
+
+<section class="quiz" id="quizLS8">
+  <style>
+    #quizLS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS8 .q{margin-bottom:1.5rem}
+    #quizLS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS8 .opt:hover{border-color:var(--accent)}
+    #quizLS8 .opt:disabled{cursor:default}
+    #quizLS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS8 .exp.show{display:block}
+    #quizLS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Corrés tu playbook por segunda vez sobre un servidor que no cambió y Ansible reporta <code>changed=7</code>. ¿Qué significa?</p>
+    <button class="opt">Es normal: Ansible siempre reaplica todo en cada corrida</button>
+    <button class="opt">El servidor tiene drift y el playbook lo está corrigiendo correctamente</button>
+    <button class="opt">Hay tasks no idempotentes: probablemente <code>shell:</code> sin <code>creates:</code>, o templates que generan contenido distinto cada vez</button>
+    <div class="exp">Sobre un servidor sin cambios, una segunda corrida debe dar <code>changed=0</code>: eso <em>es</em> la idempotencia. Un <code>changed</code> persistente indica tasks que actúan sin comparar — típicamente <code>command</code>/<code>shell</code> sin <code>creates:</code> o <code>changed_when:</code>, <code>lineinfile</code> con regex que no matchea lo que escribió, o un template con un timestamp adentro. El daño no es cosmético: te rompe la detección de drift (todo parece desviado) y dispara handlers que reinician servicios sin motivo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tenés replicación síncrona a tres nodos y failover automático probado. Un desarrollador corre un <code>DELETE</code> sin <code>WHERE</code> en producción. ¿Qué te salva?</p>
+    <button class="opt">Solo un backup con retención: la replicación ya copió el DELETE a los tres nodos</button>
+    <button class="opt">El failover automático: promovés una réplica que todavía tiene los datos</button>
+    <button class="opt">El quórum: con 3 nodos la escritura se rechaza si es destructiva</button>
+    <div class="exp">La replicación no distingue escrituras deseadas de indeseadas: propaga el <code>DELETE</code> a todos los nodos en milisegundos, y con replicación síncrona lo hace antes de confirmar la transacción. HA protege contra fallas de hardware; contra errores de software y humanos solo protege un backup que te permita volver a un punto anterior en el tiempo — y que hayas restaurado alguna vez, para saber cuánto tarda.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu dashboard dice "último backup exitoso: hace 2 horas". ¿Qué te garantiza eso sobre tu capacidad de recuperación?</p>
+    <button class="opt">Que podés recuperarte con un RPO de 2 horas</button>
+    <button class="opt">Casi nada: prueba que el proceso corrió, no que los datos sean restaurables ni cuánto tardaría</button>
+    <button class="opt">Que el RTO es menor a 2 horas</button>
+    <div class="exp">Ese indicador solo dice que el script terminó con código 0. No dice si el archivo se puede descifrar, si la base es consistente, si la app arranca con esos datos, ni cuánto lleva bajarlos y restaurarlos. El RTO es una medición empírica: se obtiene restaurando de verdad y cronometrando. Por eso el simulacro se automatiza y su resultado se expone como métrica —con el timestamp de la última restauración exitosa— para poder alertar cuando hace demasiado que nadie verifica.</div>
+  </div>
+
+  <div class="score" id="scoreLS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track Linux Senior.' : '  — repasá las que fallaste; es el módulo de cierre.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls7-systemd/lecture.html">← LS7: systemd a fondo</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

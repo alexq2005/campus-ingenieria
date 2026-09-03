@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS2 — Memoria: virtual, page cache y OOM · Linux Senior</title>
+  <meta name="description" content="Memoria virtual y MMU, por qué free bajo no es un problema, page cache, RSS vs VSZ vs PSS vs USS, overcommit, el OOM killer, swap y swappiness, PSI y huge pages. Diagnóstico real de un contenedor muerto por OOM.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS2</span>
+  <span class="badge">⏱ 35–130 min</span>
+  <span class="badge">🎯 Pre-req: LS1</span>
+  <span class="badge">💾 Memoria</span>
+</div>
+
+<article>
+
+<h1>LS2 — Memoria: virtual, page cache y OOM</h1>
+
+<h2>LS2.0 Por qué este módulo</h2>
+
+<p>Casi todo lo que la gente cree sobre la memoria en Linux está mal. Empieza con una frase que vas a escuchar en cualquier oficina: <em>"me queda poca RAM libre"</em>. Esa frase, en Linux, no significa nada. Un servidor sano con 16 GB puede tener 300 MB "libres" y estar perfecto. Otro con 8 GB libres puede estar a segundos de que el kernel mate tu proceso.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La memoria en Linux no es un balde que se llena. Es un sistema con <strong>cuatro capas que la gente confunde entre sí</strong>: <strong>(1)</strong> el espacio virtual que ve tu proceso, <strong>(2)</strong> las páginas físicas que efectivamente tiene, <strong>(3)</strong> la RAM que el kernel presta al <em>page cache</em> y devuelve cuando hace falta, y <strong>(4)</strong> el límite real que te aplica — que casi nunca es el de la máquina. Diagnosticar memoria es saber en qué capa estás parado.
+</div>
+
+<p>Este módulo se ordena alrededor de una pregunta operativa: <strong>¿por qué murió mi proceso si había memoria?</strong> Vamos a llegar a la respuesta desde abajo — MMU, páginas, page cache, contabilidad — y a terminar con el caso que aparece todas las semanas en producción: un contenedor asesinado por el OOM killer mientras <code>free</code> mostraba gigabytes disponibles.</p>
+
+<h2>LS2.1 Memoria virtual: nadie ve la RAM de verdad</h2>
+
+<p>Ningún proceso en Linux toca una dirección física. Cada proceso tiene su propio <strong>espacio de direcciones virtual</strong> —64 bits, 128 TiB útiles en x86-64 con tablas de 4 niveles— y el hardware traduce cada acceso. Esa traducción la hace la <strong>MMU</strong> (Memory Management Unit), consultando la <strong>tabla de páginas</strong> que el kernel arma para ese proceso.</p>
+
+<p>La unidad de todo esto es la <strong>página</strong>: 4 KiB en x86-64 por defecto. La RAM se administra en páginas, se mapea en páginas, se protege en páginas y se desaloja en páginas.</p>
+
+<pre><code class="lang-bash">getconf PAGESIZE          # 4096  -- tamaño de página en bytes
+getconf PAGE_SIZE         # idéntico, nombre alternativo
+
+# Cuántas páginas físicas tiene la máquina y cuántas están libres
+getconf _PHYS_PAGES       # 4093184   -&gt; 4093184 * 4096 = ~15.6 GiB
+getconf _AVPHYS_PAGES     # 104233    -&gt; "libres" AHORA (spoiler: no importa)</code></pre>
+
+<pre><code>  Proceso A                              Proceso B
+  (su propio espacio virtual)            (su propio espacio virtual)
+  +--------------------------+           +--------------------------+
+  | 0x7ffd....  [stack]      |           | 0x7ffc....  [stack]      |
+  |                          |           |                          |
+  |       (huecos sin        |           |       (huecos sin        |
+  |        mapear: SIGSEGV)  |           |        mapear: SIGSEGV)  |
+  |                          |           |                          |
+  | 0x7f9a....  libc.so.6    |---+    +--| 0x7f21....  libc.so.6    |
+  | 0x5586....  [heap]       |   |    |  | 0x55c1....  [heap]       |
+  | 0x5586....  .text (bin)  |   |    |  | 0x55c1....  .text (bin)  |
+  +--------------------------+   |    |  +--------------------------+
+              |                  |    |               |
+              v                  |    |               v
+    tabla de paginas A           |    |     tabla de paginas B
+    (4 niveles: PGD/P4D/PUD/PMD/PTE)   |     (propia, independiente)
+              |                  |    |               |
+              +---------+--------+----+---------------+
+                        |
+                        v
+                    +-------+   virtual  ==&gt;  fisica
+                    |  MMU  |   resultado cacheado en la TLB
+                    +-------+
+                        |
+                        v
+  RAM fisica (marcos de 4 KiB)
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+  | pg  | pg  | pg  | pg  | pg  | pg  | pg  | pg  |
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+     ^                             ^
+     |                             |
+  libc.so cargada UNA sola vez  page cache: paginas de
+  y compartida por A y B        archivos leidos del disco</code></pre>
+
+<div class="rule">
+  <strong>📌 Dos procesos que "usan 200 MB de libc" no usan 400 MB.</strong> La biblioteca está en RAM una vez y ambos la mapean. Este único hecho explica la mitad de las confusiones de contabilidad de memoria que vemos en LS2.4 — y es la razón por la que sumar el RSS de todos los procesos da un número absurdo.
+</div>
+
+<p>El mapa de un proceso es un archivo de texto. Podés leerlo:</p>
+
+<pre><code class="lang-bash">cat /proc/self/maps | head -12</code></pre>
+
+<pre><code>5586a1c00000-5586a1c21000 r--p 00000000 fd:00 1837201  /usr/bin/cat
+5586a1c21000-5586a1c2d000 r-xp 00021000 fd:00 1837201  /usr/bin/cat   &lt;- codigo
+5586a1c2d000-5586a1c32000 r--p 0002d000 fd:00 1837201  /usr/bin/cat
+5586a1c33000-5586a1c34000 rw-p 00032000 fd:00 1837201  /usr/bin/cat
+5586c2f41000-5586c2f62000 rw-p 00000000 00:00 0        [heap]
+7f9a3c000000-7f9a3c028000 r--p 00000000 fd:00 1841322  /usr/lib/libc.so.6
+7f9a3c028000-7f9a3c1b0000 r-xp 00028000 fd:00 1841322  /usr/lib/libc.so.6
+7ffd8a3c1000-7ffd8a3e2000 rw-p 00000000 00:00 0        [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]</code></pre>
+
+<p>Las banderas de la cuarta columna son la clave: <code>r-xp</code> es código ejecutable privado, <code>rw-p</code> es datos privados escribibles, <code>r--s</code> sería compartido. La <code>p</code> significa <em>private</em> y activa <strong>copy-on-write</strong>: cuando hacés <code>fork()</code>, el hijo no copia nada; comparte las mismas páginas físicas marcadas como solo-lectura, y recién cuando alguno escribe el kernel duplica <em>esa</em> página.</p>
+
+<div class="info">
+  Por eso un <code>fork()</code> de un proceso de 8 GB es instantáneo y "no consume" 8 GB… hasta que el hijo empieza a escribir. Redis con persistencia <code>BGSAVE</code> vive exactamente en esa apuesta: forkea, y el consumo real depende de cuánto se modifique mientras el hijo escribe el snapshot.
+</div>
+
+<h3>La TLB: por qué la traducción no cuesta cuatro accesos a RAM</h3>
+
+<p>Recorrer cuatro niveles de tabla por cada acceso a memoria sería catastrófico. La MMU cachea las traducciones recientes en la <strong>TLB</strong> (Translation Lookaside Buffer), unos pocos miles de entradas. Un <em>TLB miss</em> obliga a caminar la tabla de páginas: decenas de ciclos. En cargas con acceso disperso a mucha memoria (bases de datos, JVM con heaps grandes), los TLB misses son un costo medible — y es la motivación real de las huge pages de LS2.9.</p>
+
+<pre><code class="lang-bash"># Medir TLB misses de verdad (necesita perf y contadores de hardware)
+perf stat -e dTLB-load-misses,dTLB-loads,iTLB-load-misses ./mi_programa
+
+#        2.184.229.117      dTLB-loads
+#           38.412.905      dTLB-load-misses   #  1,76% of all dTLB cache accesses</code></pre>
+
+<h2>LS2.2 <code>free -h</code>, línea por línea</h2>
+
+<p>Este es el comando más ejecutado y peor leído de Linux.</p>
+
+<pre><code class="lang-bash">free -h</code></pre>
+
+<pre><code>               total        used        free      shared  buff/cache   available
+Mem:            15Gi       4,1Gi       302Mi       412Mi        11Gi       10Gi
+Swap:          2,0Gi       128Mi       1,9Gi</code></pre>
+
+<table>
+<thead><tr><th>Columna</th><th>Qué es realmente</th><th>¿Te preocupa si es bajo?</th></tr></thead>
+<tbody>
+<tr><td><code>total</code></td><td>RAM que el kernel administra (menos lo que reserva el firmware)</td><td>—</td></tr>
+<tr><td><code>used</code></td><td><code>total − free − buff/cache</code>. Anónima de procesos + estructuras del kernel</td><td>Sí, si se acerca a <code>total</code></td></tr>
+<tr><td><code>free</code></td><td>RAM que <strong>no se está usando para nada</strong>. Es memoria desperdiciada</td><td><strong>❌ No. Nunca.</strong></td></tr>
+<tr><td><code>shared</code></td><td>Principalmente <code>tmpfs</code> y <code>/dev/shm</code>. <strong>No</strong> es reclamable como el cache</td><td>Sí, si crece sin control</td></tr>
+<tr><td><code>buff/cache</code></td><td>Page cache + buffers de bloque + slabs reclamables</td><td>❌ No: es RAM prestada</td></tr>
+<tr><td><code>available</code></td><td>Estimación del kernel de <strong>cuánto podés pedir sin swapear</strong></td><td>✅ <strong>Este es el número</strong></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La única columna que mirás para decidir si hay memoria es <code>available</code>.</strong> <code>free</code> bajo es normal y deseable: el kernel usa toda la RAM ociosa para cachear disco. Si <code>free</code> fuera alto, estarías pagando RAM para tenerla vacía.
+</div>
+
+<p>La frase "Linux se come mi RAM" está exactamente al revés: Linux <strong>te devuelve</strong> la RAM que no usás en forma de disco más rápido. Que el número de <code>free</code> baje a 200 MB en un servidor con días de uptime es la señal de que el sistema está funcionando bien.</p>
+
+<div class="mistake">
+  <strong>El error clásico de monitoreo.</strong> Una alerta configurada sobre <code>free</code> (o sobre <code>MemFree</code> de <code>/proc/meminfo</code>) se dispara en <em>todos</em> los servidores sanos y se ignora en dos semanas. La alerta correcta es sobre <code>MemAvailable</code> —o mejor, sobre PSI (LS2.8)—. Un dashboard que grafica "memoria usada" sumando <code>used + buff/cache</code> está mintiendo por diseño.
+</div>
+
+<p><code>free</code> no calcula nada: lee <code>/proc/meminfo</code>. Ahí está el detalle real:</p>
+
+<pre><code class="lang-bash">grep -E 'MemTotal|MemFree|MemAvailable|^Cached|Buffers|Dirty|Writeback|Shmem|SReclaimable|Slab|AnonPages|SwapCached|Committed_AS|CommitLimit' /proc/meminfo</code></pre>
+
+<pre><code>MemTotal:       16362736 kB
+MemFree:          309424 kB     &lt;- casi nada libre. Correcto.
+MemAvailable:   10486132 kB     &lt;- lo que realmente podes pedir
+Buffers:          412308 kB
+Cached:         10884120 kB     &lt;- page cache: archivos en RAM
+SwapCached:        18432 kB
+AnonPages:       3921544 kB     &lt;- memoria anonima de procesos (heap, stack)
+Shmem:            422400 kB     &lt;- tmpfs, /dev/shm. NO es reclamable barato
+Dirty:             71264 kB     &lt;- escrito y todavia sin bajar a disco
+Writeback:             0 kB
+Slab:             892140 kB
+SReclaimable:     611208 kB     &lt;- parte del slab que SI se puede recuperar
+Committed_AS:   14203900 kB     &lt;- memoria PROMETIDA a los procesos
+CommitLimit:    12181368 kB     &lt;- y el limite... que ya se paso. Ver LS2.5</code></pre>
+
+<div class="info">
+  <code>MemAvailable</code> no es una resta: es una <strong>heurística del kernel</strong> (existe desde 3.14) que estima cuánto page cache y slab podría reclamar sin entrar en thrashing, restando las <em>watermarks</em> mínimas de cada zona. Es una estimación honesta pero conservadora — no es un contrato.
+</div>
+
+<h2>LS2.3 Page cache: la RAM prestada</h2>
+
+<p>Cada vez que leés un archivo, el kernel guarda sus páginas en el <strong>page cache</strong>. La segunda lectura no toca el disco. Es la optimización más importante que hace un sistema operativo, y es la razón de que <code>buff/cache</code> sea enorme en cualquier máquina con trabajo real.</p>
+
+<p>Se mide en dos comandos:</p>
+
+<pre><code class="lang-bash"># 1. Estado inicial
+free -m | awk 'NR==2 {print "cache:", $6, "MB | available:", $7, "MB"}'
+# cache: 11148 MB | available: 10240 MB
+
+# 2. Leer un archivo de 2 GB sin hacer nada con él
+dd if=/var/lib/datos/dump.bin of=/dev/null bs=1M status=progress
+# 2147483648 bytes (2,1 GB, 2,0 GiB) copied, 6,41 s, 335 MB/s
+
+# 3. El cache creció ~2 GB; available bajó bastante menos
+free -m | awk 'NR==2 {print "cache:", $6, "MB | available:", $7, "MB"}'
+# cache: 13196 MB | available: 10102 MB
+
+# 4. Segunda lectura: sale de RAM, no del disco
+dd if=/var/lib/datos/dump.bin of=/dev/null bs=1M status=progress
+# 2147483648 bytes (2,1 GB, 2,0 GiB) copied, 0,38 s, 5,6 GB/s   &lt;-- 17x</code></pre>
+
+<p>Para ver <em>qué</em> archivo ocupa el cache, <code>vmtouch</code> es la herramienta correcta:</p>
+
+<pre><code class="lang-bash">sudo apt install vmtouch          # o dnf install vmtouch
+
+vmtouch -v /var/lib/postgresql/16/main/base/16384/2619
+#            Files: 1
+#      Directories: 0
+#   Resident Pages: 24576/32768   96M/128M   75%
+#          Elapsed: 0.004 seconds
+
+vmtouch /var/log            # recursivo: cuánto de este árbol está en RAM</code></pre>
+
+<h3>Forzar un drop (y por qué casi nunca querés)</h3>
+
+<pre><code class="lang-bash"># 1 = page cache | 2 = dentries e inodes | 3 = ambos
+sync                                        # bajá lo sucio a disco PRIMERO
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+free -h        # buff/cache se desploma... y available casi no cambia</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>drop_caches</code> en producción es una autolesión.</strong> No libera memoria que estuvieras necesitando —el kernel ya la iba a reclamar solo, y más inteligentemente— y en cambio tira el trabajo de horas: la base de datos vuelve a leer sus índices del disco, la latencia p99 se dispara durante minutos, y el IO wait sube. Es una herramienta de <strong>benchmarking</strong> (para medir con cache frío) y de depuración, no de operación.
+</div>
+
+<div class="mistake">
+  <strong>El anti-patrón que sigue circulando:</strong> un cron que corre <code>drop_caches</code> "para liberar memoria" cada hora. Lo escribió alguien que leyó mal <code>free</code>. Si lo encontrás en un servidor, eso <em>es</em> el incidente de latencia que nadie podía explicar.
+</div>
+
+<div class="tip">
+  Lo que sí es legítimo: <code>posix_fadvise(POSIX_FADV_DONTNEED)</code> sobre un archivo puntual, o <code>vmtouch -e archivo</code>, para evacuar del cache algo específico —un dump enorme que acabás de escribir y no vas a volver a leer— sin destruir el cache del resto del sistema.
+</div>
+
+<h2>LS2.4 RSS vs VSZ vs PSS vs USS: la tabla que resuelve la confusión</h2>
+
+<p>Preguntá "cuánta memoria usa este proceso" y vas a recibir cuatro números distintos, todos correctos.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué cuenta</th><th>Sirve para</th><th>Trampa</th></tr></thead>
+<tbody>
+<tr><td><strong>VSZ</strong> (virtual)</td><td>Todo el espacio de direcciones <em>reservado</em>, esté o no en RAM</td><td>Detectar mapeos gigantes, fugas de <code>mmap</code></td><td>Enorme y casi siempre irrelevante. La JVM y Go reservan TiB virtuales</td></tr>
+<tr><td><strong>RSS</strong> (resident)</td><td>Páginas físicas que el proceso tiene ahora, <strong>compartidas incluidas</strong></td><td>Primera aproximación rápida</td><td>Cuenta libc y bibliotecas N veces. <strong>Sumar RSS da un total falso</strong></td></tr>
+<tr><td><strong>PSS</strong> (proportional)</td><td>Privadas + compartidas dividido la cantidad de procesos que las comparten</td><td><strong>Repartir el total honestamente.</strong> ΣPSS ≈ RAM usada</td><td>Más caro de calcular; requiere leer <code>smaps</code></td></tr>
+<tr><td><strong>USS</strong> (unique)</td><td>Solo las páginas <strong>privadas</strong> del proceso</td><td><strong>Cuánta RAM recuperás si lo matás.</strong> Es la métrica de fugas</td><td>Subestima el costo real de arrancarlo de cero</td></tr>
+</tbody>
+</table>
+
+<p>La demostración de que <code>ps</code> miente al sumar:</p>
+
+<pre><code class="lang-bash"># Sumar el RSS de todos los procesos
+ps -eo rss --no-headers | awk '{s+=$1} END {print s/1024/1024, "GiB de RSS sumado"}'
+# 23.8 GiB de RSS sumado        &lt;-- en una máquina de 16 GiB
+
+free -g | awk 'NR==2 {print $3, "GiB realmente usados"}'
+# 4 GiB realmente usados</code></pre>
+
+<div class="rule">
+  <strong>📌 Sumar RSS da más que la RAM total y eso NO es un bug.</strong> Cada proceso que mapea <code>libc</code>, <code>libssl</code> o un binario compartido cuenta esas páginas completas como propias. Con 200 procesos y una libc de 2 MB, contaste 400 MB que en RAM ocupan 2. Para repartir sin duplicar existe PSS.
+</div>
+
+<p>El kernel expone PSS y USS por proceso en <code>smaps_rollup</code> (mucho más barato que parsear <code>smaps</code> entero):</p>
+
+<pre><code class="lang-bash">sudo cat /proc/1834/smaps_rollup</code></pre>
+
+<pre><code>5586a1c00000-7ffd8a3e2000 ---p 00000000 00:00 0 [rollup]
+Rss:              412384 kB      &lt;- lo que reporta ps/top
+Pss:              238612 kB      &lt;- su parte justa del total
+Pss_Anon:         196208 kB
+Pss_File:          40120 kB
+Pss_Shmem:          2284 kB
+Shared_Clean:     198912 kB      &lt;- bibliotecas: compartidas y limpias
+Shared_Dirty:          0 kB
+Private_Clean:      9216 kB
+Private_Dirty:    204256 kB      &lt;- USS = Private_Clean + Private_Dirty
+Referenced:       390112 kB
+Anonymous:        196208 kB
+Swap:              14336 kB
+SwapPss:            9204 kB</code></pre>
+
+<pre><code class="lang-bash"># USS de un proceso, en una línea
+awk '/^Private_(Clean|Dirty)/ {s+=$2} END {printf "USS: %.1f MiB\n", s/1024}' \
+    /proc/1834/smaps_rollup
+# USS: 208.5 MiB
+
+# Top 10 procesos por PSS — la vista honesta del sistema
+for p in /proc/[0-9]*; do
+  pss=$(awk '/^Pss:/ {print $2}' "$p/smaps_rollup" 2&gt;/dev/null) || continue
+  [ -n "$pss" ] &amp;&amp; echo "$pss $(tr -d '\0' &lt; "$p/cmdline" | cut -c1-50)"
+done | sort -rn | head -10 | awk '{printf "%8.1f MiB  ", $1/1024; $1=""; print}'</code></pre>
+
+<p><code>smem</code> hace lo mismo, ya resuelto y con totales:</p>
+
+<pre><code class="lang-bash">sudo apt install smem
+
+sudo smem -tk -c "pid user command swap uss pss rss" -s pss -r | head -8</code></pre>
+
+<pre><code>  PID User     Command                         Swap      USS      PSS      RSS
+ 1834 postgres postgres: writer process           0     2.1G     2.4G     3.9G
+ 2210 java     /usr/lib/jvm/.../java -Xmx4g       12M     1.8G     1.9G     2.1G
+ 3391 www-data nginx: worker process               0    98.4M   112.3M   184.2M
+ 3392 www-data nginx: worker process               0    96.1M   110.0M   182.8M
+-------------------------------------------------------------------------------
+  187 8                                          14M     4.6G     5.1G     9.8G
+                                                        ^^^^     ^^^^     ^^^^
+                                             recuperable  honesto   inflado</code></pre>
+
+<p>Y <code>pmap</code> cuando querés ver <em>en qué</em> se le fue la memoria a un proceso:</p>
+
+<pre><code class="lang-bash">sudo pmap -x 1834 | sort -k3 -rn | head -6</code></pre>
+
+<pre><code>Address           Kbytes     RSS   Dirty Mode  Mapping
+00007f2a1c000000 2097152 2087424 2087424 rw-s- /dev/zero (deleted)   &lt;- shmem PG
+00005586c2f41000  524288  204256  204256 rw---   [ anon ]            &lt;- heap
+00007f9a3c028000    1568     892       0 r-x-- libc.so.6             &lt;- compartido
+----------------  ------  ------  ------
+total kB         3241028  412384  291680</code></pre>
+
+<div class="tip">
+  <strong>Regla de decisión rápida.</strong> ¿Sospechás de una <em>fuga</em>? Mirá el <strong>USS</strong> a lo largo del tiempo: es lo único que crece de verdad y es lo que recuperás matando el proceso. ¿Querés saber <em>quién se comió la RAM del servidor</em>? Ordená por <strong>PSS</strong>. ¿Ves un VSZ de 8 TiB en un servicio Go? Es normal, ignoralo.
+</div>
+
+<h2>LS2.5 Overcommit: Linux promete más de lo que tiene</h2>
+
+<p>Cuando un proceso hace <code>malloc(1 GiB)</code>, el kernel <strong>no reserva 1 GiB</strong>. Devuelve un rango virtual y no asigna ni una página física hasta que se escribe. Recién ahí se dispara un <em>page fault</em> y el kernel entrega una página real. Esto se llama <strong>overcommit</strong> y es la política por defecto.</p>
+
+<p>Es una apuesta sensata: los programas piden mucho más de lo que tocan (buffers "por las dudas", <code>fork()</code> con copy-on-write, arenas de allocators). Pero es una apuesta, y el OOM killer es lo que pasa cuando el kernel la pierde.</p>
+
+<pre><code class="lang-bash">sysctl vm.overcommit_memory vm.overcommit_ratio vm.overcommit_kbytes
+# vm.overcommit_memory = 0
+# vm.overcommit_ratio = 50
+# vm.overcommit_kbytes = 0</code></pre>
+
+<table>
+<thead><tr><th>Valor</th><th>Política</th><th>Comportamiento</th><th>Cuándo se usa</th></tr></thead>
+<tbody>
+<tr><td><strong>0</strong></td><td>Heurística (por defecto)</td><td>Acepta casi todo; rechaza pedidos "obviamente" absurdos</td><td>Uso general. Es lo que corre tu servidor hoy</td></tr>
+<tr><td><strong>1</strong></td><td>Siempre acepta</td><td>Nunca falla un <code>malloc</code>. El OOM killer es la única red</td><td>Cargas científicas, Redis con <code>BGSAVE</code>, matrices dispersas</td></tr>
+<tr><td><strong>2</strong></td><td>Estricto</td><td>Límite duro: <code>swap + RAM × ratio/100</code>. <code>malloc</code> devuelve <code>NULL</code></td><td>Sistemas que prefieren un error manejable a un asesinato</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Cuánto se prometió vs cuánto se puede prometer (solo relevante con modo 2)
+grep -E 'Committed_AS|CommitLimit' /proc/meminfo
+# Committed_AS:   14203900 kB     &lt;- prometido
+# CommitLimit:    12181368 kB     &lt;- techo teórico si overcommit_memory=2
+
+# Modo 2 con 90% de la RAM + swap (habría que dimensionar swap acorde)
+sudo sysctl -w vm.overcommit_memory=2
+sudo sysctl -w vm.overcommit_ratio=90</code></pre>
+
+<div class="warn">
+  <strong>Modo 2 no es "más seguro" automáticamente.</strong> Cambia <em>quién</em> maneja el fracaso: en vez de que el kernel elija una víctima, tu proceso recibe <code>NULL</code> de <code>malloc</code>. Si tu código —o una dependencia— no chequea ese retorno, el resultado es un segfault en vez de un OOM kill: peor de diagnosticar y sin línea en el log del kernel. Además, con <code>ratio</code> mal dimensionado el sistema empieza a rechazar asignaciones legítimas con RAM de sobra.
+</div>
+
+<div class="info">
+  <strong>Redis</strong> es el caso de manual del modo 1: durante <code>BGSAVE</code> forkea un proceso que en el peor caso duplicaría el dataset. Con la heurística por defecto ese fork puede fallar aunque en la práctica nunca se toquen todas las páginas. Por eso su documentación pide <code>vm.overcommit_memory=1</code>, y hace ruido en el log si no lo encuentra.
+</div>
+
+<h2>LS2.6 El OOM killer: cómo elige a quién matar</h2>
+
+<p>Cuando el kernel no puede satisfacer una asignación y ya reclamó todo lo reclamable —page cache, slab, swap—, invoca al <strong>OOM killer</strong>. No es un castigo aleatorio: recorre los candidatos, calcula un puntaje y mata al de puntaje más alto para recuperar la mayor cantidad de memoria con la menor cantidad de muertes.</p>
+
+<pre><code class="lang-bash"># Puntaje actual de un proceso: 0 (intocable) a 1000 (primer candidato)
+cat /proc/1834/oom_score
+# 342
+
+# El ajuste manual: -1000 a +1000. Se SUMA al puntaje base
+cat /proc/1834/oom_score_adj
+# 0</code></pre>
+
+<p>El puntaje base es, en esencia, <strong>proporcional a la memoria que el proceso consume</strong> respecto del total disponible en su ámbito (la máquina, o su cgroup). Consecuencia directa y contraintuitiva: <strong>el OOM killer suele matar a tu base de datos</strong>, porque es el proceso más grande, aunque el culpable del pico haya sido un script de 50 líneas.</p>
+
+<pre><code class="lang-bash"># Ranking de candidatos AHORA MISMO — antes de que pase el desastre
+for p in /proc/[0-9]*; do
+  s=$(cat "$p/oom_score" 2&gt;/dev/null) || continue
+  a=$(cat "$p/oom_score_adj" 2&gt;/dev/null)
+  c=$(tr -d '\0' &lt; "$p/cmdline" | cut -c1-45)
+  [ -n "$c" ] &amp;&amp; printf "%5s  adj=%-6s %s\n" "$s" "$a" "$c"
+done | sort -rn | head -8</code></pre>
+
+<pre><code>  681  adj=0      /usr/lib/postgresql/16/bin/postgres
+  412  adj=0      java -Xmx4g -jar /opt/app/service.jar
+  158  adj=0      node /srv/api/server.js
+   33  adj=0      nginx: worker process
+    0  adj=-1000  /usr/lib/systemd/systemd-journald</code></pre>
+
+<h3>Proteger un proceso crítico</h3>
+
+<pre><code class="lang-bash"># Proteger a mano (necesita CAP_SYS_RESOURCE para bajar el valor)
+echo -900 | sudo tee /proc/1834/oom_score_adj
+
+# Sacrificar primero a un batch que no importa
+echo 800 | sudo tee /proc/$(pgrep -f etl_nocturno)/oom_score_adj</code></pre>
+
+<p>A mano no sirve: el valor se pierde al reiniciar el servicio. Lo correcto es declararlo en la unidad de systemd (volvemos a esto en LS7):</p>
+
+<pre><code class="lang-bash"># /etc/systemd/system/postgresql.service.d/oom.conf
+[Service]
+OOMScoreAdjust=-800
+OOMPolicy=continue
+
+# /etc/systemd/system/etl-nocturno.service.d/oom.conf
+[Service]
+OOMScoreAdjust=700
+MemoryMax=2G          # mejor aún: que ni siquiera llegue a competir</code></pre>
+
+<div class="mistake">
+  <strong><code>oom_score_adj=-1000</code> hace al proceso inmune, y eso es peligroso.</strong> Si el inmune es el que tiene la fuga, el kernel va a matar todo lo demás —uno por uno— y el sistema queda inutilizable sin resolver la causa. Usá <code>-800</code> o <code>-900</code>: prioridad alta, no invulnerabilidad. Reservá <code>-1000</code> para lo que realmente no puede morir (journald, sshd de emergencia).
+</div>
+
+<h3>Leer el volcado del OOM</h3>
+
+<p>El OOM killer deja un informe completo en el ring buffer del kernel. Es la evidencia forense y hay que saber leerla:</p>
+
+<pre><code class="lang-bash">sudo dmesg -T | grep -iE 'oom|killed process' | tail -20
+journalctl -k --since "1 hour ago" | grep -iE 'oom-killer|Killed process'
+journalctl -k -b -1 | grep -i oom          # del arranque anterior</code></pre>
+
+<pre><code>[dom sep  1 03:14:07 2026] node invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL),
+                            order=0, oom_score_adj=0
+[dom sep  1 03:14:07 2026] CPU: 3 PID: 4711 Comm: node Not tainted 6.8.0-45-generic
+[dom sep  1 03:14:07 2026] memory: usage 524288kB, limit 524288kB, failcnt 1832
+[dom sep  1 03:14:07 2026] memory+swap: usage 524288kB, limit 9007199254740988kB
+[dom sep  1 03:14:07 2026] Memory cgroup stats for
+                            /system.slice/docker-9f2a3c1e....scope:
+                            anon 501219328 file 12587008 kernel_stack 819200
+[dom sep  1 03:14:07 2026] Tasks state (memory values in pages):
+[dom sep  1 03:14:07 2026] [  pid  ]  uid  tgid total_vm    rss  swapents oom_score_adj name
+[dom sep  1 03:14:07 2026] [   4711]    0  4711   312455 128932         0        0 node
+[dom sep  1 03:14:07 2026] Memory cgroup out of memory: Killed process 4711 (node)
+                            total-vm:1249820kB, anon-rss:511328kB, file-rss:4400kB,
+                            shmem-rss:0kB, UID:0 pgtables:1216kB oom_score_adj:0</code></pre>
+
+<div class="rule">
+  <strong>📌 Tres cosas que leer en ese volcado, en este orden.</strong> <strong>(1)</strong> <code>Memory <u>cgroup</u> out of memory</code> vs <code>Out of memory</code> a secas: la primera dice que el límite era del <em>cgroup</em>, no de la máquina. <strong>(2)</strong> <code>limit</code> en la línea de <code>memory:</code>: ahí está el techo real que se alcanzó (524288 kB = 512 MiB). <strong>(3)</strong> La tabla <code>Tasks state</code>: te muestra a todos los candidatos con su RSS, o sea quién <em>realmente</em> se comió la memoria — que puede no ser el que murió.
+</div>
+
+<h2>LS2.7 Swap: no es "RAM lenta"</h2>
+
+<p>La idea de que swap existe "para cuando se te acaba la RAM" es la fuente del segundo mito grande. Swap sirve para algo más valioso: <strong>permitirle al kernel sacar de RAM páginas anónimas frías</strong> —heap de un proceso que no se toca hace horas, memoria de arranque de un daemon— y usar esa RAM para page cache activo, que sí se está pidiendo.</p>
+
+<pre><code class="lang-bash">swapon --show
+# NAME      TYPE      SIZE USED PRIO
+# /dev/zram0 partition  4G  120M  100
+# /swapfile  file       2G   18M   -2
+
+# Quién está swapeado, por proceso (SwapPss reparte lo compartido)
+for p in /proc/[0-9]*; do
+  s=$(awk '/^SwapPss:/ {print $2}' "$p/smaps_rollup" 2&gt;/dev/null)
+  [ -n "$s" ] &amp;&amp; [ "$s" -gt 0 ] &amp;&amp; echo "$s $(tr -d '\0' &lt; $p/cmdline | cut -c1-40)"
+done | sort -rn | head -5</code></pre>
+
+<h3><code>vm.swappiness</code>: qué significa de verdad</h3>
+
+<pre><code class="lang-bash">sysctl vm.swappiness
+# vm.swappiness = 60</code></pre>
+
+<p>No es "cuánto swap usar". Es <strong>cuánto prefiere el kernel reclamar páginas anónimas (swap) frente a páginas de archivo (page cache)</strong> cuando necesita liberar. Con <code>60</code>, el balance está inclinado hacia el cache; con <code>10</code>, el kernel casi siempre prefiere tirar cache antes que swapear; con <code>100</code>, los trata parejo; con <code>0</code> solo swapea si no queda alternativa.</p>
+
+<table>
+<thead><tr><th>Valor</th><th>Escenario</th><th>Razonamiento</th></tr></thead>
+<tbody>
+<tr><td><code>60</code></td><td>Default de la mayoría de las distros</td><td>Balance genérico; asume disco rotativo caro</td></tr>
+<tr><td><code>10</code></td><td>Base de datos con disco lento</td><td>El cache de la DB vale más que evitar swap; swapear latencia p99 es fatal</td></tr>
+<tr><td><code>100</code>–<code>180</code></td><td>Con <strong>zram</strong> o swap en NVMe</td><td>Swapear es barato (compresión en RAM); conviene hacerlo agresivamente</td></tr>
+<tr><td><code>1</code></td><td>Sistemas de latencia dura (trading, RT)</td><td>Ningún page fault de swap es aceptable</td></tr>
+<tr><td><code>0</code></td><td>Casi nunca</td><td>No desactiva swap; solo lo deja como último recurso</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># zram: swap comprimido EN RAM. Sin disco, latencia de microsegundos
+sudo apt install zram-tools           # Debian/Ubuntu
+# /etc/default/zramswap
+#   ALGO=zstd
+#   PERCENT=25                        # 25% de la RAM como zram
+
+zramctl
+# NAME       ALGORITHM DISKSIZE  DATA COMPR TOTAL STREAMS MOUNTPOINT
+# /dev/zram0 zstd            4G  1,2G  310M  336M       8 [SWAP]
+#                                 ^^^^  ^^^^  ratio ~3.9x</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Poner <code>swap=0</code> en un servidor casi siempre empeora las cosas.</strong> Sin swap, el kernel pierde su única forma de sacar páginas anónimas frías: la <strong>única</strong> presión que puede aliviar es tirar page cache. Resultado: bajo presión, el sistema descarta el cache que sí estaba caliente, el I/O se dispara, y cuando eso no alcanza pasa <em>directo</em> al OOM killer. Con swap, hay una zona intermedia donde el sistema degrada; sin swap, la curva es un acantilado.
+</div>
+
+<div class="warn">
+  El argumento real contra el swap no es "consume disco", es <strong>thrashing</strong>: un sistema que swapea páginas <em>calientes</em> pasa el 100% del tiempo en I/O y deja de responder — a veces sin llegar nunca al OOM killer, que es peor que morir rápido. La solución no es eliminar swap: es <strong>dimensionarlo chico</strong> (1–4 GiB, o zram) y <strong>alertar sobre PSI</strong>, que es exactamente lo que viene ahora.
+</div>
+
+<h2>LS2.8 PSI: la métrica que reemplaza al load average</h2>
+
+<p><strong>Pressure Stall Information</strong> (kernel 4.20+) responde la única pregunta que importa en operaciones: <strong>¿cuánto tiempo se perdió esperando un recurso?</strong> No cuánto se usó — cuánto <em>dolió</em>.</p>
+
+<pre><code class="lang-bash">cat /proc/pressure/memory</code></pre>
+
+<pre><code>some avg10=18.42 avg60=12.07 avg300=4.31 total=88213904
+full avg10=9.88  avg60=6.14  avg300=2.02 total=41229117</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>some</code></td><td>% del tiempo en que <strong>al menos una</strong> tarea estuvo bloqueada esperando memoria</td></tr>
+<tr><td><code>full</code></td><td>% del tiempo en que <strong>todas</strong> las tareas ejecutables estuvieron bloqueadas: trabajo útil = 0</td></tr>
+<tr><td><code>avg10/60/300</code></td><td>Promedios móviles de 10 s, 1 min y 5 min</td></tr>
+<tr><td><code>total</code></td><td>Microsegundos acumulados desde el arranque (para calcular deltas exactos)</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué PSI es mucho mejor señal que el load average.</strong> El <em>load average</em> de Linux cuenta procesos en estado ejecutable <strong>más</strong> los que están en <code>D</code> (I/O ininterrumpible), promediado de una forma que nadie recuerda. Un load de 12 puede ser una máquina de 32 núcleos trabajando feliz, o una de 4 núcleos agonizando: <strong>el número no está normalizado y mezcla causas</strong>. PSI está normalizado (0–100%), separado <strong>por recurso</strong> (<code>cpu</code>, <code>memory</code>, <code>io</code>) y expresado en la única unidad que un SRE puede accionar: tiempo perdido. "El 20% del tiempo alguien esperó memoria" es una frase con la que se toma una decisión. "El load está en 12" no lo es.
+</div>
+
+<pre><code class="lang-bash">cat /proc/pressure/cpu        # solo tiene línea "some": la CPU nunca bloquea a todos
+cat /proc/pressure/io
+
+# PSI por cgroup: la vista que realmente importa en contenedores
+cat /sys/fs/cgroup/system.slice/docker-9f2a3c1e.scope/memory.pressure
+cat /sys/fs/cgroup/system.slice/mi-app.service/io.pressure
+
+# Watchdog casero: alertar si la presión "full" de memoria supera 10% a 1 min
+while :; do
+  v=$(awk '/^full/ {sub("avg60=","",$3); print $3}' /proc/pressure/memory)
+  awk -v v="$v" 'BEGIN { if (v+0 &gt; 10) print strftime("%T"), "PSI mem full:", v"%" }'
+  sleep 10
+done</code></pre>
+
+<table>
+<thead><tr><th>Umbral (<code>full avg60</code>)</th><th>Lectura</th><th>Acción</th></tr></thead>
+<tbody>
+<tr><td>&lt; 1%</td><td>Sano</td><td>Ninguna</td></tr>
+<tr><td>1–10%</td><td>Presión real, degradación medible</td><td>Investigar; revisar límites del cgroup</td></tr>
+<tr><td>&gt; 10% sostenido</td><td>Thrashing. El OOM está cerca</td><td>Alerta. Escalar o recortar</td></tr>
+<tr><td>&gt; 40%</td><td>El sistema no hace trabajo útil</td><td>Intervención inmediata</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <code>systemd-oomd</code> (presente en Fedora, Ubuntu 22.04+) usa exactamente esto: mata cgroups en base a umbrales de PSI <strong>antes</strong> de que el OOM killer del kernel entre en acción, cuando el sistema todavía responde. Se configura con <code>ManagedOOMMemoryPressure=kill</code> y <code>ManagedOOMMemoryPressureLimit=</code> en la unidad. Es matar temprano y con criterio, en vez de tarde y a ciegas.
+</div>
+
+<h2>LS2.9 Huge pages: menos TLB misses, más latencia impredecible</h2>
+
+<p>Con páginas de 4 KiB, mapear 64 GiB requiere 16 millones de entradas de tabla. La TLB no entra ni cerca, y cada miss cuesta un recorrido de cuatro niveles. Las <strong>huge pages</strong> de 2 MiB (o 1 GiB) reducen ese conteo por un factor de 512.</p>
+
+<table>
+<thead><tr><th></th><th>THP (transparentes)</th><th>Hugetlbfs (explícitas)</th></tr></thead>
+<tbody>
+<tr><td>Quién decide</td><td>El kernel, automáticamente</td><td>Vos, reservando al arranque</td></tr>
+<tr><td>Cambios en la app</td><td>Ninguno</td><td><code>mmap(MAP_HUGETLB)</code> o config del motor</td></tr>
+<tr><td>Reserva</td><td>Dinámica; el kernel compacta para conseguirlas</td><td>Estática: RAM apartada, no la usa nadie más</td></tr>
+<tr><td>Latencia</td><td>⚠️ <strong>Picos</strong> por compactación y por <code>khugepaged</code></td><td>✅ Predecible: no hay compactación en runtime</td></tr>
+<tr><td>Fragmentación interna</td><td>Sí: una página de 2 MiB para 8 KiB de datos</td><td>Sí, pero es una decisión consciente</td></tr>
+<tr><td>Uso típico</td><td>Cargas analíticas, HPC, JVM con heap grande</td><td>Oracle, PostgreSQL, DPDK, KVM</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never          &lt;- el corchete marca el modo activo
+
+cat /sys/kernel/mm/transparent_hugepage/defrag
+# always defer defer+madvise [madvise] never
+
+grep -E 'AnonHugePages|ShmemHugePages|HugePages_' /proc/meminfo
+# AnonHugePages:   2097152 kB
+# HugePages_Total:       0
+# HugePages_Free:        0
+
+# Cuánto de un proceso está en huge pages
+grep -i AnonHugePages /proc/1834/smaps_rollup</code></pre>
+
+<div class="danger">
+  <strong>⚠️ THP en <code>always</code> es un problema conocido para bases de datos.</strong> MongoDB, Redis, Couchbase y Oracle recomiendan explícitamente desactivarlo. La razón: cuando el kernel necesita una página de 2 MiB y la memoria está fragmentada, <strong>compacta sincrónicamente</strong> — el proceso que pidió memoria se queda parado mientras el kernel mueve páginas. Se ve como picos de latencia de decenas o cientos de milisegundos, esporádicos, imposibles de correlacionar con la carga. Es uno de los diagnósticos más difíciles de la lista.
+</div>
+
+<pre><code class="lang-bash"># El compromiso razonable: THP solo donde la app lo pide con madvise()
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+
+# Persistente vía kernel cmdline (GRUB):
+#   transparent_hugepage=madvise
+
+# Huge pages explícitas: 1024 páginas de 2 MiB = 2 GiB reservados
+echo 1024 | sudo tee /proc/sys/vm/nr_hugepages
+grep HugePages_ /proc/meminfo</code></pre>
+
+<div class="mistake">
+  <strong>Cuándo NO tocar nada de esto.</strong> Si tu servicio no maneja heaps de decenas de GiB con acceso disperso, las huge pages no te van a dar nada medible y sí te pueden costar latencia. Antes de habilitarlas, medí con <code>perf stat -e dTLB-load-misses</code>: si los misses son menos del 1–2% de los accesos, el TLB no es tu cuello de botella y estás optimizando ruido.
+</div>
+
+<h2>LS2.10 La caja de herramientas</h2>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Pregunta que responde</th><th>Invocación mínima</th></tr></thead>
+<tbody>
+<tr><td><code>free -h</code></td><td>¿Cuánta memoria puedo pedir? (mirá <code>available</code>)</td><td><code>free -h</code></td></tr>
+<tr><td><code>/proc/meminfo</code></td><td>El desglose real, sin interpretación</td><td><code>grep MemAvailable /proc/meminfo</code></td></tr>
+<tr><td><code>vmstat 1</code></td><td>¿Está swapeando o reclamando <em>ahora</em>?</td><td><code>vmstat 1 5</code></td></tr>
+<tr><td><code>smem</code></td><td>¿Quién se comió la RAM, sin duplicar? (PSS)</td><td><code>smem -tk -s pss -r</code></td></tr>
+<tr><td><code>smaps_rollup</code></td><td>PSS/USS/Swap de <em>un</em> proceso, barato</td><td><code>cat /proc/PID/smaps_rollup</code></td></tr>
+<tr><td><code>pmap -x</code></td><td>¿En qué mapeo se le fue la memoria?</td><td><code>pmap -x PID | sort -k3 -rn</code></td></tr>
+<tr><td><code>vmtouch</code></td><td>¿Qué archivos están en page cache?</td><td><code>vmtouch -v /ruta</code></td></tr>
+<tr><td><code>/proc/pressure/*</code></td><td>¿Cuánto tiempo se perdió esperando?</td><td><code>cat /proc/pressure/memory</code></td></tr>
+<tr><td><code>dmesg -T</code></td><td>¿Quién murió, con qué límite?</td><td><code>dmesg -T | grep -i oom</code></td></tr>
+<tr><td><code>memory.events</code></td><td>¿Hubo OOM <em>dentro del cgroup</em>?</td><td><code>cat /sys/fs/cgroup/.../memory.events</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">vmstat 1 5</code></pre>
+
+<pre><code>procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0 131072 309424 412308 10884120   0    0    18    92  841 1922 12  3 84  1  0
+ 1  0 131072 298112 412308 10891244   0    0     0   184  902 2011 14  2 83  1  0
+ 4  3 262144  98304 401120  9884120 812  4096  9820  312 3811 8722 22 19 12 47  0
+                                     ^^^  ^^^^  ^^^^                        ^^
+                              si/so distintos de 0 = swap activo     wa alto = I/O</code></pre>
+
+<div class="rule">
+  <strong>📌 Las columnas <code>si</code>/<code>so</code> de <code>vmstat</code> son el detector de thrashing más rápido que hay.</strong> Que <code>swpd</code> sea alto no dice nada (puede ser memoria fría swapeada hace días, y eso es sano). Que <code>si</code>/<code>so</code> tengan tráfico <em>sostenido</em> significa que el sistema está paginando en caliente: ahí sí tenés un problema, y PSI te va a decir cuánto cuesta.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el contenedor lo mata el OOM killer, pero <code>free</code> mostraba 4 GB disponibles"</h2>
+
+<blockquote>Un servicio Node en Docker muere cada dos o tres horas. El reinicio es automático, así que nadie lo vio durante semanas. La máquina tiene 16 GB y <code>free -h</code> dentro del contenedor muestra <code>available: 4,2Gi</code>. El equipo lleva una semana buscando una fuga que no aparece.</blockquote>
+
+<p><strong>Paso 1 — Confirmar que fue el OOM killer y no un crash de la app.</strong></p>
+
+<pre><code class="lang-bash">docker inspect api-node --format '{{.State.OOMKilled}} {{.State.ExitCode}}'
+# true 137
+#      ^^^  137 = 128 + 9 (SIGKILL). Firma clásica de OOM.
+
+sudo dmesg -T | grep -i 'killed process' | tail -3
+# [dom sep  1 03:14:07 2026] Memory cgroup out of memory: Killed process 4711 (node)
+#                            total-vm:1249820kB, anon-rss:511328kB ...</code></pre>
+
+<div class="rule">
+  <strong>📌 Ahí está la respuesta, en tres palabras: <code>Memory <u>cgroup</u> out of memory</code>.</strong> No dice "Out of memory" a secas. El límite que se alcanzó <strong>no era el de la máquina</strong>: era el del cgroup del contenedor. La máquina tenía 4 GB disponibles y era irrelevante — el proceso murió al llegar a 512 MiB.
+</div>
+
+<p><strong>Paso 2 — Leer el límite real, no el de la máquina.</strong> El techo vive en el cgroup v2 del contenedor:</p>
+
+<pre><code class="lang-bash">CID=$(docker inspect -f '{{.Id}}' api-node)
+CG=/sys/fs/cgroup/system.slice/docker-$CID.scope
+
+cat $CG/memory.max          # 536870912        -&gt; 512 MiB. El techo real.
+cat $CG/memory.high         # max              -&gt; sin throttling previo
+cat $CG/memory.current      # 534773760        -&gt; 510 MiB. Rozando el techo.
+cat $CG/memory.peak         # 536870912        -&gt; tocó el techo exacto</code></pre>
+
+<p><strong>Paso 3 — La prueba definitiva: <code>memory.events</code>.</strong> Este archivo es un contador acumulado que sobrevive a los reinicios del proceso. Es la caja negra del cgroup:</p>
+
+<pre><code class="lang-bash">cat $CG/memory.events</code></pre>
+
+<pre><code>low        0
+high       0
+max     1832      &lt;- veces que se rebotó contra memory.max
+oom        3      &lt;- veces que se declaró OOM en este cgroup
+oom_kill   3      &lt;- procesos efectivamente asesinados. AHÍ ESTÁ.</code></pre>
+
+<pre><code class="lang-bash"># Y el desglose de en qué se fue esa memoria
+grep -E '^(anon|file|slab|sock|shmem|kernel_stack) ' $CG/memory.stat
+# anon         501219328     &lt;- 478 MiB de heap. El grueso.
+# file          12587008     &lt;- 12 MiB de page cache: nada que reclamar
+# slab           3145728
+# sock            524288
+# kernel_stack    819200
+
+# ¿Y cuánto sufrió antes de morir?
+cat $CG/memory.pressure
+# some avg10=42.18 avg60=38.90 avg300=21.44 total=1882134907
+# full avg10=31.02 avg60=27.55 avg300=15.10 total=1204993318</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué <code>free</code> dentro de un contenedor confunde tanto.</strong> <code>free</code> lee <code>/proc/meminfo</code>, y <code>/proc</code> —salvo que uses <code>lxcfs</code> o similar— <strong>no está namespaceado</strong>: muestra la memoria del <em>host</em>, no la del cgroup. El contenedor ve 16 GB totales y 4 GB disponibles porque está mirando la máquina entera, mientras su propio techo es de 512 MiB. Peor todavía: los runtimes que se autoconfiguran leyendo la RAM disponible —la JVM sin <code>UseContainerSupport</code>, Node calculando su heap, pools de conexiones dimensionados por RAM— toman decisiones con el número del host y se suicidan solos.
+</div>
+
+<p><strong>Paso 4 — Decidir, con la tabla de opciones sobre la mesa.</strong></p>
+
+<table>
+<thead><tr><th>Opción</th><th>Qué resuelve</th><th>Qué cuesta / riesgo</th></tr></thead>
+<tbody>
+<tr><td>Subir <code>memory.max</code> a 1 GiB</td><td>Deja de morir hoy</td><td>Si hay fuga, solo corre la muerte 6 h. No diagnostica nada</td></tr>
+<tr><td>Poner <code>memory.high</code> por debajo de <code>max</code></td><td>El kernel throttlea y reclama <strong>antes</strong> de matar</td><td>Degradación en vez de muerte; hay que medir el impacto</td></tr>
+<tr><td>Ajustar el heap del runtime al límite real</td><td>El proceso se autolimita y hace GC a tiempo</td><td>Requiere conocer el overhead no-heap (~15–25%)</td></tr>
+<tr><td>Alertar sobre <code>memory.pressure</code> y <code>oom_kill</code></td><td>Nunca más pasan semanas sin que nadie lo vea</td><td>Bajo. Es lo que faltaba desde el principio</td></tr>
+<tr><td>Perfilar el heap y arreglar la causa</td><td>Lo único definitivo</td><td>Tiempo de desarrollo</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 5 — La corrección, en dos capas.</strong> Primero que el proceso conozca su límite; después que el sistema avise en vez de matar en silencio:</p>
+
+<pre><code class="lang-bash"># docker-compose.yml
+services:
+  api:
+    image: api-node:1.9
+    mem_limit: 1g                 # memory.max  = 1 GiB
+    mem_reservation: 768m         # memory.high = 768 MiB -&gt; reclama antes de matar
+    environment:
+      # Que Node dimensione su heap con el límite del CGROUP, no con el del host
+      - NODE_OPTIONS=--max-old-space-size=768
+
+# Equivalente en systemd (LS7):
+#   [Service]
+#   MemoryMax=1G
+#   MemoryHigh=768M
+#   ManagedOOMMemoryPressure=kill
+#   ManagedOOMMemoryPressureLimit=25%</code></pre>
+
+<pre><code class="lang-bash"># Y la señal que faltaba: exportar oom_kill y la presión del cgroup
+awk '/^oom_kill/ {print "cgroup_oom_kills_total", $2}' $CG/memory.events
+awk '/^full/ {sub("avg60=","",$3); print "cgroup_memory_pressure_full_60s", $3}' \
+    $CG/memory.pressure</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "subí el límite".</strong> Es que <strong>en un sistema con cgroups, <code>free</code> responde la pregunta equivocada</strong>. La memoria disponible del host es irrelevante para un proceso confinado: su realidad son <code>memory.max</code>, <code>memory.current</code>, <code>memory.events</code> y <code>memory.pressure</code>. Y que un contador acumulado como <code>oom_kill</code> vale más que cualquier gráfico de RAM, porque no se pierde cuando el proceso reinicia. Cómo se construye ese confinamiento —namespaces y cgroups— es exactamente el tema de <strong>LS3</strong>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Un servidor con 32 GB muestra <code>free</code> de 180 MB y <code>available</code> de 21 GB. ¿Hay que hacer algo?</summary>
+<p>No, y es la situación esperada. <code>free</code> mide RAM que no está siendo usada <em>para nada</em>, incluido el page cache — o sea, RAM desperdiciada. Un servidor con días de uptime y trabajo real siempre tiende a <code>free</code> bajo porque el kernel llena la RAM ociosa con páginas de archivos, y las devuelve en el momento en que alguien pide memoria. La columna que dice si podés pedir memoria es <code>available</code> (21 GB acá): es la estimación del kernel de cuánto puede reclamar sin swapear. Una alerta configurada sobre <code>free</code> o <code>MemFree</code> está mal por construcción; la correcta es sobre <code>MemAvailable</code> o, mejor, sobre <code>/proc/pressure/memory</code>.</p></details>
+
+<details><summary>Sumás el RSS de todos los procesos y da 26 GB en una máquina de 16 GB. ¿Qué está roto?</summary>
+<p>Nada. RSS cuenta <strong>todas</strong> las páginas residentes de un proceso, incluidas las compartidas, y las bibliotecas compartidas se cuentan enteras en cada proceso que las mapea. Con doscientos procesos mapeando <code>libc</code>, <code>libssl</code> y el mismo binario, esas páginas se contabilizan doscientas veces aunque en RAM existan una sola vez. La métrica que reparte sin duplicar es <strong>PSS</strong>: divide cada página compartida entre los procesos que la comparten, y por eso la suma de PSS sí se aproxima a la memoria realmente usada. Si además querés saber cuánta RAM recuperarías matando un proceso, la métrica es <strong>USS</strong> (<code>Private_Clean + Private_Dirty</code> en <code>smaps_rollup</code>), porque lo compartido va a seguir en RAM para los demás.</p></details>
+
+<details><summary>¿Por qué PSI es mejor señal que el load average para decidir si escalar?</summary>
+<p>Porque el load average mezcla causas y no está normalizado: cuenta tareas ejecutables <em>más</em> tareas en I/O ininterrumpible, y un valor de 12 significa cosas opuestas en una máquina de 4 núcleos y en una de 64. No sabés si el problema es CPU, disco o memoria, ni cuánto trabajo se perdió. PSI expresa exactamente eso: el porcentaje de tiempo en que alguna tarea (<code>some</code>) o todas (<code>full</code>) estuvieron bloqueadas esperando <strong>un recurso concreto</strong> —<code>cpu</code>, <code>memory</code> o <code>io</code>— en ventanas de 10 s, 1 min y 5 min. Está acotado entre 0 y 100%, es comparable entre máquinas de distinto tamaño, y se lee por cgroup, así que podés atribuir la presión al servicio que la causa. "El 30% del tiempo nadie pudo avanzar por falta de memoria" es una frase accionable; "el load está en 12" no lo es.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Cada proceso ve un <strong>espacio virtual propio</strong>; la MMU traduce con la tabla de páginas y cachea en la <strong>TLB</strong>. Las bibliotecas compartidas existen una vez en RAM y se mapean N veces.</li>
+  <li>En <code>free</code>, <strong><code>free</code> bajo es sano</strong> y <strong><code>available</code> es el único número que importa</strong>. "Linux se come mi RAM" está al revés: te la devuelve como page cache.</li>
+  <li>El <strong>page cache</strong> es RAM prestada y reclamable. <code>drop_caches</code> es para benchmarks, no para producción: tira trabajo útil y dispara la latencia.</li>
+  <li><strong>VSZ</strong> es ruido, <strong>RSS</strong> duplica lo compartido (por eso sumarlo excede la RAM total), <strong>PSS</strong> reparte honestamente y <strong>USS</strong> te dice cuánto recuperás si matás el proceso.</li>
+  <li><strong>Overcommit</strong>: el kernel promete más memoria de la que tiene porque los procesos piden más de lo que tocan. El OOM killer es lo que pasa cuando esa apuesta se pierde.</li>
+  <li>El <strong>OOM killer</strong> elige por tamaño, así que suele matar tu base de datos. Se ajusta con <code>oom_score_adj</code> (usá <code>-800</code>, no <code>-1000</code>) y se diagnostica leyendo <code>dmesg</code>: fijate si dice <em>cgroup</em>.</li>
+  <li><strong>Swap</strong> no es RAM lenta: es la capacidad de sacar páginas anónimas frías. <code>swap=0</code> convierte una degradación gradual en un acantilado hacia el OOM. <code>vm.swappiness</code> es una preferencia entre reclamar anónimas o cache, no un porcentaje de uso.</li>
+  <li><strong>PSI</strong> (<code>/proc/pressure/*</code>) mide <em>tiempo perdido</em> por recurso, normalizado y por cgroup. Reemplaza al load average para alertar, y es la base de <code>systemd-oomd</code>.</li>
+  <li><strong>Huge pages</strong> reducen TLB misses en heaps enormes, pero THP en <code>always</code> introduce picos de latencia por compactación. Medí antes con <code>perf</code>; el default seguro es <code>madvise</code>.</li>
+  <li>En contenedores, <strong><code>free</code> responde la pregunta equivocada</strong>: el límite real está en <code>memory.max</code> y la evidencia en <code>memory.events</code>.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>free -h</code> y <code>grep MemAvailable /proc/meminfo</code> en tu máquina. Leé un archivo de 1–2 GB con <code>dd ... of=/dev/null</code> y volvé a medir. Documentá cuánto subió <code>buff/cache</code>, cuánto bajó <code>available</code>, y explicá por qué no bajan en la misma proporción. Después cronometrá la segunda lectura y calculá el factor de aceleración.</li>
+  <li>Sumá el RSS de todos los procesos con <code>ps -eo rss</code> y comparalo con la memoria realmente usada. Después instalá <code>smem</code>, ordená por PSS y verificá que la suma de PSS sí se aproxima al total. Explicá con un ejemplo concreto de tu sistema (nombrá la biblioteca) de dónde sale la diferencia.</li>
+  <li>Elegí tu proceso más grande y armá una tabla con sus cuatro métricas: VSZ (de <code>ps</code>), RSS, PSS y USS (calculado desde <code>smaps_rollup</code>). Respondé: si lo matás, ¿cuánta RAM recuperás realmente?</li>
+  <li>Escribí un script que cada 5 segundos imprima <code>some avg10</code> y <code>full avg10</code> de <code>/proc/pressure/memory</code> y <code>/proc/pressure/io</code>. Dejalo corriendo mientras generás carga real (compilar algo grande, un <code>dd</code> masivo, o un programa que asigne memoria en loop) y anotá qué valores alcanza cada recurso. Compará esos números con el load average del mismo momento y explicá por qué uno te sirve más que el otro.</li>
+  <li>Ranqueá los <code>oom_score</code> de tu sistema con el bucle de LS2.6. Identificá qué moriría primero. Bajá el <code>oom_score_adj</code> de un servicio a <code>-800</code> desde una unidad drop-in de systemd (no a mano), reiniciá el servicio y comprobá que el valor persiste.</li>
+  <li>Levantá un contenedor con un límite bajo a propósito (<code>docker run --rm -m 128m ...</code>) corriendo algo que asigne memoria hasta morir. Antes del OOM, compará lo que dice <code>free -h</code> <em>dentro</em> del contenedor con lo que dicen <code>memory.max</code> y <code>memory.current</code> de su cgroup. Después del OOM, encontrá el <code>oom_kill</code> en <code>memory.events</code> y la línea correspondiente en <code>dmesg -T</code>. Escribí en tres renglones por qué <code>free</code> confundió.</li>
+  <li>Revisá el estado de THP en tu máquina (<code>transparent_hugepage/enabled</code>) y medí <code>dTLB-load-misses</code> con <code>perf stat</code> sobre alguna carga tuya que use memoria de verdad. Con ese dato en la mano, argumentá si en tu caso conviene <code>always</code>, <code>madvise</code> o <code>never</code> — y decí explícitamente qué medición cambiaría tu respuesta.</li>
+</ol>
+
+<section class="quiz" id="quizLS2">
+  <style>
+    #quizLS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS2 .q{margin-bottom:1.5rem}
+    #quizLS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS2 .opt:hover{border-color:var(--accent)}
+    #quizLS2 .opt:disabled{cursor:default}
+    #quizLS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS2 .exp.show{display:block}
+    #quizLS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un contenedor muere con exit code 137. Dentro, <code>free -h</code> mostraba 4 GB disponibles. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">Hay una fuga de memoria en la aplicación y <code>free</code> no la detecta</button>
+    <button class="opt">El host se quedó sin memoria y el kernel eligió al contenedor por su tamaño</button>
+    <button class="opt">El límite que se alcanzó era el de su cgroup, y <code>free</code> estaba leyendo <code>/proc/meminfo</code> del host</button>
+    <div class="exp"><code>/proc</code> no está namespaceado: dentro del contenedor, <code>free</code> reporta la memoria de la <strong>máquina</strong>, no el techo del cgroup. Se confirma en dos comandos: <code>dmesg</code> va a decir <em>Memory <u>cgroup</u> out of memory</em> (no "Out of memory" a secas), y <code>memory.events</code> del cgroup va a tener el contador <code>oom_kill</code> incrementado. El límite real está en <code>memory.max</code>, no en <code>free</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Sumás el RSS de todos los procesos y da 26 GB en una máquina de 16 GB. ¿Qué significa?</p>
+    <button class="opt">Nada anómalo: RSS cuenta las páginas compartidas completas en cada proceso que las mapea</button>
+    <button class="opt">Hay procesos zombis acumulando memoria que <code>free</code> no ve</button>
+    <button class="opt">El sistema está swapeando y RSS incluye lo que está en swap</button>
+    <div class="exp">Las bibliotecas compartidas (<code>libc</code>, <code>libssl</code>, el propio binario) existen una sola vez en RAM pero cada proceso que las mapea cuenta esas páginas enteras en su RSS. Con cientos de procesos, la suma se dispara sin que exista un byte de más. Para repartir sin duplicar está <strong>PSS</strong> (cada página compartida dividida entre quienes la comparten), y para saber cuánto recuperás matando un proceso está <strong>USS</strong>, que son solo sus páginas privadas. Nota aparte: RSS <em>excluye</em> lo swapeado, eso se cuenta en <code>Swap</code>/<code>SwapPss</code>.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un servidor tiene <code>swpd</code> alto en <code>vmstat</code> pero <code>si</code> y <code>so</code> en 0, y <code>full avg60</code> de <code>/proc/pressure/memory</code> en 0.2%. ¿Qué hacés?</p>
+    <button class="opt">Correr <code>swapoff -a &amp;&amp; swapon -a</code> para forzar que todo vuelva a RAM</button>
+    <button class="opt">Nada: hay memoria fría swapeada hace rato y no se está paginando en caliente</button>
+    <button class="opt">Bajar <code>vm.swappiness</code> a 0 para que deje de usar swap</button>
+    <div class="exp">Que haya páginas <em>en</em> swap (<code>swpd</code>) no es un problema: es exactamente para lo que existe el swap — sacar páginas anónimas frías y dejarle esa RAM al page cache activo. Lo que indica thrashing es <strong>tráfico sostenido</strong> en <code>si</code>/<code>so</code>, y el costo real lo cuantifica PSI: con <code>full avg60</code> en 0.2% prácticamente no se perdió tiempo esperando memoria. Forzar <code>swapoff</code> traería de golpe páginas que nadie pide y podría empujar al sistema contra el OOM; y <code>swappiness=0</code> no desactiva el swap, solo lo deja como último recurso, empeorando la curva de degradación.</div>
+  </div>
+
+  <div class="score" id="scoreLS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls1-kernel-procesos/lecture.html">← LS1: El kernel por dentro</a>
+  <a href="../ls3-namespaces-cgroups/lecture.html">LS3: Namespaces y cgroups →</a>
+</nav>
+
+</div>
+</body>
+</html>

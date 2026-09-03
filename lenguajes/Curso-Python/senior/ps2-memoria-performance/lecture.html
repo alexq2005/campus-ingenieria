@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS2 — Memoria y performance · Python Senior</title>
+  <meta name="description" content="Layout de objetos y __slots__, medir memoria de verdad con tracemalloc, cazar fugas, weakref y cachés que no retienen, profiling con cProfile / py-spy / memray / scalene, leer un flamegraph y decidir qué optimizar — y qué no.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS2</span>
+  <span class="badge">⏱ 30–90 min</span>
+  <span class="badge">🎯 Pre-req: PS1</span>
+  <span class="badge">📊 Performance</span>
+</div>
+
+<article>
+
+<h1>PS2 — Memoria y performance</h1>
+
+<h2>PS2.0 Por qué este módulo: optimizar sin medir es superstición</h2>
+
+<p>En PS1 viste <em>por qué</em> Python pesa: cada valor es un objeto en el heap con header, refcount y puntero a tipo. Este módulo es la contraparte práctica: <strong>cómo se mide eso, cómo se encuentra qué lo está causando, y qué se hace al respecto</strong>.</p>
+
+<p>La razón por la que el tema merece un módulo entero es que casi todo el mundo lo hace al revés. El patrón típico es: alguien lee que las <em>list comprehensions</em> son más rápidas que <code>append</code>, reescribe media aplicación, y el servicio sigue tardando lo mismo — porque el 90% del tiempo se iba en una consulta sin índice.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Rendimiento no es un conjunto de trucos, es un <strong>método</strong>: (1) definir la métrica que importa —latencia p99, RSS pico, throughput—, (2) medirla con la herramienta adecuada, (3) atacar el término dominante, (4) volver a medir, (5) <strong>dejar una guardia automática</strong> para que la mejora no se pierda sola en tres sprints. Los pasos 1 y 5 son los que separan trabajo senior de anécdotas.
+</div>
+
+<div class="rule">
+  <strong>📌 Ley de Amdahl, en criollo.</strong> Si una parte se lleva el 20% del tiempo y la volvés infinitamente rápida, ganás como mucho un 20%. Optimizar lo que no domina el perfil tiene techo matemático — y ese techo casi siempre es más bajo que el costo de mantener el código raro que escribiste para lograrlo.
+</div>
+
+<h2>PS2.1 El layout de un objeto y qué ahorra <code>__slots__</code></h2>
+
+<p>Una instancia común de una clase Python son <strong>dos</strong> asignaciones de memoria: el objeto en sí (header + un puntero a <code>__dict__</code> + un puntero a <code>__weakref__</code>) y, aparte, el diccionario donde viven los atributos. <code>__slots__</code> elimina la segunda: los atributos pasan a ser posiciones fijas dentro del propio objeto, como los campos de un <code>struct</code> de C.</p>
+
+<pre><code class="lang-python">import sys
+
+class PuntoDict:
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+class PuntoSlots:
+    __slots__ = ("x", "y", "z")
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+d = PuntoDict(1, 2, 3)
+s = PuntoSlots(1, 2, 3)
+
+# getsizeof es SUPERFICIAL: hay que sumar el __dict__ a mano
+print(sys.getsizeof(d), sys.getsizeof(d.__dict__))   # p.ej. 48 + 104
+print(sys.getsizeof(s), hasattr(s, "__dict__"))      # p.ej. 56  False</code></pre>
+
+<div class="info">
+  Los números exactos cambian entre versiones y builds: no memorices "104", memorizá <strong>la forma de medirlo</strong>. Desde 3.11 CPython usa <em>key-sharing dictionaries</em>: varias instancias de la misma clase comparten la tabla de claves, así que el ahorro de <code>__slots__</code> es menor que en Python 3.6, pero sigue siendo real y crece con la cantidad de instancias.
+</div>
+
+<p>La medición honesta no es sobre una instancia: es sobre un millón. Y no se hace con <code>getsizeof</code>, se hace midiendo la memoria del proceso o con <code>tracemalloc</code>:</p>
+
+<pre><code class="lang-python">import tracemalloc
+
+def medir_pico(fabrica, n=1_000_000):
+    tracemalloc.start()
+    objetos = [fabrica(i, i, i) for i in range(n)]
+    actual, pico = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    del objetos
+    return pico / 1e6   # MB
+
+print(f"dict  : {medir_pico(PuntoDict):.1f} MB")
+print(f"slots : {medir_pico(PuntoSlots):.1f} MB")
+# Orden de magnitud típico: ~150 MB vs ~90 MB. Medilo en TU build.</code></pre>
+
+<div class="rule">
+  <strong>📌 Cuándo <code>__slots__</code> paga.</strong> Cuando tenés <strong>muchas instancias de la misma clase chica</strong>: nodos de un grafo, puntos, filas de un dataset, eventos en un buffer. El ahorro es 30–50% de memoria y, de yapa, el acceso a atributos es un poco más rápido porque es un offset fijo en vez de una búsqueda en un dict. Para diez instancias de un servicio, no cambia absolutamente nada y solo agrega fricción.
+</div>
+
+<h3>Qué rompe <code>__slots__</code></h3>
+
+<p>Esto es lo que hay que saber antes de esparcirlo por el codebase, porque son limitaciones estructurales, no detalles:</p>
+
+<table>
+<thead><tr><th>Lo que se pierde</th><th>Detalle</th></tr></thead>
+<tbody>
+<tr><td>Atributos dinámicos</td><td><code>obj.nuevo = 1</code> lanza <code>AttributeError</code>. Es una feature, no un bug: te agarra los typos.</td></tr>
+<tr><td><code>__dict__</code></td><td>No existe. Cualquier código que haga <code>vars(obj)</code> o <code>obj.__dict__.update(...)</code> se rompe — incluye algunos serializadores.</td></tr>
+<tr><td>Herencia múltiple</td><td>Dos bases con <code>__slots__</code> <em>no vacíos</em> son incompatibles: <code>TypeError: multiple bases have instance lay-out conflict</code>.</td></tr>
+<tr><td>Subclases descuidadas</td><td>Una subclase que no declara <code>__slots__</code> <strong>reintroduce el <code>__dict__</code></strong> y el ahorro se evapora en silencio.</td></tr>
+<tr><td><code>weakref</code></td><td>No se puede hacer weakref al objeto salvo que agregues <code>"__weakref__"</code> a los slots.</td></tr>
+<tr><td><code>functools.cached_property</code></td><td>Necesita <code>__dict__</code> para guardar el valor: no funciona con slots.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">class Base:
+    __slots__ = ("a",)
+
+class HijaOK(Base):
+    __slots__ = ()          # mantiene el ahorro
+
+class HijaFuga(Base):
+    pass                    # ¡vuelve a tener __dict__! silenciosamente
+
+print(hasattr(HijaOK(),   "__dict__"))   # False
+print(hasattr(HijaFuga(), "__dict__"))   # True  &lt;- el ahorro se perdió</code></pre>
+
+<div class="tip">
+  Si usás <code>@dataclass</code>, no hace falta escribir los slots a mano: <code>@dataclass(slots=True)</code> los genera. Y si el objeto es realmente inmutable y chico, <code>@dataclass(frozen=True, slots=True)</code> o directamente un <code>NamedTuple</code> suelen ser aún más baratos.
+</div>
+
+<h2>PS2.2 <code>sys.getsizeof</code> miente: medir de verdad con <code>tracemalloc</code></h2>
+
+<p><code>sys.getsizeof</code> devuelve el tamaño del objeto <strong>y nada de lo que referencia</strong>. Para cualquier contenedor, eso lo vuelve casi inútil como medida de "cuánta memoria estoy usando":</p>
+
+<pre><code class="lang-python">import sys
+
+textos = ["x" * 1000 for _ in range(10_000)]
+
+sys.getsizeof(textos)          # ~80_056  -> "80 KB", dice la lista
+sum(sys.getsizeof(t) for t in textos) + sys.getsizeof(textos)
+                               # ~10_500_000 -> 10 MB de verdad</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> reportar <code>getsizeof(mi_cache)</code> en un dashboard y concluir que el caché "ocupa 300 KB". Lo que ocupa 300 KB es la <em>tabla hash</em>. Los valores adentro pueden ser gigabytes. Y sumar recursivamente tampoco es correcto, porque un objeto referenciado desde dos lugares se contaría dos veces.
+</div>
+
+<p><code>tracemalloc</code>, en la biblioteca estándar, resuelve el problema desde el otro lado: en vez de preguntarle a un objeto cuánto pesa, <strong>registra cada asignación del intérprete y la atribuye a la línea de código que la hizo</strong>.</p>
+
+<pre><code class="lang-python">import tracemalloc
+
+tracemalloc.start(10)          # guardar 10 frames de stack por asignación
+
+datos = {i: [0] * 100 for i in range(5_000)}
+otros = ["y" * 500 for _ in range(20_000)]
+
+snap = tracemalloc.take_snapshot()
+for stat in snap.statistics("lineno")[:5]:
+    print(stat)                # archivo:línea  tamaño  cantidad de bloques
+
+actual, pico = tracemalloc.get_traced_memory()
+print(f"actual {actual/1e6:.1f} MB · pico {pico/1e6:.1f} MB")
+tracemalloc.stop()</code></pre>
+
+<div class="warn">
+  <code>tracemalloc</code> tiene overhead real: entre 1,5× y 3× más lento, y la memoria del propio rastreo crece con la cantidad de frames que le pidas. Se enciende para diagnosticar, no se deja prendido en producción — para eso está <code>memray</code> o un muestreo periódico con pocos frames.
+</div>
+
+<div class="rule">
+  <strong>📌 Tres números distintos que no hay que confundir.</strong> <strong>(a)</strong> Memoria que Python cree que asignó (<code>tracemalloc</code>). <strong>(b)</strong> RSS del proceso, lo que ve el sistema operativo (<code>psutil.Process().memory_info().rss</code>) — es el número por el que te mata el OOM killer. <strong>(c)</strong> Memoria pico, no la final. Un job puede terminar en 200 MB y haber tocado 6 GB en el medio: el que te mata es el pico.
+</div>
+
+<pre><code class="lang-python">import os, psutil, tracemalloc
+
+proc = psutil.Process(os.getpid())
+
+def snapshot_completo(etiqueta):
+    py_actual, py_pico = tracemalloc.get_traced_memory()
+    rss = proc.memory_info().rss
+    print(f"{etiqueta:&lt;12} python={py_actual/1e6:7.1f} MB "
+          f"pico={py_pico/1e6:7.1f} MB  rss={rss/1e6:7.1f} MB")
+
+tracemalloc.start()
+snapshot_completo("inicio")
+buffer = bytearray(300_000_000)
+snapshot_completo("post-alloc")
+del buffer
+snapshot_completo("post-free")   # el RSS puede NO bajar: el allocator retiene arenas</code></pre>
+
+<div class="info">
+  Que el RSS no baje después de liberar objetos <strong>no es una fuga</strong>. CPython administra bloques chicos con su propio allocator (<em>pymalloc</em>) y devuelve arenas al sistema operativo solo cuando quedan completamente vacías; la fragmentación hace que muchas veces no pase. Fuga es cuando el RSS <em>crece monótonamente</em> ciclo tras ciclo, no cuando se queda en una meseta.
+</div>
+
+<h2>PS2.3 Cazar una fuga real: snapshots y <code>compare_to</code></h2>
+
+<p>Una fuga en Python casi nunca es memoria "perdida" al estilo C: es memoria <strong>que todavía es alcanzable porque alguien guardó una referencia y se olvidó</strong>. Un caché sin límite, una lista de handlers a la que se le suscriben objetos que nunca se dan de baja, un logger que acumula registros, un decorador que retiene los argumentos.</p>
+
+<p>La técnica es siempre la misma: dos snapshots separados por N ciclos de trabajo, y comparar. Lo que crece entre ambos es lo que se acumula.</p>
+
+<pre><code class="lang-python">import tracemalloc
+
+# --- el sospechoso: un "caché" que nunca borra nada ---
+_REGISTRO = []
+
+def procesar(evento):
+    resultado = {"id": evento, "payload": "z" * 2_000}
+    _REGISTRO.append(resultado)          # &lt;- acá está la fuga
+    return resultado["id"]
+
+def ciclo(n=5_000):
+    for i in range(n):
+        procesar(i)
+
+tracemalloc.start(25)
+
+ciclo()                                   # calentar: descartamos el arranque
+antes = tracemalloc.take_snapshot()
+
+ciclo()                                   # el trabajo que sospechamos que fuga
+despues = tracemalloc.take_snapshot()
+
+diferencias = despues.compare_to(antes, "lineno")
+for stat in diferencias[:5]:
+    print(f"{stat.size_diff/1e6:+7.2f} MB  {stat.count_diff:+7d} bloques  {stat}")</code></pre>
+
+<p>La salida señala la línea exacta que acumula. Cuando la línea no alcanza —porque el culpable es <code>list.append</code> llamado desde veinte lugares— se cambia el criterio a <code>"traceback"</code> y se pide el stack completo:</p>
+
+<pre><code class="lang-python">top = despues.statistics("traceback")[0]
+print(f"{top.size/1e6:.1f} MB en {top.count} bloques, asignados desde:")
+for linea in top.traceback.format():
+    print("   ", linea)</code></pre>
+
+<div class="step"><strong>Protocolo de caza de fugas, en orden.</strong> (1) Confirmar que <em>hay</em> fuga: el RSS crece ciclo tras ciclo y no se estabiliza. (2) Aislar el ciclo más chico que la reproduce. (3) <code>compare_to</code> entre dos snapshots para ubicar la línea. (4) Preguntarse <em>quién retiene</em>: <code>gc.get_referrers(obj)</code> te dice quién apunta al objeto. (5) Cortar la referencia o hacerla débil. (6) Test de regresión que falle si vuelve.</div>
+
+<pre><code class="lang-python">import gc
+
+sospechoso = _REGISTRO[0]
+for quien in gc.get_referrers(sospechoso):
+    print(type(quien), repr(quien)[:80])   # ¿quién no lo suelta?</code></pre>
+
+<div class="warn">
+  <code>gc.get_referrers</code> es una herramienta de diagnóstico interactivo, no de producción: es lenta, devuelve también frames temporales del propio intérprete, y puede resucitar objetos. Usala en un REPL o en un endpoint de debug protegido, nunca en el camino caliente.
+</div>
+
+<h2>PS2.4 Ciclos, <code>weakref</code> y cachés que no retienen</h2>
+
+<p>Del refcounting de PS1 se deduce una regla directa: <strong>mientras alguien tenga una referencia fuerte, el objeto vive</strong>. Un caché es, por definición, alguien que tiene una referencia fuerte a todo lo que cacheó. Por eso el caché es la fuente número uno de fugas en Python.</p>
+
+<p><code>weakref</code> ofrece la referencia que <em>no</em> cuenta: permite observar un objeto sin impedir que muera.</p>
+
+<pre><code class="lang-python">import weakref, gc
+
+class Sesion:
+    def __init__(self, uid): self.uid = uid
+
+s = Sesion("u-1")
+ref = weakref.ref(s)
+
+print(ref())        # &lt;Sesion object ...&gt;  el objeto sigue vivo
+del s
+gc.collect()
+print(ref())        # None  -> murió, y la referencia débil lo sabe</code></pre>
+
+<p>La forma útil de eso es un caché que no retiene: <code>WeakValueDictionary</code>. Sirve para lo que en inglés llaman <em>identity map</em> — garantizar que si dos partes del programa piden el mismo id obtengan el mismo objeto, sin que ese mapa mantenga vivo nada por su cuenta.</p>
+
+<pre><code class="lang-python">import weakref
+
+class Documento:
+    def __init__(self, doc_id, contenido):
+        self.doc_id, self.contenido = doc_id, contenido
+
+_VIVOS = weakref.WeakValueDictionary()
+
+def obtener(doc_id):
+    doc = _VIVOS.get(doc_id)
+    if doc is None:
+        doc = Documento(doc_id, cargar_de_disco(doc_id))
+        _VIVOS[doc_id] = doc          # NO impide que se libere
+    return doc
+
+a = obtener("d1")
+b = obtener("d1")
+assert a is b                          # misma instancia mientras alguien la use
+del a, b                               # cuando nadie la usa, sale del mapa sola</code></pre>
+
+<div class="danger">
+  <strong>⚠️ No todo se puede referenciar débilmente.</strong> <code>int</code>, <code>str</code>, <code>tuple</code>, <code>list</code> y <code>dict</code> <strong>no soportan weakref</strong> (y las clases con <code>__slots__</code> tampoco, salvo que incluyan <code>"__weakref__"</code>). Un <code>WeakValueDictionary</code> de strings tira <code>TypeError</code>. Si necesitás cachear valores primitivos con límite, lo correcto es un caché LRU acotado, no weakrefs.
+</div>
+
+<p>El otro uso serio de weakref es <strong>romper ciclos</strong>. El caso canónico es padre ↔ hijo: si ambos lados son fuertes, el par entero depende del GC generacional para morir. Si la referencia al padre es débil, el refcounting los libera al instante:</p>
+
+<pre><code class="lang-python">import weakref
+
+class Nodo:
+    __slots__ = ("valor", "hijos", "_padre", "__weakref__")
+
+    def __init__(self, valor):
+        self.valor, self.hijos, self._padre = valor, [], None
+
+    @property
+    def padre(self):
+        return self._padre() if self._padre is not None else None
+
+    def agregar(self, hijo):
+        self.hijos.append(hijo)             # fuerte hacia abajo
+        hijo._padre = weakref.ref(self)     # DÉBIL hacia arriba: no hay ciclo</code></pre>
+
+<div class="tip">
+  Y para la limpieza determinista de recursos asociados a un objeto, <code>weakref.finalize(obj, funcion, *args)</code> es la alternativa correcta a <code>__del__</code>: se ejecuta cuando el objeto muere, no participa del ciclo, y se puede cancelar. Igual, si el recurso es un archivo o un socket, la respuesta sigue siendo <code>with</code>.
+</div>
+
+<h2>PS2.5 El instrumental: cProfile, py-spy, memray, scalene</h2>
+
+<p>Cuatro herramientas, cuatro trabajos distintos. Elegir mal es la razón más común por la que un perfil "no muestra nada".</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué mide</th><th>Cómo</th><th>Overhead</th><th>¿En producción?</th></tr></thead>
+<tbody>
+<tr><td><code>cProfile</code> (stdlib)</td><td>CPU, por función, cantidad de llamadas</td><td>Determinista: instrumenta cada llamada</td><td>Alto (1,3–3×) y <strong>sesgado</strong></td><td>❌ No</td></tr>
+<tr><td><code>py-spy</code></td><td>CPU, por línea y por hilo</td><td>Sampling desde <em>otro</em> proceso</td><td>Casi nulo</td><td>✅ Sí, sin reiniciar</td></tr>
+<tr><td><code>memray</code></td><td>Memoria, asignación por asignación</td><td>Intercepta el allocator, incluye C nativo</td><td>Medio</td><td>⚠️ En staging o un job puntual</td></tr>
+<tr><td><code>scalene</code></td><td>CPU + memoria + GPU, y separa <strong>tiempo Python vs tiempo nativo</strong></td><td>Sampling con atribución por línea</td><td>Bajo</td><td>⚠️ Preferentemente en staging</td></tr>
+<tr><td><code>tracemalloc</code> (stdlib)</td><td>Memoria por línea de Python</td><td>Rastrea el allocator de Python</td><td>Medio-alto</td><td>⚠️ Puntual, pocos frames</td></tr>
+<tr><td><code>timeit</code> / <code>perf_counter</code></td><td>Latencia de un fragmento</td><td>Cronómetro</td><td>Nulo</td><td>✅ Para micro-benchmarks</td></tr>
+</tbody>
+</table>
+
+<h3><code>cProfile</code>: el mapa de arranque, con su sesgo</h3>
+
+<pre><code class="lang-bash">python -m cProfile -o perfil.prof mi_script.py
+
+python -c "
+import pstats
+p = pstats.Stats('perfil.prof')
+p.sort_stats('cumulative').print_stats(15)   # dónde se acumula el tiempo
+p.sort_stats('tottime').print_stats(15)      # quién LO GASTA de verdad
+"</code></pre>
+
+<div class="mistake">
+  <strong>El sesgo de <code>cProfile</code> que engaña a todo el mundo:</strong> cobra un costo fijo <em>por llamada</em>. Una función chiquita invocada diez millones de veces aparece inflada; un bloque monolítico que tarda lo mismo aparece barato. Resultado: te manda a optimizar <em>getters</em> triviales. Cuando el perfil determinista y el de sampling no coinciden, <strong>creele al de sampling</strong>.
+</div>
+
+<div class="info">
+  <code>tottime</code> es el tiempo <em>propio</em> de la función; <code>cumtime</code> incluye todo lo que llamó. Si <code>main</code> encabeza por <code>cumtime</code>, no descubriste nada — ordená por <code>tottime</code> para encontrar dónde se quema CPU realmente.
+</div>
+
+<h3><code>py-spy</code>: perfilar producción sin tocar el código</h3>
+
+<pre><code class="lang-bash">uv tool install py-spy
+
+py-spy top --pid 12345                      # "htop" de funciones, en vivo
+py-spy record --pid 12345 -d 30 -o cpu.svg  # flamegraph de 30 segundos
+py-spy dump --pid 12345                     # stack de TODOS los hilos, ahora
+
+# extras que se usan más de lo que uno cree:
+py-spy record --pid 12345 --subprocesses -o todo.svg   # gunicorn/celery
+py-spy record --pid 12345 --native -o nativo.svg       # entra en C/Rust
+py-spy record --pid 12345 --idle -o conespera.svg      # incluye hilos dormidos</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>py-spy dump</code> es la herramienta para "el proceso está colgado".</strong> No perfila: te muestra en qué línea está parado cada hilo <em>en este instante</em>. Un deadlock, una query eterna o un <code>requests</code> sin timeout se diagnostican en cinco segundos, sin reiniciar ni reproducir nada.
+</div>
+
+<h3><code>memray</code>: memoria asignación por asignación</h3>
+
+<pre><code class="lang-bash">uv tool install memray
+
+memray run -o job.bin mi_job.py             # graba todas las asignaciones
+memray flamegraph job.bin                   # -> job.html, interactivo
+memray summary  job.bin                     # tabla por función
+memray tree     job.bin                     # árbol de asignaciones
+memray run --leaks -o fuga.bin mi_job.py    # solo lo que NO se liberó
+memray run --native -o job.bin mi_job.py    # atribuye también memoria de C
+memray run --live mi_job.py                 # TUI en vivo mientras corre</code></pre>
+
+<div class="tip">
+  Por defecto el flamegraph de <code>memray</code> muestra el <strong>pico</strong> de memoria, no el total acumulado — que es exactamente lo que querés cuando el problema es un OOM. Y trae plugin de pytest (<code>pytest-memray</code>): eso convierte un hallazgo en una guardia permanente, como vas a ver en el worked example.
+</div>
+
+<h3><code>scalene</code>: cuando no sabés si el problema es Python o es C</h3>
+
+<pre><code class="lang-bash">uv tool install scalene
+scalene --html --outfile perfil.html mi_script.py
+scalene --cpu --memory --profile-interval 0.05 mi_script.py</code></pre>
+
+<div class="concept">
+  <strong>💡 Lo que hace único a scalene.</strong> Separa, línea por línea, el tiempo gastado <strong>en el intérprete de Python</strong> del gastado <strong>en código nativo</strong> (NumPy, Pandas, tu extensión en Rust). Esa distinción es la que decide la estrategia: si la línea caliente ya es 95% nativa, reescribirla en Python no te va a dar nada y hay que cambiar de algoritmo o de librería. Si es 95% Python, vectorizar o bajar a C sí va a mover la aguja.
+</div>
+
+<h2>PS2.6 Cómo se lee un flamegraph</h2>
+
+<p>Es el formato en el que te van a llegar los perfiles y se malinterpreta sistemáticamente. Tres reglas alcanzan:</p>
+
+<div class="step"><strong>1. El ancho es todo.</strong> El ancho de una barra es la fracción de muestras en las que esa función estaba en el stack: su tiempo <em>total</em> (inclusivo). Una barra que ocupa media pantalla es donde se va la mitad del tiempo. Punto.</div>
+
+<div class="step"><strong>2. La altura no significa nada.</strong> El eje vertical es profundidad de la pila de llamadas, no tiempo ni importancia. Una torre altísima y flaca es irrelevante; una barra baja y ancha es tu problema.</div>
+
+<div class="step"><strong>3. El eje X no es la línea de tiempo.</strong> Los frames se ordenan alfabéticamente para que los hermanos se agrupen y las mesetas se vean. No leas "primero esto, después aquello": no hay cronología.</div>
+
+<div class="rule">
+  <strong>📌 Qué buscar, en la práctica.</strong> <strong>Mesetas anchas</strong> (una función que domina) y sobre todo <strong>hojas anchas</strong>: una barra ancha <em>sin nada encima</em> es tiempo propio, código que está quemando CPU él mismo. Ese es el candidato número uno. Un frame ancho con una torre encima solo está esperando a sus hijos: el culpable está más arriba.
+</div>
+
+<div class="info">
+  Un <em>icicle graph</em> (crece hacia abajo, es lo que muestra <code>memray</code>) es el mismo gráfico dado vuelta. Y ojo con el eje semántico: en un flamegraph de <strong>CPU</strong> el ancho es tiempo; en uno de <strong>memoria</strong> el ancho es bytes asignados. Se leen igual, pero responden preguntas distintas.
+</div>
+
+<h2>PS2.7 Optimizaciones que mueven la aguja, en orden</h2>
+
+<p>Cuando el perfil ya te dijo dónde está el tiempo, se aplican en este orden. No es una lista de opciones: es una <strong>secuencia</strong>, y se baja un escalón solo cuando el anterior está agotado.</p>
+
+<table>
+<thead><tr><th>#</th><th>Palanca</th><th>Ganancia típica</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Algoritmo</strong> — bajar la complejidad</td><td>10×–1000×</td><td>Pensar; a veces reescribir</td></tr>
+<tr><td>2</td><td><strong>Estructura de datos</strong> — <code>set</code> en vez de <code>list</code>, <code>deque</code>, <code>array</code>, columnas</td><td>10×–100×</td><td>Bajo</td></tr>
+<tr><td>3</td><td><strong>Evitar copias</strong> — streaming, <code>memoryview</code>, generadores</td><td>2×–10×, y baja el pico de memoria</td><td>Medio</td></tr>
+<tr><td>4</td><td><strong>Cachear</strong> — <code>functools.cache</code>, memoización, precómputo</td><td>Depende del hit rate</td><td>Riesgo de fuga e invalidación</td></tr>
+<tr><td>5</td><td><strong>Vectorizar / salir de Python</strong> — NumPy, Polars, extensión nativa</td><td>10×–100× en cargas numéricas</td><td>Dependencia nueva; revalidar resultados</td></tr>
+<tr><td>—</td><td><s>Micro-optimizar bytecode</s></td><td>0–5%</td><td>Código ilegible para siempre</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">import time
+
+def lento(consultas, universo):          # O(n·m): busca en una lista
+    return [q for q in consultas if q in universo]
+
+def rapido(consultas, universo_set):     # O(n): busca en un hash
+    return [q for q in consultas if q in universo_set]
+
+universo   = list(range(200_000))
+universo_s = set(universo)
+consultas  = list(range(0, 200_000, 7))
+
+for nombre, fn, u in (("list", lento, universo), ("set", rapido, universo_s)):
+    t0 = time.perf_counter(); fn(consultas, u)
+    print(f"{nombre}: {time.perf_counter()-t0:.3f}s")
+# list: ~9 s   ·   set: ~0.003 s   -> tres órdenes de magnitud, un cambio de tipo</code></pre>
+
+<p>El escalón 3 —evitar copias— es el que más se ignora y el que más impacta en memoria. La diferencia entre materializar y transmitir:</p>
+
+<pre><code class="lang-python">import tracemalloc
+
+def materializando(path):
+    with open(path, encoding="utf-8") as f:
+        lineas = f.readlines()                       # TODO el archivo en RAM
+    return sum(len(l) for l in lineas if l.startswith("ERROR"))
+
+def transmitiendo(path):
+    with open(path, encoding="utf-8") as f:
+        return sum(len(l) for l in f if l.startswith("ERROR"))   # una línea por vez
+
+for fn in (materializando, transmitiendo):
+    tracemalloc.start()
+    fn("app.log")
+    print(fn.__name__, f"pico {tracemalloc.get_traced_memory()[1]/1e6:.1f} MB")
+    tracemalloc.stop()
+# El resultado es idéntico; el pico de memoria, no.</code></pre>
+
+<div class="mistake">
+  <strong>Micro-optimizaciones que no valen la pena en 2026:</strong> sacar el punto del loop (<em>method hoisting</em>), reemplazar <code>for</code> por <code>map</code> "porque es en C", usar variables locales en lugar de globales por deporte, o elegir <code>%</code> sobre f-strings. Todo eso rinde entre 0 y 5% y lo mata cualquier decisión de los escalones 1 a 3. La excepción real y siempre válida: <strong>no concatenes strings en un loop</strong> — usá <code>"".join(partes)</code>, porque ahí el problema no es micro, es cuadrático.
+</div>
+
+<h2>PS2.8 <code>lru_cache</code>: ganancia o fuga con buena prensa</h2>
+
+<p><code>functools.lru_cache</code> es un decorador de una línea que puede darte 100× o comerte la RAM del servidor. Las dos cosas por el mismo motivo: <strong>mantiene referencias fuertes a los argumentos y a los resultados</strong>.</p>
+
+<pre><code class="lang-python">from functools import lru_cache, cache
+
+@lru_cache(maxsize=1024)          # ACOTADO: descarta lo menos usado
+def cotizacion(par: str, dia: str) -&gt; float:
+    return consultar_api(par, dia)
+
+@cache                            # equivale a lru_cache(maxsize=None): SIN límite
+def fib(n: int) -&gt; int:
+    return n if n &lt; 2 else fib(n - 1) + fib(n - 2)
+
+# Medir el caché no es opcional: es el único modo de saber si sirve
+cotizacion("EURUSD", "2026-09-01")
+cotizacion("EURUSD", "2026-09-01")
+print(cotizacion.cache_info())
+# CacheInfo(hits=1, misses=1, maxsize=1024, currsize=1)</code></pre>
+
+<table>
+<thead><tr><th>Cachear conviene si…</th><th>Es una fuga disfrazada si…</th></tr></thead>
+<tbody>
+<tr><td>El dominio de argumentos es chico y acotado</td><td>Los argumentos son ids de usuario, timestamps o UUIDs: el dominio es infinito</td></tr>
+<tr><td>La función es pura y determinista</td><td>Los datos subyacentes cambian y nadie invalida el caché</td></tr>
+<tr><td>El <code>hit rate</code> medido es alto</td><td>Nunca miraste <code>cache_info()</code></td></tr>
+<tr><td>Los resultados son chicos</td><td>Devolvés DataFrames, respuestas HTTP completas o listas grandes</td></tr>
+<tr><td>Pusiste un <code>maxsize</code> deliberado</td><td>Usaste <code>@cache</code> "porque es más lindo"</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ La trampa que más veces vi en producción: <code>@lru_cache</code> sobre un método.</strong> El primer argumento es <code>self</code>, así que el caché <strong>guarda una referencia fuerte a la instancia y no la suelta nunca</strong>. Todos los objetos que hayan pasado por ese método quedan vivos para siempre, con todo lo que arrastren. El caché es un atributo de la <em>función</em>, que vive en la clase: no muere con la instancia.
+</div>
+
+<pre><code class="lang-python">from functools import lru_cache, cached_property
+
+class Informe:
+    def __init__(self, filas): self.filas = filas   # 200 MB, digamos
+
+    @lru_cache(maxsize=None)        # ❌ retiene TODAS las instancias, para siempre
+    def total_malo(self):
+        return sum(self.filas)
+
+    @cached_property                # ✅ el valor vive en la instancia y muere con ella
+    def total(self):
+        return sum(self.filas)</code></pre>
+
+<div class="tip">
+  Reglas de bolsillo: <strong>(1)</strong> <code>maxsize</code> explícito siempre, salvo dominio demostrablemente finito. <strong>(2)</strong> Cachés por instancia → <code>cached_property</code>, no <code>lru_cache</code>. <strong>(3)</strong> Exponé <code>cache_info()</code> en tus métricas: un caché con hit rate del 12% es solo memoria desperdiciada, y con 0% es memoria desperdiciada <em>y</em> latencia agregada. <strong>(4)</strong> En un servidor con N workers, hay N cachés independientes: multiplicá la memoria por N antes de dimensionar.
+</div>
+
+<h2>PS2.9 Cuándo NO optimizar</h2>
+
+<p>La decisión más rentable de este módulo suele ser <strong>no hacer nada</strong>. Antes de tocar una línea, pasá estos filtros:</p>
+
+<div class="step"><strong>1. ¿El tiempo está en I/O?</strong> Si el 95% se va esperando la base de datos, una API o el disco, el intérprete es irrelevante — podrías reescribir todo en C y ganar 5%. La palanca ahí es un índice, menos <em>round-trips</em>, un <code>JOIN</code> en vez de N+1 consultas, o concurrencia de I/O (PS3). No es un problema de Python.</div>
+
+<div class="step"><strong>2. ¿Tenés una métrica y un objetivo?</strong> "Hacerlo más rápido" no es un objetivo. "p99 por debajo de 300 ms" o "el job entra en 2 GB" sí lo son, y además te dicen cuándo parar. Sin número, la optimización no termina nunca.</div>
+
+<div class="step"><strong>3. ¿Cuánto cuesta el problema realmente?</strong> Un job nocturno que tarda 40 minutos en vez de 10 y a nadie le molesta no es un problema de rendimiento: es una molestia estética. Dos días de trabajo ahí son dos días que no dedicaste a algo que sí importa.</div>
+
+<div class="step"><strong>4. ¿La optimización cabe en la cabeza del próximo?</strong> Código raro y 15% más rápido, en una ruta que no domina el perfil, es deuda pura. Si lo hacés igual, dejá el benchmark que lo justifica <em>al lado del código</em>: sin esa evidencia, en seis meses alguien lo va a "limpiar" — y va a tener razón.</div>
+
+<div class="rule">
+  <strong>📌 El orden que casi nunca falla.</strong> Corrección → claridad → medición → optimización del término dominante → guardia de regresión. Saltarse la medición es la definición operativa de superstición.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el job come 6 GB y lo mata el OOM killer"</h2>
+
+<blockquote>Un ETL nocturno lee 40 millones de filas, calcula un score por fila y escribe un resumen. Andaba bien. Desde que el dataset creció, el contenedor (límite: 4 GB) lo mata a mitad de camino con <code>Killed</code> — sin traceback, sin log, sin nada. La primera propuesta del equipo es subir el límite a 8 GB.</blockquote>
+
+<p><strong>Paso 1 — Confirmar el síntoma con un número, no con una impresión.</strong> "Killed" sin traceback es la firma del OOM killer del kernel. Lo primero es medir el pico real y ver si crece con el input:</p>
+
+<pre><code class="lang-bash">/usr/bin/time -v python job.py 2&gt;&amp;1 | grep "Maximum resident"
+# Maximum resident set size (kbytes): 6120448   -> 6,1 GB de pico
+
+dmesg | tail -5
+# Out of memory: Killed process 4711 (python) total-vm:7.9G, anon-rss:6.0G</code></pre>
+
+<p><strong>Paso 2 — Perfilar la memoria, no la CPU.</strong> El problema es espacio, así que la herramienta es <code>memray</code>, con un subconjunto del input que quepa en la máquina de desarrollo:</p>
+
+<pre><code class="lang-bash">memray run --native -o job.bin job.py --limite 2000000
+memray flamegraph job.bin        # -> memray-flamegraph-job.html
+memray summary  job.bin</code></pre>
+
+<p><strong>Paso 3 — Leer el flamegraph.</strong> Una sola meseta ocupa el 88% del ancho, y su hoja es una línea:</p>
+
+<pre><code class="lang-python"># job.py  (versión original)
+def procesar(path):
+    resultados = []                                   # &lt;- 5,4 GB acá
+    for fila in leer_csv(path):
+        resultados.append({
+            "id":    fila["id"],
+            "score": calcular_score(fila),
+            "crudo": fila,                            # se guarda la fila ENTERA
+        })
+    return resumir(resultados)</code></pre>
+
+<p>El diagnóstico es completo: se acumulan 40 millones de diccionarios que además retienen la fila original, cuando lo único que <code>resumir</code> necesita es un agregado. La memoria crece linealmente con el input: subir el límite a 8 GB compra tres meses, no una solución.</p>
+
+<p><strong>Paso 4 — Las opciones, con su costo.</strong> Esta tabla es el entregable real del análisis; sin ella, la decisión es una opinión:</p>
+
+<table>
+<thead><tr><th>Opción</th><th>Pico esperado</th><th>Costo / riesgo</th></tr></thead>
+<tbody>
+<tr><td>Subir el límite del contenedor a 8 GB</td><td>6,1 GB (igual)</td><td>No arregla nada: vuelve a romperse cuando el dataset crezca. Y cuesta plata todos los meses.</td></tr>
+<tr><td><strong>Generador</strong>: <code>yield</code> en vez de <code>append</code>, y agregación incremental</td><td>~40 MB</td><td>Bajo. <code>resumir</code> debe aceptar un iterable y no indexar ni recorrer dos veces.</td></tr>
+<tr><td><strong>Chunking</strong>: procesar de a 50.000 filas y escribir parciales</td><td>~150 MB</td><td>Medio. Requiere reducción parcial + merge final; permite reanudar si falla.</td></tr>
+<tr><td>Vectorizar con Polars en modo <em>lazy</em> / streaming</td><td>~300 MB, y 10–30× más rápido</td><td>Dependencia nueva; reescribir <code>calcular_score</code> como expresión; revalidar resultados contra la salida vieja.</td></tr>
+<tr><td>Mover la agregación a SQL</td><td>~0 en el job</td><td>Alto acoplamiento a la base; el score tiene lógica difícil de expresar en SQL.</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 5 — Decidir.</strong> Gana el <strong>generador</strong>: resuelve el problema entero, no agrega dependencias y el diff es de veinte líneas. El chunking queda anotado como paso siguiente si más adelante hace falta reanudar tras un fallo; Polars queda para cuando el cuello pase de ser memoria a ser tiempo.</p>
+
+<pre><code class="lang-python"># job.py  (versión corregida)
+from collections import Counter
+from typing import Iterator
+
+def procesar(path) -&gt; Iterator[tuple[str, float]]:
+    """Perezoso a propósito: NO materializa. Ver test_no_materializa."""
+    for fila in leer_csv(path):
+        yield fila["id"], calcular_score(fila)      # solo lo que se necesita
+
+def resumir(pares) -&gt; dict:
+    total, n, por_bucket = 0.0, 0, Counter()
+    for _id, score in pares:                        # una pasada, estado O(1)
+        total += score
+        n += 1
+        por_bucket[round(score, 1)] += 1
+    return {"promedio": total / n, "n": n, "buckets": dict(por_bucket)}</code></pre>
+
+<p><strong>Paso 6 — La guardia, que es lo que hace que esto sea trabajo senior.</strong> Un arreglo sin test se deshace la primera vez que alguien "solo necesita la lista completa un momentito". Van dos guardias complementarias: una sobre el <em>contrato</em> (es perezoso) y otra sobre el <em>presupuesto</em> (no supera X MB).</p>
+
+<pre><code class="lang-python"># tests/test_job_memoria.py
+import inspect, tracemalloc, pytest
+from job import procesar, resumir
+
+def test_no_materializa():
+    """Contrato: procesar() devuelve un generador. Si alguien mete un
+    list(...) adentro, este test falla ANTES de que lo haga el OOM killer."""
+    assert inspect.isgeneratorfunction(procesar)
+    salida = procesar("tests/datos/muestra.csv")
+    assert inspect.isgenerator(salida)
+
+@pytest.mark.limit_memory("150 MB")        # requiere pytest-memray
+def test_presupuesto_de_memoria():
+    """El job entero sobre 1M de filas debe entrar en 150 MB."""
+    assert resumir(procesar("tests/datos/1M.csv"))["n"] == 1_000_000
+
+def test_pico_no_escala_con_el_input():
+    """La marca del streaming: duplicar el input NO duplica el pico."""
+    picos = []
+    for archivo in ("tests/datos/100k.csv", "tests/datos/200k.csv"):
+        tracemalloc.start()
+        resumir(procesar(archivo))
+        picos.append(tracemalloc.get_traced_memory()[1])
+        tracemalloc.stop()
+    assert picos[1] &lt; picos[0] * 1.3       # constante, no lineal</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá generadores".</strong> Es la secuencia: <strong>reproducir con un número</strong> (6,1 GB, no "mucha memoria") → <strong>elegir la herramienta según la métrica</strong> (memoria ⇒ memray, no cProfile) → <strong>tabular las opciones con su costo</strong> antes de elegir → <strong>dejar una guardia ejecutable</strong>. El tercer test es el más valioso de los tres: no verifica un valor, verifica una <em>propiedad</em> —que el pico no escala con el input— y esa propiedad es justamente la que se rompió.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu servicio libera un montón de objetos y el RSS no baja. ¿Es una fuga?</summary>
+<p>Probablemente no. CPython administra los objetos chicos con <em>pymalloc</em>, que agrupa las asignaciones en arenas y solo las devuelve al sistema operativo cuando quedan <strong>completamente</strong> vacías; con fragmentación, eso casi nunca pasa. Que la memoria se quede en una meseta después de un pico es comportamiento normal y esperado. La firma de una fuga es distinta: el RSS <strong>crece monótonamente</strong> ciclo tras ciclo, sin estabilizarse. La forma de distinguirlas es correr N ciclos idénticos y comparar <code>tracemalloc</code> entre el ciclo 2 y el ciclo 10: si el delta es plano, es fragmentación; si crece proporcional a los ciclos, alguien está guardando referencias.</p></details>
+
+<details><summary>El perfil de <code>cProfile</code> dice que el 40% del tiempo está en un <em>getter</em> de dos líneas. ¿Qué hacés?</summary>
+<p>Desconfiar y confirmar con un profiler de sampling. <code>cProfile</code> es determinista y cobra un costo fijo por llamada, así que <strong>infla sistemáticamente las funciones chicas y muy llamadas</strong> — un getter invocado diez millones de veces es el caso de manual. Corré <code>py-spy record</code> o <code>scalene</code> sobre la misma carga: si el getter desaparece del top, era artefacto del instrumento. Y si igual resulta ser real, la solución no es "optimizar el getter": es llamarlo menos veces —sacarlo de un loop, cachear el valor, o cambiar la estructura de datos— porque en Python el costo dominante es la llamada en sí, no el cuerpo.</p></details>
+
+<details><summary>¿Por qué <code>@lru_cache</code> sobre un método es peligroso, y qué usás en su lugar?</summary>
+<p>Porque el caché es un atributo de la <strong>función</strong>, que vive en la clase, no en la instancia — y el primer argumento cacheado es <code>self</code>. Eso significa que el diccionario del caché mantiene una referencia fuerte a cada instancia que haya pasado por el método, y esas instancias no se liberan nunca, con todo lo que arrastren (DataFrames, conexiones, buffers). Es una fuga que crece con el tráfico y no se ve en el código. Para un valor derivado por instancia, la herramienta correcta es <code>functools.cached_property</code>: guarda el resultado en el <code>__dict__</code> de la instancia y muere con ella. Si además necesitás invalidarlo, un <code>del obj.propiedad</code> lo limpia. Y si de verdad querés un caché compartido entre instancias, cacheá una función libre que reciba solo los datos primitivos que importan, nunca <code>self</code>.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Rendimiento es método, no trucos: métrica → medición → término dominante → <strong>guardia de regresión</strong>. Sin métrica no hay optimización, hay superstición.</li>
+  <li><code>__slots__</code> elimina el <code>__dict__</code> por instancia: 30–50% menos memoria cuando hay <strong>muchas instancias chicas</strong>. Rompe atributos dinámicos, <code>vars()</code>, herencia múltiple, <code>cached_property</code>, y una subclase sin <code>__slots__</code> anula el ahorro en silencio.</li>
+  <li><code>sys.getsizeof</code> es superficial y no sirve para contenedores. Los números reales salen de <code>tracemalloc</code> (por línea de Python) y del <strong>RSS</strong> (lo que mira el OOM killer). El que te mata es el <strong>pico</strong>, no el final.</li>
+  <li>Fugas: dos snapshots + <code>compare_to</code> ubican la línea; <code>gc.get_referrers</code> dice quién retiene. En Python la fuga casi siempre es una referencia olvidada, y casi siempre es un caché.</li>
+  <li><code>weakref</code> observa sin retener: <code>WeakValueDictionary</code> para <em>identity maps</em>, referencias débiles hacia arriba para romper ciclos padre↔hijo. Ojo: <code>int</code>, <code>str</code>, <code>tuple</code>, <code>list</code> y <code>dict</code> no admiten weakref.</li>
+  <li>Herramienta según la pregunta: <code>cProfile</code> para el mapa inicial (con su sesgo por llamada), <strong>py-spy</strong> para producción sin instrumentar y para procesos colgados, <strong>memray</strong> para memoria, <strong>scalene</strong> para separar tiempo de Python del de C.</li>
+  <li>En un flamegraph: el <strong>ancho es el tiempo</strong>, la altura no significa nada, y el eje X no es cronológico. Buscá hojas anchas.</li>
+  <li>Orden de las palancas: algoritmo → estructura de datos → evitar copias → cachear → vectorizar. Las micro-optimizaciones de bytecode rinden 0–5% y cuestan legibilidad para siempre.</li>
+  <li><code>lru_cache</code> retiene referencias fuertes: con <code>maxsize=None</code> y dominio infinito es una fuga; sobre un método retiene <code>self</code> eternamente. Medí siempre <code>cache_info()</code>.</li>
+  <li>Si el tiempo está en I/O, el intérprete es irrelevante. Es el caso más frecuente y el más ignorado.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Definí la misma clase de cinco atributos en tres versiones: normal, con <code>__slots__</code> y como <code>@dataclass(slots=True)</code>. Medí el pico con <code>tracemalloc</code> creando 1.000.000 de instancias de cada una y armá una tabla con bytes por instancia. Después agregá una subclase sin <code>__slots__</code> y mostrá cuánto del ahorro se pierde.</li>
+  <li>Construí un caso donde <code>sys.getsizeof</code> se equivoque por más de 100×, y escribí una función <code>tamano_real(obj)</code> que recorra las referencias con <code>gc.get_referents</code> y no cuente dos veces el mismo objeto (usá un <code>set</code> de <code>id()</code>). Comparala contra <code>tracemalloc</code>.</li>
+  <li>Escribí un servicio de juguete con una fuga deliberada (una lista global de handlers, o un <code>@cache</code> sobre una función con un id de usuario como argumento). Cazala con <code>compare_to</code> y adjuntá la salida que señala la línea culpable.</li>
+  <li>Implementá un caché de objetos con <code>WeakValueDictionary</code> y demostrá con un test que las entradas desaparecen solas cuando nadie las usa. Después intentá cachear <code>str</code> y documentá el <code>TypeError</code> que obtenés y por qué.</li>
+  <li>Perfilá el mismo script con <code>cProfile</code>, <code>py-spy record</code> y <code>scalene</code>. Compará los tres <em>top 5</em> en una tabla y explicá cada discrepancia. Objetivo: encontrar al menos una función que <code>cProfile</code> infle.</li>
+  <li>Tomá una función tuya que tarde más de 5 segundos y aplicá las palancas de PS2.7 <strong>en orden</strong>, midiendo después de cada una. Registrá la ganancia de cada escalón por separado y decidí, con el número en la mano, dónde parar.</li>
+  <li>Agregá <code>pytest-memray</code> a un proyecto tuyo y ponele un <code>@pytest.mark.limit_memory</code> al test más pesado. Bajá el límite hasta que falle, subilo un 30% y dejalo commiteado: acabás de escribir un presupuesto de memoria ejecutable.</li>
+</ol>
+
+<section class="quiz" id="quizPS2">
+  <style>
+    #quizPS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS2 .q{margin-bottom:1.5rem}
+    #quizPS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS2 .opt:hover{border-color:var(--accent)}
+    #quizPS2 .opt:disabled{cursor:default}
+    #quizPS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS2 .exp.show{display:block}
+    #quizPS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un job se muere por OOM y querés saber qué línea acumula la memoria. ¿Qué herramienta usás?</p>
+    <button class="opt"><code>cProfile</code> ordenado por <code>tottime</code></button>
+    <button class="opt"><code>sys.getsizeof</code> sobre las estructuras principales</button>
+    <button class="opt"><code>memray</code> (o <code>tracemalloc</code> con <code>compare_to</code>)</button>
+    <button class="opt"><code>timeit</code> sobre la función sospechosa</button>
+    <div class="exp">La pregunta es de memoria, así que la herramienta tiene que medir memoria. <code>cProfile</code> y <code>timeit</code> miden tiempo y no van a ver nada; <code>getsizeof</code> es superficial y no dice quién asignó qué. <code>memray</code> registra cada asignación y te da un flamegraph donde el ancho son bytes; <code>tracemalloc</code> con dos snapshots y <code>compare_to</code> llega al mismo lugar sin instalar nada, a cambio de más overhead.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Agregaste <code>@lru_cache(maxsize=None)</code> a un método de una clase que carga 200 MB de datos. Con el tiempo el servicio consume cada vez más RAM. ¿Por qué?</p>
+    <button class="opt">Porque <code>lru_cache</code> no libera memoria hasta que corre el GC de ciclos</button>
+    <button class="opt">Porque el caché guarda <code>self</code> como parte de la clave y mantiene vivas todas las instancias para siempre</button>
+    <button class="opt">Porque <code>maxsize=None</code> desactiva el refcounting de los resultados</button>
+    <button class="opt">Porque los métodos no son hasheables y el caché guarda copias</button>
+    <div class="exp">El caché es un atributo de la función, y la función vive en la clase — no en la instancia. Como el primer argumento cacheado es <code>self</code>, cada instancia que pasa por el método queda referenciada fuertemente por el diccionario del caché y no se libera jamás, arrastrando sus 200 MB. Para un valor derivado por instancia va <code>functools.cached_property</code>, que guarda el resultado en la instancia y muere con ella.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. En un flamegraph de CPU ves una torre muy alta y angosta, y al lado una barra baja que ocupa el 60% del ancho. ¿Dónde está el problema?</p>
+    <button class="opt">En la barra ancha: el ancho es la fracción de tiempo, la altura solo es profundidad de stack</button>
+    <button class="opt">En la torre alta: más frames anidados significa más trabajo acumulado</button>
+    <button class="opt">En ninguna de las dos; hay que mirar cuál aparece primero en el eje X</button>
+    <button class="opt">En la torre, porque la recursión profunda siempre domina el perfil</button>
+    <div class="exp">El ancho de una barra es la fracción de muestras en las que esa función estaba en el stack, o sea su tiempo total: el 60% del tiempo se va ahí. La altura es solo profundidad de llamadas y no dice nada sobre el costo. Y el eje X está ordenado alfabéticamente para agrupar hermanos y hacer visibles las mesetas — no es una línea de tiempo, así que "cuál aparece primero" no significa nada.</div>
+  </div>
+
+  <div class="score" id="scorePS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps1-cpython-internals/lecture.html">← PS1: CPython por dentro</a>
+  <a href="../ps3-asyncio/lecture.html">PS3: asyncio a fondo →</a>
+</nav>
+
+</div>
+</body>
+</html>

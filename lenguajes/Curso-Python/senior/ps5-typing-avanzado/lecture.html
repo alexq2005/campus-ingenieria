@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS5 — Typing avanzado · Python Senior</title>
+  <meta name="description" content="Protocol y tipado estructural, TypeVar y la sintaxis 3.12+, ParamSpec y Concatenate para decoradores, overload, TypedDict, narrowing con TypeGuard vs TypeIs, varianza, mypy vs pyright vs ty, y dónde va pydantic.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS5</span>
+  <span class="badge">⏱ 35–110 min</span>
+  <span class="badge">🎯 Pre-req: PS4</span>
+  <span class="badge">🔤 Tipos</span>
+</div>
+
+<article>
+
+<h1>PS5 — Typing avanzado</h1>
+
+<h2>PS5.0 Por qué: los tipos no documentan, cambian el diseño</h2>
+
+<p>La forma más común de vender el tipado en Python es la peor: <em>"sirve para documentar"</em>. Si eso fuera todo, un docstring alcanzaría. El valor real es otro, y es más incómodo: <strong>escribir el tipo te obliga a decir con precisión qué hace tu función</strong>, y cuando esa precisión es difícil de expresar, casi siempre es porque la función hace algo mal pensado.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un tipo que no se puede escribir sin <code>Any</code>, sin diez <code>overload</code> o sin una unión de siete miembros no es un problema del verificador: es <strong>una abstracción mal elegida</strong>. El sistema de tipos es el detector de humo del diseño. La reacción correcta ante un tipo horrible no es silenciarlo — es preguntarse por qué la función se comporta de tantas maneras distintas.
+</div>
+
+<p>Un ejemplo mínimo. Alguien escribe esto y no se le ocurre cómo anotarlo:</p>
+
+<pre><code class="lang-python">def procesar(entrada, modo="auto", devolver_todo=False):
+    """Si entrada es str, la parsea. Si es dict, la valida.
+    Si modo == 'batch', espera una lista. Si devolver_todo, devuelve
+    una tupla (resultado, errores, metadata); si no, solo resultado."""</code></pre>
+
+<p>La firma honesta sería algo como <code>str | dict | list[dict]</code> a la entrada y <code>Resultado | tuple[Resultado, list[Error], Meta]</code> a la salida. Ese tipo es feo porque <strong>la función es fea</strong>: son tres funciones disfrazadas de una. El tipado no inventó el problema, lo hizo visible.</p>
+
+<div class="rule">
+  <strong>📌 Regla operativa.</strong> Cuando pelear con el verificador te lleva más de diez minutos, parás de pelear con el verificador y empezás a mirar el diseño. En el 80% de los casos el <code>Any</code> que estabas por escribir se disuelve si partís la función en dos, o si el dato entra ya validado desde el borde del sistema.
+</div>
+
+<h2>PS5.1 Recordatorio: nadie verifica esto en runtime</h2>
+
+<p>Antes de todo lo demás, el hecho que más se olvida: <strong>Python ignora las anotaciones al ejecutar</strong>. No son casts, no son validaciones, no cuestan nada en tiempo de ejecución.</p>
+
+<pre><code class="lang-python">def duplicar(x: int) -&gt; int:
+    return x * 2
+
+duplicar("hola")   # devuelve 'holahola'. Ni un warning. Es Python válido.
+duplicar([1, 2])   # devuelve [1, 2, 1, 2]. Tampoco pasa nada.</code></pre>
+
+<p>Quién los verifica, entonces:</p>
+
+<table>
+<thead><tr><th>Quién</th><th>Cuándo</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td>El intérprete</td><td>Nunca</td><td>Guarda las anotaciones y sigue de largo</td></tr>
+<tr><td><strong>Verificador estático</strong> (mypy, pyright, ty)</td><td>Antes de ejecutar, en tu editor y en CI</td><td>Analiza el código y reporta inconsistencias</td></tr>
+<tr><td><strong>Validador de runtime</strong> (pydantic, attrs, msgspec)</td><td>Al construir el objeto</td><td>Verifica <em>datos reales</em> y convierte o falla</td></tr>
+</tbody>
+</table>
+
+<p>En Python 3.14 cambió cómo se guardan: el <strong>PEP 649</strong> hizo que las anotaciones se evalúen <strong>de forma diferida</strong>, por defecto. Ya no hace falta <code>from __future__ import annotations</code> para poder referenciar una clase que todavía no existe, y desapareció la mayoría de los problemas de referencias circulares en anotaciones.</p>
+
+<pre><code class="lang-python">from annotationlib import get_annotations, Format   # nuevo en 3.14
+
+def enviar(destino: "Servidor", reintentos: int = 3) -&gt; None: ...
+
+get_annotations(enviar)                        # se evalúan recién acá
+get_annotations(enviar, format=Format.STRING)  # {'destino': 'Servidor', ...}
+                                               # sin evaluar nada</code></pre>
+
+<div class="info">
+  Consecuencia práctica: una anotación que antes rompía el import ahora solo rompe si alguien la <em>lee</em>. Las librerías que introspeccionan tipos (pydantic, FastAPI, ORMs) usan <code>annotationlib</code>; tu código de aplicación, en general, no toca esto nunca.
+</div>
+
+<h2>PS5.2 <code>Protocol</code>: interfaces sin herencia</h2>
+
+<p>Python siempre fue <em>duck typing</em>: importa lo que el objeto sabe hacer, no de quién hereda. <code>Protocol</code> es exactamente eso, pero verificable. Se llama <strong>tipado estructural</strong>: un tipo encaja si tiene la forma correcta, sin declarar nada.</p>
+
+<pre><code class="lang-python">from typing import Protocol
+
+class Cerrable(Protocol):
+    def close(self) -&gt; None: ...
+
+def usar_y_cerrar(recurso: Cerrable) -&gt; None:
+    try:
+        ...
+    finally:
+        recurso.close()
+
+class MiSocket:            # NO hereda de Cerrable. No la conoce.
+    def close(self) -&gt; None:
+        print("cerrado")
+
+usar_y_cerrar(MiSocket())  # ✅ encaja por forma
+usar_y_cerrar(open("x"))   # ✅ los archivos también tienen close()</code></pre>
+
+<p>Lo poderoso es que funciona con clases que <strong>no controlás</strong>: la de una librería de terceros, la del stdlib, un mock de tus tests. No hace falta registrarlas ni modificarlas.</p>
+
+<pre><code class="lang-python">from collections.abc import Iterator
+from typing import Protocol
+
+class RepositorioUsuarios(Protocol):
+    def obtener(self, user_id: int) -&gt; "Usuario | None": ...
+    def listar(self, *, activos: bool = True) -&gt; Iterator["Usuario"]: ...
+
+# El servicio depende del PROTOCOLO, no de la implementación concreta.
+class ServicioAltas:
+    def __init__(self, repo: RepositorioUsuarios) -&gt; None:
+        self._repo = repo
+
+# En tests, un fake común y silvestre encaja sin heredar de nada:
+class RepoFalso:
+    def __init__(self, datos: dict[int, "Usuario"]) -&gt; None:
+        self._datos = datos
+    def obtener(self, user_id: int) -&gt; "Usuario | None":
+        return self._datos.get(user_id)
+    def listar(self, *, activos: bool = True) -&gt; Iterator["Usuario"]:
+        yield from self._datos.values()</code></pre>
+
+<div class="tip">
+  Si al fake le falta un método o le sobra un parámetro, <strong>el verificador te lo dice antes de correr el test</strong>. Eso resuelve el problema clásico de los mocks: el test pasa en verde mientras producción explota porque el mock quedó desactualizado respecto de la interfaz real.
+</div>
+
+<h3><code>Protocol</code> vs <code>ABC</code>: cuándo cada uno</h3>
+
+<table>
+<thead><tr><th>Criterio</th><th><code>Protocol</code> (estructural)</th><th><code>ABC</code> (nominal)</th></tr></thead>
+<tbody>
+<tr><td>Cómo encaja un tipo</td><td>Por tener los métodos</td><td>Por heredar / registrarse explícitamente</td></tr>
+<tr><td>¿Sirve con clases ajenas?</td><td>✅ Sí, sin tocarlas</td><td>❌ No, salvo <code>register()</code></td></tr>
+<tr><td>Error si falta un método</td><td>En el verificador, donde se usa</td><td><code>TypeError</code> al instanciar</td></tr>
+<tr><td>Herencia de implementación</td><td>Limitada (podés dar defaults, pero no es su fuerte)</td><td>✅ Es su fuerte: código compartido</td></tr>
+<tr><td><code>isinstance()</code></td><td>Solo con <code>@runtime_checkable</code>, y <strong>solo mira nombres</strong></td><td>✅ Completo y confiable</td></tr>
+<tr><td>Acoplamiento</td><td>Mínimo: el implementador ni se entera</td><td>Alto: crea una jerarquía</td></tr>
+<tr><td>Uso típico</td><td>Contratos de dependencias, puertos, plugins</td><td>Familias de clases con lógica común</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error con <code>@runtime_checkable</code>.</strong> Habilita <code>isinstance()</code>, pero la verificación es <em>superficial</em>: comprueba que existan los <strong>nombres</strong> de los métodos, no sus firmas ni sus tipos. Una clase con <code>def close(self, forzar, timeout, modo)</code> pasa el <code>isinstance(x, Cerrable)</code> y después explota en la llamada. Usalo para ramificar, nunca como si fuera una validación real.
+</div>
+
+<div class="rule">
+  <strong>📌 Heurística.</strong> ¿Querés <em>compartir implementación</em> entre clases tuyas? → <code>ABC</code>. ¿Querés <em>describir lo que necesitás</em> de un colaborador que puede venir de cualquier lado? → <code>Protocol</code>. En arquitecturas hexagonales / puertos y adaptadores, los puertos son <code>Protocol</code> casi siempre.
+</div>
+
+<h2>PS5.3 <code>TypeVar</code>, <code>bound</code>, constraints y la sintaxis nueva</h2>
+
+<p>Un genérico es una función o clase que <strong>preserva la relación entre sus tipos</strong>. La diferencia con <code>Any</code> es todo:</p>
+
+<pre><code class="lang-python">from typing import Any
+
+def primero_malo(xs: list[Any]) -&gt; Any: ...
+def primero_bien[T](xs: list[T]) -&gt; T: ...      # sintaxis 3.12+
+
+n = primero_malo([1, 2, 3])   # n: Any  → a partir de acá el chequeo MUERE
+m = primero_bien([1, 2, 3])   # m: int  → sigue el chequeo</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>Any</code> es contagioso.</strong> No es "un tipo desconocido": es <em>apagá el verificador desde acá para abajo</em>. Un <code>Any</code> devuelto por una función central se propaga por todo el flujo de datos y silencia errores a diez archivos de distancia, sin que nadie se entere. Los verificadores tienen una opción específica para cazarlo (<code>--disallow-any-expr</code>, <code>reportAny</code>), y es de las más útiles.
+</div>
+
+<h3>La sintaxis vieja y la nueva</h3>
+
+<pre><code class="lang-python"># Antes de 3.12 — el TypeVar vive fuera y hay que importarlo
+from typing import TypeVar
+T = TypeVar("T")
+
+def primero(xs: list[T]) -&gt; T:
+    return xs[0]
+
+# Desde 3.12 (PEP 695) — el parámetro es parte de la firma
+def primero[T](xs: list[T]) -&gt; T:
+    return xs[0]
+
+class Pila[T]:                          # clase genérica, sin heredar de Generic
+    def __init__(self) -&gt; None:
+        self._items: list[T] = []
+    def push(self, item: T) -&gt; None:
+        self._items.append(item)
+    def pop(self) -&gt; T:
+        return self._items.pop()
+
+type Json = str | int | float | bool | None | list["Json"] | dict[str, "Json"]
+type Pagina[T] = tuple[list[T], str | None]      # alias genérico</code></pre>
+
+<div class="info">
+  <code>type Alias = ...</code> no es un simple <code>=</code>: crea un <code>TypeAliasType</code> con evaluación diferida. Por eso el alias <code>Json</code> de arriba puede referirse a sí mismo — algo que con la forma vieja requería comillas y a veces ni así funcionaba.
+</div>
+
+<h3><code>bound</code> vs constraints: no son lo mismo</h3>
+
+<pre><code class="lang-python">from decimal import Decimal
+
+# BOUND: "cualquier subtipo de X". T puede ser X o cualquier descendiente.
+def maximo[T: (int | float | Decimal)](xs: list[T]) -&gt; T: ...
+
+class Entidad:
+    id: int
+
+def guardar[E: Entidad](obj: E) -&gt; E:      # E es Entidad o subclase
+    print(obj.id)                          # ✅ el bound garantiza .id
+    return obj                             # devuelve el subtipo EXACTO
+
+u = guardar(Usuario(...))   # u: Usuario, no Entidad
+
+# CONSTRAINTS: "exactamente uno de estos, elegí". Sin subtipos intermedios.
+def unir[S: (str, bytes)](a: S, b: S) -&gt; S:
+    return a + b
+
+unir("a", "b")     # ✅ S = str
+unir(b"a", b"b")   # ✅ S = bytes
+unir("a", b"b")    # ❌ no puede ser str y bytes a la vez</code></pre>
+
+<table>
+<thead><tr><th></th><th><code>bound</code></th><th>constraints</th></tr></thead>
+<tbody>
+<tr><td>Sintaxis 3.12+</td><td><code>[T: Entidad]</code></td><td><code>[T: (str, bytes)]</code> — tupla</td></tr>
+<tr><td>Significa</td><td>"T es Entidad o subtipo"</td><td>"T es str, o T es bytes; nada más"</td></tr>
+<tr><td>T resuelve a</td><td>El subtipo concreto que pasaste</td><td>Uno de los tipos listados, tal cual</td></tr>
+<tr><td>Cuándo</td><td>Casi siempre. Es lo que querés el 95% de las veces</td><td>Familias cerradas sin ancestro común útil (<code>str</code>/<code>bytes</code>)</td></tr>
+</tbody>
+</table>
+
+<h2>PS5.4 <code>ParamSpec</code> y <code>Concatenate</code>: el caso donde typing gana de verdad</h2>
+
+<p>Este es <strong>el</strong> problema que hizo falta resolver. Un decorador envuelve una función y devuelve otra. Sin <code>ParamSpec</code>, no había forma de decir <em>"la de salida tiene exactamente los mismos parámetros que la de entrada"</em>, así que todo decorador anulaba el chequeo de todo lo que decoraba.</p>
+
+<pre><code class="lang-python">from collections.abc import Callable
+
+# ❌ Lo que se escribía antes: la firma se pierde
+def loguear(fn: Callable[..., object]) -&gt; Callable[..., object]:
+    def envoltura(*args: object, **kwargs: object) -&gt; object:
+        print("llamando", fn.__name__)
+        return fn(*args, **kwargs)
+    return envoltura
+
+@loguear
+def transferir(origen: str, destino: str, monto: float) -&gt; bool: ...
+
+transferir("a")                     # 😱 nadie se queja
+transferir(1, 2, "mucha plata")     # 😱 tampoco
+resultado: int = transferir("a", "b", 10.0)   # 😱 devuelve object/Any</code></pre>
+
+<p><code>ParamSpec</code> captura la <strong>lista completa de parámetros</strong> —posicionales, keyword, defaults— como una sola variable:</p>
+
+<pre><code class="lang-python">import functools
+from collections.abc import Callable
+
+def loguear[**P, R](fn: Callable[P, R]) -&gt; Callable[P, R]:
+    @functools.wraps(fn)
+    def envoltura(*args: P.args, **kwargs: P.kwargs) -&gt; R:
+        print("llamando", fn.__name__)
+        return fn(*args, **kwargs)
+    return envoltura
+
+@loguear
+def transferir(origen: str, destino: str, monto: float) -&gt; bool: ...
+
+transferir("a")                  # ❌ error: falta 'destino' y 'monto'
+transferir(1, 2, "mucha plata")  # ❌ error: int no es str
+ok: bool = transferir("a", "b", 10.0)   # ✅ bool, no Any</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>P.args</code> y <code>P.kwargs</code> van siempre juntos y siempre así.</strong> No son tipos que puedas usar en otro lado: son la forma canónica de reenviar los argumentos. Si escribís <code>*args: P.args</code> sin el <code>**kwargs: P.kwargs</code>, el verificador lo rechaza.
+</div>
+
+<h3><code>Concatenate</code>: cuando el decorador agrega o consume un parámetro</h3>
+
+<p><code>ParamSpec</code> solo sirve si la firma queda idéntica. Si tu decorador <em>inyecta</em> un argumento (una conexión, un usuario autenticado, un span de tracing), la firma de salida es la de entrada <strong>menos</strong> ese primer parámetro. Eso es <code>Concatenate</code>:</p>
+
+<pre><code class="lang-python">import functools
+from collections.abc import Awaitable, Callable
+from typing import Concatenate
+
+def con_conexion[**P, R](
+    fn: Callable[Concatenate[Conexion, P], Awaitable[R]],
+) -&gt; Callable[P, Awaitable[R]]:
+    """Toma una función cuyo PRIMER parámetro es una Conexion
+    y devuelve otra sin ese parámetro: lo inyecta el decorador."""
+    @functools.wraps(fn)
+    async def envoltura(*args: P.args, **kwargs: P.kwargs) -&gt; R:
+        async with pool.acquire() as conn:
+            return await fn(conn, *args, **kwargs)
+    return envoltura
+
+@con_conexion
+async def buscar_usuario(conn: Conexion, user_id: int) -&gt; Usuario: ...
+
+await buscar_usuario(42)      # ✅ la conexión NO se pasa: la pone el decorador
+await buscar_usuario("42")    # ❌ error: str no es int
+await buscar_usuario(conn, 42)  # ❌ error: sobra un argumento</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué esto importa tanto.</strong> Los decoradores están en el camino crítico de casi toda app real: rutas HTTP, tareas de background, reintentos, caché, permisos, transacciones. Si cada uno de ellos devuelve <code>Any</code>, tu proyecto puede tener 100% de anotaciones y <strong>cero chequeo efectivo</strong> en las funciones que más importan. <code>ParamSpec</code> es la diferencia entre typing decorativo y typing que atrapa bugs.
+</div>
+
+<h2>PS5.5 <code>Self</code>, <code>Never</code>, <code>LiteralString</code>, <code>Final</code>, <code>ClassVar</code></h2>
+
+<p>Cinco piezas chicas que resuelven cinco problemas concretos.</p>
+
+<pre><code class="lang-python">from typing import ClassVar, Final, LiteralString, Never, Self
+
+# ── Self: métodos encadenables que respetan la subclase ──────────────
+class Query:
+    def where(self, cond: str) -&gt; Self:      # NO "-&gt; Query"
+        self._conds.append(cond)
+        return self
+
+class QueryPostgres(Query):
+    def returning(self, col: str) -&gt; Self: ...
+
+q = QueryPostgres().where("id = 1").returning("id")   # ✅ sigue siendo Postgres
+# Con "-&gt; Query", el .where() degradaba el tipo y .returning() era un error.
+
+# ── Never: esta función no vuelve nunca ──────────────────────────────
+def abortar(msg: str) -&gt; Never:
+    raise RuntimeError(msg)
+
+def clasificar(x: int | str) -&gt; str:
+    if isinstance(x, int):
+        return "número"
+    elif isinstance(x, str):
+        return "texto"
+    abortar("imposible")   # ✅ el verificador acepta que no falta un return
+
+# ── LiteralString: defensa de tipos contra inyección SQL ─────────────
+def ejecutar(sql: LiteralString) -&gt; None: ...
+
+ejecutar("SELECT * FROM usuarios")           # ✅ literal del código
+tabla: LiteralString = "usuarios"
+ejecutar(f"SELECT * FROM {tabla}")           # ✅ compuesto de literales
+ejecutar(f"SELECT * FROM {entrada_web}")     # ❌ error: str común
+
+# ── Final y ClassVar ────────────────────────────────────────────────
+class Reintentos:
+    MAXIMO: Final = 5                # no se puede reasignar ni sobrescribir
+    activos: ClassVar[int] = 0       # atributo de CLASE, no de instancia
+
+    def __init__(self, tope: int) -&gt; None:
+        self.tope = tope
+
+Reintentos.MAXIMO = 10               # ❌ error: es Final</code></pre>
+
+<div class="tip">
+  <code>ClassVar</code> además es obligatorio en dataclasses: un atributo anotado sin <code>ClassVar</code> se convierte en campo de instancia. Con <code>ClassVar</code>, la dataclass lo ignora y queda como estado de la clase — que es lo que casi siempre querías con ese contador o ese registro.
+</div>
+
+<h2>PS5.6 <code>overload</code>: cuando el retorno depende del argumento</h2>
+
+<p>Hay funciones cuyo tipo de salida cambia según lo que les pasás. Devolver <code>str | bytes</code> es correcto pero inútil: obliga a quien llama a hacer <code>isinstance</code> aunque sepa perfectamente qué pidió. <code>@overload</code> declara las combinaciones válidas una por una:</p>
+
+<pre><code class="lang-python">from typing import Literal, overload
+
+@overload
+def leer(ruta: str, *, binario: Literal[True]) -&gt; bytes: ...
+@overload
+def leer(ruta: str, *, binario: Literal[False] = False) -&gt; str: ...
+
+def leer(ruta: str, *, binario: bool = False) -&gt; str | bytes:
+    """La implementación real: no se anota con overload y NO la ve quien llama."""
+    modo = "rb" if binario else "r"
+    with open(ruta, modo) as f:
+        return f.read()
+
+texto = leer("a.txt")                   # texto: str
+datos = leer("a.bin", binario=True)     # datos: bytes
+texto.upper()                           # ✅ sin isinstance, sin cast</code></pre>
+
+<p>El otro uso clásico es <code>None</code> como default distinguible:</p>
+
+<pre><code class="lang-python">@overload
+def buscar(uid: int) -&gt; Usuario | None: ...
+@overload
+def buscar(uid: int, *, default: Usuario) -&gt; Usuario: ...
+
+def buscar(uid: int, *, default: Usuario | None = None) -&gt; Usuario | None:
+    return _tabla.get(uid, default)
+
+buscar(1).nombre                       # ❌ error: puede ser None
+buscar(1, default=ANONIMO).nombre      # ✅ nunca es None</code></pre>
+
+<div class="warn">
+  <strong>Los <code>overload</code> son un olor cuando se multiplican.</strong> Dos o tres describen un comportamiento genuinamente polimórfico. Siete significan que la función tiene siete modos y debería ser siete funciones (o una función más un par de helpers). Volvé a PS5.0: el tipo difícil está señalando el diseño.
+</div>
+
+<h2>PS5.7 <code>TypedDict</code>, <code>NamedTuple</code>, dataclass: cuál usar</h2>
+
+<p><code>TypedDict</code> le pone forma a un diccionario. En runtime <strong>es un dict común</strong>: no hay clase, no hay validación, no hay costo.</p>
+
+<pre><code class="lang-python">from typing import NotRequired, Required, TypedDict
+
+class Evento(TypedDict):
+    tipo: str
+    ts: float
+    payload: NotRequired[dict[str, object]]    # esta clave puede faltar
+
+e: Evento = {"tipo": "click", "ts": 1.0}       # ✅
+e2: Evento = {"tipo": "click"}                 # ❌ falta 'ts'
+e3: Evento = {"tipo": "click", "ts": 1.0, "x": 5}   # ❌ clave desconocida
+
+# Al revés: todo opcional salvo lo marcado
+class Filtros(TypedDict, total=False):
+    desde: str
+    hasta: str
+    usuario: Required[int]                     # esta sí es obligatoria
+
+type(e)   # &lt;class 'dict'&gt; — en runtime no existe Evento</code></pre>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Runtime</th><th>Mutable</th><th>Valida datos</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><code>TypedDict</code></td><td>Un <code>dict</code> pelado</td><td>✅</td><td>❌ Nunca</td><td>JSON que ya conocés, kwargs, payloads que van y vienen de una API interna</td></tr>
+<tr><td><code>NamedTuple</code></td><td><code>tuple</code></td><td>❌ Inmutable</td><td>❌</td><td>Retornos múltiples, claves de diccionario, puntos y coordenadas</td></tr>
+<tr><td><code>@dataclass</code></td><td>Clase normal</td><td>✅ (o <code>frozen=True</code>)</td><td>❌ (solo <code>__post_init__</code> a mano)</td><td><strong>El default</strong> para modelos de dominio internos con comportamiento</td></tr>
+<tr><td><code>pydantic.BaseModel</code></td><td>Clase con motor en Rust</td><td>✅</td><td>✅ Sí, y convierte</td><td><strong>Bordes</strong>: HTTP, archivos, colas, config, DB (ver PS5.12)</td></tr>
+<tr><td><code>msgspec.Struct</code></td><td>Clase compacta</td><td>✅</td><td>✅ Sí, muy rápido</td><td>Bordes de altísimo volumen donde pydantic ya se nota</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">from dataclasses import dataclass, field
+from typing import NamedTuple
+
+class Punto(NamedTuple):
+    x: float
+    y: float
+    def distancia_al_origen(self) -&gt; float:
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConfigDB:
+    host: str
+    puerto: int = 5432
+    opciones: dict[str, str] = field(default_factory=dict)
+
+# frozen  -&gt; hashable e inmutable, seguro para compartir entre hilos
+# slots   -&gt; sin __dict__: menos memoria y atributos verificados (ver PS1/PS2)
+# kw_only -&gt; nadie puede confundir el orden de host y puerto nunca más</code></pre>
+
+<div class="rule">
+  <strong>📌 Elegí así.</strong> ¿El dato viene de <em>afuera</em> del proceso? → pydantic. ¿Es un modelo <em>interno</em> con métodos? → dataclass. ¿Es un <em>retorno múltiple</em> corto? → NamedTuple. ¿Es un dict que ya existe y no querés convertir? → TypedDict.
+</div>
+
+<h2>PS5.8 Narrowing: <code>TypeGuard</code> vs <code>TypeIs</code></h2>
+
+<p><em>Narrowing</em> (afinado) es cuando el verificador reduce un tipo dentro de una rama. Lo hace solo, con las construcciones de siempre:</p>
+
+<pre><code class="lang-python">def procesar(x: int | str | None) -&gt; str:
+    if x is None:
+        return "vacío"          # acá x es None
+    if isinstance(x, int):
+        return str(x * 2)       # acá x es int
+    return x.upper()            # acá x es str, y el verificador lo sabe
+
+def obtener(config: dict[str, str]) -&gt; str:
+    valor = config.get("host")          # str | None
+    assert valor is not None, "falta host"
+    return valor.upper()                # ✅ afinado a str por el assert
+
+# Walrus: asignar y afinar en la misma línea
+if (m := patron.match(texto)) is not None:
+    print(m.group(1))                   # m es Match, no Match | None</code></pre>
+
+<p>El problema aparece cuando la comprobación está <strong>dentro de una función tuya</strong>: el verificador no puede mirar adentro, así que no afina nada. Para eso están los dos predicados de tipo. Y no son intercambiables.</p>
+
+<pre><code class="lang-python">from typing import TypeGuard, TypeIs
+
+def es_str_guard(x: object) -&gt; TypeGuard[str]:
+    return isinstance(x, str)
+
+def es_str_is(x: object) -&gt; TypeIs[str]:
+    return isinstance(x, str)
+
+def con_guard(x: int | str) -&gt; None:
+    if es_str_guard(x):
+        reveal_type(x)    # str
+    else:
+        reveal_type(x)    # int | str   ← ❗ NO se afinó el else
+
+def con_is(x: int | str) -&gt; None:
+    if es_str_is(x):
+        reveal_type(x)    # str
+    else:
+        reveal_type(x)    # int        ← ✅ el else también se afina</code></pre>
+
+<table>
+<thead><tr><th></th><th><code>TypeGuard[T]</code></th><th><code>TypeIs[T]</code> (3.13+)</th></tr></thead>
+<tbody>
+<tr><td>Rama <code>if</code></td><td>Afina a <code>T</code>, a secas</td><td>Afina a la intersección del tipo previo con <code>T</code></td></tr>
+<tr><td>Rama <code>else</code></td><td>❌ No afina nada</td><td>✅ Resta <code>T</code> del tipo previo</td></tr>
+<tr><td>Restricción</td><td>Ninguna: <code>T</code> puede no tener relación con el parámetro</td><td><code>T</code> debe ser subtipo del parámetro</td></tr>
+<tr><td>Semántica</td><td>"si es True, tratalo como T"</td><td>"esto <em>es</em> un T, o <em>no lo es</em>"</td></tr>
+<tr><td>Cuándo</td><td>Conversiones que no son subtipos: <code>list[object]</code> → <code>list[str]</code></td><td><strong>El default</strong>: comprobaciones genuinas de tipo</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># El caso donde TypeGuard sigue siendo necesario:
+# list[str] NO es subtipo de list[object] (list es invariante — ver PS5.9),
+# así que TypeIs lo rechazaría.
+def son_todos_str(xs: list[object]) -&gt; TypeGuard[list[str]]:
+    return all(isinstance(x, str) for x in xs)
+
+def unir(xs: list[object]) -&gt; str:
+    if son_todos_str(xs):
+        return ", ".join(xs)     # ✅ xs es list[str]
+    raise TypeError("se esperaban strings")</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Ninguno de los dos verifica nada.</strong> <code>TypeIs</code> y <code>TypeGuard</code> le <em>prometen</em> al verificador que tu función devuelve <code>True</code> exactamente cuando el valor es de ese tipo. Si tu implementación miente —revisa mal, se olvida un caso, chequea el largo en vez del contenido— el verificador te va a creer y el error va a aparecer en producción, con el tipo "confirmado". Estas dos anotaciones son de las poquísimas donde el chequeo estático depende de que vos tengas razón.
+</div>
+
+<h2>PS5.9 Varianza: por qué <code>list[int]</code> no es un <code>list[float]</code></h2>
+
+<p>La pregunta es: si <code>int</code> es compatible con <code>float</code>, ¿<code>list[int]</code> es compatible con <code>list[float]</code>? La respuesta de Python es <strong>no</strong>, y el error confunde a todo el mundo la primera vez.</p>
+
+<pre><code class="lang-python">def promedio(xs: list[float]) -&gt; float:
+    return sum(xs) / len(xs)
+
+enteros: list[int] = [1, 2, 3]
+promedio(enteros)
+# error: Argument 1 has incompatible type "list[int]"; expected "list[float]"</code></pre>
+
+<p>No es un capricho. Si se permitiera, esto sería legal y rompería en runtime:</p>
+
+<pre><code class="lang-python">def sabotear(xs: list[float]) -&gt; None:
+    xs.append(3.14)          # perfectamente válido para una list[float]
+
+enteros: list[int] = [1, 2, 3]
+sabotear(enteros)            # si list fuera covariante, esto pasaría
+enteros[3] &lt;&lt; 2              # 💥 TypeError: 3.14 no soporta shift</code></pre>
+
+<div class="concept">
+  <strong>💡 La regla de una línea.</strong> Un contenedor donde podés <strong>escribir</strong> tiene que ser <strong>invariante</strong>, porque escribir permite meter algo que rompa al que lo lee. Un contenedor de <strong>solo lectura</strong> puede ser <strong>covariante</strong> sin peligro. Por eso <code>list</code> es invariante y <code>Sequence</code> es covariante.
+</div>
+
+<pre><code class="lang-python">from collections.abc import Sequence
+
+def promedio(xs: Sequence[float]) -&gt; float:   # ✅ el arreglo correcto
+    return sum(xs) / len(xs)
+
+promedio([1, 2, 3])              # ✅ list[int] encaja
+promedio((1.5, 2.5))             # ✅ una tupla también
+promedio(range(10))              # ✅ un range también</code></pre>
+
+<table>
+<thead><tr><th>Varianza</th><th>Si <code>Perro</code> es un <code>Animal</code>...</th><th>Ejemplos</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><strong>Covariante</strong></td><td><code>C[Perro]</code> es un <code>C[Animal]</code></td><td><code>Sequence</code>, <code>Iterable</code>, <code>Mapping</code> (valores), <code>tuple</code>, <strong>retorno</strong> de <code>Callable</code></td><td>Solo se lee: sacás Perros donde esperaban Animales, y un Perro es un Animal</td></tr>
+<tr><td><strong>Contravariante</strong></td><td><code>C[Animal]</code> es un <code>C[Perro]</code></td><td><strong>Argumentos</strong> de <code>Callable</code></td><td>Quien acepta cualquier Animal sirve donde piden alguien que acepte Perros</td></tr>
+<tr><td><strong>Invariante</strong></td><td>Ninguna de las dos</td><td><code>list</code>, <code>dict</code>, <code>set</code>, <code>MutableSequence</code></td><td>Se lee <em>y</em> se escribe: cualquiera de las dos direcciones rompe</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">from collections.abc import Callable
+
+Manejador = Callable[[ValueError], None]
+
+def manejar_cualquiera(e: Exception) -&gt; None: ...   # acepta MÁS
+def manejar_especifico(e: UnicodeError) -&gt; None: ...# acepta MENOS
+
+h1: Manejador = manejar_cualquiera    # ✅ contravarianza en el argumento
+h2: Manejador = manejar_especifico    # ❌ le podrían pasar un ValueError común</code></pre>
+
+<div class="tip">
+  Con la sintaxis de 3.12+ (<code>class Caja[T]</code>) <strong>no declarás la varianza</strong>: el verificador la infiere de cómo usás <code>T</code> en la clase. Si solo aparece en retornos, sale covariante; si aparece en parámetros de métodos, invariante. Es una razón más para migrar a PEP 695.
+</div>
+
+<div class="rule">
+  <strong>📌 Regla de oro para firmas públicas.</strong> Pedí <code>Sequence</code>, <code>Iterable</code> o <code>Mapping</code> en los <strong>parámetros</strong>; devolvé <code>list</code> o <code>dict</code> concretos en el <strong>retorno</strong>. Sé flexible en lo que aceptás y específico en lo que entregás. La mayoría de los errores de varianza que vas a ver desaparecen con solo aplicar esto.
+</div>
+
+<h2>PS5.10 Los verificadores en 2026</h2>
+
+<p>El panorama cambió mucho en poco tiempo. Hasta hace dos años eran dos; hoy hay una generación nueva escrita en Rust que corre un orden de magnitud más rápido.</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Escrito en</th><th>Velocidad</th><th>Madurez</th><th>Fuerte en</th><th>Flojo en</th></tr></thead>
+<tbody>
+<tr><td><strong>mypy</strong></td><td>Python</td><td>Lento (caché ayuda)</td><td>🟢 La referencia</td><td>Es el estándar de facto; los plugins (SQLAlchemy, Django) casi siempre son para mypy; mensajes claros</td><td>Lento en repos grandes; inferencia menos agresiva</td></tr>
+<tr><td><strong>pyright</strong></td><td>TypeScript</td><td>Rápido</td><td>🟢 Maduro</td><td>Es el motor de Pylance en VS Code: ya lo estás usando aunque no lo sepas. Inferencia y narrowing superiores</td><td>Necesita Node; sin plugins; a veces <em>demasiado</em> estricto</td></tr>
+<tr><td><strong>basedpyright</strong></td><td>TypeScript</td><td>Rápido</td><td>🟢 Estable</td><td>Fork de pyright sin dependencia de Node y con reglas extra (<code>reportAny</code>) que pyright dejó afuera del open source</td><td>Comunidad más chica; sigue a pyright con retraso</td></tr>
+<tr><td><strong><code>ty</code></strong> (Astral)</td><td>Rust</td><td>🔥 Muy rápido</td><td>🟡 Joven</td><td>Del equipo de <code>ruff</code> y <code>uv</code> (ver PS6); órdenes de magnitud más rápido; server LSP incluido</td><td>Todavía en preview: reglas incompletas, falsos positivos y negativos, config en movimiento</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># mypy, el que va en CI
+uv run mypy miapp
+
+# pyright / basedpyright
+uv run basedpyright miapp
+
+# ty, el de Astral (todavía preview)
+uvx ty check miapp</code></pre>
+
+<div class="rule">
+  <strong>📌 Recomendación práctica para 2026.</strong> <strong>pyright/basedpyright en el editor</strong> (feedback instantáneo mientras escribís, y si usás VS Code ya lo tenés) y <strong>mypy como fuente de verdad en CI</strong> (es el que va a citar cualquier issue de una librería, y el que tiene los plugins). Probá <code>ty</code> en paralelo, sin bloquear el merge: cuando se estabilice va a ser reemplazo natural de mypy en CI por pura velocidad, pero <strong>hoy no le confiaría un pipeline</strong>.
+</div>
+
+<div class="mistake">
+  <strong>No corras dos verificadores en modo bloqueante a la vez.</strong> No coinciden: uno acepta lo que el otro rechaza, y terminás escribiendo código para conformar a los dos —con <code>cast</code> y <code>type: ignore</code> por todos lados— en vez de código correcto. Uno bloquea el merge; el resto informa.
+</div>
+
+<h2>PS5.11 Adoptar <code>strict</code> sin frenar al equipo</h2>
+
+<p>El error clásico: prender <code>strict = true</code> en un proyecto de 60.000 líneas, ver 4.000 errores y desactivar el tipado para siempre. La estrategia que funciona es <strong>estricto por default, con islas explícitas que se van borrando</strong>.</p>
+
+<pre><code class="lang-toml"># pyproject.toml
+[tool.mypy]
+python_version = "3.14"
+strict = true                      # el default del proyecto es estricto
+warn_unused_ignores = true         # avisa cuando un ignore ya no hace falta
+warn_unreachable = true
+
+# Isla 1: código viejo que todavía no se tipó. Se va achicando.
+[[tool.mypy.overrides]]
+module = ["miapp.legacy.*", "miapp.reportes.batch"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# Isla 2: dependencias sin stubs. No es deuda nuestra.
+[[tool.mypy.overrides]]
+module = ["libreria_vieja.*", "sdk_del_proveedor.*"]
+ignore_missing_imports = true</code></pre>
+
+<div class="step"><strong>1. Empezá por el módulo nuevo, no por el viejo.</strong> Todo archivo creado desde hoy nace en <code>strict</code>. Eso frena el crecimiento de la deuda sin tocar una línea existente.</div>
+
+<div class="step"><strong>2. Listá las islas, no las escondas.</strong> Los <code>overrides</code> por módulo son visibles en el <code>pyproject.toml</code> y se pueden contar. Un <code># type: ignore</code> disperso, no.</div>
+
+<div class="step"><strong>3. Poné un trinquete en CI.</strong> El número de errores solo puede bajar. Cualquiera puede mejorarlo; nadie puede empeorarlo. Es la mecánica que hace que la migración avance sin un proyecto dedicado.</div>
+
+<pre><code class="lang-bash">#!/usr/bin/env bash
+# scripts/trinquete_tipos.sh — falla si la deuda de tipos aumentó
+set -euo pipefail
+TOPE=$(cat .mypy_tope)
+ACTUAL=$(uv run mypy miapp 2&gt;/dev/null | grep -c "^.*error:" || true)
+
+if [ "$ACTUAL" -gt "$TOPE" ]; then
+  echo "❌ Los errores de tipos subieron: $TOPE -&gt; $ACTUAL"; exit 1
+fi
+if [ "$ACTUAL" -lt "$TOPE" ]; then
+  echo "$ACTUAL" &gt; .mypy_tope
+  echo "✅ Bajó a $ACTUAL. Commiteá .mypy_tope."
+fi</code></pre>
+
+<div class="step"><strong>4. Tipá primero las fronteras internas.</strong> Los módulos que todos importan —modelos de dominio, clientes de servicios, utilidades compartidas— rinden mucho más que las hojas del árbol: un tipo bueno ahí se propaga a todos sus consumidores.</div>
+
+<div class="step"><strong>5. Cuando pongas un <code>type: ignore</code>, ponele código y motivo.</strong> <code># type: ignore[arg-type]  # el SDK miente en el stub, ver #4821</code>. Con <code>warn_unused_ignores</code>, el día que el stub se arregle mypy te avisa que ese ignore sobra y lo borrás.</div>
+
+<h2>PS5.12 Runtime vs estático: dónde SÍ hace falta validar</h2>
+
+<p>Esta es la confusión más cara del tipado en Python. Las anotaciones te protegen de <strong>tus propios errores al escribir código</strong>. No te protegen de nada de lo que entra al proceso desde afuera.</p>
+
+<pre><code class="lang-python"># ❌ Una mentira con forma de tipo
+import json
+
+def cargar_config(ruta: str) -&gt; dict[str, int]:
+    return json.load(open(ruta))     # json.load devuelve Any
+
+cfg = cargar_config("app.json")
+cfg["puerto"] + 1                    # 💥 TypeError si el JSON traía "8080"</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El tipo dice <code>dict[str, int]</code> y el verificador está conforme.</strong> Pero nadie miró el archivo. <code>json.load</code> devuelve <code>Any</code>, y <code>Any</code> se acomoda a lo que le pidas. Anotar un borde <strong>no valida</strong> el borde: solo lo documenta y silencia al verificador, que es lo peor de los dos mundos.
+</div>
+
+<p>En los bordes va validación de verdad, con datos reales:</p>
+
+<pre><code class="lang-python">from pydantic import BaseModel, Field, ValidationError
+
+class ConfigApp(BaseModel):
+    host: str
+    puerto: int = Field(ge=1, le=65535)
+    workers: int = Field(default=4, ge=1)
+    debug: bool = False
+
+    model_config = {"extra": "forbid"}   # clave desconocida = error, no silencio
+
+def cargar_config(ruta: str) -&gt; ConfigApp:
+    try:
+        return ConfigApp.model_validate_json(Path(ruta).read_text())
+    except ValidationError as e:
+        raise SystemExit(f"Config inválida en {ruta}:\n{e}") from e
+
+cfg = cargar_config("app.json")
+cfg.puerto + 1     # ✅ ahora sí: es int de verdad, verificado con el archivo</code></pre>
+
+<table>
+<thead><tr><th>Frontera</th><th>Qué entra</th><th>Herramienta</th></tr></thead>
+<tbody>
+<tr><td>HTTP entrante</td><td>Body, query params, headers</td><td>pydantic (FastAPI lo hace solo), msgspec</td></tr>
+<tr><td>HTTP saliente</td><td>Respuesta de una API ajena</td><td>pydantic — <strong>el que más se olvida</strong>: cambian el contrato y te enterás en producción</td></tr>
+<tr><td>Archivos y config</td><td>JSON, YAML, TOML, CSV, <code>.env</code></td><td>pydantic / pydantic-settings</td></tr>
+<tr><td>Base de datos</td><td>Filas, columnas nulables</td><td>El ORM tipado (SQLAlchemy 2.x, SQLModel) + plugin de mypy</td></tr>
+<tr><td>Colas y eventos</td><td>Mensajes de Kafka, SQS, Redis</td><td>pydantic o msgspec + versionado del esquema</td></tr>
+<tr><td>CLI</td><td>Argumentos del usuario</td><td>Typer / argparse con tipos</td></tr>
+<tr><td><strong>Adentro del proceso</strong></td><td>Tus propias funciones</td><td><strong>Solo anotaciones.</strong> Validar acá es ruido y costo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El patrón se llama "validar en el borde".</strong> Se valida <strong>una vez</strong>, al entrar el dato al proceso, y desde ahí para adentro se confía en los tipos. Validar en cada capa es lento, redundante y hace que nadie sepa dónde está la verdad. Validar en ninguna es cómo llegan a producción los <code>None</code> inesperados.
+</div>
+
+<h2>PS5.13 Cuándo el tipado es contraproducente</h2>
+
+<div class="step"><strong>1. Scripts de una sola vez.</strong> Un análisis exploratorio, un notebook, un script que corre hoy y se borra mañana. El costo de anotar no se amortiza porque no hay mantenimiento futuro.</div>
+
+<div class="step"><strong>2. Código genuinamente dinámico.</strong> Metaprogramación, plugins descubiertos en runtime, decoradores que reescriben clases (PS4). A veces el tipo honesto <em>es</em> <code>Any</code>, y encerrarlo en un <code>Any</code> explícito y comentado es mejor que quince líneas de gimnasia con <code>cast</code>.</div>
+
+<div class="step"><strong>3. Cuando estás tipando para el verificador y no para el lector.</strong> Si una firma tiene tres <code>TypeVar</code>, un <code>ParamSpec</code>, dos <code>overload</code> y nadie del equipo puede explicarla, esa firma <strong>ya no ayuda a nadie</strong>. Simplificá el diseño o aceptá un tipo más flojo y honesto.</div>
+
+<div class="step"><strong>4. Anotar todo con <code>Any</code> para llegar al 100%.</strong> Es peor que no anotar: instala confianza falsa. Un archivo sin anotaciones se ve sin anotaciones; uno lleno de <code>Any</code> se ve tipado y no verifica nada.</div>
+
+<div class="step"><strong>5. Con librerías sin stubs decentes.</strong> Si el 40% de tu código toca un SDK que no tiene tipos, vas a escribir más <code>type: ignore</code> que lógica. Ahí conviene envolver el SDK en una capa fina, tipada a mano, y tener un solo lugar sucio en vez de cincuenta.</div>
+
+<div class="warn">
+  <strong>El contraejemplo importante:</strong> nada de esto aplica a <strong>librerías</strong>. Si publicás un paquete, tus tipos son parte de tu API pública y le ahorran horas a cada persona que lo usa. Ahí el tipado estricto no se discute — y acordate del <code>py.typed</code>, sin ese archivo tus anotaciones son invisibles para quien te instala.
+</div>
+
+<h2>🧑‍🎓 Worked Example — tipar un decorador async con parámetros</h2>
+
+<blockquote>Necesitás un decorador <code>@reintentar(veces=3, espera=0.5)</code> que envuelva <strong>funciones async</strong> y reintente ante fallos de red con backoff exponencial. Tiene que preservar la firma exacta de lo que decora. Es el caso de uso más común de <code>ParamSpec</code> y también el que más gente escribe mal.</blockquote>
+
+<p><strong>Paso 1 — La versión que escribe todo el mundo.</strong></p>
+
+<pre><code class="lang-python">import asyncio, functools
+
+def reintentar(veces: int = 3, espera: float = 0.5):
+    def decorador(fn):
+        @functools.wraps(fn)
+        async def envoltura(*args, **kwargs):
+            for intento in range(veces):
+                try:
+                    return await fn(*args, **kwargs)
+                except (TimeoutError, ConnectionError):
+                    if intento == veces - 1:
+                        raise
+                    await asyncio.sleep(espera * 2 ** intento)
+        return envoltura
+    return decorador</code></pre>
+
+<p>Funciona perfecto en runtime. Y desde el punto de vista de los tipos es una catástrofe silenciosa:</p>
+
+<pre><code class="lang-python">@reintentar(veces=5)
+async def cobrar(cliente_id: int, monto: float, moneda: str = "ARS") -&gt; Recibo:
+    ...
+
+# TODO esto pasa el verificador sin una queja:
+await cobrar()                             # 😱 faltan dos argumentos
+await cobrar("42", "mucha plata")          # 😱 los tipos están al revés
+await cobrar(1, 100.0, moneda=b"USD")      # 😱 bytes donde va str
+recibo: int = await cobrar(1, 100.0)       # 😱 Recibo asignado a un int</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El daño no termina en la función decorada.</strong> <code>cobrar(...)</code> ahora devuelve <code>Any</code>, así que <code>recibo</code> es <code>Any</code>, y todo lo que hagas con <code>recibo</code> —pasarlo a otra función, guardarlo, leerle atributos que no existen— también deja de verificarse. Un decorador mal tipado <strong>apaga el chequeo de una rama entera del programa</strong>, y como no genera ningún error, nadie lo nota nunca.
+</div>
+
+<p><strong>Paso 2 — Confirmarlo, no suponerlo.</strong></p>
+
+<pre><code class="lang-python">reveal_type(cobrar)
+# note: Revealed type is "Any"        ← acá está la prueba
+
+# En CI se caza así, sin depender de que a alguien se le ocurra mirar:
+# mypy --disallow-any-expr miapp/pagos.py
+# basedpyright  (reportAny está prendido por default)</code></pre>
+
+<p><strong>Paso 3 — La versión correcta, con <code>ParamSpec</code>.</strong></p>
+
+<pre><code class="lang-python">import asyncio, functools
+from collections.abc import Awaitable, Callable
+
+def reintentar[**P, R](
+    veces: int = 3,
+    espera: float = 0.5,
+    excepciones: tuple[type[Exception], ...] = (TimeoutError, ConnectionError),
+) -&gt; Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Devuelve un decorador que toma una async (P) -&gt; R
+    y devuelve otra async (P) -&gt; R: los MISMOS parámetros, el MISMO retorno."""
+    def decorador(fn: Callable[P, Awaitable[R]]) -&gt; Callable[P, Awaitable[R]]:
+        @functools.wraps(fn)
+        async def envoltura(*args: P.args, **kwargs: P.kwargs) -&gt; R:
+            ultimo: Exception | None = None
+            for intento in range(veces):
+                try:
+                    return await fn(*args, **kwargs)
+                except excepciones as exc:
+                    ultimo = exc
+                    if intento &lt; veces - 1:
+                        await asyncio.sleep(espera * 2 ** intento)
+            assert ultimo is not None      # el bucle corrió al menos una vez
+            raise ultimo
+        return envoltura
+    return decorador</code></pre>
+
+<p>Leído de afuera hacia adentro, el tipo de retorno de <code>reintentar</code> se lee literalmente: <em>"una cosa que recibe una función async de parámetros P que devuelve R, y entrega otra función async de los mismos parámetros P que devuelve el mismo R"</em>. Ese es todo el contrato.</p>
+
+<p><strong>Paso 4 — Ahora sí, los errores aparecen.</strong></p>
+
+<pre><code class="lang-python">@reintentar(veces=5, espera=0.2)
+async def cobrar(cliente_id: int, monto: float, moneda: str = "ARS") -&gt; Recibo:
+    ...
+
+reveal_type(cobrar)
+# Revealed type is "def (cliente_id: int, monto: float, moneda: str =)
+#                   -&gt; Awaitable[Recibo]"
+
+await cobrar()                        # ❌ error: faltan cliente_id y monto
+await cobrar("42", "mucha plata")     # ❌ error: str no es int
+await cobrar(1, 100.0, moneda=b"USD") # ❌ error: bytes no es str
+recibo: int = await cobrar(1, 100.0)  # ❌ error: Recibo no es int
+recibo2: Recibo = await cobrar(1, 100.0)   # ✅</code></pre>
+
+<p><strong>Paso 5 — La variante con <code>Concatenate</code>.</strong> Si además querés que el decorador <em>inyecte</em> algo —el intento actual, un span, una conexión— la firma de salida ya no es igual a la de entrada, y <code>ParamSpec</code> solo no alcanza:</p>
+
+<pre><code class="lang-python">from typing import Concatenate
+
+def con_intento[**P, R](
+    fn: Callable[Concatenate[int, P], Awaitable[R]],   # 1er param: nro de intento
+) -&gt; Callable[P, Awaitable[R]]:
+    @functools.wraps(fn)
+    async def envoltura(*args: P.args, **kwargs: P.kwargs) -&gt; R:
+        for intento in range(3):
+            try:
+                return await fn(intento, *args, **kwargs)
+            except ConnectionError:
+                if intento == 2:
+                    raise
+        raise AssertionError("inalcanzable")
+    return envoltura
+
+@con_intento
+async def descargar(intento: int, url: str, *, timeout: float = 5.0) -&gt; bytes:
+    print(f"intento {intento} de {url}")
+    ...
+
+await descargar("https://x.com")               # ✅ 'intento' lo pone el decorador
+await descargar("https://x.com", timeout=1.0)  # ✅ el kwarg sobrevive
+await descargar(0, "https://x.com")            # ❌ error: sobra un argumento</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué detecta la buena que la mala no detectaba.</strong> Cantidad de argumentos, tipo de cada argumento posicional, tipo de cada keyword, nombres de los keywords, presencia de los defaults, y el tipo de retorno — más todo lo que se hace con ese retorno aguas abajo. La versión ingenua no detectaba <strong>ninguna</strong> de esas cosas, y como no fallaba nunca, parecía estar bien. El costo de arreglarla fueron dos líneas de anotación.
+</div>
+
+<div class="mistake">
+  <strong>Y no te olvides de <code>functools.wraps</code>.</strong> Sin él, la función pierde <code>__name__</code>, <code>__doc__</code>, <code>__wrapped__</code> y <code>__annotations__</code>. Los tipos estáticos quedan bien igual, pero se rompe todo lo que introspecciona en runtime: los logs muestran <code>envoltura</code>, pytest no encuentra los fixtures, FastAPI no arma el esquema y <code>inspect.signature</code> miente. Estático y runtime son dos problemas distintos: <code>ParamSpec</code> arregla uno, <code>wraps</code> el otro.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un decorador sin <code>ParamSpec</code> es peor que no tener tipos en esa función?</summary>
+<p>Porque una función sin anotar <em>se nota</em>: el verificador puede reportarla con <code>disallow_untyped_defs</code>, y quien la lee ve que no hay contrato. Un decorador que devuelve <code>Callable[..., Any]</code> se ve tipado, no dispara ninguna regla, y además <strong>convierte en <code>Any</code> el resultado de cada llamada</strong>. Ese <code>Any</code> se propaga: todo lo que reciba ese valor deja de verificarse, en archivos que ni saben que existe el decorador. Es una fuga silenciosa de chequeo, y como los decoradores se aplican justo a las funciones más importantes (rutas, tareas, transacciones), la fuga suele estar exactamente donde más duele.</p></details>
+
+<details><summary>Tenés <code>def es_error(x: object) -&gt; bool</code> y el <code>else</code> de tu <code>if</code> no se afina. ¿Qué cambiás y por qué no <code>TypeGuard</code>?</summary>
+<p>Cambiás el retorno a <code>TypeIs[Error]</code>. <code>TypeGuard</code> solo afina la rama positiva: en el <code>else</code> el tipo queda tal como estaba, porque su semántica es "si devuelve True, tratalo como T" y no dice nada sobre el caso False. <code>TypeIs</code> tiene semántica de predicado real —"esto es un T, o no lo es"— y por eso el verificador puede restar <code>Error</code> del tipo en el <code>else</code>. El precio es una restricción: el tipo afinado tiene que ser subtipo del parámetro. <code>TypeGuard</code> queda para los casos donde esa relación no existe, como pasar de <code>list[object]</code> a <code>list[str]</code>, que por invarianza de <code>list</code> no es una relación de subtipo.</p></details>
+
+<details><summary>Tu función recibe <code>list[float]</code> y alguien te pasa <code>list[int]</code>. ¿Está mal el verificador?</summary>
+<p>No, y el arreglo no es un <code>cast</code>. <code>list</code> es <strong>invariante</strong> porque se puede escribir en ella: si <code>list[int]</code> fuera aceptable donde se pide <code>list[float]</code>, tu función podría hacer <code>xs.append(3.14)</code> y corromper la lista del que llamó, que sigue creyendo que tiene enteros. La solución correcta es pedir menos: <code>Sequence[float]</code>, que es de solo lectura y por eso puede ser covariante. Como bonus, ahora también aceptás tuplas, <code>range</code> y cualquier otra secuencia. La regla general: parámetros con tipos abstractos y de lectura, retornos con tipos concretos.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Los tipos <strong>cambian el diseño</strong>: un tipo difícil de escribir es un síntoma, no un obstáculo. Antes de meter un <code>Any</code>, revisá la abstracción.</li>
+  <li>Python <strong>ignora las anotaciones en runtime</strong> (y desde 3.14, con PEP 649, ni siquiera las evalúa hasta que alguien las pide). Verifican los checkers estáticos; validan pydantic y compañía.</li>
+  <li><code>Protocol</code> = tipado estructural, sin herencia, funciona con clases ajenas. <code>ABC</code> = jerarquía nominal con implementación compartida. Puertos y dependencias → <code>Protocol</code>.</li>
+  <li>Sintaxis moderna: <code>def f[T](x: T) -&gt; T</code>, <code>class Pila[T]</code>, <code>type Alias = ...</code>. Con PEP 695 la varianza se infiere sola.</li>
+  <li><strong><code>ParamSpec</code> es el caso donde typing gana de verdad</strong>: sin él, cada decorador devuelve <code>Any</code> y apaga el chequeo de las funciones más importantes del sistema. <code>Concatenate</code> cubre los decoradores que inyectan o consumen parámetros.</li>
+  <li><code>Self</code> para APIs encadenables, <code>Never</code> para funciones que no vuelven, <code>LiteralString</code> como defensa contra inyección, <code>Final</code> y <code>ClassVar</code> para constantes y estado de clase.</li>
+  <li><code>TypeIs</code> afina <strong>las dos ramas</strong> y es el default; <code>TypeGuard</code> solo la positiva, y queda para conversiones que no son relaciones de subtipo.</li>
+  <li>Varianza: pedí <code>Sequence</code>/<code>Iterable</code>/<code>Mapping</code>, devolvé <code>list</code>/<code>dict</code>. Los contenedores mutables son invariantes por una razón real.</li>
+  <li>2026: <strong>pyright/basedpyright en el editor, mypy en CI</strong>, <code>ty</code> observado de cerca pero todavía sin bloquear merges. Nunca dos verificadores bloqueantes a la vez.</li>
+  <li><code>strict</code> se adopta con islas explícitas en <code>pyproject.toml</code> y un <strong>trinquete en CI</strong> que solo permite bajar la deuda.</li>
+  <li>Las anotaciones <strong>no validan datos</strong>. En los bordes —HTTP, archivos, DB, colas, CLI— va pydantic. Adentro del proceso, solo anotaciones.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un decorador real de un proyecto tuyo (o escribí uno de caché) y corré <code>reveal_type</code> sobre una función decorada. Si sale <code>Any</code>, arreglalo con <code>ParamSpec</code> y documentá qué error empezó a detectar el verificador después del cambio.</li>
+  <li>Definí un <code>Protocol</code> para un repositorio con tres métodos y escribí dos implementaciones que <strong>no</strong> hereden de él: una real y un fake para tests. Después sacale un parámetro al fake y verificá que el checker lo reporte antes de correr los tests.</li>
+  <li>Escribí <code>es_positivo(x: object)</code> con <code>TypeGuard[int]</code> y otra idéntica con <code>TypeIs[int]</code>. Usá <code>reveal_type</code> en las dos ramas de un <code>if</code> y anotá las cuatro respuestas en una tabla.</li>
+  <li>Reproducí el error de varianza con <code>list[int]</code> y <code>list[float]</code>. Arreglalo con <code>Sequence</code> y después escribí la función <code>sabotear</code> que demuestre por qué el error tenía razón.</li>
+  <li>Tipá con <code>@overload</code> una función <code>obtener(clave, default=...)</code> que devuelva <code>str | None</code> sin default y <code>str</code> con default. Verificá que <code>obtener("k").upper()</code> falle y <code>obtener("k", default="x").upper()</code> pase.</li>
+  <li>Agarrá un endpoint que hoy recibe un <code>dict</code> y reescribilo con un modelo de pydantic con <code>extra="forbid"</code> y al menos dos restricciones (<code>ge</code>, <code>pattern</code>). Mandale tres payloads inválidos distintos y guardá los mensajes de error.</li>
+  <li>Corré <code>mypy</code>, <code>basedpyright</code> y <code>ty</code> sobre el mismo módulo. Armá una tabla con: cantidad de errores, tiempo de ejecución, y al menos un caso donde uno reporte algo que los otros no. Concluí cuál pondrías en CI y por qué.</li>
+</ol>
+
+<section class="quiz" id="quizPS5">
+  <style>
+    #quizPS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS5 .q{margin-bottom:1.5rem}
+    #quizPS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS5 .opt:hover{border-color:var(--accent)}
+    #quizPS5 .opt:disabled{cursor:default}
+    #quizPS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS5 .exp.show{display:block}
+    #quizPS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu proyecto tiene 100% de funciones anotadas y mypy pasa en verde, pero siguen llegando bugs de tipos a producción en las rutas HTTP. ¿Cuál es la causa más probable?</p>
+    <button class="opt">mypy no soporta <code>async def</code> y saltea esas funciones</button>
+    <button class="opt">Faltan anotaciones en las variables locales de cada ruta</button>
+    <button class="opt">Los decoradores de las rutas devuelven <code>Any</code>: apagan el chequeo de todo lo que decoran</button>
+    <div class="exp">Es el patrón clásico. Un decorador tipado como <code>Callable[..., Any]</code> hace que la función decorada —y el resultado de cada llamada— sea <code>Any</code>, así que el verificador deja de mirar exactamente las funciones más críticas. Se confirma en un segundo con <code>reveal_type(mi_ruta)</code>, y se arregla con <code>ParamSpec</code> (o <code>Concatenate</code> si el decorador inyecta parámetros). Encima nunca genera un error, así que el problema es invisible hasta que lo buscás.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Necesitás una función que confirme si un valor es <code>Error</code>, y que el <code>else</code> del <code>if</code> también quede afinado. ¿Qué anotás como retorno?</p>
+    <button class="opt"><code>TypeIs[Error]</code></button>
+    <button class="opt"><code>TypeGuard[Error]</code></button>
+    <button class="opt"><code>bool</code>, y después un <code>cast(Error, x)</code> en cada rama</button>
+    <div class="exp"><code>TypeIs</code> tiene semántica de predicado real: el verificador afina a <code>Error</code> en el <code>if</code> y <strong>resta</strong> <code>Error</code> del tipo en el <code>else</code>. <code>TypeGuard</code> solo promete algo sobre la rama positiva, así que el <code>else</code> queda con el tipo original. El precio de <code>TypeIs</code> es que el tipo afinado debe ser subtipo del parámetro; cuando esa relación no existe —por ejemplo <code>list[object]</code> a <code>list[str]</code>, que la invarianza de <code>list</code> impide— ahí sí hace falta <code>TypeGuard</code>.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una función anotada <code>-&gt; dict[str, int]</code> hace <code>return json.load(f)</code> y explota en runtime porque el JSON traía strings. ¿Cuál es el diagnóstico correcto?</p>
+    <button class="opt">Es un bug de mypy: debería haber detectado que el JSON no coincide</button>
+    <button class="opt">Las anotaciones no validan datos; en un borde como este va validación de runtime (pydantic)</button>
+    <button class="opt">Faltó <code>from __future__ import annotations</code> para que la anotación se aplique</button>
+    <div class="exp">El verificador no puede saber qué hay adentro de un archivo: <code>json.load</code> devuelve <code>Any</code>, y <code>Any</code> se acomoda a cualquier anotación sin protestar. La anotación ahí no describe la realidad, la <em>declara</em> — y encima silencia la sospecha. La regla es "validar en el borde": todo lo que entra al proceso (HTTP, archivos, DB, colas, CLI) pasa por un validador de runtime una sola vez, y de ahí para adentro se confía en los tipos estáticos.</div>
+  </div>
+
+  <div class="score" id="scorePS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps4-modelo-de-datos/lecture.html">← PS4: El modelo de datos</a>
+  <a href="../ps6-toolchain-moderno/lecture.html">PS6: Toolchain moderno →</a>
+</nav>
+
+</div>
+</body>
+</html>

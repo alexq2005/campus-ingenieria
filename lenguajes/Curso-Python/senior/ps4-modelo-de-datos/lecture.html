@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS4 — El modelo de datos: descriptors y metaclases · Python Senior</title>
+  <meta name="description" content="Los protocolos del modelo de datos, la regla __eq__/__hash__, el algoritmo real de acceso a atributos, descriptors desde cero, __slots__ y dataclasses, metaclases vs __init_subclass__, contextlib y cuándo NO usar nada de esto.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS4</span>
+  <span class="badge">⏱ 40–105 min</span>
+  <span class="badge">🎯 Pre-req: PS1</span>
+  <span class="badge">🧬 Modelo de datos</span>
+</div>
+
+<article>
+
+<h1>PS4 — El modelo de datos: descriptors y metaclases</h1>
+
+<h2>PS4.0 Por qué este módulo</h2>
+
+<p>En PS1 viste que todo valor es un <code>PyObject</code> con un puntero a su tipo. Este módulo es la continuación natural: <strong>qué le pregunta el intérprete a ese tipo</strong> cuando escribís <code>len(x)</code>, <code>x[3]</code>, <code>a == b</code>, <code>with x:</code> o simplemente <code>x.campo</code>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Python no tiene "tipos privilegiados". <code>list</code>, <code>dict</code> y <code>str</code> no reciben trato especial del intérprete: solo implementan bien un conjunto de métodos con nombres acordados. Ese conjunto de nombres <strong>es</strong> el modelo de datos, y es un contrato público. Si tu objeto lo implementa, funciona con <code>for</code>, con <code>in</code>, con <code>sorted()</code>, con <code>with</code> y con cualquier librería de terceros que nunca oyó hablar de tu clase.
+</div>
+
+<p>La consecuencia práctica es doble. La primera es de diseño: <strong>escribir un objeto que se siente nativo es cuestión de elegir qué protocolos implementar</strong>, no de heredar de nada. La segunda es de supervivencia: cuando abrís un framework serio —Django, SQLAlchemy, Pydantic, <code>dataclasses</code>— y ves clases que "mágicamente" saben cosas de sí mismas, lo que estás viendo son <strong>descriptors</strong> y <strong>metaclases</strong>. Sin este módulo, ese código es magia. Con este módulo, es mecánica.</p>
+
+<div class="warn">
+  <strong>Advertencia de tono.</strong> Esta es la caja de herramientas más peligrosa del lenguaje. Todo lo que ves acá se puede usar para escribir código elegantísimo que nadie de tu equipo va a poder debuggear un martes a las 3 de la mañana. La sección PS4.10 no es un apéndice: es la mitad del módulo.
+</div>
+
+<h2>PS4.1 Los protocolos: el catálogo</h2>
+
+<p>Un <em>protocolo</em> del modelo de datos es un grupo de métodos especiales (los <em>dunder</em>, <code>__x__</code>) que habilitan una sintaxis. No se declaran, no se registran: se implementan y listo.</p>
+
+<table>
+<thead><tr><th>Protocolo</th><th>Métodos clave</th><th>Qué te habilita</th></tr></thead>
+<tbody>
+<tr><td><strong>Secuencia</strong></td><td><code>__len__</code>, <code>__getitem__</code>, <code>__setitem__</code>, <code>__contains__</code></td><td><code>len(x)</code>, <code>x[i]</code>, <code>x[a:b]</code>, <code>y in x</code>, <code>reversed(x)</code></td></tr>
+<tr><td><strong>Iteración</strong></td><td><code>__iter__</code>, <code>__next__</code></td><td><code>for</code>, desempaquetado, <code>list(x)</code>, comprensiones</td></tr>
+<tr><td><strong>Contexto</strong></td><td><code>__enter__</code>, <code>__exit__</code></td><td><code>with x:</code> — adquirir y liberar de forma garantizada</td></tr>
+<tr><td><strong>Numérico</strong></td><td><code>__add__</code>, <code>__radd__</code>, <code>__iadd__</code>, <code>__mul__</code>, <code>__neg__</code></td><td><code>+</code>, <code>*</code>, <code>sum()</code>, operadores in-place</td></tr>
+<tr><td><strong>Comparación</strong></td><td><code>__eq__</code>, <code>__lt__</code>, <strong><code>__hash__</code></strong></td><td><code>==</code>, <code>sorted()</code>, y poder entrar a un <code>set</code> o a un <code>dict</code></td></tr>
+<tr><td><strong>Representación</strong></td><td><code>__repr__</code>, <code>__str__</code>, <code>__format__</code></td><td>debug útil, <code>f"{x:&gt;10}"</code>, logs legibles</td></tr>
+<tr><td><strong>Llamada</strong></td><td><code>__call__</code></td><td><code>obj()</code> — objetos que se comportan como funciones</td></tr>
+<tr><td><strong>Atributos</strong></td><td><code>__getattr__</code>, <code>__setattr__</code>, <code>__getattribute__</code>, <code>__dir__</code></td><td>proxies, lazy loading, objetos dinámicos (PS4.3)</td></tr>
+<tr><td><strong>Descriptor</strong></td><td><code>__get__</code>, <code>__set__</code>, <code>__set_name__</code></td><td>atributos gestionados: <code>property</code>, métodos, <code>__slots__</code> (PS4.4)</td></tr>
+<tr><td><strong>Asíncrono</strong></td><td><code>__aiter__</code>/<code>__anext__</code>, <code>__aenter__</code>/<code>__aexit__</code></td><td><code>async for</code>, <code>async with</code> (visto en PS3)</td></tr>
+<tr><td><strong>Patrones</strong></td><td><code>__match_args__</code></td><td><code>match</code>/<code>case</code> con captura posicional</td></tr>
+<tr><td><strong>Copia y serialización</strong></td><td><code>__copy__</code>, <code>__deepcopy__</code>, <code>__getstate__</code>, <code>__reduce__</code></td><td><code>copy.deepcopy()</code>, <code>pickle</code>, <code>multiprocessing</code></td></tr>
+<tr><td><strong>Buffer</strong> (3.12+)</td><td><code>__buffer__</code>, <code>__release_buffer__</code></td><td><code>memoryview</code>, I/O sin copias — PEP 688</td></tr>
+</tbody>
+</table>
+
+<p>La demostración canónica de por qué esto importa: dos métodos y el objeto ya se comporta como una secuencia de la biblioteca estándar.</p>
+
+<pre><code class="lang-python">import random
+from collections import namedtuple
+
+Carta = namedtuple("Carta", "valor palo")
+
+class Baraja:
+    palos = "espadas bastos oros copas".split()
+    valores = [str(n) for n in range(1, 8)] + ["sota", "caballo", "rey"]
+
+    def __init__(self):
+        self._cartas = [Carta(v, p) for p in self.palos for v in self.valores]
+
+    def __len__(self):
+        return len(self._cartas)
+
+    def __getitem__(self, pos):
+        return self._cartas[pos]     # delegar en la lista: el slicing viene gratis
+
+b = Baraja()
+len(b)                  # 40
+b[0]                    # Carta(valor='1', palo='espadas')
+b[:3]                   # slicing: list.__getitem__ ya lo resuelve
+random.choice(b)        # funciona: random usa len() + indexación
+Carta("rey", "oros") in b   # True — __contains__ cae de vuelta al escaneo secuencial
+for carta in b: ...     # itera: sin __iter__, Python usa el protocolo VIEJO de secuencia
+sorted(b, key=lambda c: c.palo)</code></pre>
+
+<div class="info">
+  Ese último punto es un detalle que casi nadie sabe: si una clase <strong>no</strong> define <code>__iter__</code> pero sí <code>__getitem__</code>, <code>iter()</code> fabrica un iterador legacy que llama <code>obj[0]</code>, <code>obj[1]</code>, … hasta que salte <code>IndexError</code>. Es compatibilidad hacia atrás con Python 1.x que sigue viva. Funciona, pero <strong>no la uses a propósito</strong>: es más lenta, no soporta índices no enteros y confunde a quien lea el código.
+</div>
+
+<h3>Los métodos especiales se buscan en el TIPO, no en la instancia</h3>
+
+<p>Esta es la regla que explica el 90% de las sorpresas del modelo de datos, y es una optimización deliberada de CPython: las invocaciones implícitas de dunders saltean <code>__getattribute__</code> y el <code>__dict__</code> de la instancia, y van directo a la ranura (<em>slot</em>) del tipo.</p>
+
+<pre><code class="lang-python">class Raro:
+    def __init__(self):
+        self.__len__ = lambda: 42        # asignado en la INSTANCIA
+
+r = Raro()
+r.__len__()      # 42  — llamada explícita: sí encuentra el atributo de instancia
+len(r)           # TypeError: object of type 'Raro' has no len()
+
+# La versión que sí funciona: el método vive en el TIPO
+Raro.__len__ = lambda self: 42
+len(r)           # 42  — y afecta a todas las instancias, incluso las ya creadas</code></pre>
+
+<div class="rule">
+  <strong>📌 Corolario que se cobra caro:</strong> un objeto proxy que implemente <code>__getattr__</code> para reenviar todo a otro objeto <strong>no reenvía los dunders</strong>. Tu proxy va a fallar en <code>len()</code>, <code>in</code>, <code>with</code>, <code>==</code> y <code>repr()</code> aunque el <code>__getattr__</code> esté perfecto. Por eso los proxies serios declaran explícitamente cada dunder que quieren delegar.
+</div>
+
+<h2>PS4.2 <code>__eq__</code> y <code>__hash__</code>: la regla de oro</h2>
+
+<p>El error clásico. Definís igualdad por valor, todo anda bien, y el día que metés el objeto en un <code>set</code> explota:</p>
+
+<pre><code class="lang-python">class Punto:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+    def __eq__(self, otro):
+        if not isinstance(otro, Punto):
+            return NotImplemented          # que Python pruebe la operación reflejada
+        return (self.x, self.y) == (otro.x, otro.y)
+
+Punto(1, 2) == Punto(1, 2)     # True
+{Punto(1, 2)}                  # TypeError: unhashable type: 'Punto'
+{Punto(1, 2): "origen"}        # TypeError: idem
+
+Punto.__hash__                 # None   ← acá está la explicación</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué pasa.</strong> Todo objeto hereda de <code>object</code> un <code>__hash__</code> basado en su identidad. Ese hash es consistente con la igualdad <em>por defecto</em> (que también es identidad). Cuando redefinís <code>__eq__</code>, esa consistencia se rompería en silencio: dos puntos iguales tendrían hashes distintos y el <code>set</code> guardaría duplicados. Python prefiere romper ruidosamente, así que <strong>al definir <code>__eq__</code> pone <code>__hash__ = None</code> automáticamente</strong>.
+</div>
+
+<div class="rule">
+  <strong>📌 El invariante, que no es opcional:</strong> si <code>a == b</code>, entonces <code>hash(a) == hash(b)</code>. La recíproca no hace falta (dos objetos distintos pueden colisionar). Y ambos deben calcularse sobre <strong>los mismos campos</strong>, que además tienen que ser <strong>inmutables mientras el objeto viva en un set o dict</strong>.
+</div>
+
+<pre><code class="lang-python"># Opción 1 — a mano, sobre los MISMOS campos que usa __eq__
+class Punto:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+    def __eq__(self, otro):
+        if not isinstance(otro, Punto):
+            return NotImplemented
+        return (self.x, self.y) == (otro.x, otro.y)
+
+    def __hash__(self):
+        return hash((self.x, self.y))      # misma tupla que en __eq__
+
+    def __repr__(self):
+        return f"Punto({self.x}, {self.y})"
+
+# Opción 2 — la que deberías usar el 95% de las veces
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class Punto:
+    x: float
+    y: float
+    # eq=True por defecto; frozen=True hace que se genere __hash__ coherente</code></pre>
+
+<table>
+<thead><tr><th>Configuración de <code>@dataclass</code></th><th><code>__hash__</code> resultante</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>eq=True</code> (por defecto), <code>frozen=False</code></td><td><code>None</code> — no hasheable</td><td>Entidad mutable: un registro que vas a editar</td></tr>
+<tr><td><code>eq=True, frozen=True</code></td><td>Generado a partir de los campos</td><td><strong>Value object</strong>: coordenada, dinero, ID compuesto</td></tr>
+<tr><td><code>eq=False</code></td><td>Heredado de <code>object</code> (identidad)</td><td>Objeto con identidad propia: una conexión, un actor</td></tr>
+<tr><td><code>unsafe_hash=True</code></td><td>Generado aunque sea mutable</td><td>Casi nunca. El nombre te está avisando</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La trampa mortal: hashear sobre campos mutables.</strong> Si metés un objeto en un <code>set</code> y después mutás un campo que participa del hash, el objeto queda <em>huérfano</em>: sigue adentro de la tabla, ocupando memoria, pero en el bucket equivocado. <code>obj in mi_set</code> devuelve <code>False</code> aunque el objeto esté ahí, y <code>mi_set.remove(obj)</code> tira <code>KeyError</code>. No hay excepción, no hay warning: es corrupción silenciosa de una estructura de datos.
+</div>
+
+<pre><code class="lang-python">@dataclass(unsafe_hash=True)     # mutable + hasheable = bomba de tiempo
+class Etiqueta:
+    nombre: str
+
+e = Etiqueta("urgente")
+s = {e}
+e.nombre = "normal"      # mutamos un campo que participa del hash
+e in s                   # False  (!!) — el objeto está adentro, pero en otro bucket
+s.remove(e)              # KeyError: Etiqueta(nombre='normal')
+list(s)                  # [Etiqueta(nombre='normal')] — ahí está, inalcanzable</code></pre>
+
+<h2>PS4.3 El acceso a atributos, paso a paso</h2>
+
+<p>Antes de los descriptors hay que ver el algoritmo que los usa. Cuando escribís <code>obj.x</code>, esto es lo que pasa realmente:</p>
+
+<pre><code class="lang-text">obj.x
+  │
+  ▼
+type(obj).__getattribute__(obj, "x")     ← TODO acceso con punto entra por acá
+  │
+  ├─ 1. Buscar "x" recorriendo type(obj).__mro__  →  lo llamamos attr_cls
+  │
+  ├─ 2. ¿attr_cls define __set__ o __delete__?
+  │        SÍ → DESCRIPTOR DE DATOS
+  │             return attr_cls.__get__(obj, type(obj))        ★ GANA SIEMPRE
+  │
+  ├─ 3. ¿"x" está en obj.__dict__?
+  │        SÍ → return obj.__dict__["x"]                        ← el caso común
+  │
+  ├─ 4. ¿attr_cls define solo __get__?
+  │        SÍ → descriptor de NO-DATOS (funciones, classmethod…)
+  │             return attr_cls.__get__(obj, type(obj))
+  │
+  ├─ 5. ¿attr_cls existe y es un valor común?
+  │        SÍ → return attr_cls                                 ← atributo de clase
+  │
+  └─ 6. AttributeError
+           │
+           └→ ¿type(obj) define __getattr__?
+                    SÍ → type(obj).__getattr__(obj, "x")        ← último recurso
+                    NO → propagar el AttributeError</code></pre>
+
+<p>Tres consecuencias que hay que tener grabadas:</p>
+
+<div class="step"><strong>1. Descriptor de datos &gt; instancia &gt; descriptor de no-datos.</strong> Ese orden es todo. Un descriptor con <code>__set__</code> no puede ser tapado por un atributo de instancia; uno que solo tiene <code>__get__</code>, sí.</div>
+
+<div class="step"><strong>2. <code>__getattr__</code> ≠ <code>__getattribute__</code>.</strong> El primero es un <em>fallback</em>: se llama solo cuando la búsqueda normal fracasó. El segundo intercepta <strong>todos</strong> los accesos, incluso los que existen — es potentísimo y es la forma más fácil de escribir una recursión infinita.</div>
+
+<div class="step"><strong>3. Los dunders implícitos no pasan por acá</strong> (PS4.1). <code>len(obj)</code> mira la ranura del tipo directamente, sin tocar <code>__getattribute__</code>.</div>
+
+<pre><code class="lang-python">class Log:
+    def __getattribute__(self, nombre):
+        print(f"acceso a {nombre}")
+        # ⛔ return self.__dict__[nombre]  →  self.__dict__ vuelve a entrar acá: RecursionError
+        return object.__getattribute__(self, nombre)      # ✅ la salida correcta
+
+class Perezoso:
+    """__getattr__ solo se dispara si el atributo NO existe: costo cero en el caso normal."""
+    def __getattr__(self, nombre):
+        if nombre == "conexion":
+            print("abriendo conexión (una sola vez)")
+            self.conexion = "conn-abierta"   # queda en __dict__ → nunca más pasa por acá
+            return self.conexion
+        raise AttributeError(nombre)         # ¡obligatorio! si no, todo objeto tiene todo</code></pre>
+
+<div class="warn">
+  Un <code>__getattr__</code> que no levanta <code>AttributeError</code> para los nombres desconocidos rompe <code>hasattr()</code>, <code>copy</code>, <code>pickle</code>, <code>unittest.mock</code> y los autocompletados del IDE — todos ellos preguntan por atributos como <code>__deepcopy__</code>, <code>__getstate__</code> o <code>__wrapped__</code> y esperan que fallen.
+</div>
+
+<h2>PS4.4 Descriptors: el mecanismo debajo de todo</h2>
+
+<p>Un descriptor es, simplemente, <strong>un objeto que define <code>__get__</code>, <code>__set__</code> o <code>__delete__</code> y vive como atributo de una clase</strong>. No hereda de nada ni se registra en ningún lado.</p>
+
+<table>
+<thead><tr><th>Método</th><th>Firma</th><th>Cuándo lo llama Python</th></tr></thead>
+<tbody>
+<tr><td><code>__get__</code></td><td><code>(self, obj, objtype=None)</code></td><td>Al leer. <code>obj</code> es <code>None</code> si se accede desde la clase</td></tr>
+<tr><td><code>__set__</code></td><td><code>(self, obj, value)</code></td><td>Al asignar. Su sola presencia lo convierte en <strong>descriptor de datos</strong></td></tr>
+<tr><td><code>__delete__</code></td><td><code>(self, obj)</code></td><td>En <code>del obj.attr</code>. También lo hace de datos</td></tr>
+<tr><td><code>__set_name__</code></td><td><code>(self, owner, name)</code></td><td>Una vez, al crear la clase: le avisa cómo se llama. PEP 487</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  Pensalo como un <em>middleware</em> para un atributo. Sin descriptor, <code>obj.edad</code> es una consulta a un diccionario. Con descriptor, es una <strong>llamada a función</strong> que vos controlás: podés validar, cachear, loguear, convertir tipos o traer el dato de una base — sin que quien escribe <code>obj.edad</code> se entere de nada.
+</div>
+
+<h3><code>property</code> es un descriptor, y podés escribirlo vos</h3>
+
+<p>La mejor forma de convencerse es reimplementarlo. Son 25 líneas y no hay nada mágico adentro:</p>
+
+<pre><code class="lang-python">class Propiedad:
+    """Un clon funcional de property(). Sí: property es solo esto, escrito en C."""
+
+    def __init__(self, fget=None, fset=None, fdel=None, doc=None):
+        self.fget, self.fset, self.fdel = fget, fset, fdel
+        self.__doc__ = doc or getattr(fget, "__doc__", None)
+        self._nombre = ""
+
+    def __set_name__(self, owner, name):
+        self._nombre = name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self                     # Clase.prop → el descriptor mismo
+        if self.fget is None:
+            raise AttributeError(f"la propiedad {self._nombre!r} no tiene getter")
+        return self.fget(obj)
+
+    def __set__(self, obj, value):          # ← definirlo (aunque fset sea None) lo hace de DATOS
+        if self.fset is None:
+            raise AttributeError(f"la propiedad {self._nombre!r} es de solo lectura")
+        self.fset(obj, value)
+
+    def __delete__(self, obj):
+        if self.fdel is None:
+            raise AttributeError(f"la propiedad {self._nombre!r} no se puede borrar")
+        self.fdel(obj)
+
+    # los decoradores encadenados devuelven un descriptor NUEVO, no mutan el actual
+    def getter(self, fget):  return type(self)(fget, self.fset, self.fdel, self.__doc__)
+    def setter(self, fset):  return type(self)(self.fget, fset, self.fdel, self.__doc__)
+    def deleter(self, fdel): return type(self)(self.fget, self.fset, fdel, self.__doc__)</code></pre>
+
+<pre><code class="lang-python">class Rectangulo:
+    def __init__(self, ancho, alto):
+        self.ancho, self.alto = ancho, alto
+
+    @Propiedad                       # exactamente la misma sintaxis que @property
+    def area(self):
+        """Calculada, nunca almacenada."""
+        return self.ancho * self.alto
+
+r = Rectangulo(3, 4)
+r.area              # 12
+r.area = 99         # AttributeError: la propiedad 'area' es de solo lectura
+r.__dict__          # {'ancho': 3, 'alto': 4}  — 'area' NO está: no es un dato guardado</code></pre>
+
+<div class="rule">
+  <strong>📌 Acá se ve por qué el orden de PS4.3 importa.</strong> <code>Propiedad</code> define <code>__set__</code> aunque no tenga setter, así que es un descriptor <em>de datos</em> y gana sobre <code>obj.__dict__</code>. Por eso una propiedad de solo lectura es realmente de solo lectura: ni siquiera <code>r.__dict__["area"] = 99</code> logra taparla. Si <code>Propiedad</code> solo tuviera <code>__get__</code>, cualquier asignación la sepultaría para siempre en esa instancia.
+</div>
+
+<h3>El caso real: un validador reutilizable</h3>
+
+<p>Las <code>property</code> no escalan cuando tenés doce campos con la misma validación: terminás copiando doce getters y doce setters idénticos. El descriptor te deja escribir la regla <strong>una vez</strong>.</p>
+
+<pre><code class="lang-python">from abc import ABC, abstractmethod
+
+class Validado(ABC):
+    """Descriptor de datos: valida en cada asignación y guarda en el __dict__ del objeto."""
+
+    def __set_name__(self, owner, name):
+        self.nombre = name                       # 'edad', 'apellido', …
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        try:
+            return obj.__dict__[self.nombre]
+        except KeyError:
+            raise AttributeError(
+                f"{type(obj).__name__}.{self.nombre} no fue asignado todavía"
+            ) from None
+
+    def __set__(self, obj, value):
+        obj.__dict__[self.nombre] = self.validar(value)   # guardar el valor YA validado
+
+    @abstractmethod
+    def validar(self, value):
+        """Devuelve el valor normalizado o levanta ValueError/TypeError."""
+
+
+class Entero(Validado):
+    def __init__(self, *, minimo=None, maximo=None):
+        self.minimo, self.maximo = minimo, maximo
+
+    def validar(self, value):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{self.nombre} debe ser int, llegó {type(value).__name__}")
+        if self.minimo is not None and value &lt; self.minimo:
+            raise ValueError(f"{self.nombre} debe ser &gt;= {self.minimo}, llegó {value}")
+        if self.maximo is not None and value &gt; self.maximo:
+            raise ValueError(f"{self.nombre} debe ser &lt;= {self.maximo}, llegó {value}")
+        return value
+
+
+class Texto(Validado):
+    def __init__(self, *, largo_max=None, opciones=None):
+        self.largo_max, self.opciones = largo_max, opciones
+
+    def validar(self, value):
+        if not isinstance(value, str):
+            raise TypeError(f"{self.nombre} debe ser str")
+        value = value.strip()
+        if self.largo_max is not None and len(value) &gt; self.largo_max:
+            raise ValueError(f"{self.nombre}: máximo {self.largo_max} caracteres")
+        if self.opciones is not None and value not in self.opciones:
+            raise ValueError(f"{self.nombre} debe ser uno de {sorted(self.opciones)}")
+        return value</code></pre>
+
+<pre><code class="lang-python">class Empleado:
+    nombre  = Texto(largo_max=60)
+    edad    = Entero(minimo=18, maximo=99)
+    turno   = Texto(opciones={"mañana", "tarde", "noche"})
+
+    def __init__(self, nombre, edad, turno):
+        self.nombre, self.edad, self.turno = nombre, edad, turno
+
+e = Empleado("  Ana  ", 34, "tarde")
+e.nombre            # 'Ana'  — el validador normalizó (strip) al asignar
+e.__dict__          # {'nombre': 'Ana', 'edad': 34, 'turno': 'tarde'}
+
+Empleado("Ana", 12, "tarde")    # ValueError: edad debe ser &gt;= 18, llegó 12
+e.edad = True                   # TypeError: edad debe ser int, llegó bool
+e.turno = "madrugada"           # ValueError: turno debe ser uno de ['mañana',…]</code></pre>
+
+<div class="tip">
+  <strong>Dos detalles que separan un descriptor correcto de uno roto.</strong> <strong>(1)</strong> Guardar en <code>obj.__dict__[self.nombre]</code> con el <em>mismo</em> nombre no genera recursión, justamente porque el descriptor de datos tiene prioridad sobre el <code>__dict__</code>: las lecturas nunca lo encuentran solas. <strong>(2)</strong> El estado va en <code>obj</code>, <strong>nunca en <code>self</code></strong>: el descriptor es <em>uno solo</em> compartido por todas las instancias de la clase. Un <code>self.valor = value</code> ahí adentro hace que las mil instancias de <code>Empleado</code> compartan la misma edad — y es un bug que en tests con una sola instancia no aparece.
+</div>
+
+<h2>PS4.5 Los métodos también son descriptors</h2>
+
+<p>Nunca te preguntaste de dónde sale el <code>self</code>. La respuesta es que <strong>las funciones son descriptors de no-datos</strong>: definen <code>__get__</code> y nada más.</p>
+
+<pre><code class="lang-python">def saludar(self):
+    return f"hola desde {self}"
+
+saludar.__get__                 # &lt;method-wrapper '__get__' of function object&gt;
+
+class C:
+    metodo = saludar
+
+c = C()
+C.metodo                        # la función pelada (Python 3)
+c.metodo                        # &lt;bound method saludar of &lt;C object…&gt;&gt;
+c.metodo.__self__ is c          # True — el binding es literalmente esto:
+saludar.__get__(c, C)           # el mismo bound method, hecho a mano
+
+# Y como las funciones son descriptors de NO-datos, la instancia les gana:
+c.metodo = lambda: "yo mando"
+c.metodo()                      # 'yo mando'  — el __dict__ tapó al método (paso 3 &gt; paso 4)</code></pre>
+
+<div class="concept">
+  <strong>💡 Todo el sistema de métodos de Python es una aplicación del protocolo de descriptors.</strong> Un <em>bound method</em> es un objeto creado al vuelo por <code>function.__get__</code>, que guarda <code>__func__</code> y <code>__self__</code> y al llamarse inserta el <code>self</code> como primer argumento. <code>staticmethod</code> y <code>classmethod</code> son descriptors también: el primero devuelve la función sin tocar, el segundo la liga a la clase en vez de a la instancia. No hay una regla especial del intérprete: hay tres descriptors.
+</div>
+
+<pre><code class="lang-python">class D:
+    @staticmethod
+    def estatico(): return "sin self ni cls"
+
+    @classmethod
+    def declase(cls): return f"cls={cls.__name__}"
+
+vars(D)["estatico"]     # &lt;staticmethod object&gt;  — el descriptor crudo
+vars(D)["declase"]      # &lt;classmethod object&gt;
+D.estatico              # la función pelada: staticmethod.__get__ la devuelve tal cual
+D().declase()           # 'cls=D' — classmethod.__get__ liga cls, venga de instancia o de clase</code></pre>
+
+<div class="info">
+  Desde 3.10 los objetos <code>staticmethod</code> son <strong>invocables directamente</strong> (antes había que sacarlos del <code>__dict__</code> con <code>.__func__</code>). Y ojo con un cambio que rompe código viejo: encadenar <code>@classmethod</code> sobre <code>@property</code> —un truco popular en 3.9–3.10 para hacer "propiedades de clase"— quedó deprecado en 3.11 y <strong>eliminado en 3.13</strong>. En 3.14 no funciona: si necesitás una propiedad de clase, escribí un descriptor propio cuyo <code>__get__</code> use el parámetro <code>objtype</code>.
+</div>
+
+<h2>PS4.6 <code>__slots__</code>, dataclasses y su choque con los descriptors</h2>
+
+<p><code>__slots__</code> no es una anotación de tipos ni una optimización opaca: <strong>le pide al constructor de clases que genere un descriptor de datos por cada nombre</strong> y que no cree <code>__dict__</code>. Es, otra vez, el mismo mecanismo.</p>
+
+<pre><code class="lang-python">class Punto:
+    __slots__ = ("x", "y")
+    def __init__(self, x, y): self.x, self.y = x, y
+
+type(vars(Punto)["x"])      # &lt;class 'member_descriptor'&gt;  ← un descriptor de datos en C
+vars(Punto)["x"].__get__    # tiene __get__ y __set__: por eso las asignaciones funcionan
+
+p = Punto(1, 2)
+p.__dict__                  # AttributeError: 'Punto' object has no attribute '__dict__'
+p.z = 3                     # AttributeError: 'Punto' object has no attribute 'z'</code></pre>
+
+<table>
+<thead><tr><th>Qué ganás</th><th>Qué perdés</th></tr></thead>
+<tbody>
+<tr><td>Memoria: sin <code>__dict__</code>, típicamente 40–50% menos por instancia</td><td>No podés agregar atributos dinámicos (a veces eso <em>es</em> lo que querés)</td></tr>
+<tr><td>Acceso algo más rápido: offset fijo en vez de hash de diccionario</td><td><code>__weakref__</code> hay que pedirlo explícitamente en <code>__slots__</code></td></tr>
+<tr><td>Detecta typos: <code>p.nomrbe = "x"</code> falla en vez de crear un campo fantasma</td><td>Herencia frágil: si <strong>cualquier</strong> base no tiene <code>__slots__</code>, vuelve el <code>__dict__</code></td></tr>
+</tbody>
+</table>
+
+<h3>La interacción con descriptors: el conflicto de nombres</h3>
+
+<pre><code class="lang-python">class Roto:
+    __slots__ = ("edad",)
+    edad = Entero(minimo=0)      # ValueError al CREAR la clase:
+                                 # 'edad' in __slots__ conflicts with class variable</code></pre>
+
+<p>Es coherente: el slot y el descriptor quieren ocupar el mismo casillero del <code>__dict__</code> de la clase. Y hay un segundo problema, más callado: nuestro <code>Validado</code> guarda en <code>obj.__dict__</code>, que con <code>__slots__</code> <strong>no existe</strong>. La solución estándar es que el descriptor use un slot privado con otro nombre:</p>
+
+<pre><code class="lang-python">class ValidadoSlots(Validado):
+    def __set_name__(self, owner, name):
+        self.nombre = name
+        self.privado = "_slot_" + name        # el casillero real
+
+    def __get__(self, obj, objtype=None):
+        if obj is None: return self
+        return getattr(obj, self.privado)     # lee el slot, no el __dict__
+
+    def __set__(self, obj, value):
+        setattr(obj, self.privado, self.validar(value))
+
+class Persona:
+    __slots__ = ("_slot_edad",)               # el slot se llama distinto del atributo
+    edad = Entero.__new__(Entero)             # (en la práctica: class Edad(ValidadoSlots))</code></pre>
+
+<h3><code>@dataclass(slots=True)</code>: la letra chica</h3>
+
+<pre><code class="lang-python">from dataclasses import dataclass, field
+
+@dataclass(slots=True, frozen=True)
+class Medicion:
+    sensor: str
+    valor: float
+    etiquetas: tuple[str, ...] = ()</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>slots=True</code> no agrega slots: construye una CLASE NUEVA.</strong> <code>__slots__</code> tiene que estar presente <em>antes</em> de que el tipo se cree, y un decorador corre después. Entonces <code>dataclasses</code> arma un segundo objeto-clase y lo devuelve en lugar del original. Todo lo que haya capturado una referencia a la clase original <strong>antes</strong> del decorador —un registro global poblado en <code>__init_subclass__</code>, otro decorador aplicado más abajo, un <code>weakref</code>, un <code>isinstance</code> contra la referencia vieja— sigue apuntando a una clase que ya no es la que usa nadie. El <code>super()</code> sin argumentos sí fue arreglado (CPython repara la celda <code>__class__</code> desde 3.12), pero el problema de identidad no tiene arreglo posible.
+</div>
+
+<div class="info">
+  <strong>Dataclasses y descriptors sí se llevan bien.</strong> Si el <em>default</em> de un campo es un descriptor, <code>dataclasses</code> lo respeta: se le llama <code>__set_name__</code> como a cualquier atributo de clase, y el valor por defecto que usa el <code>__init__</code> generado se obtiene invocando <code>descriptor.__get__(None, cls)</code>. Es la vía oficial para combinar validación con dataclasses sin escribir un <code>__post_init__</code> gigante. Con <code>slots=True</code>, recordá que la clase se crea dos veces: <code>__set_name__</code> corre dos veces, así que ese método debe ser <strong>idempotente</strong> y no tocar estado global.
+</div>
+
+<h2>PS4.7 Metaclases: la clase de una clase</h2>
+
+<p>Si las instancias son creadas por su clase, ¿quién crea a las clases? Otra clase. Esa es toda la idea.</p>
+
+<pre><code class="lang-python">class C: pass
+
+type(C())          # &lt;class '__main__.C'&gt;   — la clase de la instancia
+type(C)            # &lt;class 'type'&gt;         — la clase de la clase = su METACLASE
+type(type)         # &lt;class 'type'&gt;         — el punto fijo: type se crea a sí mismo
+
+# Una sentencia class es azúcar sobre una llamada a type con tres argumentos:
+D = type("D", (object,), {"saludar": lambda self: "hola", "version": 3})
+D().saludar()      # 'hola'</code></pre>
+
+<p>El protocolo completo que ejecuta <code>__build_class__</code> cuando ve una sentencia <code>class</code>:</p>
+
+<pre><code class="lang-text">class Usuario(Modelo, tabla="usuarios"):
+    nombre = Campo(str)
+
+ 1. Determinar la metaclase (la de las bases, o el keyword metaclass=)
+ 2. ns = metacls.__prepare__("Usuario", bases, tabla="usuarios")   → un mapeo vacío
+ 3. Ejecutar el CUERPO de la clase dentro de ns  → ns["nombre"] = Campo(str)
+ 4. cls = metacls.__new__(metacls, "Usuario", bases, ns, tabla="usuarios")
+        └─ type.__new__ hace además, en este orden:
+              a) llamar __set_name__(cls, nombre) en cada objeto de ns que lo tenga
+              b) llamar Modelo.__init_subclass__(cls, tabla="usuarios")
+ 5. metacls.__init__(cls, ...)
+ 6. Ligar el nombre "Usuario" en el módulo</code></pre>
+
+<pre><code class="lang-python">class RegistroMeta(type):
+    """Lleva un registro de todas las subclases y prohíbe métodos duplicados."""
+    registro: dict[str, type] = {}
+
+    @classmethod
+    def __prepare__(mcls, nombre, bases, **kw):
+        return DetectorDeDuplicados()          # ← lo único que SOLO una metaclase puede hacer
+
+    def __new__(mcls, nombre, bases, ns, *, abstracta=False, **kw):
+        cls = super().__new__(mcls, nombre, bases, dict(ns), **kw)
+        if not abstracta:
+            mcls.registro[nombre.lower()] = cls
+        return cls
+
+    def __repr__(cls):                          # 'self' acá es la CLASE, no la instancia
+        return f"&lt;modelo {cls.__name__}&gt;"
+
+class DetectorDeDuplicados(dict):
+    def __setitem__(self, k, v):
+        if k in self:
+            raise TypeError(f"'{k}' está definido dos veces en el cuerpo de la clase")
+        super().__setitem__(k, v)</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo único que <em>solo</em> una metaclase puede hacer:</strong> <strong>(1)</strong> <code>__prepare__</code>, o sea controlar el mapeo donde se ejecuta el cuerpo de la clase — así <code>enum</code> detecta miembros duplicados y así se preservaba el orden antes de 3.7; <strong>(2)</strong> cambiar las bases o devolver algo que no es la clase pedida; <strong>(3)</strong> personalizar <code>isinstance</code>/<code>issubclass</code> con <code>__instancecheck__</code> (es lo que hace <code>abc.ABCMeta</code>); <strong>(4)</strong> definir comportamiento <em>de la clase como objeto</em>: su <code>__repr__</code>, su <code>__call__</code>, su <code>__getattr__</code>, su iteración (<code>for miembro in MiEnum</code>). Todo lo demás que se hace con metaclases se puede hacer más simple.
+</div>
+
+<div class="danger">
+  <strong>⚠️ El conflicto de metaclases: el costo que nadie calcula.</strong> Una clase solo puede tener <em>una</em> metaclase, y tiene que ser subclase de las metaclases de todas sus bases. En cuanto tu <code>RegistroMeta</code> existe, nadie puede escribir <code>class X(TuModelo, abc.ABC)</code>, ni combinarlo con <code>Protocol</code>, ni con un modelo de Django, ni con <code>Generic</code> en según qué versiones. El error es <code>TypeError: metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases</code>, aparece meses después, en el código de otro, y la única salida es fabricar una metaclase combinada. <strong>Una metaclase no es una decisión local: es un impuesto sobre todo el árbol de herencia, para siempre.</strong>
+</div>
+
+<pre><code class="lang-python">import abc
+
+class MiMeta(type): pass
+class Base(metaclass=MiMeta): pass
+
+class Hijo(Base, abc.ABC): ...     # TypeError: metaclass conflict
+
+class MetaCombinada(MiMeta, abc.ABCMeta): pass    # el "arreglo": más metaclases
+class Hijo(Base, abc.ABC, metaclass=MetaCombinada): ...   # ahora sí, y así crece la bola</code></pre>
+
+<h2>PS4.8 <code>__init_subclass__</code>: el 90% de las metaclases, sin metaclase</h2>
+
+<p>PEP 487 —el mismo que trajo <code>__set_name__</code>— agregó un gancho que cubre el caso de uso dominante: <em>"quiero que pase algo cada vez que alguien hereda de mi clase"</em>. Es un <code>classmethod</code> implícito que recibe la <strong>subclase recién creada</strong>.</p>
+
+<pre><code class="lang-python">class Plugin:
+    registro: dict[str, type] = {}
+
+    def __init_subclass__(cls, /, nombre=None, abstracto=False, **kw):
+        super().__init_subclass__(**kw)          # ← obligatorio: cooperación en el MRO
+        if abstracto:
+            return
+        cls.nombre = nombre or cls.__name__.lower()
+        if cls.nombre in Plugin.registro:
+            raise TypeError(f"plugin duplicado: {cls.nombre!r}")
+        Plugin.registro[cls.nombre] = cls
+
+class ExportadorCSV(Plugin, nombre="csv"):       # los kwargs de la sentencia class llegan acá
+    def exportar(self, filas): ...
+
+class ExportadorJSON(Plugin):                     # sin nombre → 'exportadorjson'
+    def exportar(self, filas): ...
+
+Plugin.registro          # {'csv': ExportadorCSV, 'exportadorjson': ExportadorJSON}
+type(ExportadorCSV)      # &lt;class 'type'&gt;  ← metaclase normal: se combina con TODO</code></pre>
+
+<div class="tip">
+  <strong>Dos detalles operativos.</strong> <strong>(1)</strong> <code>__init_subclass__</code> <em>no</em> corre para la clase que lo define, solo para sus descendientes — por eso <code>Plugin.registro</code> se inicializa a mano. <strong>(2)</strong> Cuando corre, los <code>__set_name__</code> de todos los descriptors del cuerpo <strong>ya se ejecutaron</strong> (paso 4a de PS4.7), así que podés inspeccionar los descriptors sabiendo que ya conocen su nombre. Ese orden es lo que hace viable el mini-ORM del worked example.
+</div>
+
+<table>
+<thead><tr><th>Criterio</th><th>Metaclase</th><th><code>__init_subclass__</code></th><th>Decorador de clase</th></tr></thead>
+<tbody>
+<tr><td>Alcance</td><td>La clase y <strong>todo</strong> el subárbol, automático</td><td>Todas las subclases (no la que lo define)</td><td>Solo la clase decorada; <strong>no se hereda</strong></td></tr>
+<tr><td>Controla el namespace antes del cuerpo (<code>__prepare__</code>)</td><td>✅ Sí</td><td>❌ No</td><td>❌ No</td></tr>
+<tr><td>Puede cambiar bases o devolver otra clase</td><td>✅ Sí</td><td>❌ No (la clase ya existe)</td><td>✅ Sí</td></tr>
+<tr><td>Personaliza <code>isinstance</code>, <code>repr</code> de la clase, iteración de la clase</td><td>✅ Sí</td><td>❌ No</td><td>❌ No</td></tr>
+<tr><td>Recibe kwargs de la sentencia <code>class</code></td><td>✅ Sí</td><td>✅ Sí</td><td>Vía argumentos del decorador</td></tr>
+<tr><td>Riesgo de <em>metaclass conflict</em></td><td>🔴 Alto y permanente</td><td>🟢 Ninguno</td><td>🟢 Ninguno</td></tr>
+<tr><td>Lo entiende alguien con 2 años de Python</td><td>🔴 No</td><td>🟢 Sí</td><td>🟢 Sí</td></tr>
+<tr><td>Ejemplos reales</td><td><code>abc.ABCMeta</code>, <code>enum.EnumType</code>, ORMs clásicos</td><td>Registros de plugins, validación de subclases</td><td><code>@dataclass</code>, <code>@functools.total_ordering</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El árbol de decisión, en orden:</strong> ¿alcanza con un <strong>decorador de clase</strong>? Usalo. ¿Necesitás que aplique a todas las subclases sin que se acuerden de decorarse? <strong><code>__init_subclass__</code></strong>. ¿Necesitás <code>__prepare__</code>, <code>__instancecheck__</code>, o cambiar la clase <em>como objeto</em>? Recién ahí, <strong>metaclase</strong> — y escribí en el docstring por qué no alcanzaba lo anterior.
+</div>
+
+<h2>PS4.9 <code>contextlib</code>: el protocolo de contexto sin escribir clases</h2>
+
+<p>El protocolo <code>__enter__</code>/<code>__exit__</code> es el que más veces vas a implementar, y casi nunca hace falta una clase para eso.</p>
+
+<pre><code class="lang-python">from contextlib import contextmanager
+import time, logging
+
+@contextmanager
+def cronometrar(etiqueta):
+    t0 = time.perf_counter()
+    try:                                   # ⚠️ el try/finally NO es opcional
+        yield                              # todo lo de antes = __enter__; lo de después = __exit__
+    finally:
+        logging.info("%s tardó %.3fs", etiqueta, time.perf_counter() - t0)
+
+with cronometrar("consulta pesada"):
+    hacer_la_consulta()                    # aunque esto explote, el log se escribe</code></pre>
+
+<div class="mistake">
+  <strong>El bug del <code>@contextmanager</code> sin <code>try/finally</code>.</strong> Si el bloque <code>with</code> levanta una excepción, Python la <em>inyecta</em> dentro del generador en el punto del <code>yield</code>. Sin <code>try/finally</code>, el generador muere ahí y el código de limpieza posterior al <code>yield</code> <strong>nunca corre</strong>: la conexión queda abierta, el lock tomado, el archivo temporal en disco. Y como el camino feliz sí funciona, los tests pasan.
+</div>
+
+<pre><code class="lang-python">from contextlib import ExitStack, suppress, closing, nullcontext
+
+# 1. ExitStack — N contextos decididos en runtime, cerrados en orden inverso
+def procesar(rutas):
+    with ExitStack() as stack:
+        archivos = [stack.enter_context(open(r, encoding="utf-8")) for r in rutas]
+        # si el archivo 7 de 10 falla al abrir, los 6 anteriores se cierran igual
+        return combinar(archivos)
+
+# 2. ExitStack como "rollback": registrar deshacer a medida que se avanza
+def desplegar(servicios):
+    with ExitStack() as stack:
+        for s in servicios:
+            s.arrancar()
+            stack.callback(s.parar)        # si algo falla más adelante, se para todo
+        verificar_salud(servicios)
+        stack.pop_all()                    # ✅ todo OK: renunciamos al rollback
+
+# 3. suppress — reemplaza el try/except/pass, y dice explícitamente qué ignora
+with suppress(FileNotFoundError):
+    Path("cache.tmp").unlink()
+
+# 4. nullcontext — un with condicional sin duplicar el bloque
+ctx = abrir_transaccion() if usar_tx else nullcontext()
+with ctx:
+    guardar(datos)
+
+# 5. closing — para objetos con .close() que no implementan el protocolo
+with closing(urlopen(url)) as respuesta:
+    cuerpo = respuesta.read()</code></pre>
+
+<div class="info">
+  Un context manager hecho con <code>@contextmanager</code> es <strong>de un solo uso</strong>: el generador se agota. Si necesitás reentrancia o reutilización, heredá de <code>contextlib.ContextDecorator</code> o escribí la clase. Y para el mundo <code>async</code> de PS3 existen los espejos exactos: <code>@asynccontextmanager</code> y <code>AsyncExitStack</code>, con la misma semántica.
+</div>
+
+<h2>PS4.10 Cuándo NO usar nada de esto</h2>
+
+<p>Todo lo anterior comparte una propiedad incómoda: <strong>hace que el comportamiento del código no esté donde se lo lee</strong>. Quien lee <code>usuario.edad = -5</code> ve una asignación. Que en realidad sea una llamada a un validador definido en otro archivo, en una clase base, es información que no está en la pantalla.</p>
+
+<div class="concept">
+  <strong>💡 El criterio.</strong> Estas herramientas cambian <em>dónde</em> vive la complejidad, no <em>cuánta</em> hay. Se justifican cuando la magia se escribe <strong>una vez</strong> y se consume <strong>muchas</strong> veces: cien clases con validación declarativa contra un descriptor de treinta líneas es un negocio excelente. Un descriptor de treinta líneas para dos atributos de una clase es una deuda que va a pagar otro.
+</div>
+
+<table>
+<thead><tr><th>Si tu impulso es…</th><th>Probá primero</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Un descriptor para validar dos campos</td><td>Un <code>if</code> en <code>__init__</code>, o <code>@property</code></td><td>La regla de los 3 usos. Con 2 no amortiza</td></tr>
+<tr><td>Una metaclase que registra subclases</td><td><code>__init_subclass__</code></td><td>Mismo resultado, cero conflicto de metaclases</td></tr>
+<tr><td>Una metaclase que inyecta métodos</td><td>Un decorador de clase, o herencia común</td><td>Explícito, visible en el <code>git blame</code>, testeable solo</td></tr>
+<tr><td><code>__getattr__</code> para "cualquier campo del JSON"</td><td>Un <code>dataclass</code>, un <code>TypedDict</code> o Pydantic</td><td>Tipado, autocompletado, y errores en el borde y no 200 líneas después</td></tr>
+<tr><td><code>__getattribute__</code> para loguear accesos</td><td>Logging en los pocos puntos que importan</td><td>Interceptás <em>todo</em>, incluidos los dunders, y el costo es por acceso</td></tr>
+<tr><td>Sobrecargar operadores en un objeto de dominio</td><td>Métodos con nombre: <code>pedido.agregar(item)</code></td><td><code>+</code> solo se justifica si la semántica algebraica es obvia para todos</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Las cuatro señales de que te pasaste.</strong> <strong>(1)</strong> El <code>pdb</code> entra a un archivo que no escribió nadie del equipo. <strong>(2)</strong> El IDE no autocompleta atributos que sí existen en runtime. <strong>(3)</strong> Un <code>AttributeError</code> con un traceback que no menciona ninguna línea tuya. <strong>(4)</strong> Un onboarding donde tenés que explicar de palabra cómo funciona una clase, porque leerla no alcanza. La magia que ahorra diez líneas y cuesta dos horas de debugging al que venga después <strong>no ahorró nada</strong>: movió el costo a alguien que no participó de la decisión.
+</div>
+
+<div class="tip">
+  <strong>El seguro barato.</strong> Si igual la escribís, dejá tres cosas: un docstring en el descriptor o en la metaclase que diga <em>qué alternativa más simple descartaste y por qué</em>; un test que verifique el comportamiento mágico (para que se rompa ruidosamente si alguien lo toca); y un <code>__repr__</code> decente en el descriptor, porque el día del incendio alguien va a imprimir <code>vars(MiClase)</code>.
+</div>
+
+<h2>🧑‍🎓 Worked Example — un mini-ORM declarativo</h2>
+
+<blockquote>Objetivo: que el usuario de nuestra librería escriba <code>class Usuario(Modelo): nombre = Campo(str)</code> y obtenga gratis <code>__init__</code> con validación de tipos, <code>__repr__</code>, el nombre de la tabla y un <code>INSERT</code>. Es <em>el</em> caso de uso histórico de las metaclases. Vamos a construirlo dos veces y a elegir.</blockquote>
+
+<p><strong>Paso 1 — La pieza que no cambia: el descriptor <code>Campo</code>.</strong> Independientemente de cómo construyamos la clase, cada atributo necesita saber su nombre, su tipo y cómo validarse. Eso es un descriptor de datos, tal cual PS4.4:</p>
+
+<pre><code class="lang-python">class Campo:
+    """Descriptor de datos: un atributo tipado, validado y con nombre de columna."""
+
+    def __init__(self, tipo, *, requerido=True, default=None, columna=None):
+        self.tipo, self.requerido, self.default = tipo, requerido, default
+        self.columna = columna
+
+    def __set_name__(self, owner, name):        # lo llama type.__new__, gratis
+        self.nombre = name
+        self.columna = self.columna or name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self                          # Usuario.nombre → el Campo (lo usa el SQL)
+        return obj.__dict__.get(self.nombre, self.default)
+
+    def __set__(self, obj, value):
+        if value is None:
+            if self.requerido:
+                raise ValueError(f"{self.nombre} es obligatorio")
+        elif not isinstance(value, self.tipo):
+            raise TypeError(
+                f"{self.nombre} debe ser {self.tipo.__name__}, "
+                f"llegó {type(value).__name__}"
+            )
+        obj.__dict__[self.nombre] = value
+
+    def __repr__(self):
+        return f"Campo({self.tipo.__name__}, columna={self.columna!r})"</code></pre>
+
+<p><strong>Paso 2 — Versión A: con metaclase.</strong> Es como está escrito Django y como estaba escrito SQLAlchemy clásico.</p>
+
+<pre><code class="lang-python">class ModeloMeta(type):
+    def __new__(mcls, nombre, bases, ns, *, tabla=None, **kw):
+        cls = super().__new__(mcls, nombre, bases, ns, **kw)
+        # recorrer el MRO al revés para que las subclases pisen a las bases
+        cls._campos = {
+            k: v
+            for klass in reversed(cls.__mro__)
+            for k, v in vars(klass).items()
+            if isinstance(v, Campo)
+        }
+        cls._tabla = tabla or nombre.lower()
+        return cls
+
+    def __repr__(cls):
+        return f"&lt;Modelo {cls.__name__}({', '.join(cls._campos)})&gt;"
+
+class Modelo(metaclass=ModeloMeta):
+    def __init__(self, **kw):
+        faltantes = set(kw) - set(self._campos)
+        if faltantes:
+            raise TypeError(f"campos desconocidos: {sorted(faltantes)}")
+        for nombre, campo in self._campos.items():
+            setattr(self, nombre, kw.get(nombre, campo.default))   # pasa por Campo.__set__</code></pre>
+
+<div class="warn">
+  <strong>Dos bugs que aparecen solos si escribís esto rápido.</strong> <strong>(1)</strong> Juntar los campos con <code>ns</code> en vez del <code>__mro__</code> hace que las subclases <em>pierdan</em> los campos heredados — clásico, y se descubre en producción. <strong>(2)</strong> Si <code>__set_name__</code> no corriera antes, <code>campo.nombre</code> no existiría todavía; funciona porque <code>super().__new__</code> (o sea <code>type.__new__</code>) lo dispara <em>durante</em> la creación. Ese orden hay que conocerlo, no deducirlo.
+</div>
+
+<p><strong>Paso 3 — Versión B: <code>__init_subclass__</code> + descriptors.</strong> Misma API pública, sin metaclase:</p>
+
+<pre><code class="lang-python">class Modelo:
+    _campos: dict[str, Campo] = {}
+    _tabla: str = ""
+
+    def __init_subclass__(cls, /, tabla=None, **kw):
+        super().__init_subclass__(**kw)
+        cls._tabla = tabla or cls.__name__.lower()
+        cls._campos = {
+            k: v
+            for klass in reversed(cls.__mro__)
+            for k, v in vars(klass).items()
+            if isinstance(v, Campo)
+        }
+
+    def __init__(self, **kw):
+        faltantes = set(kw) - set(self._campos)
+        if faltantes:
+            raise TypeError(f"campos desconocidos: {sorted(faltantes)}")
+        for nombre, campo in self._campos.items():
+            setattr(self, nombre, kw.get(nombre, campo.default))
+
+    def __repr__(self):
+        args = ", ".join(f"{k}={getattr(self, k)!r}" for k in self._campos)
+        return f"{type(self).__name__}({args})"
+
+    def insert(self):
+        cols = ", ".join(c.columna for c in self._campos.values())
+        marks = ", ".join("?" for _ in self._campos)
+        valores = tuple(getattr(self, k) for k in self._campos)
+        return f"INSERT INTO {self._tabla} ({cols}) VALUES ({marks})", valores</code></pre>
+
+<pre><code class="lang-python">class Usuario(Modelo, tabla="usuarios"):
+    nombre = Campo(str)
+    edad   = Campo(int, requerido=False, default=0)
+    email  = Campo(str, columna="correo_electronico")
+
+class UsuarioPremium(Usuario, tabla="usuarios_premium"):
+    descuento = Campo(float, requerido=False, default=0.0)
+
+u = Usuario(nombre="Ana", email="ana@ejemplo.com")
+u                       # Usuario(nombre='Ana', edad=0, email='ana@ejemplo.com')
+u.insert()
+# ('INSERT INTO usuarios (nombre, edad, correo_electronico) VALUES (?, ?, ?)',
+#  ('Ana', 0, 'ana@ejemplo.com'))
+
+Usuario(nombre=123, email="x@y.z")     # TypeError: nombre debe ser str, llegó int
+Usuario(email="x@y.z")                 # ValueError: nombre es obligatorio
+Usuario(nombre="Ana", apodo="anita")   # TypeError: campos desconocidos: ['apodo']
+
+list(UsuarioPremium._campos)           # ['nombre', 'edad', 'email', 'descuento'] ← hereda
+type(Usuario)                          # &lt;class 'type'&gt;  ← metaclase normal
+</code></pre>
+
+<p><strong>Paso 4 — La decisión.</strong> Las dos versiones funcionan y hacen exactamente lo mismo. Lo que cambia es el costo a un año:</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Versión A (metaclase)</th><th>Versión B (<code>__init_subclass__</code>)</th></tr></thead>
+<tbody>
+<tr><td>Composición con <code>ABC</code>, <code>Protocol</code>, <code>Generic</code>, otro framework</td><td>🔴 <em>metaclass conflict</em> tarde o temprano</td><td>🟢 Sin fricción: <code>type(Usuario) is type</code></td></tr>
+<tr><td><code>__repr__</code> lindo de la <em>clase</em> (<code>&lt;Modelo Usuario(...)&gt;</code>)</td><td>🟢 Sí</td><td>🔴 No — solo con metaclase</td></tr>
+<tr><td>Detectar campos duplicados en el cuerpo</td><td>🟢 Con <code>__prepare__</code></td><td>🔴 No</td></tr>
+<tr><td>Quién puede mantenerlo en el equipo</td><td>🔴 Uno o dos</td><td>🟢 Cualquiera que sepa herencia</td></tr>
+<tr><td>Debuggear "por qué mi campo no se guarda"</td><td>🔴 Hay que saber <code>__build_class__</code></td><td>🟡 Un <code>breakpoint()</code> en un método normal</td></tr>
+<tr><td>Líneas de código</td><td>Prácticamente idénticas</td><td>Prácticamente idénticas</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 En un equipo elijo la B, y no es por gusto: es por la primera fila.</strong> El <code>metaclass conflict</code> no lo paga quien escribe el ORM, lo paga el que seis meses después necesita <code>class Pedido(Modelo, Protocol)</code> o mezclar el modelo con un mixin de otra librería. Ese costo es invisible el día de la decisión y no tiene arreglo barato después. Lo único que la A da de más —el <code>repr</code> de la clase y la detección de duplicados— no vale ese seguro. <strong>Si algún día hace falta <code>__prepare__</code>, agregar la metaclase después es fácil; sacarla, no.</strong>
+</div>
+
+<div class="info">
+  <strong>Detalle de 3.14 si extendés esto a anotaciones.</strong> Es tentador reemplazar <code>nombre = Campo(str)</code> por <code>nombre: str</code> y leer <code>cls.__annotations__</code>. Desde <strong>Python 3.14</strong>, con PEP 649/749, las anotaciones se evalúan <strong>de forma diferida</strong>: la clase guarda un <code>__annotate__</code> y el diccionario se materializa recién cuando alguien lo pide. Tocar <code>__annotations__</code> crudo dentro de <code>__init_subclass__</code> puede forzar la evaluación de nombres que todavía no existen (referencias adelantadas). Usá <code>annotationlib.get_annotations(cls, format=...)</code> —el módulo nuevo de 3.14— o <code>typing.get_type_hints()</code>, y nunca el atributo directo.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés un descriptor con <code>__get__</code> y <code>__set__</code>, y en el <code>__init__</code> hacés <code>self.edad = 30</code>. ¿Dónde termina el 30, y qué pasa si en vez de <code>obj.__dict__</code> el descriptor guardara en <code>self</code>?</summary>
+<p>El <code>30</code> termina donde vos decidas dentro de <code>__set__</code>, porque la asignación <strong>no</strong> escribe en <code>obj.__dict__</code> por su cuenta: al ser un descriptor de datos, <code>__setattr__</code> se lo delega. El idioma correcto es <code>obj.__dict__[self.nombre] = value</code>, que funciona sin recursión precisamente porque los descriptors de datos tienen prioridad sobre el <code>__dict__</code> en la lectura (paso 2 antes que paso 3 en PS4.3). Si en cambio guardaras en <code>self.valor</code>, estarías escribiendo en el <strong>descriptor</strong>, que es un único objeto compartido por todas las instancias de la clase: la última instancia creada le pisaría la edad a todas las demás. Es un bug que no aparece en tests con un solo objeto y se manifiesta bajo concurrencia o en un bucle.</p></details>
+
+<details><summary>Tu framework define una metaclase. Un usuario te reporta <code>TypeError: metaclass conflict</code>. ¿Qué le pasó y qué opciones tiene?</summary>
+<p>Intentó heredar de tu clase y de otra que también tiene metaclase propia —típicamente <code>abc.ABC</code>, un <code>Protocol</code>, un modelo de Django o de SQLAlchemy—. Python exige que la metaclase de la clase derivada sea subclase de las metaclases de todas sus bases, y ninguna de las dos lo es de la otra. Las opciones son: crear una metaclase combinada (<code>class Combinada(TuMeta, ABCMeta): pass</code>) y pasarla con <code>metaclass=</code>, lo cual funciona pero multiplica el problema; evitar la herencia múltiple usando composición; o —la solución de fondo— que el framework no use metaclase y resuelva lo mismo con <code>__init_subclass__</code>. Esta es exactamente la razón por la que en el worked example elegimos la versión B.</p></details>
+
+<details><summary>¿Por qué <code>len(obj)</code> puede fallar aunque <code>obj.__len__()</code> funcione perfecto?</summary>
+<p>Porque las invocaciones <em>implícitas</em> de métodos especiales se resuelven en el <strong>tipo</strong>, no en la instancia: <code>len(obj)</code> mira la ranura correspondiente de <code>type(obj)</code> y saltea <code>__getattribute__</code> y el <code>__dict__</code> de la instancia. Si el <code>__len__</code> lo asignaste a la instancia (<code>self.__len__ = ...</code>), la llamada explícita <code>obj.__len__()</code> lo encuentra por la vía normal de atributos, pero <code>len(obj)</code> no. Es una optimización deliberada de CPython, y su consecuencia práctica más importante es que un proxy basado en <code>__getattr__</code> no delega ningún dunder: hay que declararlos uno por uno.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>modelo de datos</strong> es el contrato entre tus objetos y el intérprete: implementá los dunders del protocolo y tu clase se comporta como una nativa, sin heredar de nada.</li>
+  <li>Los <strong>dunders implícitos se buscan en el tipo</strong>, no en la instancia. Por eso los proxies con <code>__getattr__</code> no delegan <code>len()</code>, <code>with</code> ni <code>==</code>.</li>
+  <li><strong><code>__eq__</code> pone <code>__hash__ = None</code></strong>. Van juntos, sobre los mismos campos, y esos campos tienen que ser inmutables mientras el objeto viva en un <code>set</code> o <code>dict</code>. En la práctica: <code>@dataclass(frozen=True)</code>.</li>
+  <li>El acceso a atributos tiene un orden fijo: <strong>descriptor de datos &gt; <code>__dict__</code> de la instancia &gt; descriptor de no-datos &gt; atributo de clase &gt; <code>__getattr__</code></strong>. Todo lo demás del módulo se deduce de ahí.</li>
+  <li>Un <strong>descriptor</strong> convierte un atributo en una llamada a función que vos controlás. <code>property</code>, los métodos, <code>classmethod</code>, <code>staticmethod</code> y <code>__slots__</code> son todos aplicaciones del mismo protocolo.</li>
+  <li>El estado de un descriptor va en <strong><code>obj</code>, nunca en <code>self</code></strong>: el descriptor es único y compartido por todas las instancias.</li>
+  <li><code>@dataclass(slots=True)</code> <strong>construye una clase nueva</strong>: cuidado con toda referencia capturada antes del decorador.</li>
+  <li>Una <strong>metaclase</strong> solo se justifica por <code>__prepare__</code>, <code>__instancecheck__</code> o por customizar la clase como objeto. Todo lo demás lo hace <strong><code>__init_subclass__</code></strong> sin el impuesto permanente del <em>metaclass conflict</em>.</li>
+  <li><code>contextlib</code> te da el protocolo de contexto sin clases: <code>@contextmanager</code> (siempre con <code>try/finally</code>), <code>ExitStack</code> para N recursos y rollback, <code>suppress</code> para decir qué ignorás.</li>
+  <li>La magia se paga en debugging ajeno. Se justifica cuando se escribe una vez y se consume muchas; nunca para ahorrar diez líneas.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Implementá una clase <code>Vector2D</code> con <code>__add__</code>, <code>__mul__</code> (escalar), <code>__eq__</code>, <code>__hash__</code>, <code>__repr__</code>, <code>__iter__</code> y <code>__match_args__</code>. Verificá que funciona con <code>sum()</code>, con desempaquetado <code>x, y = v</code>, dentro de un <code>set</code> y en un <code>match/case</code> con captura posicional.</li>
+  <li>Escribí una clase con <code>__eq__</code> y sin <code>__hash__</code>, comprobá el <code>TypeError</code> e inspeccioná <code>Clase.__hash__</code>. Después reproducí la corrupción de <code>set</code> del ejemplo de PS4.2 con <code>unsafe_hash=True</code> y escribí un test que la detecte.</li>
+  <li>Implementá <code>Cacheado</code>, un descriptor de <strong>no-datos</strong> que calcule un valor caro una sola vez y lo guarde en <code>obj.__dict__</code> con el mismo nombre. Explicá por escrito por qué <em>tiene</em> que ser de no-datos para que la caché funcione, y compará tu implementación con <code>functools.cached_property</code>.</li>
+  <li>Tomá el <code>Validado</code> de PS4.4 y agregá una subclase <code>Email</code> con validación por regex y una <code>Rango</code> para floats. Después escribí, a propósito, la versión que guarda el estado en <code>self</code> y escribí el test que demuestra el bug de estado compartido entre dos instancias.</li>
+  <li>Escribí un objeto <code>Proxy</code> que delegue todo con <code>__getattr__</code>. Comprobá que <code>len()</code>, <code>bool()</code>, <code>in</code> y <code>with</code> fallan sobre el proxy, y arreglalo declarando explícitamente los dunders. Justificá por qué no alcanzaba con <code>__getattr__</code>.</li>
+  <li>Convertí el registro de plugins de PS4.8 a las tres formas: metaclase, <code>__init_subclass__</code> y decorador de clase. Después intentá heredar de cada versión junto con <code>abc.ABC</code> y documentá cuál falla, con el mensaje de error exacto.</li>
+  <li>Extendé el mini-ORM del worked example con un método de clase <code>create_table()</code> que genere el <code>CREATE TABLE</code> a partir de <code>_campos</code>, y con un <code>Campo</code> que soporte <code>unique=True</code> y <code>indice=True</code>. Verificá que <code>UsuarioPremium</code> hereda los campos de <code>Usuario</code> en el orden correcto.</li>
+  <li>Escribí un context manager con <code>@contextmanager</code> <strong>sin</strong> <code>try/finally</code> que "libere" un lock. Demostrá con un test que el lock queda tomado cuando el bloque levanta una excepción, y arreglalo. Después reescribí el mismo caso con <code>ExitStack</code> y <code>stack.callback</code>.</li>
+</ol>
+
+<section class="quiz" id="quizPS4">
+  <style>
+    #quizPS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS4 .q{margin-bottom:1.5rem}
+    #quizPS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS4 .opt:hover{border-color:var(--accent)}
+    #quizPS4 .opt:disabled{cursor:default}
+    #quizPS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS4 .exp.show{display:block}
+    #quizPS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Una clase define <code>x</code> como descriptor con <code>__get__</code> y <code>__set__</code>. Alguien hace <code>obj.__dict__["x"] = 99</code> y después lee <code>obj.x</code>. ¿Qué obtiene?</p>
+    <button class="opt">99, porque el <code>__dict__</code> de la instancia siempre tiene prioridad</button>
+    <button class="opt">Lo que devuelva el descriptor: al tener <code>__set__</code> es de datos y gana sobre el <code>__dict__</code></button>
+    <button class="opt">Un <code>AttributeError</code>, porque hay dos definiciones en conflicto</button>
+    <div class="exp">El orden de <code>__getattribute__</code> es: descriptor de datos, después <code>obj.__dict__</code>, después descriptor de no-datos. Como <code>x</code> define <code>__set__</code>, es de <em>datos</em> y se resuelve en el paso 2, antes de que el diccionario de la instancia entre en juego. Esa entrada del <code>__dict__</code> queda inaccesible por atributo — y es exactamente el mecanismo que hace que una <code>property</code> de solo lectura sea realmente de solo lectura. Si el descriptor tuviera únicamente <code>__get__</code>, el resultado sería 99.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Agregás <code>__eq__</code> a una clase que funcionaba bien y de golpe explota al meterla en un <code>set</code>. ¿Por qué?</p>
+    <button class="opt">Los <code>set</code> requieren que la clase herede de <code>collections.abc.Hashable</code></button>
+    <button class="opt">Porque <code>__eq__</code> es más lento y el <code>set</code> lo rechaza por performance</button>
+    <button class="opt">Definir <code>__eq__</code> hace que Python ponga <code>__hash__ = None</code>: el objeto deja de ser hasheable</button>
+    <div class="exp">El <code>__hash__</code> heredado de <code>object</code> se basa en la identidad, y sería incoherente con una igualdad por valor: dos objetos iguales caerían en buckets distintos y el <code>set</code> guardaría duplicados. Python prefiere fallar ruidosamente y anula el hash. La corrección es definir <code>__hash__</code> sobre <strong>los mismos campos</strong> que usa <code>__eq__</code> —y asegurarse de que sean inmutables— o directamente usar <code>@dataclass(frozen=True)</code>, que genera ambos de forma coherente.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Querés que todas las subclases de tu clase base se registren solas en un diccionario. ¿Cuál es la primera herramienta que probás?</p>
+    <button class="opt"><code>__init_subclass__</code>: hace exactamente eso y no introduce una metaclase en el árbol</button>
+    <button class="opt">Una metaclase con <code>__new__</code>, que es la forma canónica de intervenir en la creación de clases</button>
+    <button class="opt">Un decorador de clase, que es la única forma de tocar una clase después de crearla</button>
+    <div class="exp">El registro automático de subclases es el caso de uso número uno de las metaclases, y es justo el que PEP 487 resolvió sin ellas. <code>__init_subclass__</code> recibe cada subclase recién creada (con los <code>kwargs</code> de la sentencia <code>class</code>, y con los <code>__set_name__</code> ya ejecutados) y deja <code>type(MiClase) is type</code>, así que sigue componiendo con <code>ABC</code>, <code>Protocol</code> y cualquier framework de terceros. El decorador funciona pero <strong>no se hereda</strong>: cada subclase tendría que acordarse de decorarse. La metaclase se reserva para <code>__prepare__</code>, <code>__instancecheck__</code> o customizar la clase como objeto.</div>
+  </div>
+
+  <div class="score" id="scorePS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps3-asyncio/lecture.html">← PS3: asyncio a fondo</a>
+  <a href="../ps5-typing-avanzado/lecture.html">PS5: Typing avanzado →</a>
+</nav>
+
+</div>
+</body>
+</html>

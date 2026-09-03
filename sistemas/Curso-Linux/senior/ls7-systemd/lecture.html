@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS7 — systemd a fondo: sandboxing y activación · Linux Senior</title>
+  <meta name="description" content="El modelo de units y el grafo de dependencias, Wants vs Requires vs BindsTo, el Type= correcto, bucles de reinicio, systemd-analyze, sandboxing con puntaje antes y después, límites de cgroups v2, socket activation, timers, journald, drop-ins y units de usuario.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS7</span>
+  <span class="badge">⏱ 35–110 min</span>
+  <span class="badge">🎯 Pre-req: LS1, LS3</span>
+  <span class="badge">⚙️ systemd</span>
+</div>
+
+<article>
+
+<h1>LS7 — systemd a fondo: sandboxing y activación</h1>
+
+<h2>LS7.0 Por qué este módulo</h2>
+
+<p>Preguntale a diez personas qué es systemd y nueve te van a decir "el que arranca los servicios". Eso es como decir que un avión es "una cosa con ruedas": técnicamente cierto, y te perdés todo lo importante.</p>
+
+<p>systemd es, al mismo tiempo, un <strong>supervisor de procesos</strong>, un <strong>gestor de cgroups v2</strong>, un <strong>sandbox de seguridad</strong> con casi cincuenta directivas de aislamiento, un <strong>planificador de tareas</strong>, un <strong>activador por socket</strong> y un <strong>sistema de logs estructurados</strong>. La mayoría de la gente escribe una unit de siete líneas con <code>ExecStart=</code> y <code>Restart=always</code>, y ahí termina su relación con la herramienta.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Cada capa de aislamiento que <em>no</em> pusiste en la unit la vas a terminar pagando en otro lado: un contenedor entero para correr un script de 200 líneas, un usuario de sistema creado a mano que nadie limpia, un <code>ulimit</code> en un wrapper de bash, un cron que no deja rastro cuando falla. systemd ya trae todo eso, es declarativo, está auditado y no cuesta nada. <strong>Aprenderlo bien es la diferencia entre operar servicios y rezarle a un <code>.service</code>.</strong>
+</div>
+
+<p>Y hay algo que hace a este módulo distinto de los otros: existe una herramienta, <code>systemd-analyze security</code>, que le pone <strong>un número a tu unit</strong>. Eso convierte "endurecer un servicio" de una discusión de opiniones en un antes y un después medible. Vamos a usar ese número todo el módulo.</p>
+
+<h2>LS7.1 El modelo: todo es una unit</h2>
+
+<p>systemd no administra "servicios": administra <strong>units</strong>, que son objetos de tipos distintos con un ciclo de vida común (<em>inactive → activating → active → deactivating → failed</em>). El tipo va en la extensión del archivo.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Qué representa</th><th>Dónde aparece</th></tr></thead>
+<tbody>
+<tr><td><code>.service</code></td><td>Un proceso supervisado</td><td>El 90% de lo que escribís</td></tr>
+<tr><td><code>.socket</code></td><td>Un socket que systemd abre y escucha por vos</td><td>Activación bajo demanda (LS7.8)</td></tr>
+<tr><td><code>.timer</code></td><td>Un disparador temporal que activa otra unit</td><td>Reemplazo de cron (LS7.9)</td></tr>
+<tr><td><code>.target</code></td><td>Un punto de sincronización sin proceso propio</td><td><code>multi-user.target</code>, <code>network-online.target</code></td></tr>
+<tr><td><code>.mount</code> / <code>.automount</code></td><td>Un punto de montaje (generado desde <code>/etc/fstab</code>)</td><td>Almacenamiento (LS4)</td></tr>
+<tr><td><code>.path</code></td><td>Activación cuando un archivo aparece o cambia</td><td>Colas de trabajo basadas en directorio</td></tr>
+<tr><td><code>.slice</code></td><td>Un nodo del árbol de cgroups donde se reparten recursos</td><td>Límites por grupo (LS7.7)</td></tr>
+<tr><td><code>.scope</code></td><td>Procesos que systemd <em>no</em> arrancó pero sí administra</td><td>Sesiones de usuario, contenedores</td></tr>
+</tbody>
+</table>
+
+<p>Las units viven en tres lugares, y el orden importa muchísimo:</p>
+
+<pre><code class="lang-bash">/usr/lib/systemd/system/    # las que instala el paquete — NO SE TOCAN
+/run/systemd/system/        # transitorias, se pierden al reiniciar
+/etc/systemd/system/        # las tuyas y tus overrides — GANAN sobre las anteriores
+
+systemctl cat nginx.service        # muestra la unit efectiva + todos sus drop-ins
+systemd-delta                      # lista TODO lo que estás sobrescribiendo en el sistema
+systemctl show nginx.service       # ~200 propiedades con su valor REAL en runtime
+systemctl list-dependencies nginx.service --all</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>systemctl show</code> es la fuente de verdad, no el archivo.</strong> Entre defaults del sistema, drop-ins, <code>DefaultLimitNOFILE=</code> global y opciones que tu versión de systemd no conoce y descarta, lo que el archivo <em>dice</em> y lo que el servicio <em>tiene</em> pueden ser dos cosas distintas. Antes de afirmar "el límite de memoria está puesto", corré <code>systemctl show mi.service -p MemoryMax</code>.
+</div>
+
+<h2>LS7.2 Dependencias: Wants, Requires, BindsTo — y por qué After no es ninguna de las tres</h2>
+
+<p>Acá está el malentendido más caro de systemd, y lo cometen equipos enteros durante años. Hay <strong>dos ejes independientes</strong>:</p>
+
+<div class="step"><strong>Eje 1 — Requerimiento (¿tiene que estar?).</strong> <code>Wants=</code>, <code>Requires=</code>, <code>BindsTo=</code>, <code>Requisite=</code>, <code>PartOf=</code>, <code>Conflicts=</code>. Definen <em>qué se activa junto con qué</em> y qué pasa si algo falla.</div>
+
+<div class="step"><strong>Eje 2 — Orden (¿en qué secuencia?).</strong> <code>After=</code>, <code>Before=</code>. Definen <em>únicamente</em> la secuencia temporal de activación. No activan nada.</div>
+
+<div class="danger">
+  <strong>⚠️ <code>Requires=postgresql.service</code> sin <code>After=postgresql.service</code> arranca los dos EN PARALELO.</strong> systemd cumple: activa Postgres. Pero tu servicio arranca en el mismo instante, intenta conectar a un puerto que todavía no está abierto y muere. Después reinicia, Postgres ya está listo, y "funciona" — así que nadie investiga. El bug queda latente hasta el día que el disco esté lento y el reintento tampoco alcance.
+</div>
+
+<table>
+<thead><tr><th>Directiva</th><th>Si el otro no arranca</th><th>Si el otro se detiene después</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><code>Wants=</code></td><td>Seguimos igual</td><td>Nada</td><td><strong>El default sensato.</strong> Dependencias blandas: métricas, cachés opcionales</td></tr>
+<tr><td><code>Requires=</code></td><td>Nosotros también fallamos</td><td>Nos detiene</td><td>La base de datos sin la cual el servicio no tiene sentido</td></tr>
+<tr><td><code>BindsTo=</code></td><td>Nosotros también fallamos</td><td>Nos detiene <strong>siempre</strong>, incluso si se murió solo</td><td>Un dispositivo físico, un montaje, un contenedor que puede desaparecer</td></tr>
+<tr><td><code>Requisite=</code></td><td>Fallamos y <strong>no</strong> lo arrancamos</td><td>Nada</td><td>"Solo corré si tal cosa ya está activa"</td></tr>
+<tr><td><code>PartOf=</code></td><td>Nada</td><td>Se propaga stop/restart hacia abajo</td><td>Grupos: reiniciar el padre reinicia los hijos</td></tr>
+</tbody>
+</table>
+
+<p>La diferencia entre <code>Requires=</code> y <code>BindsTo=</code> se ve solo en el caso raro: si la otra unit se detiene <strong>de forma inesperada</strong> (el proceso muere, el dispositivo se desenchufa), <code>Requires=</code> no siempre te arrastra, <code>BindsTo=</code> sí. Para un montaje NFS o un dispositivo USB, <code>BindsTo=</code> más <code>After=</code> es la combinación correcta.</p>
+
+<pre><code class="lang-ini"># La forma correcta: SIEMPRE los dos ejes juntos
+[Unit]
+Description=API de informes
+Requires=postgresql.service
+After=postgresql.service network-online.target
+Wants=network-online.target</code></pre>
+
+<div class="mistake">
+  <strong><code>network.target</code> no significa "hay red".</strong> Significa "el subsistema de red terminó de configurarse", que puede ser antes de que haya una IP o una ruta por default. Lo que querés casi siempre es <code>network-online.target</code> — y ojo, ese target <strong>solo espera de verdad</strong> si está habilitado el servicio correspondiente (<code>NetworkManager-wait-online.service</code> o <code>systemd-networkd-wait-online.service</code>). Si no lo está, tu <code>After=</code> no espera nada. Verificá con <code>systemctl is-enabled systemd-networkd-wait-online.service</code>.
+</div>
+
+<h2>LS7.3 Anatomía de un .service y el Type= correcto</h2>
+
+<pre><code class="lang-ini"># /etc/systemd/system/informes.service
+[Unit]
+Description=API de informes internos
+Documentation=https://wiki.interna/informes
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+StartLimitIntervalSec=60s        # ventana del rate limit de arranque
+StartLimitBurst=5                # 5 arranques en 60s y queda en failed
+
+[Service]
+Type=notify                      # el proceso avisa cuando está listo de verdad
+NotifyAccess=main
+WatchdogSec=30s                  # si no manda WATCHDOG=1 cada 15s, lo matamos
+User=informes
+Group=informes
+WorkingDirectory=/opt/informes
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/informes/env      # el "-" = no falles si no existe
+ExecStartPre=/opt/informes/.venv/bin/python -m app.check_migrations
+ExecStart=/opt/informes/.venv/bin/python -m app.server
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=90s
+TimeoutStopSec=30s
+KillSignal=SIGTERM               # SIGTERM primero, SIGKILL al vencer TimeoutStopSec
+StateDirectory=informes          # crea /var/lib/informes con el dueño correcto
+LogsDirectory=informes           # crea /var/log/informes
+RuntimeDirectory=informes        # crea /run/informes, se borra al parar
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+<p>El campo que más gente elige mal es <code>Type=</code>. Determina <strong>en qué momento systemd considera que el servicio arrancó</strong> — y por lo tanto, cuándo deja arrancar a los que tienen <code>After=</code> sobre él.</p>
+
+<table>
+<thead><tr><th><code>Type=</code></th><th>"Arrancado" significa…</th><th>Usalo para</th></tr></thead>
+<tbody>
+<tr><td><code>simple</code></td><td>Se hizo el <code>fork()</code>. Ni siquiera se ejecutó el binario todavía</td><td>Es el default histórico. Hoy casi siempre querés <code>exec</code></td></tr>
+<tr><td><code>exec</code></td><td>El <code>execve()</code> salió bien</td><td>Lo mismo que <code>simple</code> pero <strong>te enterás si el binario no existe</strong> o no tiene permisos</td></tr>
+<tr><td><code>forking</code></td><td>El proceso padre terminó</td><td>Daemons clásicos que se mandan al fondo solos. Sumale <code>PIDFile=</code></td></tr>
+<tr><td><code>oneshot</code></td><td>El proceso terminó (systemd espera)</td><td>Migraciones, setup, jobs de timer. Admite varios <code>ExecStart=</code></td></tr>
+<tr><td><code>notify</code></td><td>El proceso mandó <code>READY=1</code> por <code>sd_notify()</code></td><td>Servicios con arranque lento donde el orden importa de verdad</td></tr>
+<tr><td><code>notify-reload</code></td><td>Igual, y además soporta <code>RELOADING=1</code></td><td>Recarga de config sin ventana de indisponibilidad</td></tr>
+<tr><td><code>dbus</code></td><td>Apareció el <code>BusName=</code> en el bus</td><td>Servicios D-Bus</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Tu <code>After=</code> vale exactamente lo que valga el <code>Type=</code> del otro.</strong> Si el servicio del que dependés es <code>Type=simple</code>, "arrancó" significa que el kernel hizo un fork. Puede tardar diez segundos más en abrir el puerto. Por eso <code>After=</code> sobre servicios <code>simple</code> es una garantía de papel: las dos soluciones reales son <code>Type=notify</code> del otro lado, o <strong>socket activation</strong> (LS7.8), que elimina el problema de raíz.
+</div>
+
+<p>En Python, <code>Type=notify</code> son tres líneas. La librería <code>systemd-python</code> lo envuelve, pero se puede hacer a mano escribiendo al socket de <code>$NOTIFY_SOCKET</code>:</p>
+
+<pre><code class="lang-python">import os, socket
+
+def notificar(mensaje: str) -&gt; None:
+    """Manda READY=1 / WATCHDOG=1 / STATUS=... al supervisor."""
+    ruta = os.environ.get("NOTIFY_SOCKET")
+    if not ruta:                      # corriendo fuera de systemd: no-op
+        return
+    if ruta.startswith("@"):          # namespace abstracto
+        ruta = "\0" + ruta[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        s.connect(ruta)
+        s.sendall(mensaje.encode())
+
+# después de conectar a la DB, cargar el modelo y abrir el puerto:
+notificar("READY=1")
+notificar("STATUS=escuchando en :8080")
+# y cada WatchdogSec/2 desde el loop principal:
+notificar("WATCHDOG=1")</code></pre>
+
+<h2>LS7.4 Reinicio y resiliencia: Restart= y el bucle que voltea un servidor</h2>
+
+<table>
+<thead><tr><th><code>Restart=</code></th><th>Reinicia cuando…</th></tr></thead>
+<tbody>
+<tr><td><code>no</code></td><td>Nunca (default)</td></tr>
+<tr><td><code>on-success</code></td><td>Salió con código 0 o una señal "limpia"</td></tr>
+<tr><td><code>on-failure</code></td><td>Código distinto de 0, señal, timeout o watchdog. <strong>El que querés el 90% de las veces</strong></td></tr>
+<tr><td><code>on-abnormal</code></td><td>Señal, timeout o watchdog — pero no por código de salida</td></tr>
+<tr><td><code>on-watchdog</code></td><td>Solo si venció <code>WatchdogSec=</code></td></tr>
+<tr><td><code>always</code></td><td>Siempre, incluso si terminó bien y a propósito</td></tr>
+</tbody>
+</table>
+
+<p>Ahora el incidente clásico. Alguien pone <code>Restart=always</code>, <code>RestartSec=0</code> y, para que "no se quede caído", <code>StartLimitBurst=0</code> (que desactiva el limitador). El servicio tiene un bug que lo mata al arrancar. Resultado: <strong>miles de fork/exec por segundo</strong>. Un núcleo al 100%, el journal saturado (y descartando mensajes, así que ni siquiera ves el error), y si tu <code>ExecStartPre=</code> hacía un <code>curl</code> a un endpoint de auth, acabás de armarte un DoS contra tu propio proveedor de identidad.</p>
+
+<pre><code class="lang-ini">[Unit]
+StartLimitIntervalSec=300s
+StartLimitBurst=5
+StartLimitAction=none          # none | reboot | reboot-force | poweroff | exit
+
+[Service]
+Restart=on-failure
+RestartSec=5s                  # NUNCA 0 en producción
+RestartSteps=6                 # backoff exponencial (systemd 254+)
+RestartMaxDelaySec=5min        # de 5s hasta 5min en 6 escalones
+</code></pre>
+
+<div class="warn">
+  <strong>El limitador te protege del bucle, y por eso mismo te deja caído.</strong> Cuando se supera <code>StartLimitBurst=</code>, la unit entra en estado <code>failed</code> y <strong>systemd no vuelve a intentar nunca más</strong>: hace falta un <code>systemctl reset-failed mi.service</code> manual. Si no tenés una alerta sobre <code>systemctl is-failed</code> (o sobre la unidad <code>OnFailure=</code>), el servicio va a estar muerto hasta que un humano lo mire.
+</div>
+
+<pre><code class="lang-ini"># Patrón: cualquier unit que falle dispara un avisador con el nombre como argumento
+# En la unit del servicio:
+[Unit]
+OnFailure=avisar@%n.service
+
+# /etc/systemd/system/avisar@.service  — plantilla; %i recibe el nombre de la unit
+[Unit]
+Description=Avisar de la falla de %i
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/avisar-slack "%i falló en %H"</code></pre>
+
+<h2>LS7.5 systemd-analyze: entender el arranque</h2>
+
+<pre><code class="lang-bash">systemd-analyze time
+# Startup finished in 4.1s (firmware) + 2.3s (loader) + 1.9s (kernel) + 12.4s (userspace) = 20.8s
+# multi-user.target reached after 12.3s in userspace
+
+systemd-analyze blame | head -10          # units ordenadas por lo que tardaron
+systemd-analyze critical-chain            # el camino crítico REAL del arranque
+systemd-analyze critical-chain nginx.service
+systemd-analyze plot &gt; arranque.svg       # línea de tiempo gráfica de todo el boot
+systemd-analyze verify /etc/systemd/system/informes.service   # errores y opciones desconocidas
+systemd-analyze dump | less               # el estado interno completo del manager</code></pre>
+
+<p>En <code>critical-chain</code>, <code>@</code> es el momento en que la unit terminó de activarse y <code>+</code> es lo que tardó ella misma:</p>
+
+<pre><code class="lang-bash">multi-user.target @12.309s
+└─informes.service @9.871s +2.436s
+  └─postgresql.service @6.104s +3.760s
+    └─network-online.target @6.098s
+      └─NetworkManager-wait-online.service @2.401s +3.695s</code></pre>
+
+<div class="mistake">
+  <strong><code>blame</code> miente por omisión.</strong> Ordena las units por cuánto tardaron, pero una unit que tarda 30 segundos y de la que <strong>nadie depende</strong> no atrasa el arranque ni un milisegundo: corre en paralelo con todo lo demás. Optimizar la primera línea de <code>blame</code> suele ser trabajo tirado. La lista que importa es la de <code>critical-chain</code>, porque ahí está lo que realmente está bloqueando.
+</div>
+
+<h2>LS7.6 Sandboxing: convertir una unit en una jaula</h2>
+
+<p>Esta es la parte del módulo que cambia cómo escribís units para siempre. systemd puede darle a tu proceso <strong>namespaces de mount, un /dev falso, un filtro seccomp, un bounding set de capabilities vacío y un filesystem entero de solo lectura</strong> — sin contenedores, sin imágenes, sin runtime extra, en diez líneas de configuración declarativa.</p>
+
+<h3>Identidad</h3>
+
+<pre><code class="lang-ini">User=informes
+Group=informes
+SupplementaryGroups=redis
+
+# O, mejor todavía, que systemd invente el usuario y lo destruya al parar:
+DynamicUser=yes
+StateDirectory=informes        # /var/lib/informes, con el dueño correcto en cada arranque</code></pre>
+
+<div class="info">
+  <code>DynamicUser=yes</code> asigna un UID transitorio al arrancar y lo libera al parar. No hay usuario que crear, ni que documentar, ni que quede huérfano cuando desinstalás. Además <strong>implica</strong> <code>ProtectSystem=strict</code>, <code>ProtectHome=read-only</code>, <code>PrivateTmp=yes</code> y <code>RemoveIPC=yes</code>. Es la opción por default para cualquier servicio nuevo que no tenga que compartir archivos con nadie.
+</div>
+
+<div class="mistake">
+  <strong>Con <code>DynamicUser=yes</code>, todo lo persistente va en <code>StateDirectory=</code>.</strong> Como el UID cambia entre arranques, un archivo que tu servicio escriba en cualquier otro lado queda con un dueño numérico que systemd va a reciclar para <em>otro</em> servicio más adelante. Las directivas <code>StateDirectory=</code>, <code>CacheDirectory=</code>, <code>LogsDirectory=</code> y <code>RuntimeDirectory=</code> existen precisamente para eso: systemd las crea, les pone el dueño correcto en cada arranque y las expone en <code>%S</code>, <code>%C</code>, <code>%L</code> y <code>%t</code>.
+</div>
+
+<h3>Filesystem</h3>
+
+<table>
+<thead><tr><th>Directiva</th><th>Efecto</th></tr></thead>
+<tbody>
+<tr><td><code>ProtectSystem=yes</code></td><td><code>/usr</code> y <code>/boot</code> de solo lectura</td></tr>
+<tr><td><code>ProtectSystem=full</code></td><td>Lo anterior más <code>/etc</code></td></tr>
+<tr><td><code>ProtectSystem=strict</code></td><td><strong>Todo</strong> de solo lectura salvo <code>/dev</code>, <code>/proc</code> y <code>/sys</code></td></tr>
+<tr><td><code>ProtectHome=yes</code></td><td><code>/home</code>, <code>/root</code> y <code>/run/user</code> aparecen vacíos</td></tr>
+<tr><td><code>PrivateTmp=yes</code></td><td><code>/tmp</code> y <code>/var/tmp</code> propios; nadie más los ve</td></tr>
+<tr><td><code>ReadWritePaths=</code></td><td>Las excepciones a <code>strict</code>. La lista corta y explícita</td></tr>
+<tr><td><code>ProtectProc=invisible</code> + <code>ProcSubset=pid</code></td><td>En <code>/proc</code> solo ve sus propios procesos, y sin los archivos del sistema</td></tr>
+</tbody>
+</table>
+
+<h3>Kernel, capabilities y syscalls</h3>
+
+<pre><code class="lang-ini">NoNewPrivileges=yes            # ningún setuid ni file-capability puede escalar
+CapabilityBoundingSet=         # vacío = ninguna capability, ni siquiera para root
+AmbientCapabilities=           # y ninguna otorgada
+PrivateDevices=yes             # /dev sintético: null, zero, random, tty y nada más
+ProtectKernelTunables=yes      # /proc/sys y /sys de solo lectura
+ProtectKernelModules=yes       # no puede cargar ni descargar módulos
+ProtectKernelLogs=yes          # nada de dmesg
+ProtectControlGroups=yes       # no puede reescribir su propio cgroup
+ProtectClock=yes               # no puede tocar el reloj del sistema
+ProtectHostname=yes
+RestrictNamespaces=yes         # no puede crear namespaces (no se escapa a un "contenedor")
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes            # no puede pedir una personality de otra arquitectura
+UMask=0077
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6   # nada de AF_NETLINK, AF_PACKET…
+SystemCallArchitectures=native                      # sin esto, el filtro se esquiva por otra ABI
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallErrorNumber=EPERM                         # devolver error en vez de matar con SIGSYS
+
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8                 # firewall por unit, vía eBPF (LS6)</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>SystemCallArchitectures=native</code> no es opcional.</strong> Un filtro seccomp se aplica por ABI. En un x86-64, un binario puede entrar por la ABI de 32 bits o por x32 y ejecutar syscalls que tu filtro nunca vio. Sin esa línea, buena parte de <code>SystemCallFilter=</code> es decorativa. Lo mismo con <code>RestrictAddressFamilies=</code>, que en algunas arquitecturas de 32 bits directamente no se puede aplicar porque los argumentos van multiplexados.
+</div>
+
+<h3>El número: <code>systemd-analyze security</code></h3>
+
+<pre><code class="lang-bash">systemd-analyze security                    # tabla de TODAS las units del sistema
+systemd-analyze security informes.service   # el desglose de una, opción por opción
+
+# NAME                  DESCRIPTION                              EXPOSURE
+# PrivateNetwork=       Service has access to the host's network      0.5
+# User=/DynamicUser=    Service runs as root user                     0.4
+# CapabilityBoundingSet=~CAP_SYS_ADMIN  Service has admin privileges  0.3
+# ...
+# → Overall exposure level for informes.service: 9.6 UNSAFE 😨</code></pre>
+
+<table>
+<thead><tr><th>Exposición</th><th>Etiqueta</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td>0.0</td><td>PERFECT 🤩</td><td>Prácticamente imposible en un servicio de red real</td></tr>
+<tr><td>≥ 0.1</td><td>SAFE 😀</td><td>Requiere <code>PrivateNetwork=</code>, <code>PrivateUsers=</code> y compañía</td></tr>
+<tr><td>≥ 1.0</td><td>OK 🙂</td><td><strong>El objetivo realista para un servicio en producción</strong></td></tr>
+<tr><td>≥ 5.0</td><td>MEDIUM 😐</td><td>Hiciste la mitad: usuario y filesystem, nada de syscalls</td></tr>
+<tr><td>≥ 7.5</td><td>EXPOSED 🙁</td><td>Poco más que <code>User=</code></td></tr>
+<tr><td>≥ 9.0</td><td>UNSAFE 😨</td><td>La unit de siete líneas corriendo como root</td></tr>
+<tr><td>10.0</td><td>DANGEROUS 😨</td><td>Root con <code>PrivateMounts=no</code> y todo abierto</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El puntaje es una heurística, no un modelo de amenazas.</strong> Cuenta directivas con pesos fijos: no sabe qué hace tu servicio, ni si tiene una inyección de SQL, ni si el secreto de la API está en el repo. Bajar de 2.0 a 1.5 agregando <code>PrivateUsers=yes</code> puede romperte la app a cambio de cero seguridad real. <strong>Usalo como checklist de lo que te olvidaste, jamás como certificado.</strong> El modelo de amenazas se hace aparte — mirá <a href="../../../Curso-Ciberseguridad/m06-hardening/lecture.html">M06 — Hardening del curso de Ciberseguridad</a>, que cubre el análisis de superficie de ataque, gestión de secretos y la parte de auditoría que systemd no puede darte.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Una opción que tu systemd no conoce se ignora con un warning y sigue de largo.</strong> Escribís <code>RestartSteps=6</code> en un Debian con systemd 247, la unit arranca perfecto, y el backoff exponencial simplemente no existe. Lo mismo con cualquier directiva de sandboxing agregada después de tu versión: <strong>creés que estás protegido y no lo estás</strong>. Chequeá siempre con <code>systemctl --version</code> y validá con <code>systemd-analyze verify</code>, que sí te marca las opciones desconocidas.
+</div>
+
+<h3>Cuándo NO endurecer</h3>
+
+<div class="mistake">
+  <ul>
+    <li><strong><code>MemoryDenyWriteExecute=yes</code></strong> rompe todo lo que tenga un JIT: Node.js, la JVM, LuaJIT, Python con ciertas extensiones nativas. Es de las mejores mitigaciones que existen y también de las que más servicios voltea.</li>
+    <li><strong><code>PrivateNetwork=yes</code></strong> te deja solo con loopback. Combinalo con socket activation (LS7.8) si el servicio igual tiene que atender la red; si no, no lo pongas.</li>
+    <li><strong><code>ProtectSystem=strict</code></strong> sin los <code>ReadWritePaths=</code> correctos produce un <code>EROFS</code> a las tres de la mañana, en el único code path que nadie probó.</li>
+    <li><strong><code>SystemCallFilter=</code></strong> mata con <code>SIGSYS</code> (<code>status=31/SYS</code> en el journal) la primera vez que la app usa una syscall que no listaste, y puede pasar meses después, en una rama poco frecuentada.</li>
+    <li><strong>Endurecer lo que no podés probar.</strong> Una unit blindada que se cae sola es peor que una unit floja: cambiaste un riesgo hipotético por una caída segura.</li>
+  </ul>
+</div>
+
+<div class="tip">
+  Para depurar filtros sin romper nada, systemd 247+ trae <code>SystemCallLog=@privileged</code>: <strong>registra</strong> cada uso de esas syscalls en el journal sin bloquearlas. Dejalo unos días en staging, mirá qué aparece y recién ahí convertí la lista en <code>SystemCallFilter=</code>.
+</div>
+
+<h2>LS7.7 Recursos: systemd habla cgroups v2</h2>
+
+<p>Todo lo que viste en <a href="../ls3-namespaces-cgroups/lecture.html">LS3 (namespaces y cgroups)</a> tiene una cara declarativa acá: systemd <strong>es</strong> el gestor de la jerarquía unificada, y cada unit vive en su propio cgroup dentro de un árbol de slices.</p>
+
+<pre><code class="lang-bash">systemd-cgls                 # el árbol de cgroups con los procesos adentro
+systemd-cgtop                # top por cgroup: CPU, memoria, I/O en vivo
+systemctl status informes.service | tail -5    # Memory: 412.3M / Tasks: 17 / CPU: 3min 12s</code></pre>
+
+<pre><code class="lang-ini">[Service]
+Slice=aplicaciones.slice
+
+MemoryHigh=1G                # presión de reclaim: frena, NO mata
+MemoryMax=1500M              # límite duro: OOM kill del cgroup
+MemorySwapMax=0
+CPUQuota=200%                # dos núcleos de cómputo como techo
+CPUWeight=100                # peso relativo cuando hay competencia (1-10000)
+IOWeight=100
+TasksMax=256                 # controlador pids: cortafuegos contra fork bombs
+IOAccounting=yes             # CPU y memoria se contabilizan solas; I/O no</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>MemoryHigh=</code> antes que <code>MemoryMax=</code>.</strong> <code>MemoryMax=</code> es un muro: al tocarlo, el OOM killer del cgroup mata el proceso. <code>MemoryHigh=</code> es un freno: el kernel empieza a reclamar páginas agresivamente y el servicio se pone lento, lo cual te da tiempo de verlo en las métricas y actuar. El par recomendado es <code>MemoryHigh=</code> en el valor esperado y <code>MemoryMax=</code> bastante más arriba, como red de contención.
+</div>
+
+<p>Los slices se heredan: si <code>aplicaciones.slice</code> tiene <code>CPUQuota=400%</code>, la suma de todos sus servicios no puede pasarse, sin importar lo que diga cada uno. Y para probar un límite sin escribir ninguna unit:</p>
+
+<pre><code class="lang-bash"># unit transitoria con límites, para medir antes de comprometerse
+systemd-run --scope -p MemoryMax=200M -p CPUQuota=50% -p TasksMax=32 \
+    /opt/informes/.venv/bin/python -m app.batch
+
+systemctl show informes.service -p MemoryMax -p CPUQuota -p TasksMax   # valor EFECTIVO</code></pre>
+
+<h2>LS7.8 Socket activation</h2>
+
+<p>La idea: <strong>systemd abre el socket, lo escucha, y arranca tu servicio recién cuando llega la primera conexión</strong>, pasándole el descriptor ya abierto. El proceso hereda el fd número 3 y no hace <code>bind()</code> nunca.</p>
+
+<pre><code class="lang-ini"># /etc/systemd/system/informes.socket
+[Unit]
+Description=Socket de la API de informes
+
+[Socket]
+ListenStream=0.0.0.0:8080
+Accept=no                    # un solo proceso atiende todas las conexiones
+Backlog=2048
+
+[Install]
+WantedBy=sockets.target</code></pre>
+
+<pre><code class="lang-python"># El lado Python: el fd 3 ya viene abierto y escuchando
+import os, socket
+
+SD_LISTEN_FDS_START = 3
+
+def socket_heredado():
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None                       # no venimos de systemd
+    cantidad = int(os.environ.get("LISTEN_FDS", "0"))
+    if cantidad &lt; 1:
+        return None
+    return socket.socket(fileno=SD_LISTEN_FDS_START)
+
+sock = socket_heredado() or crear_socket_propio()   # funciona en los dos modos</code></pre>
+
+<table>
+<thead><tr><th>Lo que te da de verdad</th><th>Por qué importa</th></tr></thead>
+<tbody>
+<tr><td>Elimina dependencias de orden</td><td>El socket existe desde el boot: los clientes conectan y <strong>esperan</strong> en el backlog en vez de recibir <code>ECONNREFUSED</code></td></tr>
+<tr><td>Reinicio sin rechazar conexiones</td><td><code>systemctl restart</code> del <em>servicio</em> no cierra el socket: las conexiones nuevas se encolan en el kernel</td></tr>
+<tr><td>Separación de privilegios</td><td>systemd hace <code>bind()</code> al :443 como root; tu servicio corre sin <code>CAP_NET_BIND_SERVICE</code></td></tr>
+<tr><td>Habilita <code>PrivateNetwork=yes</code></td><td>El servicio queda sin red propia y aun así atiende, porque el fd le llega ya abierto</td></tr>
+<tr><td>Arranque bajo demanda</td><td>Servicios de uso esporádico que no ocupan memoria mientras nadie los llama</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>"Reinicio sin downtime" tiene letra chica.</strong> Las conexiones <em>nuevas</em> se encolan, sí. Pero las que el proceso viejo ya aceptó se cortan cuando lo matás, salvo que tu app haga un drenaje ordenado al recibir <code>SIGTERM</code>. Socket activation te da la mitad del problema resuelto gratis; la otra mitad la tenés que escribir vos. Y el costo de entrada es que la app debe soportar <code>LISTEN_FDS</code> — Gunicorn, nginx, Podman y systemd-journald lo hacen; muchos frameworks no.
+</div>
+
+<h2>LS7.9 Timers en vez de cron</h2>
+
+<pre><code class="lang-ini"># /etc/systemd/system/backup.timer
+[Unit]
+Description=Backup nocturno
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true              # si la máquina estaba apagada, corré al volver
+RandomizedDelaySec=900       # dispersá hasta 15 min: 500 VMs no pegan al mismo endpoint
+AccuracySec=1min
+Unit=backup.service          # opcional si se llama igual que el .timer
+
+[Install]
+WantedBy=timers.target</code></pre>
+
+<pre><code class="lang-bash">systemctl list-timers --all                       # próximo disparo, último, cuánto falta
+systemd-analyze calendar "Mon *-*-* 03:00:00"     # valida la expresión y muestra las próximas
+systemd-analyze calendar --iterations=5 "daily"
+systemctl start backup.service                    # probar el job EXACTO, sin esperar al horario
+journalctl -u backup.service --since "7 days ago"</code></pre>
+
+<table>
+<thead><tr><th>Timer</th><th>cron</th></tr></thead>
+<tbody>
+<tr><td>Logs estructurados en el journal, con código de salida y duración</td><td>La salida se te va por mail o a <code>/dev/null</code></td></tr>
+<tr><td>El job corre en un cgroup con <code>MemoryMax=</code> y <code>CPUQuota=</code></td><td>Sin límites: un job pesado compite con producción</td></tr>
+<tr><td>Todo el sandboxing de LS7.6 aplica igual</td><td>Corre con el entorno completo del usuario</td></tr>
+<tr><td><code>After=</code>, <code>Requires=</code>: podés depender de otras units</td><td>Sin dependencias, solo hora</td></tr>
+<tr><td><code>Persistent=true</code> recupera ejecuciones perdidas</td><td>Si estaba apagado, se perdió (salvo anacron)</td></tr>
+<tr><td><code>RandomizedDelaySec=</code> evita el efecto manada</td><td>Las 500 máquinas disparan en el mismo segundo</td></tr>
+<tr><td>No se solapa: si sigue corriendo, no arranca otra</td><td>Se solapa alegremente</td></tr>
+<tr><td><code>systemd-analyze calendar</code> valida antes de desplegar</td><td>Un <code>*/7</code> mal puesto no se descubre hasta el mes siguiente</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Cuándo cron sigue estando bien:</strong> un job personal de una línea; un contenedor sin systemd adentro; un script que tiene que ser portable a Alpine, BSD o cualquier sistema sin systemd; o un equipo que sabe <code>crontab -e</code> y nada más — porque dos archivos que nadie entiende son peores que una línea que todos leen. La regla práctica: si el job toca datos de producción, necesita límites de recursos o querés saber por qué falló, es un timer. Si es <code>0 4 * * * /usr/local/bin/limpiar-cache.sh</code>, dejalo en cron.
+</div>
+
+<div class="mistake">
+  <code>OnCalendar=</code> se interpreta en <strong>hora local</strong> salvo que le pongas el sufijo <code>UTC</code>. Una VM que cambia de zona horaria, o un país que mueve el horario de verano, mueve tus jobs. En infraestructura, <code>OnCalendar=*-*-* 03:00:00 UTC</code> y se terminó la discusión.
+</div>
+
+<h2>LS7.10 journald: los logs que ya tenés</h2>
+
+<pre><code class="lang-bash">journalctl -u informes.service -f              # seguir en vivo
+journalctl -u informes.service -b             # solo este arranque
+journalctl -u informes.service -b -1          # el arranque anterior (el del incidente)
+journalctl -u informes.service -p err         # prioridad error o peor
+journalctl --since "2026-09-03 09:00" --until "2026-09-03 10:30"
+journalctl -u informes.service --grep 'timeout|refused'
+journalctl -u informes.service -o json-pretty | head -40    # todos los campos
+journalctl _SYSTEMD_UNIT=informes.service _UID=1001         # filtros por campo indexado
+journalctl -k -b                              # mensajes del kernel de este arranque
+journalctl -xe                                # las últimas líneas con explicaciones
+journalctl --disk-usage
+journalctl --verify</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Por default, en muchas distros el journal es volátil.</strong> Con <code>Storage=auto</code> (el default), journald solo persiste si <strong>existe el directorio</strong> <code>/var/log/journal</code>. Si no existe, todo vive en <code>/run</code> y <strong>se evapora al reiniciar</strong> — justo los logs del arranque que te tumbó el server. Se arregla en dos comandos y hay que verificarlo en cada máquina nueva.
+</div>
+
+<pre><code class="lang-bash">mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal
+systemctl restart systemd-journald
+journalctl --header | grep -i 'file path'      # confirmá que ahora escribe en /var/log</code></pre>
+
+<pre><code class="lang-ini"># /etc/systemd/journald.conf.d/limites.conf
+[Journal]
+Storage=persistent
+SystemMaxUse=4G              # techo total del journal
+SystemKeepFree=2G
+SystemMaxFileSize=256M
+MaxRetentionSec=30d
+RateLimitIntervalSec=30s     # default: 10000 mensajes por servicio cada 30s…
+RateLimitBurst=20000         # …y los que pasan se DESCARTAN
+ForwardToSyslog=yes          # para que rsyslog los mande a un colector remoto</code></pre>
+
+<div class="warn">
+  <strong>El rate limit de journald descarta mensajes en silencio</strong> (deja una línea "Suppressed N messages"). Un servicio conversador durante un incidente es exactamente el que va a perder las líneas que necesitás. Si estás construyendo un pipeline de auditoría, subí <code>RateLimitBurst=</code> para esa unit o mandala a su propio <code>LogNamespace=</code>.
+</div>
+
+<h3>Exportar a un SIEM</h3>
+
+<pre><code class="lang-bash"># Recorte por tamaño o antigüedad, a mano
+journalctl --vacuum-size=2G
+journalctl --vacuum-time=30d
+
+# Streaming con cursor: cada evento trae __CURSOR, y se retoma desde ahí sin duplicar
+journalctl -o json --follow --after-cursor "$(cat /var/lib/shipper/cursor)"
+
+# systemd-journal-upload manda el journal a un systemd-journal-remote
+systemctl enable --now systemd-journal-upload.service</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué el journal es mejor insumo para un SIEM que un archivo de texto.</strong> Los campos que empiezan con guion bajo (<code>_PID</code>, <code>_UID</code>, <code>_SYSTEMD_UNIT</code>, <code>_BOOT_ID</code>, <code>_SELINUX_CONTEXT</code>) los agrega <strong>journald</strong>, no la aplicación: un proceso comprometido puede escribir el texto que quiera, pero <strong>no puede falsificar de qué unit y de qué UID salió el mensaje</strong>. Eso es una propiedad de seguridad real que un <code>tail -f /var/log/app.log</code> no te da nunca.
+</div>
+
+<h2>LS7.11 Drop-ins: systemctl edit y por qué no se toca la unit del paquete</h2>
+
+<pre><code class="lang-bash">systemctl edit nginx.service
+# crea y abre /etc/systemd/system/nginx.service.d/override.conf
+
+systemctl edit --full nginx.service     # copia la unit ENTERA a /etc — evitalo
+systemctl cat nginx.service             # la unit efectiva, con el origen de cada fragmento
+systemd-delta                           # todo lo sobrescrito o enmascarado del sistema
+systemctl daemon-reload                 # obligatorio después de editar a mano</code></pre>
+
+<pre><code class="lang-ini"># /etc/systemd/system/nginx.service.d/limites.conf
+[Service]
+MemoryHigh=2G
+LimitNOFILE=65535</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Editar el archivo en <code>/usr/lib/systemd/system/</code> es un cambio con fecha de vencimiento.</strong> El próximo <code>apt upgrade</code> o <code>dnf update</code> del paquete lo pisa —o te deja un <code>.rpmnew</code> que nadie mira— y tu cambio desaparece sin ruido. En sistemas basados en imagen (ostree, sistemas inmutables) <code>/usr</code> ni siquiera es escribible. El drop-in en <code>/etc</code> sobrevive actualizaciones, es un archivo chiquito que se lee de una y se versiona en Git sin arrastrar 40 líneas ajenas.
+</div>
+
+<div class="mistake">
+  <strong>La trampa de los drop-ins: <code>ExecStart=</code> no es acumulativo… pero tampoco se reemplaza solo.</strong> Un drop-in con <code>ExecStart=/nuevo/comando</code> te da <em>"Service has more than one ExecStart= setting"</em> y la unit no arranca. Hay que <strong>vaciarlo primero</strong>. Las listas (<code>After=</code>, <code>Environment=</code>, <code>ReadWritePaths=</code>) sí se acumulan, y también se resetean asignando vacío.
+</div>
+
+<pre><code class="lang-ini"># La forma correcta de cambiar el comando desde un drop-in
+[Service]
+ExecStart=
+ExecStart=/opt/informes/.venv/bin/python -m app.server --workers 4</code></pre>
+
+<h2>LS7.12 Units de usuario y lingering</h2>
+
+<p>Cada usuario tiene su propio manager de systemd (<code>user@1000.service</code>), con sus units, su journal y sus cgroups — sin necesitar root para nada.</p>
+
+<pre><code class="lang-bash">mkdir -p ~/.config/systemd/user
+$EDITOR ~/.config/systemd/user/bot.service     # WantedBy=default.target, no multi-user
+
+systemctl --user daemon-reload
+systemctl --user enable --now bot.service
+systemctl --user status bot.service
+journalctl --user -u bot.service -f</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Tu servicio de usuario muere cuando cerrás la sesión SSH.</strong> El manager arranca en el primer login y se apaga en el último logout. Todo lo que tenga que sobrevivir —un contenedor rootless de Podman, un bot, un sincronizador— necesita <strong>lingering</strong> explícito. Es la causa número uno de "lo dejé andando y a la mañana no estaba".
+</div>
+
+<pre><code class="lang-bash">loginctl enable-linger alex        # el manager arranca en el boot y sobrevive al logout
+loginctl show-user alex | grep -i linger
+loginctl user-status alex</code></pre>
+
+<div class="info">
+  Dos detalles que muerden con units de usuario: <strong>(1)</strong> el sandboxing que exige privilegios (<code>DynamicUser=</code>, <code>User=</code>, buena parte de <code>Protect*=</code> si el kernel no permite user namespaces sin privilegio) no aplica; <strong>(2)</strong> por SSH no interactivo pueden faltarte <code>XDG_RUNTIME_DIR</code> y <code>DBUS_SESSION_BUS_ADDRESS</code>, y <code>systemctl --user</code> falla con un mensaje poco claro. La solución es entrar con <code>machinectl shell alex@</code> o exportar <code>XDG_RUNTIME_DIR=/run/user/$(id -u)</code>.
+</div>
+
+<h2>🧑‍🎓 Worked Example — de root a jaula, con los números</h2>
+
+<blockquote>Heredás <code>informes.service</code>: una API en Python que corre como root con una unit de siete líneas. El equipo de seguridad pide "endurecerla". Nadie sabe qué significa eso ni cómo se verifica.</blockquote>
+
+<p><strong>Paso 0 — La línea de base, medida.</strong></p>
+
+<pre><code class="lang-ini"># /etc/systemd/system/informes.service — lo que hay hoy
+[Unit]
+Description=API de informes
+After=network.target
+
+[Service]
+ExecStart=/opt/informes/.venv/bin/python -m app.server
+Restart=always
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+<pre><code class="lang-bash">systemd-analyze security informes.service | tail -1
+# → Overall exposure level for informes.service: 9.6 UNSAFE 😨</code></pre>
+
+<p><strong>Paso 1 — Identidad y estado.</strong> Usuario dedicado y directorios administrados por systemd. Antes de tocar nada, hay que saber qué escribe la app: <code>ReadWritePaths=</code> mal puesto es el error más común de todo el ejercicio.</p>
+
+<pre><code class="lang-bash"># ¿Qué archivos abre para escritura, realmente?
+sudo lsof -p "$(systemctl show informes.service -p MainPID --value)" | grep -E '[0-9]+[uw]'</code></pre>
+
+<pre><code class="lang-ini">User=informes
+Group=informes
+StateDirectory=informes
+LogsDirectory=informes
+RuntimeDirectory=informes
+NoNewPrivileges=yes
+# → 8.4 EXPOSED 🙁</code></pre>
+
+<p><strong>Paso 2 — Filesystem de solo lectura con excepciones explícitas.</strong></p>
+
+<pre><code class="lang-ini">ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/informes /var/log/informes
+# → 6.3 MEDIUM 😐</code></pre>
+
+<p><strong>Paso 3 — Capabilities, dispositivos y kernel.</strong> El servicio escucha en :8080, así que no necesita ni una sola capability.</p>
+
+<pre><code class="lang-ini">CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+UMask=0077
+# → 3.2 OK 🙂</code></pre>
+
+<p><strong>Paso 4 — Red y syscalls.</strong> Acá es donde hay que ir con cuidado: lo que sobra en la lista es superficie de ataque, lo que falta es una caída.</p>
+
+<pre><code class="lang-ini">RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallErrorNumber=EPERM
+# → 1.9 OK 🙂</code></pre>
+
+<p><strong>Paso 5 — Límites de recursos y reinicio con backoff.</strong></p>
+
+<pre><code class="lang-ini">MemoryHigh=800M
+MemoryMax=1G
+CPUQuota=150%
+TasksMax=128
+Restart=on-failure
+RestartSec=5s
+</code></pre>
+
+<table>
+<thead><tr><th>Paso</th><th>Qué se agregó</th><th>Exposición</th><th>Etiqueta</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>Unit original, root, 7 líneas</td><td><strong>9.6</strong></td><td>UNSAFE 😨</td></tr>
+<tr><td>1</td><td><code>User=</code>, <code>*Directory=</code>, <code>NoNewPrivileges=</code></td><td>8.4</td><td>EXPOSED 🙁</td></tr>
+<tr><td>2</td><td><code>ProtectSystem=strict</code>, <code>ProtectHome</code>, <code>PrivateTmp</code>, <code>ReadWritePaths</code></td><td>6.3</td><td>MEDIUM 😐</td></tr>
+<tr><td>3</td><td>Capabilities, <code>PrivateDevices</code>, <code>Protect*</code>, <code>Restrict*</code></td><td>3.2</td><td>OK 🙂</td></tr>
+<tr><td>4</td><td><code>RestrictAddressFamilies</code>, <code>SystemCallFilter</code>, <code>SystemCallArchitectures</code></td><td><strong>1.9</strong></td><td>OK 🙂</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 6 — Verificar, que es la mitad del trabajo.</strong> Un puntaje de 1.9 con el servicio caído vale menos que 9.6 con el servicio andando.</p>
+
+<pre><code class="lang-bash">systemd-analyze verify /etc/systemd/system/informes.service   # sintaxis y opciones desconocidas
+systemctl daemon-reload &amp;&amp; systemctl restart informes.service
+
+# Los tres síntomas del sandbox demasiado apretado:
+journalctl -u informes.service -b | grep -E 'SIGSYS|31/SYS|EROFS|Permission denied|EPERM'
+systemctl show informes.service -p SystemCallFilter -p ReadWritePaths -p MemoryMax  # valor REAL
+curl -fsS localhost:8080/health &amp;&amp; echo "smoke test OK"</code></pre>
+
+<div class="rule">
+  <strong>📌 De 9.6 a 1.9 sin escribir una línea de código de la aplicación.</strong> Bajar de 1.9 exigiría <code>PrivateUsers=yes</code>, <code>PrivateNetwork=yes</code> con socket activation y <code>MemoryDenyWriteExecute=yes</code> — cosas que <em>pueden</em> tener sentido, pero que hay que justificar contra un modelo de amenazas, no contra el marcador. <strong>El objetivo nunca fue el número: era que un RCE en la app no pueda leer <code>/etc/shadow</code>, montar nada, cargar un módulo, tocar el reloj ni abrir un socket raw.</strong> Eso ya se cumple.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés <code>Requires=redis.service</code> y el servicio igual arranca antes que Redis. ¿Qué falta?</summary>
+<p><code>After=redis.service</code>. <code>Requires=</code> y <code>After=</code> son <strong>ejes independientes</strong>: el primero dice "activá Redis y si falla, fallo yo"; el segundo dice "no arranques hasta que Redis haya arrancado". Sin el segundo, systemd los activa en paralelo y tu proceso intenta conectar a un puerto que todavía no existe. Y hay un segundo nivel: aunque pongas <code>After=</code>, si <code>redis.service</code> es <code>Type=simple</code>, "arrancó" solo significa que se hizo el fork — puede faltar todavía para que escuche. La garantía firme la da <code>Type=notify</code> del otro lado, o socket activation, que hace que el socket exista desde el boot y el cliente espere en el backlog en vez de recibir un rechazo.</p></details>
+
+<details><summary>Agregaste ocho directivas de sandboxing, la unit arranca sin errores y <code>systemd-analyze security</code> no bajó nada. ¿Qué pasó?</summary>
+<p>Lo más probable es que tu versión de systemd no conozca esas directivas. Una opción desconocida <strong>se ignora con un warning en el journal y la unit carga igual</strong> — no falla, no avisa fuerte, y quedás creyendo que estás protegido. Se confirma con <code>systemctl --version</code> y, sobre todo, con <code>systemd-analyze verify</code>, que sí marca las opciones que no existen. La otra causa posible es que estés editando un archivo que no es el efectivo: un drop-in en <code>/etc/systemd/system/x.service.d/</code> le gana a lo que escribiste, o te olvidaste el <code>systemctl daemon-reload</code>. <code>systemctl cat</code> y <code>systemctl show -p &lt;propiedad&gt;</code> resuelven la duda en dos segundos: el archivo dice una cosa, el runtime dice la verdad.</p></details>
+
+<details><summary>¿Por qué un drop-in en <code>/etc</code> y no editar directamente la unit que instaló el paquete?</summary>
+<p>Porque el archivo de <code>/usr/lib/systemd/system/</code> es propiedad del gestor de paquetes: la próxima actualización lo reemplaza y tu cambio desaparece sin dejar rastro, o te deja un <code>.rpmnew</code>/<code>.dpkg-dist</code> que nadie va a mirar. Además, en sistemas de <code>/usr</code> inmutable directamente no se puede escribir. El drop-in <code>/etc/systemd/system/x.service.d/algo.conf</code> tiene precedencia sobre el del paquete, sobrevive actualizaciones, contiene <strong>solo tu delta</strong> —lo que lo hace legible y versionable en Git— y se audita en conjunto con <code>systemd-delta</code>. La única trampa es que <code>ExecStart=</code> no se puede redefinir sin vaciarlo primero con una línea <code>ExecStart=</code> sola.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>systemd administra <strong>units</strong> de ocho tipos, no "servicios". El grafo tiene dos ejes independientes: requerimiento (<code>Wants</code>/<code>Requires</code>/<code>BindsTo</code>) y orden (<code>After</code>/<code>Before</code>). <strong>Casi siempre necesitás los dos</strong>.</li>
+  <li><code>Type=</code> define cuándo systemd considera que arrancaste, y por lo tanto cuánto vale el <code>After=</code> de los demás. <code>exec</code> en vez de <code>simple</code>; <code>notify</code> cuando el orden importa de verdad.</li>
+  <li><code>Restart=on-failure</code> con <code>RestartSec≥5s</code> y el limitador de arranque activo. Un bucle de reinicio sin freno satura CPU, journal y dependencias externas; y el limitador, al frenarlo, te deja en <code>failed</code> hasta que alguien haga <code>reset-failed</code> — por eso hace falta <code>OnFailure=</code>.</li>
+  <li><strong>El sandboxing es la funcionalidad más subutilizada de Linux.</strong> <code>DynamicUser</code>, <code>ProtectSystem=strict</code> + <code>ReadWritePaths</code>, <code>CapabilityBoundingSet=</code> vacío, <code>SystemCallFilter=@system-service</code> y <code>SystemCallArchitectures=native</code> llevan una unit típica de <strong>9.6 UNSAFE a ~1.9 OK</strong> sin tocar la aplicación.</li>
+  <li><code>systemd-analyze security</code> es un checklist con peso, <strong>no un certificado</strong>: no conoce tu modelo de amenazas. Y una directiva que tu versión no soporta se ignora en silencio — validá con <code>systemd-analyze verify</code> y <code>systemctl show</code>.</li>
+  <li>Los límites son cgroups v2 declarativos: <code>MemoryHigh</code> antes que <code>MemoryMax</code>, <code>CPUQuota</code>, <code>TasksMax</code>, slices para repartir entre grupos, <code>systemd-cgtop</code> para mirarlo en vivo.</li>
+  <li><strong>Socket activation</strong> elimina dependencias de orden, permite bind privilegiado sin proceso privilegiado y encola las conexiones nuevas durante un restart — pero no drena solo las que ya estaban abiertas.</li>
+  <li><strong>Timers</strong> ganan a cron por logs, límites de recursos, dependencias, <code>Persistent=true</code> y <code>RandomizedDelaySec=</code>. Cron sigue bien para lo trivial y lo portable.</li>
+  <li><strong>journald</strong> es volátil hasta que creás <code>/var/log/journal</code>. Sus campos con guion bajo no se pueden falsificar desde la app: es mejor insumo para un SIEM que cualquier archivo de texto.</li>
+  <li>Los cambios van en <strong>drop-ins</strong> (<code>systemctl edit</code>), nunca en la unit del paquete. Las units de usuario mueren al cerrar sesión salvo <code>loginctl enable-linger</code>.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>systemd-analyze security</code> en tu máquina y ordená las units por exposición. Elegí la peor que sea tuya (no del sistema) y anotá su puntaje inicial y las cinco directivas que más peso aportan.</li>
+  <li>Escribí un servicio mínimo en Python que escuche en un puerto, endurecelo siguiendo los pasos 1 a 4 del worked example y documentá el puntaje después de <em>cada</em> paso. ¿Cuál te dio el salto más grande por línea escrita?</li>
+  <li>Rompé la jaula a propósito: sacá <code>/var/lib/tu-servicio</code> de <code>ReadWritePaths=</code> y hacé que la app escriba ahí. Encontrá el error en el journal e identificá el <code>errno</code> exacto. Repetí agregando una syscall prohibida y compará el síntoma (<code>EROFS</code> vs <code>31/SYS</code>).</li>
+  <li>Armá un par <code>.socket</code> + <code>.service</code>. Con el servicio detenido, hacé <code>curl</code> al puerto y comprobá que el servicio arranca solo. Después, con <code>ab</code> o <code>hey</code> generando tráfico constante, hacé <code>systemctl restart</code> del servicio y contá cuántas peticiones fallan con y sin socket activation.</li>
+  <li>Convertí un job de cron real a timer con <code>Persistent=true</code> y <code>RandomizedDelaySec=</code>. Validá la expresión con <code>systemd-analyze calendar</code>, y apagá la máquina durante la ventana programada para verificar que el job corre al volver.</li>
+  <li>Poné <code>MemoryMax=100M</code> a un script que asigna memoria en un loop. Observá el OOM kill en el journal y en <code>systemctl status</code>. Repetí con <code>MemoryHigh=100M</code> en lugar de <code>MemoryMax=</code> y describí en qué se diferencia el comportamiento.</li>
+  <li>Auditá tu propia máquina: verificá si <code>/var/log/journal</code> existe, si <code>systemd-networkd-wait-online</code> está habilitado, y buscá con <code>systemd-delta</code> qué units está sobrescribiendo alguien. Escribí tres líneas por hallazgo: qué encontraste, qué riesgo implica y cómo lo arreglarías.</li>
+</ol>
+
+<section class="quiz" id="quizLS7">
+  <style>
+    #quizLS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS7 .q{margin-bottom:1.5rem}
+    #quizLS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS7 .opt:hover{border-color:var(--accent)}
+    #quizLS7 .opt:disabled{cursor:default}
+    #quizLS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS7 .exp.show{display:block}
+    #quizLS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu unit tiene <code>Requires=postgresql.service</code> pero no <code>After=</code>. ¿Qué hace systemd?</p>
+    <button class="opt">Deduce el orden automáticamente: <code>Requires=</code> implica esperar a que arranque</button>
+    <button class="opt">Rechaza la unit al cargarla, porque la configuración es inconsistente</button>
+    <button class="opt">Activa las dos units en paralelo, así que tu servicio puede intentar conectar antes de que Postgres escuche</button>
+    <div class="exp">Requerimiento y orden son ejes <strong>independientes</strong> en systemd, y esa separación es deliberada: permite arrancar en paralelo todo lo que no tenga una dependencia temporal real. <code>Requires=</code> solo dice "activá esto y si falla, fallo yo"; el orden lo pone <code>After=</code>. El bug es especialmente traicionero porque el <code>Restart=</code> lo tapa: el primer intento falla, el segundo funciona, y nadie mira el journal. Y aun con <code>After=</code>, si el otro es <code>Type=simple</code>, "arrancó" significa apenas que se hizo el fork.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Endureciste una unit hasta <code>1.9 OK</code> en <code>systemd-analyze security</code>. ¿Qué podés afirmar?</p>
+    <button class="opt">Que cerraste muchas vías de escalada del proceso, pero nada sobre las vulnerabilidades de la aplicación en sí</button>
+    <button class="opt">Que el servicio es seguro: systemd verificó que no tiene vulnerabilidades explotables</button>
+    <button class="opt">Que ya no hace falta actualizar las dependencias, porque el sandbox contiene cualquier exploit</button>
+    <div class="exp">El puntaje es una suma ponderada de directivas presentes o ausentes: mide <strong>contención</strong>, no ausencia de bugs. Con 1.9 lograste que un RCE en tu código no pueda leer <code>/etc/shadow</code>, cargar módulos, montar nada ni abrir sockets raw — que es muchísimo. Pero la app sigue pudiendo leer su propia base de datos, usar sus credenciales y hablar con la red, porque para eso existe. La contención limita el radio de la explosión; no impide la explosión. Por eso el hardening de unit va <em>además</em> del modelo de amenazas, nunca en su lugar.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un servicio con <code>DynamicUser=yes</code> guarda un archivo en <code>/opt/app/datos/</code> y al siguiente arranque no puede leerlo. ¿Por qué?</p>
+    <button class="opt">Porque <code>DynamicUser=</code> monta todo el filesystem como <code>tmpfs</code> y se borra al parar</button>
+    <button class="opt">Porque el UID es transitorio y cambia entre arranques: lo persistente va en <code>StateDirectory=</code>, que systemd reasigna al dueño correcto cada vez</button>
+    <button class="opt">Porque <code>DynamicUser=</code> solo permite leer, nunca escribir en disco</button>
+    <div class="exp">systemd asigna un UID prestado al arrancar y lo libera al parar, así que el archivo queda con un número de dueño que en el próximo arranque pertenece a otro (o a nadie) — y ese UID reciclado puede terminar en otro servicio, lo que además es un problema de seguridad. La respuesta correcta es <code>StateDirectory=app</code>: systemd crea <code>/var/lib/app</code>, le pone el dueño correcto en cada arranque y te lo expone en <code>%S</code>. Como bonus, <code>DynamicUser=yes</code> implica <code>ProtectSystem=strict</code>, así que <code>/opt</code> ya venía de solo lectura de todas formas.</div>
+  </div>
+
+  <div class="score" id="scoreLS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls6-ebpf-observabilidad/lecture.html">← LS6: eBPF y observabilidad</a>
+  <a href="../ls8-produccion/lecture.html">LS8: Producción y automatización →</a>
+</nav>
+
+</div>
+</body>
+</html>

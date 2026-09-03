@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS6 — Toolchain moderno: uv, ruff y ty · Python Senior</title>
+  <meta name="description" content="El toolchain de Python en 2026: uv reemplazando a pip/poetry/pyenv/virtualenv, ruff en lugar de black+flake8+isort, ty y el estado del type-checking, PEP 723, workspaces, pyproject.toml a fondo, publicación de paquetes, reproducibilidad y CI.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS6</span>
+  <span class="badge">⏱ 35–95 min</span>
+  <span class="badge">🎯 Pre-req: PS5</span>
+  <span class="badge">🛠️ Tooling</span>
+</div>
+
+<article>
+
+<h1>PS6 — Toolchain moderno: uv, ruff y ty</h1>
+
+<h2>PS6.0 Por qué este módulo</h2>
+
+<p>Entre 2024 y 2026 el toolchain de Python cambió más que en los quince años anteriores. Durante casi dos décadas la respuesta a "¿cómo armo un proyecto Python?" fue una lista de seis o siete herramientas que había que aprender por separado, que no se hablaban entre sí y que cada una resolvía una porción del problema. Hoy la respuesta cabe en dos binarios.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El toolchain no es una cuestión de gusto personal. Define <strong>cuánto tarda tu CI</strong>, <strong>si tu build es reproducible</strong> y <strong>cuánto tarda una persona nueva en tener el proyecto corriendo</strong>. Esos tres números son medibles, y las herramientas de 2026 los mejoran por un factor grande — no por un 10%.
+</div>
+
+<p>Los números que motivaron el cambio no son de marketing. <strong>uv</strong>, la herramienta de Astral escrita en Rust, pasó a <strong>126 millones de descargas mensuales en PyPI</strong> contra unos 75 millones de Poetry: en dos años se convirtió en el instalador más usado después de pip. OpenAI migró la infraestructura de Codex de pip a uv y reportó un ahorro de <strong>alrededor de un millón de minutos de cómputo por semana</strong>. Ese es el orden de magnitud del que hablamos cuando decimos "10 a 100 veces más rápido".</p>
+
+<p>Este módulo no es un tour de features. Es cómo se arma, se bloquea, se verifica, se publica y se integra a CI un proyecto Python serio hoy — y, al final, cuándo <em>no</em> conviene migrar.</p>
+
+<h2>PS6.1 De dónde venimos: un problema, siete herramientas</h2>
+
+<p>El stack clásico no era malo por incompetencia: creció por acumulación. Cada herramienta resolvió un agujero que la anterior dejaba, y ninguna podía absorber a las otras porque todas estaban escritas en Python y arrancaban dentro del mismo intérprete que intentaban administrar. Ese era el techo.</p>
+
+<table>
+<thead><tr><th>Problema</th><th>Stack 2015–2023</th><th>Stack 2026</th></tr></thead>
+<tbody>
+<tr><td>Instalar dependencias</td><td><code>pip</code></td><td><code>uv add</code> / <code>uv sync</code></td></tr>
+<tr><td>Aislar el entorno</td><td><code>venv</code> / <code>virtualenv</code></td><td>uv, implícito (crea y mantiene el <code>.venv</code>)</td></tr>
+<tr><td>Instalar versiones de Python</td><td><code>pyenv</code>, deadsnakes, conda</td><td><code>uv python install</code></td></tr>
+<tr><td>Lockfile reproducible</td><td><code>pip-tools</code>, <code>poetry.lock</code>, <code>Pipfile.lock</code></td><td><code>uv.lock</code> (universal)</td></tr>
+<tr><td>Herramientas CLI aisladas</td><td><code>pipx</code></td><td><code>uv tool install</code> / <code>uvx</code></td></tr>
+<tr><td>Formatear código</td><td><code>black</code></td><td><code>ruff format</code></td></tr>
+<tr><td>Linter</td><td><code>flake8</code> + 20 plugins</td><td><code>ruff check</code></td></tr>
+<tr><td>Ordenar imports</td><td><code>isort</code></td><td>ruff, regla <code>I</code></td></tr>
+<tr><td>Modernizar sintaxis</td><td><code>pyupgrade</code></td><td>ruff, regla <code>UP</code></td></tr>
+<tr><td>Borrar imports muertos</td><td><code>autoflake</code></td><td>ruff, reglas <code>F401</code>/<code>F841</code></td></tr>
+<tr><td>Type checking</td><td><code>mypy</code></td><td><code>mypy</code>, <code>pyright</code>, <code>ty</code> (ver PS6.6)</td></tr>
+<tr><td>Publicar un paquete</td><td><code>build</code> + <code>twine</code></td><td><code>uv build</code> + <code>uv publish</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Lo que realmente cambió no es la velocidad: es la cantidad de estados posibles.</strong> Con el stack viejo, "el proyecto está bien instalado" era una afirmación sobre siete herramientas independientes, cada una con su archivo de configuración y su noción de "entorno activo". Con uv, hay un <code>pyproject.toml</code>, un <code>uv.lock</code> y un comando que garantiza que el entorno coincide con el lock antes de ejecutar nada. La velocidad es lo que se nota primero; la reducción de estados es lo que te ahorra las tardes perdidas.
+</div>
+
+<h2>PS6.2 uv a fondo</h2>
+
+<p>uv es un binario único, sin dependencias, escrito en Rust. No necesita un Python instalado para funcionar — de hecho, instala Pythons.</p>
+
+<pre><code class="lang-bash"># macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# o, si ya tenés pipx o un pip a mano
+pipx install uv
+
+uv --version
+uv self update</code></pre>
+
+<h3>Arrancar un proyecto</h3>
+
+<pre><code class="lang-bash">uv init mi-proyecto
+cd mi-proyecto
+
+# lo que quedó:
+# .python-version    versión de Python fijada para el proyecto
+# pyproject.toml     metadata + dependencias
+# README.md
+# main.py
+# (el .venv y el uv.lock aparecen en el primer uv add / uv run)
+
+uv init --lib mi-libreria     # layout src/ + build backend, para publicar
+uv init --app mi-servicio     # layout de aplicación (por defecto)</code></pre>
+
+<h3>Agregar y quitar dependencias</h3>
+
+<pre><code class="lang-bash">uv add "httpx&gt;=0.27"
+uv add "fastapi[standard]"
+uv add --dev pytest pytest-cov ruff
+uv add --group docs mkdocs-material          # grupo propio (PEP 735)
+uv add "polars@git+https://github.com/pola-rs/polars"   # desde git
+uv add ./libs/interno                        # path local
+
+uv remove requests</code></pre>
+
+<div class="concept">
+  <strong>💡 <code>uv add</code> hace cuatro cosas en un comando:</strong> escribe la dependencia en <code>pyproject.toml</code>, re-resuelve el grafo completo, actualiza <code>uv.lock</code> y sincroniza el <code>.venv</code>. Con pip, esas cuatro cosas eran cuatro pasos manuales, y olvidarte del segundo era el origen clásico del "en mi máquina anda".
+</div>
+
+<h3>Ejecutar cosas</h3>
+
+<pre><code class="lang-bash">uv run python -m mi_proyecto
+uv run pytest
+uv run ruff check .
+
+# probar una librería sin instalarla en el proyecto
+uv run --with rich python -c "from rich import print; print('[bold]hola[/bold]')"
+
+# forzar otro intérprete para esta corrida
+uv run --python 3.14t python -c "import sys; print(sys._is_gil_enabled())"</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>uv run</code> sincroniza antes de ejecutar.</strong> Verifica que el <code>.venv</code> coincida con el <code>uv.lock</code> y, si no, lo arregla — en milisegundos. Consecuencia práctica: <strong>desaparece el <code>source .venv/bin/activate</code></strong> y desaparece la clase entera de bugs de "estaba en el venv equivocado". Es probablemente el cambio de hábito más grande del módulo.
+</div>
+
+<h3>Sincronizar y bloquear</h3>
+
+<pre><code class="lang-bash">uv sync                    # el entorno pasa a ser EXACTAMENTE el lockfile
+uv sync --frozen           # falla si el lock no está al día — esto va en CI
+uv sync --no-dev           # solo dependencias de runtime (imagen de producción)
+uv sync --all-extras --all-groups
+
+uv lock                    # resolver y escribir uv.lock, sin tocar el .venv
+uv lock --check            # ¿el lock está sincronizado con el pyproject?
+uv lock --upgrade          # subir todo lo que se pueda
+uv lock --upgrade-package httpx   # subir SOLO httpx y lo que arrastre</code></pre>
+
+<h3>Gestionar versiones de Python</h3>
+
+<pre><code class="lang-bash">uv python list                 # lo instalado y lo disponible para bajar
+uv python install 3.13 3.14
+uv python install 3.14t        # build free-threaded (PEP 779, ver PS1)
+uv python pin 3.14             # escribe .python-version
+uv python find                 # qué intérprete usaría acá
+
+uv venv                        # .venv con el Python fijado
+uv venv --python 3.14t .venv-ft</code></pre>
+
+<div class="info">
+  El <code>3.14t</code> es el build sin GIL <strong>oficialmente soportado</strong> desde Python 3.14 gracias al PEP 779 (lo vimos en PS1). Que <code>uv</code> lo instale con un comando es parte de por qué el free-threading dejó de ser un experimento de laboratorio: probarlo cuesta treinta segundos, no una tarde de compilar CPython.
+</div>
+
+<h3>Herramientas CLI: <code>uv tool</code> y <code>uvx</code></h3>
+
+<pre><code class="lang-bash">uv tool install ruff           # instalada global, en su propio entorno aislado
+uv tool install py-spy
+uv tool list
+uv tool upgrade --all
+
+uvx ruff check .               # efímero: baja, corre y se olvida
+uvx --from httpie http GET https://example.com</code></pre>
+
+<h3>La interfaz compatible con pip</h3>
+
+<p>uv también expone una capa <code>uv pip</code> deliberadamente compatible, pensada para meterlo en proyectos viejos sin cambiarles nada:</p>
+
+<pre><code class="lang-bash">uv pip install -r requirements.txt      # mismo comando, 10-100x más rápido
+uv pip compile requirements.in -o requirements.txt
+uv pip sync requirements.txt            # el entorno pasa a ser EXACTAMENTE el archivo
+uv pip list
+uv pip freeze</code></pre>
+
+<div class="tip">
+  Esa capa es la puerta de entrada barata: si tu equipo no quiere migrar el proyecto entero, cambiar <code>pip install</code> por <code>uv pip install</code> en el Dockerfile y en el CI ya te da la mayor parte de la ganancia de tiempo, con un diff de dos líneas y cero riesgo de resolución distinta si usás <code>uv pip sync</code>.
+</div>
+
+<h3>El <code>uv.lock</code> es universal</h3>
+
+<div class="rule">
+  <strong>📌 Un solo lockfile para todas las plataformas.</strong> <code>uv.lock</code> no es una foto de tu máquina: contiene la resolución para Linux, macOS y Windows, para las arquitecturas relevantes y para todo el rango de <code>requires-python</code> que declaraste. Un <code>pip freeze</code> hecho en tu portátil con macOS y Python 3.12 <em>no</em> describe lo que se va a instalar en el contenedor Linux con 3.13. Ese desajuste silencioso es la causa raíz de una fracción enorme de los "anda en local, falla en prod".
+</div>
+
+<h2>PS6.3 Scripts con dependencias embebidas (PEP 723)</h2>
+
+<p>Esta es, de lejos, la funcionalidad más útil y menos conocida del stack moderno. El <strong>PEP 723</strong> define un bloque de metadata en un comentario dentro de un <code>.py</code>: el script declara sus propias dependencias y su versión mínima de Python.</p>
+
+<pre><code class="lang-python"># /// script
+# requires-python = "&gt;=3.12"
+# dependencies = [
+#     "httpx&gt;=0.27",
+#     "rich&gt;=13",
+# ]
+# ///
+"""Chequea el estado de una lista de endpoints y lo muestra en una tabla."""
+import asyncio
+import httpx
+from rich.console import Console
+from rich.table import Table
+
+ENDPOINTS = [
+    "https://example.com",
+    "https://httpbin.org/status/503",
+]
+
+async def revisar(cliente: httpx.AsyncClient, url: str) -&gt; tuple[str, int | str]:
+    try:
+        r = await cliente.get(url, timeout=5)
+        return url, r.status_code
+    except httpx.HTTPError as e:
+        return url, type(e).__name__
+
+async def main() -&gt; None:
+    async with httpx.AsyncClient() as c:
+        filas = await asyncio.gather(*(revisar(c, u) for u in ENDPOINTS))
+    tabla = Table("endpoint", "estado")
+    for url, estado in filas:
+        tabla.add_row(url, str(estado))
+    Console().print(tabla)
+
+asyncio.run(main())</code></pre>
+
+<pre><code class="lang-bash">uv run chequeo.py          # uv lee el bloque, arma un entorno efímero y ejecuta
+
+# y podés editar el bloque con comandos, sin tocarlo a mano:
+uv add --script chequeo.py "pandas&gt;=2.2"
+uv remove --script chequeo.py rich
+
+# hasta se le puede dar su propio lockfile
+uv lock --script chequeo.py</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué importa más de lo que parece.</strong> Elimina la carpeta <code>scripts/</code> con su <code>requirements-scripts.txt</code> que nadie mantiene. Un script de operaciones queda como <strong>un solo archivo</strong>: se manda por Slack, se pega en un ticket, se guarda en un gist, y quien lo reciba lo corre con <code>uv run</code> sin leer un README ni crear un venv. Los scripts internos dejan de pudrirse porque el archivo lleva su contexto adentro.
+</div>
+
+<div class="tip">
+  En Linux/macOS podés hacerlo ejecutable con un shebang: <code>#!/usr/bin/env -S uv run --script</code> como primera línea, antes del bloque <code>/// script</code>. Después es <code>./chequeo.py</code> y listo.
+</div>
+
+<h2>PS6.4 Workspaces: un monorepo, un lockfile</h2>
+
+<p>Cuando un repositorio tiene varios paquetes que se importan entre sí —un <code>core</code>, una <code>api</code>, un <code>worker</code>— el problema clásico es que cada uno resuelve sus dependencias por su cuenta y terminan con versiones incompatibles de la misma librería. Los <em>workspaces</em> de uv resuelven todo el conjunto de una vez.</p>
+
+<pre><code class="lang-toml"># pyproject.toml de la raíz
+[project]
+name = "plataforma"
+version = "0.1.0"
+requires-python = "&gt;=3.12"
+dependencies = ["core", "api"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+exclude = ["packages/legacy-*"]
+
+[tool.uv.sources]
+core = { workspace = true }
+api  = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest&gt;=8", "ruff&gt;=0.8"]</code></pre>
+
+<pre><code class="lang-bash">uv sync                                  # resuelve TODOS los miembros juntos
+uv run --package api uvicorn api.main:app --reload
+uv add --package api "httpx&gt;=0.27"       # agrega la dep AL paquete api
+uv run --package worker pytest</code></pre>
+
+<div class="rule">
+  <strong>📌 Un solo <code>uv.lock</code> en la raíz para todo el monorepo.</strong> Eso hace <em>estructuralmente imposible</em> que <code>api</code> y <code>worker</code> corran con versiones distintas de <code>pydantic</code>: la resolución es única. Es la misma idea que Cargo en Rust o los workspaces de pnpm.
+</div>
+
+<div class="warn">
+  <strong>Un workspace no es gratis.</strong> Fuerza una resolución compartida: si <code>api</code> necesita <code>numpy 2.x</code> y <code>worker</code> está clavado en <code>numpy 1.x</code>, el workspace <strong>no puede</strong> satisfacer a los dos y vas a tener que arreglar el conflicto de verdad. Eso suele ser bueno, pero si tus paquetes necesitan versionado y ciclos de release independientes, la respuesta correcta puede ser repositorios separados, no un workspace.
+</div>
+
+<h2>PS6.5 ruff: un binario en lugar de veinte</h2>
+
+<p><strong>ruff</strong> es el linter y formateador de Astral, también en Rust. Reemplaza a <code>black</code>, <code>flake8</code> (y su ecosistema de plugins), <code>isort</code>, <code>pyupgrade</code>, <code>autoflake</code>, <code>pydocstyle</code>, <code>bandit</code> y una decena más — reimplementando más de 800 reglas de esas herramientas en un solo ejecutable. En 2026 es el linter por defecto del ecosistema.</p>
+
+<pre><code class="lang-bash">uv add --dev ruff          # o: uv tool install ruff
+
+ruff check .               # lintear
+ruff check --fix .         # arreglar lo que se puede arreglar sin riesgo
+ruff check --fix --unsafe-fixes .   # incluir arreglos que PUEDEN cambiar semántica
+ruff check --statistics .  # ¿cuántas violaciones de cada regla? empezá siempre por acá
+ruff check --watch .       # loop mientras editás
+
+ruff format .              # formatear (compatible con el estilo de black)
+ruff format --check .      # ¿está formateado? no toca nada — esto va en CI
+ruff format --diff .       # mostrar qué cambiaría
+
+ruff rule F401             # documentación de una regla, sin abrir el navegador</code></pre>
+
+<h3>Configuración en <code>pyproject.toml</code></h3>
+
+<pre><code class="lang-toml">[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["migrations", "_generated", "vendor"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle: errores y warnings
+    "F",         # pyflakes: imports/variables sin usar, nombres indefinidos
+    "I",         # isort: orden de imports
+    "N",         # pep8-naming
+    "UP",        # pyupgrade: modernizar sintaxis al target-version
+    "B",         # flake8-bugbear: trampas reales (mutable default args, etc.)
+    "C4",        # comprehensions innecesarias
+    "SIM",       # simplificaciones
+    "ASYNC",     # errores típicos de asyncio (ver PS3)
+    "S",         # bandit: seguridad
+    "RUF",       # reglas propias de ruff
+]
+ignore = [
+    "E501",      # largo de línea: lo maneja el formateador
+    "S101",      # assert: lo permitimos, ver per-file-ignores
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ARG", "PLR2004"]   # asserts y magic numbers en tests: OK
+"__init__.py" = ["F401"]                   # re-exports intencionales
+
+[tool.ruff.lint.isort]
+known-first-party = ["mi_proyecto"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true   # también formatea el código dentro de los docstrings</code></pre>
+
+<table>
+<thead><tr><th>Prefijo</th><th>Reemplaza a</th><th>¿Vale la pena prenderlo?</th></tr></thead>
+<tbody>
+<tr><td><code>F</code>, <code>E</code>, <code>W</code></td><td>pyflakes + pycodestyle</td><td>✅ Siempre. Es el piso.</td></tr>
+<tr><td><code>I</code></td><td>isort</td><td>✅ Siempre. Elimina discusiones de imports.</td></tr>
+<tr><td><code>B</code></td><td>flake8-bugbear</td><td>✅ Sí: encuentra bugs reales, no estilo.</td></tr>
+<tr><td><code>UP</code></td><td>pyupgrade</td><td>✅ Sí, junto con <code>target-version</code> bien puesto.</td></tr>
+<tr><td><code>S</code></td><td>bandit</td><td>⚠️ Sí, con <code>per-file-ignores</code> para tests.</td></tr>
+<tr><td><code>ANN</code></td><td>flake8-annotations</td><td>⚠️ Solo si ya tenés typing serio (PS5).</td></tr>
+<tr><td><code>D</code></td><td>pydocstyle</td><td>⚠️ Solo en librerías públicas. En apps es ruido.</td></tr>
+<tr><td><code>ALL</code></td><td>—</td><td>❌ Nunca de entrada: son 800+ reglas contradictorias entre sí.</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico al adoptar ruff:</strong> poner <code>select = ["ALL"]</code> el primer día, recibir 4.000 errores, apagarlo y no volver nunca. El camino que funciona es al revés: arrancá con el equivalente exacto a lo que ya tenías, verificá que el diff sea vacío, mergeá, y recién después prendé un prefijo por sprint con su commit de arreglos aparte.
+</div>
+
+<h3>Migrar sin destruir el historial de git</h3>
+
+<p>Formatear un repo entero produce un commit que toca todos los archivos y arruina <code>git blame</code>. Hay una solución estándar y es de dos líneas:</p>
+
+<pre><code class="lang-bash">ruff format .
+git commit -am "style: formatear todo el repo con ruff format"
+
+# registrar ESE commit como ignorable por blame
+git rev-parse HEAD &gt;&gt; .git-blame-ignore-revs
+git add .git-blame-ignore-revs
+git commit -m "chore: ignorar el commit de formateo en git blame"
+
+# que git lo use localmente (cada persona lo corre una vez)
+git config blame.ignoreRevsFile .git-blame-ignore-revs</code></pre>
+
+<div class="info">
+  GitHub y GitLab leen <code>.git-blame-ignore-revs</code> automáticamente en su vista de blame. Con eso, el commit de formateo se vuelve invisible: el blame sigue apuntando a quien escribió cada línea de verdad. Lo mismo aplica al commit de <code>ruff check --fix</code> masivo, si lo hacés aparte.
+</div>
+
+<h2>PS6.6 ty y el estado del type-checking</h2>
+
+<p><strong>ty</strong> es el type-checker de Astral, también en Rust. Sigue la misma jugada que ruff: reimplementar en un lenguaje compilado algo que tardaba minutos en Python puro. Los órdenes de magnitud son parecidos — donde mypy tarda 40 segundos en un repo grande, ty tarda menos de uno.</p>
+
+<pre><code class="lang-bash">uvx ty check                   # probarlo sin instalar nada
+uv add --dev ty
+uv run ty check src/
+uv run ty check --error-on-warning src/</code></pre>
+
+<table>
+<thead><tr><th>Checker</th><th>Estado 2026</th><th>Fuerte en</th><th>Débil en</th></tr></thead>
+<tbody>
+<tr><td><code>mypy</code></td><td>Maduro, referencia de facto</td><td>Ecosistema de plugins (Django, SQLAlchemy, Pydantic), semántica muy discutida y estable</td><td>Lento en repos grandes; incremental frágil</td></tr>
+<tr><td><code>pyright</code> / <code>basedpyright</code></td><td>Maduro, motor de Pylance</td><td>Rápido, inferencia potente, es lo que ya corre en el editor de la mayoría</td><td>Node como dependencia; sin sistema de plugins</td></tr>
+<tr><td><code>ty</code></td><td><strong>Joven</strong>, en preview</td><td>Velocidad; integración natural con uv/ruff</td><td>Cobertura de casos raros y de stubs de terceros todavía en construcción</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Recomendación honesta para un proyecto serio hoy.</strong> El <em>gate</em> de CI —el que bloquea el merge— ponelo en <code>mypy</code> o en <code>pyright</code>, que es lo que ya corre en el editor de tu equipo. Agregá <code>ty</code> como un job <strong>no bloqueante</strong> en paralelo, y mirá el reporte cada tanto. El día que ty deje de reportar falsos positivos en tu código y su versión se declare estable, invertís los roles y ganás el tiempo de CI. Adoptar un checker en preview como gate de merge es apostar la velocidad del equipo a un roadmap ajeno.
+</div>
+
+<div class="danger">
+  <strong>⚠️ No confundas linter con type-checker.</strong> ruff <strong>no</strong> reemplaza a mypy ni a ty: ruff hace análisis por archivo, sin resolver tipos entre módulos. Que <code>ruff check</code> pase en verde no dice absolutamente nada sobre si tus tipos cierran. Son dos herramientas con dos trabajos distintos, y las dos van en CI.
+</div>
+
+<h2>PS6.7 <code>pyproject.toml</code> a fondo</h2>
+
+<p>Un solo archivo declara metadata, dependencias, build backend y la configuración de casi todas las herramientas. Este es un ejemplo completo y comentado:</p>
+
+<pre><code class="lang-toml">[project]                                  # PEP 621: metadata estándar
+name = "reporte-ventas"
+version = "1.4.0"
+description = "Genera reportes de ventas desde el data warehouse."
+readme = "README.md"
+requires-python = "&gt;=3.12"
+license = "MIT"
+authors = [{ name = "Alex Quiñones", email = "alex@ejemplo.com" }]
+keywords = ["reporting", "etl"]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+dependencies = [                           # lo que necesita en RUNTIME
+    "httpx&gt;=0.27,&lt;1.0",
+    "pydantic&gt;=2.7",
+    "polars&gt;=1.0",
+]
+
+[project.optional-dependencies]            # extras PÚBLICOS: pip install reporte-ventas[pdf]
+pdf = ["weasyprint&gt;=62"]
+excel = ["xlsxwriter&gt;=3.2"]
+
+[dependency-groups]                        # PEP 735: grupos PRIVADOS de desarrollo
+dev = ["pytest&gt;=8", "pytest-cov&gt;=5", "ruff&gt;=0.8", "mypy&gt;=1.11"]
+docs = ["mkdocs-material&gt;=9"]
+
+[project.scripts]                          # entry points de CLI
+reporte = "reporte_ventas.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ejemplo/reporte-ventas"
+Changelog = "https://github.com/ejemplo/reporte-ventas/blob/main/CHANGELOG.md"
+
+[build-system]                             # cómo se construye el paquete
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev"]                   # qué grupos instala uv sync por defecto
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+warn_unreachable = true</code></pre>
+
+<div class="concept">
+  <strong>💡 <code>optional-dependencies</code> vs <code>dependency-groups</code> — la distinción que casi todos confunden.</strong> Los <strong>extras</strong> (<code>[project.optional-dependencies]</code>) son públicos: viajan en el paquete publicado y tus usuarios los instalan con <code>pip install paquete[pdf]</code>. Los <strong>grupos</strong> (<code>[dependency-groups]</code>, PEP 735) son privados del desarrollo: <strong>no se publican</strong> y no existen para quien instala tu librería. Poner <code>pytest</code> como extra es un error clásico que le mete tus dependencias de test a todos tus usuarios.
+</div>
+
+<table>
+<thead><tr><th>Build backend</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>hatchling</code></td><td>Por defecto para casi todo. Rápido, buena configuración de archivos incluidos.</td></tr>
+<tr><td><code>uv_build</code></td><td>El backend propio de uv: mínimo y muy rápido, para paquetes Python puros.</td></tr>
+<tr><td><code>setuptools</code></td><td>Proyectos viejos con <code>setup.py</code> hecho a medida que todavía funciona.</td></tr>
+<tr><td><code>maturin</code></td><td>Extensiones en Rust (PyO3).</td></tr>
+<tr><td><code>scikit-build-core</code></td><td>Extensiones en C/C++ con CMake (ver PS8).</td></tr>
+</tbody>
+</table>
+
+<h2>PS6.8 Publicar un paquete</h2>
+
+<pre><code class="lang-bash">uv build                # produce dist/*.whl y dist/*.tar.gz
+uv build --wheel        # solo el wheel
+uv build --sdist
+
+# probar SIEMPRE contra TestPyPI antes de la publicación real
+uv publish --publish-url https://test.pypi.org/legacy/ --token "$TEST_PYPI_TOKEN"
+uvx --from reporte-ventas --index https://test.pypi.org/simple/ reporte --help
+
+uv publish --token "$PYPI_TOKEN"</code></pre>
+
+<table>
+<thead><tr><th></th><th>Wheel (<code>.whl</code>)</th><th>Sdist (<code>.tar.gz</code>)</th></tr></thead>
+<tbody>
+<tr><td>Qué es</td><td>Artefacto ya construido</td><td>Código fuente + instrucciones de build</td></tr>
+<tr><td>Instalación</td><td>Descomprimir y copiar</td><td>Ejecutar el build backend en la máquina del usuario</td></tr>
+<tr><td>Velocidad</td><td>Instantánea</td><td>Lenta; con extensiones nativas requiere compilador</td></tr>
+<tr><td>Por qué igual publicarlo</td><td>—</td><td>Reproducibilidad, auditoría, plataformas para las que no hiciste wheel</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Publicá los dos, y no publiques tokens.</strong> En CI usá <strong>Trusted Publishing</strong>: PyPI acepta el token OIDC efímero que emite GitHub Actions para tu repositorio, y no necesitás guardar ningún secreto de larga vida. Un token de PyPI filtrado en un log de CI es una toma de control de tu paquete, y por lo tanto de todos los entornos que lo instalan.
+</div>
+
+<div class="warn">
+  <strong>Una versión publicada en PyPI es inmutable y para siempre.</strong> Podés <em>yankear</em> una release (marcarla como no elegible para resoluciones nuevas) pero no borrarla ni reemplazarla. Por eso el paso de TestPyPI no es burocracia: es la única oportunidad de descubrir que el wheel se armó sin el paquete de datos, o que el entry point apunta a un módulo que no existe.
+</div>
+
+<h2>PS6.9 Reproducibilidad: el lockfile es el contrato</h2>
+
+<p>Esta sección existe por una afirmación que se repite mucho y es falsa: "mi <code>requirements.txt</code> tiene todas las versiones pineadas, o sea que es reproducible".</p>
+
+<table>
+<thead><tr><th>Por qué <code>pip install -r requirements.txt</code> no es reproducible</th></tr></thead>
+<tbody>
+<tr><td><strong>No cubre lo transitivo.</strong> Pinear <code>fastapi==0.115.0</code> no pinea <code>starlette</code>, <code>anyio</code> ni <code>typing-extensions</code>, que se resuelven de nuevo en cada instalación.</td></tr>
+<tr><td><strong>Es una foto de una plataforma.</strong> Un <code>pip freeze</code> desde macOS/3.12 no describe lo que instala un contenedor Linux/3.13: los marcadores de entorno cambian el conjunto de paquetes.</td></tr>
+<tr><td><strong>Sin hashes, no hay integridad.</strong> Sin <code>--require-hashes</code>, nada garantiza que el artefacto que bajás hoy sea byte a byte el de ayer.</td></tr>
+<tr><td><strong>Resuelve otra vez, cada vez.</strong> Un paquete nuevo publicado a las 3 AM puede cambiar tu build de las 9 sin que vos hayas tocado una línea.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># En desarrollo: si cambiaste pyproject, el lock se actualiza solo
+uv add "polars&gt;=1.10"
+
+# En CI: NUNCA re-resolver. Fallar si el lock no coincide con el pyproject.
+uv sync --frozen --all-groups
+uv lock --check
+
+# Puente hacia sistemas que todavía piden requirements.txt (Docker viejo, un cliente)
+uv export --format requirements-txt --no-dev --no-emit-project -o requirements.txt</code></pre>
+
+<div class="rule">
+  <strong>📌 Commiteá el <code>uv.lock</code>. Siempre.</strong> En aplicaciones es obvio: es la definición de qué se despliega. En librerías también, aunque suene contradictorio — el lock no se publica ni le impone nada a tus usuarios (ellos resuelven contra los rangos de tu <code>pyproject.toml</code>), pero le da a <em>tu</em> CI un entorno estable, así un fallo de tests significa "rompí algo" y no "alguien publicó algo".
+</div>
+
+<div class="mistake">
+  <strong>El anti-patrón que anula todo lo anterior:</strong> correr <code>uv sync</code> a secas en CI en vez de <code>uv sync --frozen</code>. Sin <code>--frozen</code>, si alguien tocó <code>pyproject.toml</code> y no actualizó el lock, uv <strong>lo actualiza en silencio</strong> y tu pipeline testea un conjunto de paquetes que no está commiteado en ningún lado. Ese pipeline pasa en verde y no prueba lo que vas a desplegar.
+</div>
+
+<h2>PS6.10 CI: el workflow completo</h2>
+
+<pre><code class="lang-yaml">name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  calidad:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Instalar Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Sincronizar (sin re-resolver)
+        run: uv sync --frozen --all-extras --all-groups
+
+      - name: El lock está al día
+        run: uv lock --check
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Formato
+        run: uv run ruff format --check .
+
+      - name: Tipos (gate)
+        run: uv run mypy src/
+
+      - name: Tipos (ty, informativo)
+        run: uv run ty check src/
+        continue-on-error: true
+
+      - name: Tests
+        run: uv run pytest -q --cov=src --cov-report=xml
+
+  free-threading:
+    runs-on: ubuntu-latest
+    continue-on-error: true      # informativo hasta que el ecosistema esté listo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv python install 3.14t
+      - run: uv sync --frozen --python 3.14t
+      - run: uv run --python 3.14t pytest -q</code></pre>
+
+<div class="info">
+  El <code>--output-format=github</code> de ruff hace que las violaciones aparezcan como anotaciones sobre las líneas del diff en el pull request, en vez de esconderse en el log. Es una línea de configuración que cambia por completo cuánta gente lee el resultado del linter.
+</div>
+
+<div class="concept">
+  <strong>💡 Dónde se va el tiempo de un CI Python.</strong> En el stack viejo, un pipeline típico repartía sus 4–5 minutos así: instalar dependencias 2:30, tests 1:00, black+flake8+isort 0:40, mypy 0:40. Con uv la instalación cae a segundos (y con caché, a menos aún) y ruff colapsa esos 0:40 en menos de un segundo. El pipeline queda dominado por los tests — que es exactamente donde <em>debería</em> irse el tiempo.
+</div>
+
+<h2>PS6.11 uv vs poetry vs pip: la comparación honesta</h2>
+
+<table>
+<thead><tr><th></th><th>pip + venv</th><th>poetry</th><th>uv</th></tr></thead>
+<tbody>
+<tr><td>Velocidad de instalación</td><td>Base</td><td>Similar o peor</td><td>10–100×</td></tr>
+<tr><td>Lockfile</td><td>No (necesitás pip-tools)</td><td>Sí, <code>poetry.lock</code></td><td>Sí, <code>uv.lock</code> universal</td></tr>
+<tr><td>Instala versiones de Python</td><td>No</td><td>No</td><td>Sí</td></tr>
+<tr><td>Workspaces / monorepo</td><td>No</td><td>Parcial (con plugins)</td><td>Sí, nativo</td></tr>
+<tr><td>Scripts PEP 723</td><td>No</td><td>No</td><td>Sí</td></tr>
+<tr><td>Herramientas CLI aisladas</td><td>No (pipx)</td><td>No</td><td>Sí (<code>uv tool</code>)</td></tr>
+<tr><td>Estándares (PEP 621/735)</td><td>Parcial</td><td>Sí (desde 2.0)</td><td>Sí, de nacimiento</td></tr>
+<tr><td>Madurez / años en producción</td><td>~15 años</td><td>~7 años</td><td>~2 años</td></tr>
+<tr><td>Descargas mensuales en PyPI</td><td>Universal</td><td>~75 M</td><td>~126 M</td></tr>
+</tbody>
+</table>
+
+<p>Ahora la parte que la mayoría de los artículos se saltea: <strong>cuándo cada uno sigue siendo la respuesta correcta.</strong></p>
+
+<div class="step"><strong><code>pip</code> + <code>venv</code> todavía tiene sentido</strong> en un script de veinte líneas con dos dependencias; en una imagen Docker donde ya tenés un <code>requirements.txt</code> con hashes que funciona y agregar otra herramienta solo agrega superficie; y en entornos corporativos donde el mirror interno o el proceso de aprobación de binarios no contempla uv todavía. "Es la herramienta que ya está aprobada" es una razón técnica legítima.</div>
+
+<div class="step"><strong><code>poetry</code> todavía tiene sentido</strong> en un proyecto grande, estable y con poca actividad, donde ya funciona y donde el equipo tiene plugins propios de poetry. Migrar cuesta días de trabajo humano; si tu CI tarda 90 segundos y a nadie le molesta, el retorno de esa migración es cero. Poetry sigue mantenido y adoptó PEP 621 en su versión 2.</div>
+
+<div class="step"><strong><code>uv</code> es la respuesta</strong> en cualquier proyecto nuevo; cuando el CI tarda minutos y ese tiempo se paga en cada PR; en monorepos; cuando el equipo pelea con versiones de Python; y cuando el "en mi máquina anda" ya costó un incidente. Cuanto más grande el proyecto y más gente lo toca, más grande el retorno.</div>
+
+<div class="warn">
+  <strong>El riesgo real de uv, dicho sin adornos:</strong> es joven, y tanto uv como ruff y ty vienen de <strong>una sola empresa</strong> con capital de riesgo. Depender de un proveedor único es un riesgo de verdad, no un detalle. La mitigación es concreta y conviene <em>verificarla antes de adoptar, no después</em>: uv no inventa formatos propietarios — se apoya en <code>pyproject.toml</code> estándar (PEP 621, 723, 735) y <code>uv export</code> te devuelve un <code>requirements.txt</code> en un comando. Probá la salida de emergencia una vez, comprobá que el proyecto sigue instalándose con pip, y ahí sí adoptá tranquilo.
+</div>
+
+<h2>🧑‍🎓 Worked Example — migrar una API real a uv + ruff sin romper el CI</h2>
+
+<blockquote>Una API Flask de tres años: <code>requirements.txt</code> con 41 dependencias directas pineadas, <code>requirements-dev.txt</code> con 12 más, entorno con <code>venv</code>, formateo con <code>black</code>, lint con <code>flake8</code> + <code>flake8-bugbear</code> + <code>isort</code>, CI en GitHub Actions que tarda <strong>4 min 20 s</strong>. Hay que migrarla sin que producción se entere.</blockquote>
+
+<p><strong>Paso 0 — La línea de base. Este paso no es opcional.</strong> Antes de tocar nada hay que capturar exactamente qué se instala hoy, porque ese es el conjunto de paquetes que está corriendo en producción ahora mismo:</p>
+
+<pre><code class="lang-bash">python -m venv .venv-baseline
+.venv-baseline/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv-baseline/bin/pip freeze | sort &gt; baseline.txt
+.venv-baseline/bin/pytest -q         # anotar: 312 passed en 48 s
+
+wc -l baseline.txt                   # 118 paquetes, contando transitivos</code></pre>
+
+<p><strong>Paso 1 — Crear el <code>pyproject.toml</code> importando lo que ya existe.</strong> uv sabe leer un requirements y volcarlo:</p>
+
+<pre><code class="lang-bash">uv init --app --no-readme .          # no pisa archivos existentes
+uv add -r requirements.txt
+uv add --dev -r requirements-dev.txt
+uv sync --all-groups</code></pre>
+
+<p><strong>Paso 2 — Verificar equivalencia ANTES de mergear.</strong> Acá está el corazón del ejercicio. Los tests pasando no alcanzan: hay que comparar el conjunto resuelto contra la línea de base, paquete por paquete:</p>
+
+<pre><code class="lang-bash">uv export --format requirements-txt --all-groups --no-hashes --no-emit-project \
+  | grep -v '^#' | grep -v '^$' | sort &gt; resuelto.txt
+
+# comparar solo nombre==versión, ignorando los marcadores de entorno
+diff &lt;(cut -d';' -f1 baseline.txt | tr -d ' ') \
+     &lt;(cut -d';' -f1 resuelto.txt | tr -d ' ')</code></pre>
+
+<p>El diff dio 9 líneas. Cada una entra en una de tres categorías, y cada categoría tiene una acción distinta:</p>
+
+<table>
+<thead><tr><th>Tipo de diferencia</th><th>Por qué pasa</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>Versión <strong>más nueva</strong> de un transitivo (6 casos)</td><td><code>requirements.txt</code> solo pineaba las directas; los transitivos se re-resolvían igual en cada deploy</td><td>Es un upgrade real, aunque estuviera pasando sin que nadie lo viera. Decidí: o lo aceptás y lo anotás en el PR, o lo pineás para que el diff quede vacío y lo subís en un PR aparte.</td></tr>
+<tr><td>Paquete que <strong>estaba y ya no está</strong> (2 casos)</td><td>Transitivos que dejaron de ser necesarios, o un extra que se perdió al importar</td><td><strong>Investigar uno por uno.</strong> Si desapareció un extra (por ejemplo <code>psycopg[binary]</code> importado como <code>psycopg</code>), producción arranca y falla al abrir la conexión. Los tests con SQLite no lo detectan.</td></tr>
+<tr><td>Paquete <strong>nuevo</strong> (1 caso)</td><td>uv resolvió un backport distinto para el rango de <code>requires-python</code> declarado</td><td>Normal. Verificá que el <code>requires-python</code> del <code>pyproject.toml</code> coincida con lo que realmente soportás.</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La migración se mergea con el diff vacío, o con el diff explicado línea por línea en el PR.</strong> "Los tests pasan" no es evidencia suficiente: los tests no cubren el <code>import</code> opcional que solo se ejecuta con la variable de entorno de producción puesta. Este paso es lo que separa una migración de una ruleta.
+</div>
+
+<p><strong>Paso 3 — Reemplazar black + flake8 + isort por ruff, con configuración conservadora.</strong> El objetivo del primer commit es que el diff de formateo sea <em>casi nulo</em>:</p>
+
+<pre><code class="lang-bash">uv remove --dev black flake8 flake8-bugbear isort
+uv add --dev ruff
+
+ruff check --statistics .     # qué se rompería con esta config: leer ANTES de arreglar
+ruff format --diff . | wc -l  # cuántas líneas cambia respecto de black</code></pre>
+
+<pre><code class="lang-toml">[tool.ruff]
+line-length = 88              # el default de black: hace que el diff sea mínimo
+target-version = "py312"
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+# equivalente aproximado a lo que ya corría: flake8 + bugbear + isort
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api"]   # replicar lo que decía el setup.cfg de isort</code></pre>
+
+<p><strong>Paso 4 — El commit de formateo, aislado y neutralizado en el blame:</strong></p>
+
+<pre><code class="lang-bash">ruff format .
+git commit -am "style: formateo con ruff format (equivalente a black)"
+git rev-parse HEAD &gt;&gt; .git-blame-ignore-revs
+git add .git-blame-ignore-revs
+git commit -m "chore: ignorar el commit de formateo en git blame"</code></pre>
+
+<p><strong>Paso 5 — CI en dos fases, nunca de golpe.</strong> Primero se agrega el job de uv <em>en paralelo</em> al de pip, marcado como no bloqueante. Durante una semana los dos corren sobre los mismos PRs y se comparan resultados. Si en esa semana el job de uv nunca difiere del de pip, se invierten: el de uv pasa a ser requerido y el de pip se borra. Si difieren aunque sea una vez, ahí está el bug que te habrías comido en producción.</p>
+
+<p><strong>Paso 6 — Limpieza, con una excepción.</strong></p>
+
+<pre><code class="lang-bash">git rm requirements.txt requirements-dev.txt setup.cfg .flake8
+git add pyproject.toml uv.lock .python-version</code></pre>
+
+<div class="warn">
+  Si el Dockerfile de producción todavía hace <code>pip install -r requirements.txt</code>, <strong>no borres el archivo: generalo</strong>. Un paso de <code>uv export --no-dev -o requirements.txt</code> en el build mantiene el contrato viejo con el lockfile nuevo como fuente de verdad. Cambiar el gestor de paquetes y el Dockerfile en el mismo PR es duplicar la superficie de fallo justo en el punto donde no querés ambigüedad sobre qué rompió.
+</div>
+
+<table>
+<thead><tr><th>Métrica</th><th>Antes</th><th>Después</th></tr></thead>
+<tbody>
+<tr><td>CI completo (3 versiones de Python)</td><td>4 min 20 s</td><td>52 s</td></tr>
+<tr><td>Instalación de dependencias en frío</td><td>2 min 30 s</td><td>6 s</td></tr>
+<tr><td>Lint + formato</td><td>41 s</td><td>&lt; 1 s</td></tr>
+<tr><td>Herramientas de dev a instalar</td><td>6</td><td>2</td></tr>
+<tr><td>Archivos de configuración</td><td><code>setup.cfg</code>, <code>.flake8</code>, <code>.isort.cfg</code>, 2 requirements</td><td><code>pyproject.toml</code> + <code>uv.lock</code></td></tr>
+<tr><td>Transitivos reproducibles</td><td>❌ Se re-resolvían en cada deploy</td><td>✅ Bloqueados y commiteados</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá uv".</strong> Es que una migración de toolchain se valida <strong>comparando el conjunto resuelto contra la línea de base</strong>, no confiando en que los tests pasen. Y que se despliega por fases con los dos sistemas corriendo en paralelo, porque el objetivo no es migrar rápido: es poder afirmar, con evidencia, que no cambió nada más que lo que querías cambiar.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Mi <code>requirements.txt</code> tiene todas las versiones con <code>==</code>. ¿Por qué no es reproducible?</summary>
+<p>Porque pinea solo las dependencias <strong>directas</strong>. Las transitivas —lo que traen tus dependencias— se vuelven a resolver en cada instalación, así que un release nuevo de <code>starlette</code> o de <code>typing-extensions</code> puede cambiar tu build sin que vos hayas tocado una línea. Además, un <code>pip freeze</code> es una foto de <em>una</em> plataforma y <em>una</em> versión de Python: los marcadores de entorno hacen que el conjunto instalado difiera entre tu macOS y el contenedor Linux. Y sin <code>--require-hashes</code> tampoco hay garantía de integridad del artefacto. El <code>uv.lock</code> resuelve las tres cosas: incluye transitivos, cubre todas las plataformas dentro de tu <code>requires-python</code>, y trae hashes.</p></details>
+
+<details><summary>Migraste a uv, los 312 tests pasan, pero el diff de <code>uv export</code> contra el <code>pip freeze</code> viejo tiene 9 líneas. ¿Mergeás?</summary>
+<p>No, todavía no: primero clasificás las 9. Las que son un transitivo más nuevo son un upgrade real y hay que declararlo en el PR (o pinear para dejar el diff vacío y subir el upgrade aparte). Las peligrosas son las que <strong>desaparecieron</strong>: si al importar el requirements se perdió un extra —típico <code>psycopg[binary]</code> importado como <code>psycopg</code>— la app arranca perfecto y explota al abrir la primera conexión real. Los tests con SQLite o con mocks nunca lo tocan. Mergeás con diff vacío, o con cada línea explicada.</p></details>
+
+<details><summary>Si ruff reemplaza a flake8, black, isort y pyupgrade, ¿también reemplaza a mypy?</summary>
+<p>No, y confundir eso es peligroso. ruff hace análisis estático <strong>por archivo</strong>: detecta imports sin usar, sintaxis vieja, orden de imports, patrones riesgosos. No construye un modelo de tipos que atraviese módulos, así que no puede decirte que le estás pasando un <code>str</code> a una función que espera <code>Path</code> definida tres paquetes más allá. Ese trabajo lo hacen mypy, pyright o ty. Un CI serio corre las dos cosas: <code>ruff check</code> como lint y un type-checker como gate aparte.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>uv</strong> (Astral, en Rust) absorbió pip, venv, pyenv, virtualenv, pipx y poetry en un binario, 10–100× más rápido. Con ~126 M de descargas mensuales contra ~75 M de Poetry, es el default de facto en 2026; OpenAI ahorra ~1 millón de minutos de cómputo por semana desde que migró Codex.</li>
+  <li><strong><code>uv run</code> sincroniza antes de ejecutar</strong>: se termina el <code>activate</code> y se termina la clase de bugs del venv equivocado.</li>
+  <li>El <strong><code>uv.lock</code> es universal</strong> — cubre plataformas y versiones de Python. Un <code>requirements.txt</code> con <code>==</code> <em>no</em> es reproducible: no pinea transitivos y es una foto de una sola máquina.</li>
+  <li><strong>PEP 723</strong> deja que un <code>.py</code> declare sus dependencias adentro. <code>uv run script.py</code> resuelve solo: un archivo autocontenido, sin README ni venv.</li>
+  <li><strong>ruff</strong> reemplaza a black + flake8 + isort + pyupgrade y 15 herramientas más. Adoptalo conservador (equivalente a lo que ya tenías), y aislá el commit de formateo con <code>.git-blame-ignore-revs</code>.</li>
+  <li><strong>ty</strong> es rapidísimo pero joven: hoy va como job informativo, con mypy o pyright como gate real. Y ruff <strong>no</strong> reemplaza al type-checker.</li>
+  <li>En CI: <code>uv sync --frozen</code> + <code>uv lock --check</code>. Sin <code>--frozen</code>, uv re-resuelve en silencio y tu pipeline testea algo que no está commiteado.</li>
+  <li>Sé honesto sobre cuándo <em>no</em> migrar: pip sigue bien para scripts chicos y entornos corporativos cerrados; poetry sigue bien en proyectos estables donde la migración no paga. Y verificá la salida de emergencia (<code>uv export</code>) <em>antes</em> de adoptar.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instalá uv y cronometrá con <code>time</code> la creación de un entorno con 20 dependencias reales, primero con <code>python -m venv</code> + <code>pip install</code> y después con <code>uv sync</code>. Repetí cada uno dos veces (frío y con caché) y armá una tabla con tus cuatro números.</li>
+  <li>Escribí un script de una sola pieza con bloque PEP 723 que consulte una API pública y muestre el resultado en una tabla de <code>rich</code>. Verificá que corre con <code>uv run</code> en una máquina donde esas librerías no están instaladas.</li>
+  <li>Tomá un proyecto tuyo con <code>requirements.txt</code> y hacé el Paso 0 y el Paso 2 del Worked Example: capturá la línea de base, migrá a uv y producí el diff clasificado. Escribí qué categoría es cada línea.</li>
+  <li>Configurá ruff en ese proyecto empezando por <code>select = ["E4","E7","E9","F","I","B"]</code>. Corré <code>ruff check --statistics</code>, elegí <strong>un</strong> prefijo nuevo (<code>UP</code>, <code>SIM</code> o <code>C4</code>), arreglá todo lo que reporte y medí cuántos archivos tocó.</li>
+  <li>Armá un workspace de uv con dos paquetes donde uno importe al otro, y provocá a propósito un conflicto de versiones entre ambos. Documentá el mensaje de error de uv y cómo lo resolviste.</li>
+  <li>Escribí el workflow de CI de PS6.10 para un repo tuyo, con la matriz de tres versiones de Python y el job informativo de <code>ty</code>. Anotá el tiempo total antes y después de activar <code>enable-cache</code>.</li>
+  <li>Empaquetá una librería chica con <code>uv build</code>, publicala en <strong>TestPyPI</strong> y instalala desde ahí en un entorno limpio con <code>uvx</code>. Verificá que el entry point de <code>[project.scripts]</code> funciona.</li>
+  <li>Probá la salida de emergencia: en un proyecto ya migrado a uv, generá <code>requirements.txt</code> con <code>uv export</code> e instalalo con pip en un venv limpio. ¿El conjunto resultante coincide con el que da <code>uv sync</code>? Explicá cualquier diferencia.</li>
+</ol>
+
+<section class="quiz" id="quizPS6">
+  <style>
+    #quizPS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS6 .q{margin-bottom:1.5rem}
+    #quizPS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS6 .opt:hover{border-color:var(--accent)}
+    #quizPS6 .opt:disabled{cursor:default}
+    #quizPS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS6 .exp.show{display:block}
+    #quizPS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu CI corre <code>uv sync</code> a secas. Alguien abre un PR que agrega una dependencia al <code>pyproject.toml</code> pero se olvida de commitear el <code>uv.lock</code> actualizado. ¿Qué pasa?</p>
+    <button class="opt">El pipeline falla con un error claro de lockfile desactualizado</button>
+    <button class="opt">uv ignora el <code>pyproject.toml</code> y usa solo el lock viejo, así que el test de la feature nueva falla</button>
+    <button class="opt">uv re-resuelve en silencio y el pipeline pasa en verde testeando un conjunto de paquetes que no está commiteado en ningún lado</button>
+    <div class="exp">Este es el anti-patrón que anula toda la reproducibilidad. Sin <code>--frozen</code>, <code>uv sync</code> actualiza el lock sobre la marcha y el CI valida algo que después nadie va a poder reconstruir — el lock que se despliega es distinto del que se testeó. La forma correcta en CI es <code>uv sync --frozen</code> (falla si el lock no está al día) y, si querés el mensaje explícito, además <code>uv lock --check</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás migrando de <code>requirements.txt</code> a uv. Los 312 tests pasan y el diff entre el <code>pip freeze</code> viejo y el <code>uv export</code> nuevo muestra que dos paquetes <strong>desaparecieron</strong>. ¿Cuál es la lectura correcta?</p>
+    <button class="opt">Hay que investigar los dos antes de mergear: puede ser un extra que se perdió al importar, y eso rompe en producción sin que ningún test lo toque</button>
+    <button class="opt">Es normal, uv limpia dependencias innecesarias — si los tests pasan, se mergea</button>
+    <button class="opt">Da igual, el lockfile va a volver a agregarlos en el primer <code>uv sync</code> del deploy</button>
+    <div class="exp">Un paquete que estaba y ya no está es la categoría peligrosa del diff. El caso típico es un extra perdido —<code>psycopg[binary]</code> importado como <code>psycopg</code>— que hace que la app arranque perfecto y explote al abrir la primera conexión real. Los tests con SQLite o con mocks nunca ejercitan ese camino. La regla es mergear con diff vacío, o con cada línea clasificada y explicada en el PR.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu proyecto tiene <code>ruff check</code> y <code>ruff format --check</code> en verde en CI, con <code>select = ["ALL"]</code>. ¿Qué garantía te da eso sobre los tipos?</p>
+    <button class="opt">Ninguna, porque <code>select = ["ALL"]</code> desactiva el chequeo de tipos</button>
+    <button class="opt">Ninguna: ruff analiza archivo por archivo y no construye un modelo de tipos entre módulos — eso lo hacen mypy, pyright o ty</button>
+    <button class="opt">Total, si además tenés las reglas <code>ANN</code> activadas, que verifican las anotaciones</button>
+    <div class="exp">ruff es un linter, no un type-checker: encuentra imports sin usar, sintaxis vieja y patrones riesgosos dentro de un archivo, pero no resuelve tipos a través de módulos y por eso no puede detectar que le pasás un <code>str</code> a una función que espera un <code>Path</code> definida en otro paquete. Las reglas <code>ANN</code> solo verifican que las anotaciones <em>existan</em>, no que sean correctas. Un CI serio corre ruff <strong>y</strong> un type-checker como gate aparte.</div>
+  </div>
+
+  <div class="score" id="scorePS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps5-typing-avanzado/lecture.html">← PS5: Typing avanzado</a>
+  <a href="../ps7-testing-serio/lecture.html">PS7: Testing serio →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS1 — CPython por dentro: objetos, GIL y free-threading · Python Senior</title>
+  <meta name="description" content="Cómo representa CPython un objeto, refcounting y GC de ciclos, del código al bytecode, qué protege realmente el GIL, free-threading oficial desde 3.14 (PEP 779) y el JIT experimental.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS1</span>
+  <span class="badge">⏱ 15–50 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Python M00–M13</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>PS1 — CPython por dentro: objetos, GIL y free-threading</h1>
+
+<h2>PS1.0 Por qué este módulo</h2>
+
+<p>Hasta acá usaste Python. Desde acá vas a entender <strong>por qué se comporta como se comporta</strong>. Esa diferencia aparece el día que tenés que explicar por qué un <code>for</code> en Python es 50 veces más lento que en C, por qué agregar hilos no aceleró nada, o por qué una lista de un millón de enteros come 40 MB en vez de 8.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todas las rarezas de rendimiento de Python se explican con tres hechos: <strong>(1)</strong> todo valor es un objeto con header en el heap, <strong>(2)</strong> la memoria se administra con conteo de referencias, y <strong>(3)</strong> ese conteo tenía que ser seguro entre hilos, y la forma barata de lograrlo fue un candado global. Entendé esos tres y el resto se deduce.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>: el punto (3) dejó de ser una verdad absoluta. Desde <strong>Python 3.14</strong>, gracias al <strong>PEP 779</strong>, el build sin GIL pasó de experimental a <strong>oficialmente soportado</strong>. Lo que aprendiste sobre concurrencia en Python está cambiando debajo de tus pies, y conviene saber exactamente qué cambia y qué no.</p>
+
+<h2>PS1.1 Todo es un objeto: el header que pagás siempre</h2>
+
+<p>En C, un <code>int</code> son 4 bytes en el stack. En CPython, un entero es una estructura en el heap con un encabezado. Todo objeto arranca con, como mínimo, un contador de referencias y un puntero a su tipo:</p>
+
+<pre><code class="lang-c">// Objects/object.h, simplificado
+typedef struct _object {
+    Py_ssize_t ob_refcnt;      // cuántos apuntan a esto
+    PyTypeObject *ob_type;     // de qué tipo es
+} PyObject;</code></pre>
+
+<p>Podés verlo desde Python:</p>
+
+<pre><code class="lang-python">import sys
+
+sys.getsizeof(0)          # 28  bytes — un cero "vacío" ya pesa 28
+sys.getsizeof(2**30)      # 32
+sys.getsizeof(2**300)     # 68  — los enteros son de precisión arbitraria
+sys.getsizeof([])         # 56  — una lista vacía
+sys.getsizeof([0] * 1000) # 8056 — 8 bytes por puntero, más el header</code></pre>
+
+<div class="rule">
+  <strong>📌 Una lista de enteros no guarda enteros: guarda punteros a objetos entero.</strong> <code>[0]*1000</code> ocupa ~8 KB de punteros, y además existe en algún lado el objeto <code>0</code>. Por eso un <code>array.array</code> o un <code>numpy.ndarray</code> —que guardan los valores <em>crudos</em>, contiguos— usan una fracción de la memoria y permiten que la CPU aproveche la caché.
+</div>
+
+<pre><code class="lang-python">import array, sys
+lista = [i for i in range(1000)]
+arr   = array.array("q", range(1000))   # enteros de 64 bits, contiguos
+
+sys.getsizeof(lista)   # 8856  + 1000 objetos int aparte
+sys.getsizeof(arr)     # 8064  y nada más: los valores están adentro</code></pre>
+
+<div class="info">
+  CPython <strong>internea</strong> (cachea) los enteros chicos, de −5 a 256, y muchos strings que parecen identificadores. Por eso <code>a = 256; b = 256; a is b</code> da <code>True</code> pero con <code>257</code> da <code>False</code>. Es un detalle de implementación, no del lenguaje: <strong>nunca</strong> escribas lógica que dependa de eso.
+</div>
+
+<h2>PS1.2 Reference counting y el recolector de ciclos</h2>
+
+<p>CPython libera memoria en el instante en que el contador llega a cero. Es determinista y de baja latencia — a diferencia de la JVM o Go, que tienen un GC que corre cuando quiere.</p>
+
+<pre><code class="lang-python">import sys
+
+x = object()
+sys.getrefcount(x)   # 2: la variable x, y el argumento temporal de la llamada
+y = x
+sys.getrefcount(x)   # 3
+del y
+sys.getrefcount(x)   # 2</code></pre>
+
+<p>El problema del refcounting puro son los <strong>ciclos</strong>: dos objetos que se apuntan entre sí nunca bajan a cero, aunque nadie más los referencie. Para eso existe el módulo <code>gc</code>, un recolector generacional que solo busca ciclos:</p>
+
+<pre><code class="lang-python">import gc
+
+class Nodo:
+    def __init__(self): self.otro = None
+
+a, b = Nodo(), Nodo()
+a.otro = b
+b.otro = a          # ciclo: refcount de ambos nunca llega a 0
+del a, b            # inalcanzables, pero NO liberados todavía
+
+gc.collect()        # devuelve la cantidad de objetos liberados</code></pre>
+
+<div class="mistake">
+  <strong>Consecuencia práctica:</strong> si tu clase tiene <code>__del__</code> y participa de un ciclo, el orden de finalización queda en manos del GC y puede tardar. Por eso <strong>los recursos se liberan con context managers</strong> (<code>with</code>), no con <code>__del__</code>. Un <code>__del__</code> nunca es una garantía de cuándo.
+</div>
+
+<h3>Cuándo apagar el GC (y por qué casi nunca)</h3>
+
+<p>En procesos de vida corta que crean muchos objetos y terminan —un script de ETL, un job por lote— apagar el recolector de ciclos puede dar unos puntos de rendimiento. Es una optimización real y medible, y también una forma fácil de crear una fuga si el proceso pasa a ser de vida larga:</p>
+
+<pre><code class="lang-python">import gc, time
+
+def medir(fn):
+    t0 = time.perf_counter(); fn(); return time.perf_counter() - t0
+
+def carga():
+    for _ in range(200_000):
+        {"a": [1, 2, 3], "b": {"c": 4}}
+
+con_gc = medir(carga)
+gc.disable()
+sin_gc = medir(carga)
+gc.enable()
+print(f"con GC {con_gc:.3f}s · sin GC {sin_gc:.3f}s · {con_gc/sin_gc:.2f}x")</code></pre>
+
+<div class="warn">
+  <strong>Medí en TU carga antes de creer cualquier número.</strong> La ganancia depende por completo de cuántos objetos con ciclos generás. En muchos programas la diferencia es ruido, y el riesgo de olvidarte el <code>gc.disable()</code> puesto es permanente.
+</div>
+
+<h2>PS1.3 Del código al bytecode</h2>
+
+<p>Python compila a bytecode y lo ejecuta en una máquina virtual de pila. <code>dis</code> te deja verlo, y es la herramienta que convierte discusiones de rendimiento en hechos:</p>
+
+<pre><code class="lang-python">import dis
+
+def suma_lenta(xs):
+    total = 0
+    for x in xs:
+        total = total + x
+    return total
+
+dis.dis(suma_lenta)</code></pre>
+
+<p>Comparando dos formas de escribir lo mismo, el bytecode te muestra el costo real:</p>
+
+<pre><code class="lang-python">import dis
+
+def con_punto(s):     # busca el atributo en CADA iteración
+    r = []
+    for x in s:
+        r.append(x)
+    return r
+
+def sin_punto(s):     # resuelve el método UNA vez
+    r = []
+    add = r.append
+    for x in s:
+        add(x)
+    return r
+
+dis.dis(con_punto)    # vas a ver LOAD_METHOD dentro del loop
+dis.dis(sin_punto)    # el LOAD_METHOD salió del loop</code></pre>
+
+<div class="tip">
+  Ese truco (<em>method hoisting</em>) era un clásico de optimización. Los intérpretes modernos lo mitigan bastante, así que <strong>hoy se usa más para leer bytecode que para optimizar</strong>. La lección que sí sirve: en Python, cada punto es una búsqueda en un diccionario, y los loops calientes pagan esa búsqueda por iteración.
+</div>
+
+<h2>PS1.4 El GIL: qué protege realmente</h2>
+
+<p>El <strong>Global Interpreter Lock</strong> es un mutex único por intérprete que garantiza que <strong>un solo hilo ejecuta bytecode a la vez</strong>. No existe para hacerte la vida difícil: existe porque el refcounting de PS1.2 no es atómico, y ponerle un candado a cada objeto sería más lento que un candado global.</p>
+
+<table>
+<thead><tr><th>Escenario</th><th>¿Los hilos ayudan?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><strong>CPU-bound</strong> (cálculo puro)</td><td>❌ No, y a veces empeora</td><td>Solo uno corre bytecode; se suma el costo de cambiar de contexto</td></tr>
+<tr><td><strong>I/O-bound</strong> (red, disco)</td><td>✅ Sí, mucho</td><td>El GIL <strong>se libera</strong> durante la espera de I/O</td></tr>
+<tr><td><strong>NumPy / C extensions</strong></td><td>✅ Sí</td><td>La extensión libera el GIL mientras hace su trabajo en C</td></tr>
+</tbody>
+</table>
+
+<p>Se comprueba en treinta segundos:</p>
+
+<pre><code class="lang-python">import time, threading
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+def cpu(n=8_000_000):
+    x = 0
+    for i in range(n): x += i
+    return x
+
+def cronometrar(nombre, fn):
+    t0 = time.perf_counter(); fn(); print(f"{nombre}: {time.perf_counter()-t0:.2f}s")
+
+cronometrar("secuencial x4", lambda: [cpu() for _ in range(4)])
+cronometrar("4 hilos     ", lambda: list(ThreadPoolExecutor(4).map(lambda _: cpu(), range(4))))
+cronometrar("4 procesos  ", lambda: list(ProcessPoolExecutor(4).map(cpu, [8_000_000]*4)))</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla clásica:</strong> CPU-bound → procesos (<code>ProcessPoolExecutor</code>). I/O-bound → hilos o <code>asyncio</code> (PS3). Esa regla fue verdad durante 30 años. En 3.14 dejó de ser toda la verdad.
+</div>
+
+<h2>PS1.5 Free-threading: el GIL dejó de ser obligatorio</h2>
+
+<div class="concept">
+  <strong>💡 Lo que cambió.</strong> Desde Python 3.13 existe un build alternativo con el GIL desactivado. Con el <strong>PEP 779</strong>, en <strong>Python 3.14</strong> ese build pasó de <em>experimental</em> a <strong>oficialmente soportado</strong>. No es el build por defecto todavía, pero ya no es un juguete: es una configuración con la que se puede ir a producción.
+</div>
+
+<p>Se instala y se usa como un intérprete aparte — la <code>t</code> es de <em>threaded</em>:</p>
+
+<pre><code class="lang-bash"># Con uv (ver PS6), el free-threaded se pide explícitamente
+uv python install 3.14t
+uv run --python 3.14t python -c "import sys; print(sys._is_gil_enabled())"
+# False  -> estás corriendo sin GIL
+
+python3.14t -VV        # el build lo dice en la versión</code></pre>
+
+<pre><code class="lang-python">import sys, sysconfig
+
+# ¿Este intérprete puede correr sin GIL?
+sysconfig.get_config_var("Py_GIL_DISABLED")   # 1 en el build free-threaded
+sys._is_gil_enabled()                          # False si está realmente apagado</code></pre>
+
+<h3>Qué ganás y qué pagás</h3>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Estado en 3.14</th></tr></thead>
+<tbody>
+<tr><td>Paralelismo real con hilos</td><td>✅ Sí: el código CPU-bound escala con los núcleos</td></tr>
+<tr><td>Penalidad en un solo hilo</td><td>~5–10% más lento que el build normal</td></tr>
+<tr><td>Código Python puro</td><td>Corre sin cambios en la enorme mayoría de los casos</td></tr>
+<tr><td>Extensiones en C</td><td>⚠️ Deben declararse compatibles; si no, <strong>el intérprete vuelve a activar el GIL</strong></td></tr>
+<tr><td>Biblioteca estándar</td><td>Soporte prácticamente completo</td></tr>
+<tr><td>Ecosistema de terceros</td><td>Mixto: hay librerías listas y otras atrasadas</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El error que te va a morder.</strong> Correr con el build free-threaded <strong>no garantiza</strong> que estés sin GIL. Si importás una extensión C que no se declaró compatible, CPython <strong>vuelve a habilitar el GIL en caliente</strong> y tu paralelismo desaparece — sin error, sin warning visible. Por eso el <code>sys._is_gil_enabled()</code> del ejemplo no es curiosidad: es una verificación que va en el arranque de tu app, o en un test.
+</div>
+
+<pre><code class="lang-python"># Verificación defensiva al iniciar un servicio que DEPENDE del paralelismo real
+import sys, logging
+
+def exigir_free_threading():
+    if not hasattr(sys, "_is_gil_enabled"):
+        raise RuntimeError("Se requiere Python 3.13+ para free-threading")
+    if sys._is_gil_enabled():
+        raise RuntimeError(
+            "El GIL está activo. Alguna extensión C lo reactivó: "
+            "revisá las dependencias nativas antes de asumir paralelismo."
+        )
+    logging.info("free-threading activo: %d núcleos disponibles", __import__("os").cpu_count())</code></pre>
+
+<div class="mistake">
+  <strong>Sin GIL, tu código Python deja de ser accidentalmente seguro.</strong> Muchas operaciones que parecían atómicas lo eran <em>por efecto lateral</em> del GIL. Un <code>contador += 1</code> desde varios hilos siempre estuvo mal, pero muchas veces "funcionaba". Sin GIL, la carrera aparece de verdad. La corrección es la de siempre: <code>threading.Lock</code>, estructuras inmutables, o no compartir estado.
+</div>
+
+<h2>PS1.6 El JIT experimental</h2>
+
+<p>La otra pieza que llegó con 3.13–3.14 es un compilador JIT (<em>copy-and-patch</em>) que traduce bytecode caliente a código máquina. Sigue siendo <strong>experimental</strong> y hay que habilitarlo explícitamente al compilar el intérprete.</p>
+
+<div class="info">
+  Hoy las ganancias del JIT son modestas y muy dependientes de la carga. Su valor real es estructural: por primera vez CPython tiene la infraestructura para optimizar en tiempo de ejecución, y eso es lo que va a mover la aguja en las próximas versiones. <strong>No diseñes nada asumiendo que el JIT te va a salvar</strong> — todavía no.
+</div>
+
+<h2>PS1.7 Cuándo esto te importa de verdad</h2>
+
+<p>Saber internals no sirve para escribir código más raro. Sirve para <strong>tomar tres o cuatro decisiones</strong> que después no se pueden revertir barato:</p>
+
+<div class="step"><strong>1. Elegir el modelo de concurrencia.</strong> I/O masivo → <code>asyncio</code>. CPU con librerías nativas (NumPy, Polars) → hilos, que ya escalan. CPU en Python puro → procesos, o free-threading si tus dependencias lo soportan y lo verificaste.</div>
+
+<div class="step"><strong>2. Elegir la estructura de datos.</strong> Millones de números homogéneos nunca van en una <code>list</code>: van en <code>array</code>, NumPy o Polars. La diferencia no es 20%, son órdenes de magnitud en memoria y en caché.</div>
+
+<div class="step"><strong>3. Saber cuándo salir de Python.</strong> Si el perfil dice que el 80% del tiempo está en un loop numérico tuyo, ninguna micro-optimización de Python lo va a arreglar. Ahí se vectoriza, o se baja a una extensión nativa (PS8).</div>
+
+<div class="step"><strong>4. Saber cuándo NO optimizar.</strong> Si el 95% del tiempo lo pasás esperando a la base de datos, el intérprete es irrelevante. Esto es lo más frecuente, y lo que más se ignora.</div>
+
+<h2>🧑‍🎓 Worked Example — "el servicio no escala con más hilos"</h2>
+
+<blockquote>Un servicio procesa documentos: los baja de S3, extrae texto y calcula un hash de contenido. Con 1 hilo tarda 40 s por lote. Alguien sube a 8 hilos y ahora tarda 38 s. Pregunta: ¿qué pasó?</blockquote>
+
+<p><strong>Paso 1 — No adivinar: medir dónde se va el tiempo.</strong></p>
+
+<pre><code class="lang-bash"># py-spy perfila un proceso EN PRODUCCIÓN sin reiniciarlo ni instrumentarlo
+uv tool install py-spy
+py-spy top --pid 12345
+py-spy record --pid 12345 --duration 30 --output perfil.svg</code></pre>
+
+<p><strong>Paso 2 — Leer el resultado.</strong> El flamegraph muestra 15% en <code>socket.recv</code> (I/O, libera el GIL) y <strong>78% en la función de extracción de texto</strong>, que es Python puro. Ahí está la respuesta: la carga es CPU-bound, no I/O-bound. Los 8 hilos se pelean por el mismo GIL y encima pagan cambios de contexto.</p>
+
+<p><strong>Paso 3 — Las opciones, con su costo.</strong></p>
+
+<table>
+<thead><tr><th>Opción</th><th>Ganancia esperada</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><code>ProcessPoolExecutor</code></td><td>~N núcleos</td><td>Serializar datos entre procesos; memoria × N</td></tr>
+<tr><td>Free-threading (3.14t)</td><td>~N núcleos, sin serializar</td><td>Verificar TODAS las dependencias nativas</td></tr>
+<tr><td>Reemplazar la extracción por una librería nativa</td><td>Puede ser 10×</td><td>Cambiar dependencia; revalidar resultados</td></tr>
+<tr><td>Vectorizar el hash con <code>hashlib</code> sobre buffers</td><td>Marginal acá</td><td>Bajo</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 4 — Decidir y verificar.</strong> Se elige procesos porque una dependencia nativa todavía no es compatible con free-threading. Y —esto es lo que separa el trabajo senior— se deja el chequeo escrito para que la decisión no se degrade sola:</p>
+
+<pre><code class="lang-python">import sys, pytest
+
+@pytest.mark.skipif(sys._is_gil_enabled(), reason="build con GIL: paralelismo por procesos")
+def test_free_threading_disponible():
+    """Cuando la dependencia nativa se actualice, este test empieza a correr
+    y nos avisa que ya podemos volver a hilos y ahorrar la serialización."""
+    assert not sys._is_gil_enabled()</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá procesos".</strong> Es que <em>hilos</em> vs <em>procesos</em> vs <em>async</em> no se decide por costumbre: se decide mirando un perfil. Y que cada decisión así merece dejar una prueba o una nota que explique por qué, porque dentro de seis meses el motivo ya no va a ser obvio.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué el GIL existe si "solo trae problemas"?</summary>
+<p>Porque la administración de memoria de CPython es por conteo de referencias, y ese contador se toca en cada asignación, cada paso de un loop y cada llamada. Hacerlo seguro entre hilos requiere sincronización: un candado por objeto significaría millones de operaciones atómicas por segundo, y el resultado medido es que el intérprete de un solo hilo se vuelve más lento. El GIL fue el intercambio pragmático: se penaliza el caso multi-hilo CPU-bound (raro en 1992) para no penalizar el caso de un hilo (el 99%). Free-threading finalmente paga ese costo —5–10% en un hilo— porque los núcleos de hoy hacen que valga la pena.</p></details>
+
+<details><summary>Estás en el build free-threaded y tu código sigue sin escalar. ¿Qué revisás primero?</summary>
+<p><code>sys._is_gil_enabled()</code>. Si devuelve <code>True</code>, alguna extensión C que importaste no se declaró compatible y CPython reactivó el GIL en caliente, sin error visible. Recién si el GIL está realmente apagado tiene sentido buscar la causa en otro lado: contención de un <code>Lock</code> propio, trabajo que en realidad es I/O, o falso compartido de caché.</p></details>
+
+<details><summary>¿Por qué una lista de un millón de enteros usa mucha más memoria que un array del mismo tamaño?</summary>
+<p>Porque la lista guarda <strong>punteros</strong> (8 bytes cada uno) a objetos <code>int</code> que viven aparte en el heap, y cada uno de esos objetos tiene su propio header con refcount y tipo — 28 bytes o más. El <code>array.array</code> y NumPy guardan los valores crudos y contiguos: 8 bytes por número y nada más. Además de la memoria, la diferencia grande es la localidad: recorrer memoria contigua aprovecha la caché de la CPU, mientras que seguir punteros dispersos la desperdicia.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Todo valor es un objeto en el heap con header: por eso Python pesa y por eso los tipos nativos contiguos ganan por órdenes de magnitud.</li>
+  <li>La memoria se libera por <strong>refcounting</strong> (determinista) más un <strong>GC de ciclos</strong>. Los recursos se cierran con <code>with</code>, nunca con <code>__del__</code>.</li>
+  <li>El <strong>GIL</strong> existe para proteger ese refcounting. Limita solo el CPU-bound en Python puro; el I/O y las extensiones nativas ya escalaban.</li>
+  <li><strong>PEP 779</strong>: free-threading es <strong>oficialmente soportado en 3.14</strong>. Cuesta 5–10% en un hilo y exige que las extensiones C sean compatibles — verificalo con <code>sys._is_gil_enabled()</code>, porque el fallback es silencioso.</li>
+  <li>Sin GIL, las carreras que "funcionaban de casualidad" dejan de funcionar. Lo que siempre estuvo mal, ahora se rompe.</li>
+  <li>El <strong>JIT</strong> es experimental: importante por lo que habilita a futuro, no por lo que rinde hoy.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Medí con <code>sys.getsizeof</code> una <code>list</code>, un <code>array.array</code> y un <code>numpy.ndarray</code> de 100.000 enteros. Calculá bytes por elemento en cada caso y explicá la diferencia.</li>
+  <li>Escribí una clase con <code>__del__</code> que participe de un ciclo. Comprobá que no se libera hasta el <code>gc.collect()</code>. Después reescribila con un context manager y mostrá que el recurso se cierra a tiempo.</li>
+  <li>Usá <code>dis</code> sobre dos versiones de la misma función (con y sin <em>method hoisting</em>) y cronometrá ambas con <code>timeit</code>. ¿La diferencia de bytecode se traduce en diferencia de tiempo medible?</li>
+  <li>Reproducí el experimento de PS1.4 con las tres estrategias y armá una tabla con tus números reales, no con los del módulo.</li>
+  <li>Instalá <code>3.14t</code> con <code>uv</code> y corré el mismo experimento CPU-bound con hilos. Verificá antes con <code>sys._is_gil_enabled()</code> que el GIL esté realmente apagado.</li>
+  <li>Escribí un contador compartido entre 8 hilos sin candado y corrélo en los dos builds. Documentá qué pasa en cada uno y por qué.</li>
+  <li>Perfilá con <code>py-spy</code> cualquier script tuyo que tarde más de 10 segundos y determiná, con evidencia, si es CPU-bound o I/O-bound.</li>
+</ol>
+
+<section class="quiz" id="quizPS1">
+  <style>
+    #quizPS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS1 .q{margin-bottom:1.5rem}
+    #quizPS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS1 .opt:hover{border-color:var(--accent)}
+    #quizPS1 .opt:disabled{cursor:default}
+    #quizPS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS1 .exp.show{display:block}
+    #quizPS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Corrés tu servicio con <code>python3.14t</code> y el trabajo CPU-bound sigue sin escalar con hilos. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">El free-threading solo acelera I/O, no CPU</button>
+    <button class="opt">Una extensión C no compatible hizo que CPython reactivara el GIL en caliente</button>
+    <button class="opt">Hay que habilitar además el JIT para que los hilos funcionen</button>
+    <div class="exp">Es el fallback silencioso: si una extensión nativa no se declara compatible con free-threading, el intérprete vuelve a activar el GIL sin emitir un error visible. Se confirma en un segundo con <code>sys._is_gil_enabled()</code> — por eso conviene dejar esa verificación en el arranque del servicio, no descubrirlo perfilando.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Por qué se recomienda cerrar recursos con <code>with</code> y no con <code>__del__</code>?</p>
+    <button class="opt">Porque <code>__del__</code> no existe en Python 3</button>
+    <button class="opt">Porque <code>with</code> es más corto de escribir</button>
+    <button class="opt">Porque si el objeto queda en un ciclo, su finalización depende del GC y no hay garantía de cuándo ocurre</button>
+    <div class="exp">El refcounting libera en el acto <em>solo</em> cuando no hay ciclos. Dentro de un ciclo, el objeto lo recoge el GC generacional cuando le toca, así que un <code>__del__</code> que cierra un archivo o una conexión puede ejecutarse mucho después — o competir con el apagado del intérprete. El <code>with</code> hace el cierre determinista y explícito.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. El 95% del tiempo de tu servicio se va esperando respuestas de la base de datos. ¿Qué esperás ganar pasándolo al build free-threaded?</p>
+    <button class="opt">Prácticamente nada: el GIL ya se libera durante la espera de I/O</button>
+    <button class="opt">Un 8× en un servidor de 8 núcleos</button>
+    <button class="opt">Una mejora grande, porque el GIL es el cuello de botella de toda app Python</button>
+    <div class="exp">El GIL nunca fue el problema en cargas de I/O: se libera mientras el hilo espera, así que los hilos ya escalaban ahí. Free-threading resuelve el caso CPU-bound en Python puro. Encima pagarías la penalidad de 5–10% en un solo hilo a cambio de nada. Es el ejemplo de manual de optimizar donde no está el tiempo.</div>
+  </div>
+
+  <div class="score" id="scorePS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../ps2-memoria-performance/lecture.html">PS2: Memoria y performance →</a>
+</nav>
+
+</div>
+</body>
+</html>

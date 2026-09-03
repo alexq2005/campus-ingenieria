@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS5 — Redes a fondo: el stack, nftables y diagnóstico · Linux Senior</title>
+  <meta name="description" content="El camino de un paquete por el kernel, colas de accept y buffers de socket, TCP donde importa (BBR, TIME_WAIT, keepalive), nftables, conntrack, namespaces de red, herramientas de diagnóstico, tuning real vs cargo cult y DNS como causa raíz.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS5</span>
+  <span class="badge">⏱ 35–110 min</span>
+  <span class="badge">🎯 Pre-req: LS1</span>
+  <span class="badge">🌐 Redes</span>
+</div>
+
+<article>
+
+<h1>LS5 — Redes a fondo: el stack, nftables y diagnóstico</h1>
+
+<h2>LS5.0 Por qué este módulo</h2>
+
+<p>«La red anda lenta» es, con distancia, la queja peor diagnosticada de la industria. Se dice cuando la app tarda, cuando el disco satura, cuando el garbage collector frena el mundo, cuando el DNS reintenta y —de vez en cuando— cuando efectivamente hay un problema de red. El costo de esa imprecisión es enorme: equipos enteros cambian de proveedor de nube por un problema que estaba en un <code>backlog</code> de 128.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Entre el cable y tu <code>read()</code> hay ocho o nueve tramos, cada uno con su cola, su límite y su contador. <strong>Diagnosticar una red es identificar en qué tramo se pierde el tiempo o se tiran paquetes</strong>, y en Linux cada tramo <em>ya está instrumentado</em>: hay un contador que te lo dice. La diferencia entre adivinar y saber son tres comandos.
+</div>
+
+<p>Este módulo no es un tour de comandos. Es el mapa del camino, los puntos donde se rompe, y cómo leer la evidencia que el kernel ya está guardando para vos.</p>
+
+<h2>LS5.1 El camino de un paquete por el kernel</h2>
+
+<p>Un paquete que entra por la placa hasta que tu proceso lo ve pasa por esto:</p>
+
+<pre><code>  RECEPCIÓN (RX)                                 EMISIÓN (TX)
+
+  cable                                          tu app
+    │                                              │  write() / send()
+    ▼                                              ▼
+ ┌──────────┐  DMA                          ┌──────────────┐
+ │   NIC    │──────► ring buffer RX         │ send buffer  │  ← wmem
+ └──────────┘                               │  del socket  │
+    │ IRQ (una vez)                         └──────────────┘
+    ▼                                              │  tcp_sendmsg
+ ┌──────────────────┐                              ▼
+ │ softirq NET_RX   │  NAPI: polling,        ┌──────────────┐
+ │ (por CPU)        │  GRO agrupa segmentos  │ TCP: cwnd,   │
+ └──────────────────┘                        │ rwnd, pacing │
+    │                                        └──────────────┘
+    ▼                                              │  GSO/TSO
+ ┌──────────────────┐                              ▼
+ │ tc ingress       │                        ┌──────────────┐
+ └──────────────────┘                        │ netfilter    │
+    │                                        │ output +     │
+    ▼                                        │ postrouting  │
+ ┌──────────────────┐                        └──────────────┘
+ │ netfilter        │  conntrack mira                │
+ │ prerouting       │  y clasifica                   ▼
+ └──────────────────┘                        ┌──────────────┐
+    │                                        │ qdisc        │  ← fq / fq_codel
+    ▼  decisión de ruteo                     │ (cola de TX) │
+ ┌──────────────────┐                        └──────────────┘
+ │ netfilter input  │  (o forward)                   │
+ └──────────────────┘                                ▼
+    │                                        ┌──────────────┐
+    ▼                                        │ ring buffer  │
+ ┌──────────────────┐                        │ TX + NIC     │
+ │ tcp_v4_rcv       │  reensambla,           └──────────────┘
+ │                  │  ACKea, ordena                 │
+ └──────────────────┘                                ▼
+    │                                              cable
+    ▼
+ ┌──────────────────┐
+ │ receive queue    │  ← rmem.  Acá se ve el Recv-Q
+ │   del socket     │
+ └──────────────────┘
+    │  el kernel despierta al proceso
+    ▼
+  tu app: read() / recv()</code></pre>
+
+<p>Cada caja de arriba es un lugar donde se puede perder tiempo o tirar paquetes, y cada una tiene su propio contador:</p>
+
+<table>
+<thead><tr><th>Tramo</th><th>Qué lo rompe</th><th>Cómo lo ves</th></tr></thead>
+<tbody>
+<tr><td>Ring buffer de la NIC</td><td>Ráfagas más rápidas que el softirq</td><td><code>ethtool -S eth0</code> → <code>rx_dropped</code>, <code>rx_no_buffer</code>; <code>ip -s link</code> → <code>overrun</code></td></tr>
+<tr><td>softirq NET_RX</td><td>Todo el tráfico cae en un solo core</td><td><code>/proc/softirqs</code>, <code>mpstat -P ALL</code> con <code>%soft</code> al 100 en una CPU</td></tr>
+<tr><td>Backlog del stack</td><td><code>netdev_max_backlog</code> chico con RPS</td><td><code>/proc/net/softnet_stat</code>, columna 2 (dropped)</td></tr>
+<tr><td>netfilter / conntrack</td><td>Tabla de conntrack llena</td><td><code>dmesg</code>: <em>nf_conntrack: table full</em>; <code>conntrack -S</code></td></tr>
+<tr><td>Cola de accept</td><td>Backlog chico y app lenta en <code>accept()</code></td><td><code>ss -ltn</code> (Recv-Q), <code>nstat</code> → <code>ListenOverflows</code></td></tr>
+<tr><td>Receive queue del socket</td><td>La app no lee rápido</td><td><code>ss -tn</code> con Recv-Q creciendo y estable</td></tr>
+<tr><td>Send queue / cwnd</td><td>Pérdida, ventana chica, receptor lento</td><td><code>ss -tin</code> → <code>retrans</code>, <code>cwnd</code>, <code>rtt</code></td></tr>
+<tr><td>qdisc de salida</td><td>Bufferbloat o shaping mal puesto</td><td><code>tc -s qdisc show dev eth0</code> → <code>drops</code>, <code>backlog</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla de oro del diagnóstico.</strong> Antes de tocar un sysctl, contestá <em>en qué tramo</em> está el problema. Un <code>Recv-Q</code> alto en el socket y un <code>Send-Q</code> en cero significan que la red entregó todo y <strong>la app es la lenta</strong>. Eso pasa muchísimo más seguido de lo que se admite.
+</div>
+
+<h2>LS5.2 Sockets y buffers: las colas que nadie mira</h2>
+
+<h3>Las dos colas de un listener</h3>
+
+<p>Cuando tu servidor hace <code>listen(fd, backlog)</code>, el kernel no crea una cola: crea <strong>dos</strong>.</p>
+
+<pre><code>  SYN entra
+     │
+     ▼
+ ┌───────────────────┐   se completa el handshake
+ │ SYN queue         │─────────────────────────────►┌──────────────────┐
+ │ (half-open)       │                              │ accept queue     │
+ │ tcp_max_syn_backlog│                             │ min(backlog,     │
+ └───────────────────┘                              │  somaxconn)      │
+   si se llena: syncookies                          └──────────────────┘
+                                                       si se llena:
+                                                       ListenOverflow
+                                                            │
+                                                            ▼
+                                                   tu app: accept()</code></pre>
+
+<pre><code class="lang-bash"># Los dos límites que importan
+sysctl net.core.somaxconn            # tope duro del accept queue
+sysctl net.ipv4.tcp_max_syn_backlog  # tope del SYN queue
+sysctl net.ipv4.tcp_syncookies       # 1 = defensa ante SYN flood</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> subir <code>somaxconn</code> a 65535 y no cambiar nada. <code>somaxconn</code> es un <em>techo</em>: el valor efectivo es <code>min(backlog_que_pidió_la_app, somaxconn)</code>. Si tu framework llama <code>listen(fd, 128)</code> —y muchísimos lo hacen hardcodeado—, subir el sysctl no hace absolutamente nada. Hay que cambiar <strong>los dos</strong>: el sysctl y el parámetro de la app (<code>backlog=</code> en gunicorn/uvicorn, <code>listen ... backlog=</code> en nginx, <code>SOMAXCONN</code> en Go vía <code>ListenConfig</code>).
+</div>
+
+<h3>Cómo se lee <code>ss</code> de verdad</h3>
+
+<p>Este es el detalle que separa a quien lee la salida de quien la entiende: <strong><code>Recv-Q</code> y <code>Send-Q</code> significan cosas distintas según el estado del socket.</strong></p>
+
+<pre><code class="lang-bash">ss -ltn        # listeners TCP, sin resolver nombres
+
+State   Recv-Q  Send-Q   Local Address:Port
+LISTEN  0       4096           0.0.0.0:443
+LISTEN  129     128            0.0.0.0:8080</code></pre>
+
+<table>
+<thead><tr><th>Estado</th><th><code>Recv-Q</code></th><th><code>Send-Q</code></th></tr></thead>
+<tbody>
+<tr><td><strong>LISTEN</strong></td><td>Conexiones <em>ya establecidas</em> esperando que la app haga <code>accept()</code></td><td>El <strong>máximo</strong> del accept queue (el backlog efectivo)</td></tr>
+<tr><td><strong>ESTABLISHED</strong></td><td>Bytes recibidos que la app todavía no leyó</td><td>Bytes enviados que el otro extremo todavía no ACKeó</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Leé otra vez la línea del puerto 8080:</strong> <code>Recv-Q 129</code> contra <code>Send-Q 128</code>. Ese listener está <strong>desbordado</strong>: hay más conexiones esperando <code>accept()</code> que capacidad de cola. Cada SYN nuevo que llegue se va a tirar en silencio, el cliente va a retransmitir, y en el log de la app no va a aparecer <em>nada</em>. Se ve como «latencia intermitente de red». No lo es.
+</div>
+
+<pre><code class="lang-bash"># La confirmación numérica: contadores del kernel, no impresiones
+nstat -az | grep -E 'ListenOverflows|ListenDrops|TCPBacklogDrop'
+# TcpExtListenOverflows   14832   0.0
+# TcpExtListenDrops       14832   0.0
+
+# nstat sin -a muestra el DELTA desde la última corrida: ideal para
+# ver si el contador se mueve AHORA o quedó de un incidente viejo
+nstat -n; sleep 10; nstat | grep -i listen</code></pre>
+
+<h3>Buffers de envío y recepción</h3>
+
+<p>Cada socket TCP tiene dos buffers en memoria de kernel. Linux los autoajusta entre un mínimo y un máximo:</p>
+
+<pre><code class="lang-bash">sysctl net.ipv4.tcp_rmem    # min  default  max  (recepción)
+sysctl net.ipv4.tcp_wmem    # min  default  max  (envío)
+sysctl net.core.rmem_max    # techo para SO_RCVBUF pedido a mano
+sysctl net.core.wmem_max</code></pre>
+
+<div class="concept">
+  <strong>💡 El número que decide todo: el BDP.</strong> El <em>bandwidth-delay product</em> es cuántos bytes caben «en vuelo» por el cable. <code>BDP = ancho_de_banda × RTT</code>. Para 1 Gbps con 100 ms de RTT: <code>125.000.000 B/s × 0,1 s ≈ 12,5 MB</code>. Si tu buffer máximo es 6 MB, <strong>físicamente no podés llenar ese enlace</strong>, por más que tengas banda de sobra. Ese es el único caso donde subir <code>rmem_max</code> es la respuesta correcta.
+</div>
+
+<div class="warn">
+  Y el reverso: en una LAN de datacenter con RTT de 0,2 ms, el BDP es de unos <strong>25 KB</strong>. Subir los buffers ahí no acelera nada y sí agrega latencia, porque hay más datos encolados esperando. Buffers grandes «por las dudas» son la receta del bufferbloat.
+</div>
+
+<h2>LS5.3 TCP donde importa</h2>
+
+<h3>Handshake y el costo de abrir</h3>
+
+<p>Abrir una conexión cuesta un RTT completo antes de mandar el primer byte útil; con TLS 1.3 se suma otro. Con 150 ms de RTT eso son 300 ms de puro protocolo. Por eso el <em>connection pooling</em> y el <code>keep-alive</code> de HTTP no son una optimización: son la diferencia entre una API usable y una lenta.</p>
+
+<pre><code class="lang-bash"># ss -tin te da las tripas de cada conexión establecida
+ss -tin dst 10.0.3.20
+
+ESTAB 0 0  10.0.1.5:44112  10.0.3.20:5432
+     cubic wscale:7,7 rto:204 rtt:3.2/1.1 mss:1448 cwnd:10
+     ssthresh:7 bytes_sent:1204882 bytes_acked:1204882
+     bytes_received:88231 segs_out:912 segs_in:844
+     retrans:0/3 rcv_rtt:4 rcv_space:14480</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Qué te dice</th></tr></thead>
+<tbody>
+<tr><td><code>rtt:3.2/1.1</code></td><td>RTT medio y su variación. Si varía mucho, hay encolamiento en el camino</td></tr>
+<tr><td><code>cwnd:10</code></td><td>Ventana de congestión en segmentos. Si se quedó en 10 (el inicial), algo la está frenando</td></tr>
+<tr><td><code>retrans:0/3</code></td><td>Retransmisiones actuales / totales. Distinto de cero sostenido = pérdida real</td></tr>
+<tr><td><code>ssthresh</code></td><td>Si bajó mucho, hubo un evento de congestión que recortó la ventana</td></tr>
+<tr><td><code>cubic</code> / <code>bbr</code></td><td>El algoritmo de congestión que está usando ESE socket</td></tr>
+</tbody>
+</table>
+
+<h3>Control de congestión: BBR contra cubic</h3>
+
+<p><strong>Cubic</strong> (el default de Linux) es <em>loss-based</em>: sube la ventana hasta que se pierde un paquete y ahí la recorta. Funciona genial cuando la pérdida <em>significa</em> congestión. <strong>BBR</strong> estima el ancho de banda disponible y el RTT mínimo, y manda a esa tasa: la pérdida esporádica no lo asusta.</p>
+
+<table>
+<thead><tr><th>Escenario</th><th>Elegí</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>WAN larga con pérdida leve (0,1–2%)</td><td><strong>BBR</strong></td><td>Cubic interpreta cada pérdida como congestión y se autolimita; puede quedar en 10× menos throughput</td></tr>
+<tr><td>Egress a internet / CDN / usuarios móviles</td><td><strong>BBR</strong></td><td>Mejora los percentiles altos de descarga en enlaces sucios</td></tr>
+<tr><td>LAN de datacenter, RTT sub-ms</td><td><strong>Cubic</strong></td><td>Ya satura el enlace; BBR no agrega nada y complica el diagnóstico</td></tr>
+<tr><td>Datacenter con soporte de ECN extremo a extremo</td><td><strong>DCTCP</strong></td><td>Diseñado exactamente para eso; latencia de cola mucho menor</td></tr>
+<tr><td>Enlace compartido con flujos cubic en un buffer chico</td><td><strong>Cuidado</strong></td><td>BBRv1 puede quedarse con una porción desproporcionada de la cola</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Qué hay disponible y qué está en uso
+sysctl net.ipv4.tcp_available_congestion_control
+sysctl net.ipv4.tcp_congestion_control
+
+# Activar BBR (y fq, que le da el pacing que BBR necesita)
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+# Persistirlo
+printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' \
+  | tee /etc/sysctl.d/99-bbr.conf
+sysctl --system</code></pre>
+
+<div class="tip">
+  El cambio afecta a las conexiones <strong>nuevas</strong>, no a las abiertas — no hace falta reiniciar nada, pero tampoco esperes ver el efecto instantáneo en un pool de conexiones persistentes. Y es un cambio del lado que <em>envía</em>: para acelerar descargas de tus usuarios, BBR va en tus servidores, no en los clientes.
+</div>
+
+<h3><code>TIME_WAIT</code>: por qué existe y por qué casi nunca es tu problema</h3>
+
+<p>El lado que <strong>cierra activamente</strong> la conexión queda 60 segundos en <code>TIME_WAIT</code> (en Linux es <code>TCP_TIMEWAIT_LEN</code>, compilado en el kernel: <em>no hay sysctl para bajarlo</em>). Existe por dos motivos concretos:</p>
+
+<div class="step"><strong>1. Que no se contamine la próxima encarnación.</strong> Si un segmento retrasado de la conexión vieja llega cuando ya se reusó la misma 4-tupla (IP origen, puerto origen, IP destino, puerto destino), se metería datos ajenos en una conexión nueva.</div>
+
+<div class="step"><strong>2. Que el ACK final llegue.</strong> Si el ACK del último FIN se pierde, el otro extremo retransmite el FIN. Alguien tiene que estar vivo para contestarle; si no, recibe un RST y registra un error que no existió.</div>
+
+<div class="mistake">
+  <strong>Ver 30.000 sockets en <code>TIME_WAIT</code> no es un problema.</strong> Cada uno pesa unos cientos de bytes de kernel: 30.000 son unos pocos MB. El problema real aparece solo en un caso específico: <strong>un cliente que abre miles de conexiones por segundo hacia el mismo par (IP, puerto) de destino</strong> y agota el rango de puertos efímeros. Ahí vas a ver <code>EADDRNOTAVAIL</code> en los logs, que es evidencia concreta — no un conteo de <code>ss</code> que te pareció alto.
+</div>
+
+<pre><code class="lang-bash"># El síntoma REAL, no el conteo
+nstat -az | grep -E 'TcpExtTW|TCPTimeWaitOverflow'
+ss -s                        # resumen por estado
+sysctl net.ipv4.ip_local_port_range   # rango efímero disponible
+
+# Si de verdad agotás puertos SALIENTES, esto es seguro:
+sysctl -w net.ipv4.tcp_tw_reuse=1     # reusa TIME_WAIT solo para conexiones
+                                       # salientes, protegido por timestamps</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>net.ipv4.tcp_tw_recycle</code> no existe más.</strong> Fue <strong>eliminado del kernel en 4.12</strong> porque rompía silenciosamente a cualquier cliente detrás de un NAT: descartaba paquetes de hosts distintos que compartían IP pública si sus timestamps no venían en orden. Si encontrás un tutorial que te lo recomienda, ese tutorial está desactualizado por casi una década — y probablemente el resto de sus consejos también. Y <code>tcp_fin_timeout</code>, el otro «arreglo» que circula, <strong>no toca <code>TIME_WAIT</code></strong>: controla <code>FIN_WAIT_2</code>.
+</div>
+
+<h3>Keepalive: el default que no sirve para nada</h3>
+
+<pre><code class="lang-bash">sysctl net.ipv4.tcp_keepalive_time    # 7200  segundos = 2 horas
+sysctl net.ipv4.tcp_keepalive_intvl   # 75
+sysctl net.ipv4.tcp_keepalive_probes  # 9</code></pre>
+
+<p>Con esos valores, un peer muerto se detecta a las <strong>dos horas y once minutos</strong>. Mientras tanto, cualquier firewall o NAT intermedio ya liberó su entrada de estado a los 5–15 minutos, así que tu conexión «viva» en realidad es un agujero negro. Es la causa número uno de pools de conexiones a base de datos que devuelven sockets zombis después de un rato de inactividad.</p>
+
+<div class="rule">
+  <strong>📌 El keepalive se configura por socket, no por sistema.</strong> <code>SO_KEEPALIVE</code> para activarlo, más <code>TCP_KEEPIDLE</code> / <code>TCP_KEEPINTVL</code> / <code>TCP_KEEPCNT</code> para los tiempos. Casi todos los drivers de base de datos y clientes HTTP lo exponen. Y para detectar peers muertos <em>con tráfico en vuelo</em>, la opción correcta suele ser <code>TCP_USER_TIMEOUT</code>: aborta si los datos no se ACKean en N milisegundos, sin depender de que haya sondas.
+</div>
+
+<h2>LS5.4 nftables: la sintaxis que reemplazó a iptables</h2>
+
+<p><code>nftables</code> unificó <code>iptables</code>, <code>ip6tables</code>, <code>arptables</code> y <code>ebtables</code> en un solo motor con un solo lenguaje. En cualquier distribución moderna, <code>iptables</code> es un <em>frontend de compatibilidad</em> que traduce a nftables por detrás (<code>iptables-nft</code>). Escribir reglas nuevas en la sintaxis vieja hoy es elegir la peor de las dos.</p>
+
+<h3>El modelo: familia → tabla → cadena → regla</h3>
+
+<pre><code>familia   ip · ip6 · inet (ambas) · arp · bridge · netdev
+  └─ tabla       contenedor con nombre, la creás vos
+      └─ cadena  se engancha a un hook con una prioridad y una política
+          └─ regla   expresiones + veredicto
+
+hooks (familia inet):
+  ingress → prerouting → ┬─ input  → proceso local → output ─┐
+                         └─ forward ────────────────────────┴→ postrouting</code></pre>
+
+<h3>Un firewall completo, con política DROP</h3>
+
+<pre><code class="lang-bash">#!/usr/sbin/nft -f
+# /etc/nftables.conf  — se aplica ATÓMICAMENTE: o entra todo, o no entra nada
+
+flush ruleset
+
+table inet filter {
+
+  # Sets: listas nombradas, con búsqueda O(1). No son 40 reglas seguidas.
+  set puertos_publicos {
+    type inet_service
+    elements = { 22, 80, 443 }
+  }
+
+  set admin_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { 10.0.0.0/8, 192.168.10.0/24 }
+  }
+
+  set escaneadores {
+    type ipv4_addr
+    flags dynamic, timeout
+    timeout 1h              # se vacía solo
+  }
+
+  chain entrada {
+    type filter hook input priority filter; policy drop;
+
+    # 1. Lo barato primero: estado de conexión
+    ct state established,related accept
+    ct state invalid drop
+
+    # 2. Loopback, siempre
+    iif lo accept
+
+    # 3. ICMP: NO lo bloquees entero. Path MTU discovery lo necesita.
+    ip protocol icmp icmp type { echo-request, destination-unreachable,
+                                 time-exceeded, parameter-problem } accept
+    ip6 nexthdr icmpv6 icmpv6 type { echo-request, nd-neighbor-solicit,
+                                     nd-neighbor-advert, nd-router-advert,
+                                     packet-too-big } accept
+
+    # 4. SSH solo desde la red de administración, con límite de intentos
+    tcp dport 22 ip saddr @admin_v4 ct state new \
+        limit rate 10/minute burst 5 packets accept
+    tcp dport 22 ip saddr @admin_v4 drop
+
+    # 5. Servicios públicos
+    tcp dport @puertos_publicos ct state new accept
+
+    # 6. Lo que sobra se registra con freno y cae por política
+    limit rate 5/minute log prefix "nft-drop-in " level info
+  }
+
+  chain reenvio {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related accept
+  }
+
+  chain salida {
+    type filter hook output priority filter; policy accept;
+  }
+}
+
+# NAT de salida en una tabla aparte
+table inet nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "eth0" masquerade
+  }
+}</code></pre>
+
+<pre><code class="lang-bash">nft -c -f /etc/nftables.conf    # -c = solo chequear sintaxis, NO aplicar
+nft -f /etc/nftables.conf       # aplicar (atómico)
+nft list ruleset                # ver todo lo cargado
+nft list ruleset | nft -f -     # recargar lo que hay (test de round-trip)
+
+# Contadores por regla: agregá "counter" a la regla y después
+nft -a list chain inet filter entrada   # -a muestra los handles
+
+# Depurar una regla que no entiende por qué no matchea
+nft add rule inet filter entrada tcp dport 8443 meta nftrace set 1
+nft monitor trace</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>policy drop</code> más SSH remoto es cómo se pierde una máquina.</strong> Si aplicás un ruleset con un error y tu sesión SSH muere, no hay vuelta atrás sin consola. El seguro se pone <em>antes</em>: <code>( sleep 300; nft flush ruleset ) &amp;</code> en una sesión aparte, o <code>systemd-run --on-active=5m nft flush ruleset</code>. Si la regla estaba bien, cancelás el temporizador; si no, en cinco minutos volvés a entrar.
+</div>
+
+<h3>Equivalencias iptables → nftables</h3>
+
+<table>
+<thead><tr><th>iptables</th><th>nftables</th></tr></thead>
+<tbody>
+<tr><td><code>-A INPUT -j ACCEPT</code></td><td><code>add rule inet filter input accept</code></td></tr>
+<tr><td><code>-p tcp --dport 443</code></td><td><code>tcp dport 443</code></td></tr>
+<tr><td><code>-s 10.0.0.0/8</code></td><td><code>ip saddr 10.0.0.0/8</code></td></tr>
+<tr><td><code>-i eth0</code> / <code>-o eth0</code></td><td><code>iifname "eth0"</code> / <code>oifname "eth0"</code></td></tr>
+<tr><td><code>-m conntrack --ctstate ESTABLISHED</code></td><td><code>ct state established</code></td></tr>
+<tr><td><code>-m multiport --dports 80,443</code></td><td><code>tcp dport { 80, 443 }</code></td></tr>
+<tr><td><code>-m limit --limit 5/min</code></td><td><code>limit rate 5/minute</code></td></tr>
+<tr><td><code>-j DNAT --to 10.0.0.5:8080</code></td><td><code>dnat to 10.0.0.5:8080</code></td></tr>
+<tr><td><code>-j MASQUERADE</code></td><td><code>masquerade</code></td></tr>
+<tr><td><code>-P INPUT DROP</code></td><td><code>policy drop;</code> en la definición de la cadena</td></tr>
+<tr><td><code>iptables-save</code> / <code>-restore</code></td><td><code>nft list ruleset</code> / <code>nft -f</code></td></tr>
+<tr><td>Reglas separadas para v4 y v6</td><td>Una sola, en la familia <code>inet</code></td></tr>
+<tr><td>ipset como herramienta aparte</td><td><code>set</code> nativo, dentro del ruleset</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Para migrar un ruleset grande no lo traduzcas a mano: <code>iptables-save | iptables-restore-translate -f -</code> te da la versión nftables. Sale funcional pero literal — después vale la pena reescribir las repeticiones como <code>set</code>, que es donde nftables gana de verdad en performance y legibilidad.
+</div>
+
+<h2>LS5.5 Conntrack: el que se llena a las 3 de la mañana</h2>
+
+<p>Apenas usás una regla con <code>ct state</code> o cualquier NAT, el kernel carga <code>nf_conntrack</code> y empieza a guardar <strong>una entrada por cada flujo</strong> que pasa. Esa tabla tiene un tope, y cuando se llena el kernel <em>tira paquetes</em>.</p>
+
+<pre><code class="lang-bash">sysctl net.netfilter.nf_conntrack_max        # tope de entradas
+sysctl net.netfilter.nf_conntrack_count      # cuántas hay ahora
+sysctl net.netfilter.nf_conntrack_buckets    # tamaño de la tabla hash
+
+conntrack -S            # estadísticas por CPU: insert_failed, drop, invalid
+conntrack -L | wc -l    # listado completo
+conntrack -L -p tcp --state TIME_WAIT | wc -l</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico, en su forma exacta.</strong> A cierto volumen aparece en <code>dmesg</code>: <em>nf_conntrack: table full, dropping packet</em>. Desde afuera se ve como pérdida de paquetes aleatoria y latencia errática bajo carga — lo más difícil de diagnosticar que existe, porque no falla <em>siempre</em>, falla cuando hay tráfico. Nadie mira <code>dmesg</code>. El monitoreo mira CPU y memoria, que están perfectas. La solución es de una línea; encontrarla lleva días.
+</div>
+
+<pre><code class="lang-bash"># Detección: esto va en el monitoreo, no en la memoria de nadie
+awk '{ printf "conntrack %.1f%%\n", $1*100/$2 }' \
+    /proc/sys/net/netfilter/nf_conntrack_count \
+    /proc/sys/net/netfilter/nf_conntrack_max
+
+dmesg -T | grep -i conntrack
+
+# Ampliar (subí buckets junto con max: ideal max ≈ buckets × 4)
+sysctl -w net.netfilter.nf_conntrack_buckets=262144
+sysctl -w net.netfilter.nf_conntrack_max=1048576</code></pre>
+
+<div class="warn">
+  <strong>El otro problema es el timeout, no el tamaño.</strong> <code>nf_conntrack_tcp_timeout_established</code> viene en <strong>432000 segundos: cinco días</strong>. Una entrada de una conexión que terminó hace horas sigue ocupando lugar. Bajarlo a algo razonable (1–2 horas) suele liberar más espacio que duplicar <code>max</code>, y sin gastar memoria extra. Pero ojo: si lo bajás por debajo del keepalive de tus conexiones largas, vas a cortar sesiones ociosas legítimas. Los dos números tienen que mirarse juntos.
+</div>
+
+<pre><code class="lang-bash">sysctl net.netfilter.nf_conntrack_tcp_timeout_established   # 432000
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=7200
+
+# Cada entrada pesa ~300 bytes. 1M de entradas ≈ 300 MB de kernel.
+# Verificá que la máquina los tenga ANTES de subir el número.</code></pre>
+
+<div class="tip">
+  <strong>Cuándo NO usar conntrack.</strong> Si una máquina solo hace <em>forwarding</em> de mucho tráfico sin NAT ni reglas stateful, marcá ese tráfico como <code>notrack</code> en la tabla <code>raw</code> (<code>chain prerouting { type filter hook prerouting priority raw; ... notrack }</code>). El seguimiento de estado que no usás es puro costo: memoria, CPU por paquete y un límite que se puede llenar.
+</div>
+
+<h2>LS5.6 Namespaces de red: lo que hace Docker por dentro</h2>
+
+<p>En <a href="../ls3-namespaces-cgroups/lecture.html">LS3</a> viste los namespaces como mecanismo de aislamiento. El de red (<code>CLONE_NEWNET</code>) le da a un proceso <strong>su propio stack completo</strong>: interfaces, tabla de rutas, reglas de netfilter, sockets, contadores. Un contenedor no tiene «red virtual»: tiene un netns con un cable virtual hacia afuera.</p>
+
+<pre><code class="lang-bash"># Crear un namespace y conectarlo al host — esto es, línea por línea,
+# lo que hace el runtime de contenedores.
+
+ip netns add app1
+
+# Un par veth: dos puntas de un mismo cable virtual.
+# Lo que entra por una, sale por la otra.
+ip link add veth-host type veth peer name veth-app
+
+# Una punta se muda adentro del namespace
+ip link set veth-app netns app1
+
+# Configurar el lado del host
+ip addr add 10.200.0.1/24 dev veth-host
+ip link set veth-host up
+
+# Configurar el lado de adentro (ip netns exec = correr ahí adentro)
+ip netns exec app1 ip addr add 10.200.0.2/24 dev veth-app
+ip netns exec app1 ip link set veth-app up
+ip netns exec app1 ip link set lo up
+ip netns exec app1 ip route add default via 10.200.0.1
+
+# Probar
+ip netns exec app1 ping -c2 10.200.0.1
+ip netns exec app1 ss -ltn        # sockets SOLO de ese namespace</code></pre>
+
+<pre><code class="lang-bash"># Que salga a internet: forwarding + NAT en el host
+sysctl -w net.ipv4.ip_forward=1
+nft add table inet natns
+nft add chain inet natns post '{ type nat hook postrouting priority srcnat; }'
+nft add rule inet natns post ip saddr 10.200.0.0/24 oifname "eth0" masquerade
+
+ip netns exec app1 ping -c2 1.1.1.1</code></pre>
+
+<div class="analogy">
+  <strong>El modelo de Docker, ahora sin magia.</strong> Un bridge (<code>docker0</code>), un par <code>veth</code> por contenedor con una punta en el bridge y otra adentro del netns, IPs de un rango privado, y una regla de <code>masquerade</code> para la salida. Los <em>port mappings</em> (<code>-p 8080:80</code>) son reglas <code>dnat</code>. Eso es todo. Si entendés estas veinte líneas, entendés el 90% de la red de contenedores — y podés depurarla cuando la abstracción falla.
+</div>
+
+<pre><code class="lang-bash"># Entrar al namespace de red de un contenedor en marcha, sin exec
+PID=$(docker inspect -f '{{.State.Pid}}' mi-contenedor)
+nsenter -t $PID -n ss -ltnp
+nsenter -t $PID -n tcpdump -ni any port 5432
+
+# Truco: tcpdump y ss NO tienen que estar instalados en el contenedor.
+# Corren desde el host, dentro del namespace de red del contenedor.</code></pre>
+
+<div class="rule">
+  <strong>📌 Este es el superpoder de depuración de contenedores.</strong> Una imagen mínima (<code>distroless</code>, <code>scratch</code>) no tiene ni <code>ping</code>. Con <code>nsenter -t PID -n</code> usás las herramientas del <em>host</em> dentro de la red del contenedor: capturás su tráfico, listás sus sockets, mirás sus rutas. Sin instalar nada, sin cambiar la imagen, sin reiniciar el contenedor.
+</div>
+
+<h2>LS5.7 Diagnóstico: qué contesta cada herramienta</h2>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Pregunta que contesta</th><th>Reemplaza a</th></tr></thead>
+<tbody>
+<tr><td><code>ip</code></td><td>¿Cómo está configurada la capa 2/3? ¿Por dónde sale este paquete?</td><td><code>ifconfig</code>, <code>route</code>, <code>arp</code></td></tr>
+<tr><td><code>ss</code></td><td>¿Qué sockets hay, en qué estado, con qué colas y qué parámetros TCP?</td><td><code>netstat</code></td></tr>
+<tr><td><code>nstat</code></td><td>¿Qué contadores del <em>stack</em> se movieron? (drops, overflows, retransmisiones)</td><td><code>netstat -s</code></td></tr>
+<tr><td><code>tcpdump</code></td><td>¿Qué pasó <strong>de verdad</strong> en el cable, byte por byte?</td><td>—</td></tr>
+<tr><td><code>mtr</code></td><td>¿En qué salto del camino se pierde o se agrega latencia?</td><td><code>traceroute</code> + <code>ping</code></td></tr>
+<tr><td><code>ethtool</code></td><td>¿La capa física está bien? ¿Negoció la velocidad? ¿El driver tira paquetes?</td><td>—</td></tr>
+<tr><td><code>tc</code></td><td>¿La cola de salida está tirando paquetes o encolando de más?</td><td>—</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># ─── ip: configuración y ruteo ───────────────────────────────
+ip -br -c addr                 # resumen legible de interfaces
+ip -s link show eth0           # contadores: errors, dropped, overrun
+ip route get 8.8.8.8           # ¿por cuál interfaz y gateway sale ESTO?
+ip route get 10.0.5.7 from 10.0.1.3   # ruteo con origen: policy routing
+ip neigh show                  # tabla ARP/NDP (¿el vecino responde?)
+ip -br -c link                 # estado de enlace de cada interfaz</code></pre>
+
+<pre><code class="lang-bash"># ─── ss: sockets ─────────────────────────────────────────────
+ss -s                          # resumen global por estado
+ss -ltnp                       # listeners + qué proceso los tiene
+ss -tnp state established '( dport = :443 )'
+ss -tin dst 10.0.3.20          # tripas TCP: rtt, cwnd, retrans
+ss -tn -o                      # con temporizadores: ¿está retransmitiendo?
+ss -tn state syn-sent          # conexiones salientes trabadas en el SYN</code></pre>
+
+<pre><code class="lang-bash"># ─── nstat: los contadores que nadie mira ────────────────────
+nstat -az | grep -E 'Retrans|Drop|Overflow|Prune|TCPLoss'
+nstat -n && sleep 30 && nstat   # delta de 30 s: qué se mueve AHORA
+
+# Los que más veces resolvieron un caso:
+#   TcpExtListenOverflows   → backlog corto (LS5.2)
+#   TcpRetransSegs          → pérdida en el camino
+#   TcpExtTCPBacklogDrop    → la app no lee y el backlog del socket se llena
+#   TcpExtPruneCalled       → presión de memoria en buffers de socket
+#   TcpExtTCPTimeouts       → RTOs: pérdida severa o peer muerto</code></pre>
+
+<pre><code class="lang-bash"># ─── tcpdump: la verdad ──────────────────────────────────────
+tcpdump -ni eth0 'port 5432' -c 100          # -n: no resolver DNS (¡rápido!)
+tcpdump -ni any 'tcp[tcpflags] &amp; (tcp-syn|tcp-rst) != 0'   # solo SYN y RST
+tcpdump -ni eth0 'port 53' -A                # DNS legible
+tcpdump -ni eth0 -w captura.pcap -s 0 -C 100 -W 5   # rotativo, para Wireshark
+tcpdump -ni eth0 'tcp[tcpflags] &amp; tcp-rst != 0'     # ¿quién manda RST?
+
+# Timestamps relativos: para medir CUÁNTO tardó cada tramo
+tcpdump -nttt -r captura.pcap</code></pre>
+
+<pre><code class="lang-bash"># ─── mtr y ethtool ───────────────────────────────────────────
+mtr -rwzbc 100 api.ejemplo.com    # 100 ciclos, reporte con ASN
+
+ethtool eth0                       # velocidad, dúplex, autonegociación
+ethtool -S eth0 | grep -Ei 'err|drop|discard|miss|fifo'
+ethtool -g eth0                    # ring buffers: actual vs máximo
+ethtool -k eth0                    # offloads (GRO, TSO, GSO, checksum)
+ethtool -c eth0                    # interrupt coalescing</code></pre>
+
+<div class="warn">
+  <strong>Leer <code>mtr</code> mal es un deporte.</strong> La pérdida en un salto <em>intermedio</em> casi siempre es mentira: los routers limitan la tasa de respuestas ICMP que generan, porque es trabajo de su CPU y no de su plano de reenvío. <strong>Solo importa la pérdida en el último salto</strong>, o una pérdida que aparece en un salto y <em>se mantiene en todos los siguientes</em>. Un 40% de pérdida en el salto 6 con 0% en el 7 significa que el salto 6 está ocupado contestando, no que tire tu tráfico.
+</div>
+
+<h2>LS5.8 Tuning: el que sirve y el cargo cult</h2>
+
+<table>
+<thead><tr><th>Parámetro</th><th>¿Sirve?</th><th>Cuándo y por qué</th></tr></thead>
+<tbody>
+<tr><td><code>net.core.somaxconn</code> <strong>+ backlog de la app</strong></td><td>✅ Sí</td><td>Solo si <code>ListenOverflows</code> se mueve. Los dos juntos o no sirve de nada</td></tr>
+<tr><td><code>tcp_rmem</code> / <code>rmem_max</code></td><td>✅ Condicional</td><td>Solo si el BDP lo justifica (WAN de alta latencia). En LAN, empeora</td></tr>
+<tr><td><code>tcp_congestion_control=bbr</code> + <code>fq</code></td><td>✅ Sí</td><td>Egress a internet o WAN con pérdida. Medible en throughput real</td></tr>
+<tr><td><code>default_qdisc=fq_codel</code> / <code>cake</code></td><td>✅ Sí</td><td>Contra bufferbloat: baja la latencia bajo carga sin bajar throughput</td></tr>
+<tr><td><code>nf_conntrack_max</code> + timeouts</td><td>✅ Sí</td><td>Cuando el uso de la tabla pasa el 80%. Con memoria verificada</td></tr>
+<tr><td><code>tcp_notsent_lowat</code></td><td>✅ Nicho</td><td>Apps interactivas: baja la latencia de datos nuevos frente a un buffer lleno</td></tr>
+<tr><td>RPS / RSS / <code>irqbalance</code></td><td>✅ Sí</td><td>Cuando un solo core está al 100% de <code>%soft</code> y el resto ocioso</td></tr>
+<tr><td><code>tcp_tw_recycle</code></td><td>❌ <strong>Removido</strong></td><td>Ya no existe (kernel 4.12+). Rompía clientes detrás de NAT</td></tr>
+<tr><td><code>tcp_fin_timeout</code> «contra TIME_WAIT»</td><td>❌ Cargo cult</td><td>No toca <code>TIME_WAIT</code>. Controla <code>FIN_WAIT_2</code>, otra cosa</td></tr>
+<tr><td><code>rmem_max</code> gigante «por las dudas»</td><td>❌ Contraproducente</td><td>Bufferbloat: agrega latencia sin agregar throughput</td></tr>
+<tr><td>Desactivar GRO/TSO «por seguridad»</td><td>❌ Cargo cult</td><td>Multiplica la CPU por paquete. Solo desactivalo para <em>capturar</em>, y volvelo a poner</td></tr>
+<tr><td><code>tcp_syncookies=0</code> «por performance»</td><td>❌ Peligroso</td><td>Solo actúa cuando el SYN queue se llena. Apagarlo es regalar un vector de DoS</td></tr>
+<tr><td><code>tcp_timestamps=0</code></td><td>❌ Casi nunca</td><td>Rompe RTT estimation, PAWS y <code>tw_reuse</code>. Ahorra 12 bytes por segmento</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cómo se mide si un tuning sirvió.</strong> Nunca «se siente más rápido». <strong>(1)</strong> <code>nstat -n</code>, esperar, <code>nstat</code>: ¿bajó el contador que querías bajar? <strong>(2)</strong> El percentil 99 de latencia de la app, no el promedio — el promedio esconde exactamente los casos que te importan. <strong>(3)</strong> Un solo cambio por vez. Si tocás cinco sysctls juntos y mejora, no sabés cuál sirvió, no podés revertir el que hizo daño, y en seis meses nadie va a saber por qué están ahí.
+</div>
+
+<pre><code class="lang-bash"># El ciclo honesto de tuning, completo
+nstat -n                                    # línea de base
+# ... generar carga representativa ...
+nstat | grep -E 'Overflow|Retrans|Drop'     # ¿qué se mueve?
+
+sysctl -w net.core.somaxconn=8192           # UN cambio
+# ... reiniciar la app con backlog=8192, misma carga ...
+
+nstat -n; sleep 60; nstat | grep Overflow   # ¿bajó el contador?
+# Sí  → documentarlo en /etc/sysctl.d/ con un comentario del PORQUÉ
+# No  → revertir. No lo dejes puesto "no molesta": sí molesta,
+#       porque el próximo que audite va a creer que hace algo.</code></pre>
+
+<h2>LS5.9 DNS: la causa raíz más subdiagnosticada</h2>
+
+<p>Si tuviera que apostar a ciegas la causa de un problema de latencia intermitente que nadie logra reproducir, apostaría a DNS. No porque el DNS sea frágil, sino porque <strong>falla de forma que no parece DNS</strong>: la app anda bien, la red anda bien, los pings andan bien, y cada tanto algo tarda cinco segundos exactos.</p>
+
+<pre><code class="lang-bash">cat /etc/resolv.conf
+# nameserver 127.0.0.53
+# options edns0 trust-ad ndots:5 timeout:5 attempts:2 single-request
+
+cat /etc/nsswitch.conf | grep hosts
+# hosts: files mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns</code></pre>
+
+<table>
+<thead><tr><th>Opción de <code>resolv.conf</code></th><th>Qué hace</th><th>Trampa</th></tr></thead>
+<tbody>
+<tr><td><code>timeout:5</code></td><td>Espera 5 s por respuesta antes de reintentar</td><td>Es el default. <strong>Ese es el «5 segundos» de casi todos los casos</strong></td></tr>
+<tr><td><code>attempts:2</code></td><td>Reintentos por servidor</td><td>Peor caso = <code>timeout × attempts × nameservers</code> = 20 s con dos servidores</td></tr>
+<tr><td><code>ndots:5</code></td><td>Con menos de 5 puntos, prueba primero los sufijos de búsqueda</td><td>Default en Kubernetes: <code>api.ejemplo.com</code> genera 4 consultas fallidas antes de la buena</td></tr>
+<tr><td><code>single-request</code></td><td>Serializa las consultas A y AAAA en vez de mandarlas en paralelo</td><td>Evita un bug clásico, pero agrega un RTT a cada resolución nueva</td></tr>
+<tr><td><code>single-request-reopen</code></td><td>Paralelo, pero con un socket distinto para cada consulta</td><td>Casi siempre la mejor de las dos</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># systemd-resolved: el resolver de casi todas las distros modernas
+resolvectl status              # servidores por interfaz, DNSSEC, dominios
+resolvectl query api.interno   # resolución con el detalle de por dónde fue
+resolvectl statistics          # tasa de aciertos del caché
+resolvectl flush-caches        # vaciar caché — clave para reproducir un bug
+
+# Medir la resolución sin el caché de por medio
+dig +stats @1.1.1.1 api.ejemplo.com
+dig +trace api.ejemplo.com      # el camino completo desde la raíz</code></pre>
+
+<div class="mistake">
+  <strong>El error de instrumentación que lo esconde todo.</strong> Casi ninguna librería HTTP separa el tiempo de <em>resolución</em> del tiempo de <em>request</em>. Tu métrica dice «la API tardó 5,2 s» y todo el equipo se pone a mirar la API — que en su propio log dice que tardó 12 ms, y tiene razón. Los 5 segundos se fueron antes de que existiera la conexión. Si tu cliente HTTP expone <em>tracing</em> de fases (Go tiene <code>httptrace</code>, curl tiene <code>-w '%{time_namelookup}'</code>), medirlo por separado es la instrumentación de mejor relación costo-beneficio que podés agregar.
+</div>
+
+<pre><code class="lang-bash"># Desglose de fases con curl: 30 segundos de trabajo, meses de ahorro
+curl -o /dev/null -s -w \
+  'dns:%{time_namelookup}s  tcp:%{time_connect}s  tls:%{time_appconnect}s
+total:%{time_total}s\n' \
+  https://api.ejemplo.com/health</code></pre>
+
+<h2>🧑‍🎓 Worked Example — «tarda 5 segundos, pero solo la primera vez de cada minuto»</h2>
+
+<blockquote>Un servicio interno llama a una API. El p99 está en 5,1 s; la mediana en 40 ms. El patrón es regular: la primera petición de cada minuto tarda ~5 s, las demás son instantáneas. El equipo de la API jura que sus logs muestran 12 ms. Reiniciar no cambia nada. Nadie encuentra el problema.</blockquote>
+
+<p><strong>Paso 1 — Leer las dos pistas que ya están en el enunciado.</strong> Antes de tocar nada, dos números gritan:</p>
+
+<div class="step"><strong>«5 segundos exactos»</strong> — La latencia real de red es sucia: 4,7 s, 5,3 s. Un valor <em>redondo y repetido</em> no es congestión: es un <strong>timeout configurado</strong> que se venció. Hay que buscar qué componente tiene un timeout de 5.</div>
+
+<div class="step"><strong>«la primera vez de cada minuto»</strong> — Ese es el patrón de un <strong>caché con TTL de 60 segundos</strong>. Mientras hay caché, no se paga; cuando expira, la primera petición paga y repuebla. Lo que estamos midiendo es <em>lo que pasa cuando el caché falla</em>.</div>
+
+<p>Un timeout de 5 s, más un caché de 60 s, más un actor que no aparece en el log de nadie. Eso ya apunta al resolver.</p>
+
+<p><strong>Paso 2 — Separar la resolución del request.</strong> Un solo comando decide si vale la pena seguir por acá:</p>
+
+<pre><code class="lang-bash">for i in 1 2 3; do
+  resolvectl flush-caches
+  curl -o /dev/null -s -w 'dns:%{time_namelookup}  total:%{time_total}\n' \
+       https://api.interno.ejemplo/health
+  sleep 1
+done
+
+# dns:5.012  total:5.048     ← primera, sin caché
+# dns:0.001  total:0.039     ← con caché
+# dns:0.001  total:0.037</code></pre>
+
+<p>Listo: <strong>5,012 de los 5,048 segundos se van en <code>time_namelookup</code></strong>. La API nunca tuvo la culpa. Todavía no sabemos <em>por qué</em>, pero ya sabemos dónde.</p>
+
+<p><strong>Paso 3 — Mirar el cable.</strong> <code>tcpdump</code> sobre el puerto 53, con el caché vaciado:</p>
+
+<pre><code class="lang-bash">resolvectl flush-caches
+tcpdump -ni any -ttt 'port 53' &amp;
+curl -s -o /dev/null https://api.interno.ejemplo/health</code></pre>
+
+<pre><code>00:00:00.000000 IP 10.0.1.5.51823 &gt; 10.0.0.53.53: 4821+ A? api.interno.ejemplo. (37)
+00:00:00.000112 IP 10.0.1.5.51823 &gt; 10.0.0.53.53: 4822+ AAAA? api.interno.ejemplo. (37)
+00:00:00.002104 IP 10.0.0.53.53 &gt; 10.0.1.5.51823: 4821 1/0/0 A 10.0.7.31 (53)
+        ← la respuesta AAAA NUNCA llega. Silencio.
+00:00:05.001987 IP 10.0.1.5.51824 &gt; 10.0.0.53.53: 4822+ AAAA? api.interno.ejemplo. (37)
+00:00:05.004501 IP 10.0.0.53.53 &gt; 10.0.1.5.51824: 4822 0/1/0 (95)
+        ← recién ahí la app tiene la dirección y abre la conexión TCP</code></pre>
+
+<p><strong>Paso 4 — Armar la historia completa.</strong> Ahora todo encaja:</p>
+
+<ul>
+  <li><code>getaddrinfo()</code> de glibc pide <strong>A y AAAA en paralelo</strong>, porque el sistema tiene IPv6 habilitado aunque no lo use.</li>
+  <li>La respuesta A vuelve en 2 ms. La <strong>AAAA se pierde</strong>: el resolver interno la descarta en vez de contestar <code>NOERROR</code> con cero registros, que es lo que manda el estándar.</li>
+  <li>glibc <strong>no puede devolver nada hasta tener las dos</strong>. Se queda esperando.</li>
+  <li>A los 5 s se vence el <code>timeout:5</code> de <code>resolv.conf</code> — el default. Reintenta, esta vez le contestan, y la app arranca.</li>
+  <li>El resultado queda en el caché con el <strong>TTL de 60 s</strong> del registro. Durante ese minuto todo vuela. Al minuto siguiente, de nuevo.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Ningún log lo mostraba, y era correcto que no lo mostrara.</strong> La app registra el tiempo del request HTTP, que empieza <em>después</em> de resolver. La API registra su propio procesamiento. El resolver no registra las consultas que decide no contestar. Los cinco segundos ocurrían en un hueco que ningún componente consideraba suyo. <strong>La evidencia estaba únicamente en el cable</strong> — y el cable siempre está disponible.
+</div>
+
+<p><strong>Paso 5 — Las tres formas de arreglarlo, con su costo real.</strong></p>
+
+<table>
+<thead><tr><th>Arreglo</th><th>Qué hace</th><th>Costo</th><th>Cuándo elegirlo</th></tr></thead>
+<tbody>
+<tr><td><strong>A.</strong> <code>options single-request-reopen</code> en <code>resolv.conf</code></td><td>Cada consulta sale por su propio socket; la A responde y no queda enganchada a la AAAA perdida</td><td>Hay que distribuirlo a cada host (o al <code>dnsConfig</code> del pod, o al <code>--dns-opt</code> del contenedor). Es un parche: el resolver sigue roto para todo el resto</td><td><strong>Mitigación inmediata.</strong> Se aplica hoy y corta el sangrado</td></tr>
+<tr><td><strong>B.</strong> Arreglar el resolver: que conteste <code>NOERROR</code>/<code>NODATA</code> a las AAAA</td><td>Elimina la causa. Nadie más en la organización vuelve a pisar esto</td><td>Depende de otro equipo. Semanas, a veces un cambio de proveedor de DNS. Requiere probar que nada dependía de ese comportamiento</td><td><strong>La corrección real.</strong> Se abre en paralelo con A, no en lugar de A</td></tr>
+<tr><td><strong>C.</strong> Caché local (<code>systemd-resolved</code>, <code>dnsmasq</code>, <code>NodeLocal DNSCache</code>)</td><td>Baja la frecuencia con la que se paga y absorbe picos del resolver central</td><td>Un componente más que puede fallar, cachear negativos o servir datos viejos. <strong>No elimina el problema</strong>: el primer fallo de caché sigue costando 5 s</td><td>Vale por sí solo en infraestructura grande, pero <strong>no como arreglo de esto</strong></td></tr>
+<tr><td><strong>D.</strong> Bajar a <code>timeout:1</code></td><td>Convierte 5 s en 1 s</td><td>No arregla nada, solo achica el daño. Y rompe resolvers legítimamente lentos bajo carga, creando fallas nuevas</td><td>Solo como red de contención, y con el número documentado</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>La respuesta senior es «A ahora, B en paralelo, y una alerta».</strong> Aplicar A hoy porque el usuario está sufriendo hoy; abrir B porque es la única corrección de verdad; y —lo que separa apagar un incendio de cerrar un caso— <strong>dejar una métrica de <code>time_namelookup</code> con alerta sobre 500 ms</strong>. Así, la próxima vez que un resolver se porte mal, lo sabés en minutos y no en semanas.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Ves <code>ss -ltn</code> con <code>Recv-Q 200</code> y <code>Send-Q 128</code> en tu servidor. ¿Qué significa y qué hacés?</summary>
+<p>En un socket en <strong>LISTEN</strong>, <code>Recv-Q</code> son las conexiones ya establecidas esperando que la app llame a <code>accept()</code>, y <code>Send-Q</code> es el máximo del accept queue. <code>200 &gt; 128</code> significa que el listener está <strong>desbordado</strong>: los SYN nuevos se descartan en silencio y los clientes ven timeouts o latencia que no aparece en ningún log de la app. Se confirma con <code>nstat -az | grep ListenOverflows</code> — si ese contador se mueve, es esto. La corrección tiene dos mitades obligatorias: subir <code>net.core.somaxconn</code> <em>y</em> el parámetro <code>backlog</code> que la app le pasa a <code>listen()</code>; cambiar solo el sysctl no hace absolutamente nada porque el valor efectivo es el mínimo de los dos. Y una tercera pregunta que hay que hacerse: si la cola se llena, quizá la app tarda demasiado en aceptar y el backlog es el síntoma, no la causa.</p></details>
+
+<details><summary>Tu servicio de transferencia de archivos a otro continente rinde 8 Mbps sobre un enlace de 1 Gbps. ¿Por dónde empezás?</summary>
+<p>Con 200 ms de RTT, el BDP de 1 Gbps es de unos <strong>25 MB</strong>: si <code>rmem_max</code> está en el default, el buffer no alcanza para llenar el cable, sin importar la banda contratada. Así que primero: <code>ss -tin</code> hacia ese destino para ver <code>cwnd</code>, <code>rtt</code> y <code>retrans</code>. Si <code>retrans</code> es distinto de cero de forma sostenida, hay pérdida, y cubic la interpreta como congestión y se autolimita — ahí <strong>BBR</strong> (con <code>fq</code> como qdisc) suele multiplicar el throughput porque no reacciona a la pérdida no congestiva. Si <code>retrans</code> es cero pero <code>cwnd</code> no crece, el límite es de ventana: subir <code>tcp_rmem</code>/<code>tcp_wmem</code> y <code>rmem_max</code>/<code>wmem_max</code> por encima del BDP. Este es <em>el</em> caso donde agrandar buffers es correcto — y el motivo por el que hacerlo en una LAN es contraproducente.</p></details>
+
+<details><summary>Bajo carga alta ves pérdida de paquetes errática, pero CPU, memoria y disco están perfectos. ¿Qué mirás antes de culpar a la red?</summary>
+<p>Tres cosas, en orden de costo. <strong>(1)</strong> <code>dmesg -T | grep -i conntrack</code>: si aparece <em>table full, dropping packet</em>, el kernel está tirando paquetes porque la tabla de seguimiento de conexiones se llenó, y eso solo pasa bajo carga — exactamente el patrón errático. Se confirma comparando <code>nf_conntrack_count</code> contra <code>nf_conntrack_max</code>. <strong>(2)</strong> <code>ethtool -S eth0 | grep -Ei 'drop|miss|fifo'</code> junto con <code>/proc/net/softnet_stat</code>: si el ring buffer de la NIC o el backlog del stack se desbordan, la pérdida es local y no del proveedor. <strong>(3)</strong> <code>mpstat -P ALL</code>: si un solo core está al 100% de <code>%soft</code> mientras el resto está ocioso, el promedio de CPU miente y el cuello de botella es el procesamiento de softirq en una sola CPU — se resuelve con RSS/RPS, no con más ancho de banda.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Entre el cable y tu <code>read()</code> hay ocho tramos con cola propia. Diagnosticar es <strong>ubicar el tramo</strong>, y cada uno tiene su contador: <code>ethtool -S</code>, <code>/proc/net/softnet_stat</code>, <code>nstat</code>, <code>ss</code>, <code>tc -s</code>.</li>
+  <li>En un socket <strong>LISTEN</strong>, <code>Recv-Q</code> son conexiones esperando <code>accept()</code> y <code>Send-Q</code> es el backlog máximo. <code>somaxconn</code> es solo un techo: hay que cambiarlo <em>junto con</em> el backlog de la app.</li>
+  <li>Los buffers se dimensionan con el <strong>BDP</strong> (<code>banda × RTT</code>), no con intuición. Grandes en WAN de alta latencia; grandes en LAN es bufferbloat.</li>
+  <li><strong>BBR</strong> gana donde hay pérdida no congestiva (WAN, egress a internet). <strong>Cubic</strong> alcanza en datacenter. BBR quiere <code>fq</code>.</li>
+  <li><code>TIME_WAIT</code> casi nunca es el problema; <code>tcp_tw_recycle</code> <strong>no existe desde el kernel 4.12</strong> y <code>tcp_fin_timeout</code> no lo afecta. El síntoma real es <code>EADDRNOTAVAIL</code>.</li>
+  <li>El keepalive por defecto tarda <strong>2 h 11 min</strong>: inútil. Se configura por socket, o se usa <code>TCP_USER_TIMEOUT</code>.</li>
+  <li><strong>nftables</strong> es una familia + tabla + cadena con hook y política, con <code>set</code> nativos y aplicación atómica. <code>nft -c -f</code> antes de aplicar, y un temporizador de rescate antes de un <code>policy drop</code> remoto.</li>
+  <li><strong>Conntrack</strong> se llena en silencio bajo carga y solo lo dice <code>dmesg</code>. Mirá el <em>timeout</em> de 5 días antes de duplicar <code>max</code>.</li>
+  <li>Un contenedor es un <strong>netns con un par <code>veth</code></strong>. <code>nsenter -t PID -n</code> te da <code>tcpdump</code> y <code>ss</code> adentro de una imagen que no tiene ni <code>ping</code>.</li>
+  <li>Un tuning sin un contador que baje y un p99 que mejore es cargo cult. Un cambio por vez, documentado con el porqué.</li>
+  <li><strong>DNS</strong> es la causa raíz más subdiagnosticada: latencias redondas de 5 s con patrón periódico casi siempre son <code>timeout:5</code> más un TTL de caché. Medí <code>time_namelookup</code> aparte.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>ss -ltn</code> en una máquina con servicios y armá una tabla con el backlog efectivo de cada listener. Compará cada uno contra <code>net.core.somaxconn</code> y contra el valor que pide la app en su configuración. ¿Cuántos están limitados por la app y no por el kernel?</li>
+  <li>Generá carga contra un servidor con un backlog chico a propósito (poné <code>listen(fd, 4)</code>) y capturá <code>nstat -n; sleep 30; nstat | grep -i listen</code>. Mostrá el contador moviéndose y después arreglalo cambiando las dos mitades. Documentá el antes y el después.</li>
+  <li>Calculá el BDP de tres enlaces reales que uses (medí el RTT con <code>ping</code>) y comparalo con tu <code>tcp_rmem</code> máximo actual. Decidí, con el número en la mano, en cuál de los tres tendría sentido subirlo y en cuáles no.</li>
+  <li>Escribí un ruleset nftables completo con <code>policy drop</code> para una máquina tuya, usando al menos un <code>set</code> y un límite de tasa. Validalo con <code>nft -c -f</code>, aplicalo <strong>con un temporizador de rescate</strong>, y verificá con <code>nft -a list ruleset</code> qué reglas están matcheando.</li>
+  <li>Creá un namespace de red con un par <code>veth</code>, dale salida a internet con <code>masquerade</code>, y comprobá desde adentro con <code>ping</code> y <code>curl</code>. Después usá <code>nsenter -t PID -n tcpdump</code> sobre un contenedor Docker en marcha y capturá su tráfico sin instalar nada dentro de la imagen.</li>
+  <li>Reproducí el worked example: cambiá <code>timeout</code> en <code>resolv.conf</code>, apuntá a un servidor DNS inexistente como primero de la lista, y medí <code>time_namelookup</code> con <code>curl -w</code>. Verificá que el tiempo observado coincide con <code>timeout × attempts</code>.</li>
+  <li>Elegí <strong>un solo</strong> sysctl de la tabla de LS5.8 que tenga sentido en una máquina tuya. Medí antes con <code>nstat</code> y el p99 de latencia, aplicalo, medí después. Si no mejoró nada medible, <strong>revertilo</strong> y escribí por qué no sirvió — ese informe vale más que uno donde funcionó.</li>
+</ol>
+
+<section class="quiz" id="quizLS5">
+  <style>
+    #quizLS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS5 .q{margin-bottom:1.5rem}
+    #quizLS5 .q p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS5 .opt:hover{border-color:var(--accent)}
+    #quizLS5 .opt:disabled{cursor:default}
+    #quizLS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS5 .exp.show{display:block}
+    #quizLS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. <code>ss -ltn</code> muestra un listener con <code>Recv-Q 300</code> y <code>Send-Q 128</code>. ¿Qué está pasando?</p>
+    <button class="opt">Hay 300 bytes sin leer en el buffer de recepción del socket</button>
+    <button class="opt">El servidor está enviando 128 bytes que el cliente todavía no ACKeó</button>
+    <button class="opt">Hay 300 conexiones establecidas esperando <code>accept()</code> contra un backlog de 128: el listener está desbordado y se están tirando SYN en silencio</button>
+    <div class="exp">En estado <strong>LISTEN</strong> las columnas cambian de significado: <code>Recv-Q</code> es la cantidad de conexiones ya completadas esperando que la app las acepte, y <code>Send-Q</code> es el máximo del accept queue. La interpretación de «bytes» solo vale para sockets ESTABLISHED. Se confirma con <code>nstat -az | grep ListenOverflows</code>, y se corrige subiendo <code>somaxconn</code> <em>y</em> el backlog que la app pasa a <code>listen()</code> — el valor efectivo es el mínimo de los dos.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Encontrás un runbook que recomienda <code>net.ipv4.tcp_tw_recycle=1</code> para «resolver los TIME_WAIT». ¿Qué hacés?</p>
+    <button class="opt">No lo aplico: fue removido del kernel en 4.12 porque rompía a los clientes detrás de NAT, y además un conteo alto de <code>TIME_WAIT</code> rara vez es un problema real</button>
+    <button class="opt">Lo aplico, es la forma estándar de liberar sockets más rápido</button>
+    <button class="opt">Lo aplico junto con <code>tcp_fin_timeout=10</code> para reforzar el efecto</button>
+    <div class="exp"><code>tcp_tw_recycle</code> <strong>no existe desde el kernel 4.12</strong>: descartaba paquetes de hosts distintos que compartían IP pública detrás de un NAT cuando sus timestamps no venían en orden, causando fallas de conectividad imposibles de diagnosticar. Y <code>tcp_fin_timeout</code> tampoco toca <code>TIME_WAIT</code>: controla <code>FIN_WAIT_2</code>. El síntoma que sí importa es <code>EADDRNOTAVAIL</code> por agotamiento de puertos efímeros hacia un mismo destino, y para eso la opción segura es <code>tcp_tw_reuse=1</code>, que se apoya en timestamps y solo aplica a conexiones salientes.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una petición tarda 5,0 s de forma reproducible, pero solo la primera de cada minuto. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">Congestión de red en algún salto intermedio del camino</button>
+    <button class="opt">Un timeout de DNS de 5 s (el default de <code>resolv.conf</code>) combinado con un TTL de caché de 60 s</button>
+    <button class="opt">El garbage collector de la aplicación corriendo una vez por minuto</button>
+    <div class="exp">Dos señales lo delatan. La latencia de red real es sucia y variable; un valor <strong>redondo y repetido</strong> es un timeout configurado que se venció, y 5 s es exactamente el <code>timeout:5</code> por defecto de <code>resolv.conf</code>. Y el patrón «la primera de cada minuto» es la firma de un <strong>caché con TTL de 60 s</strong>: mientras hay caché no se paga, cuando expira la primera petición paga y repuebla. Se confirma en un comando con <code>curl -w '%{time_namelookup}'</code> tras un <code>resolvectl flush-caches</code>, y se explica en el cable con <code>tcpdump port 53</code> — típicamente una consulta AAAA que el resolver descarta en vez de contestar NODATA.</div>
+  </div>
+
+  <div class="score" id="scoreLS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls4-almacenamiento/lecture.html">← LS4: Almacenamiento</a>
+  <a href="../ls6-ebpf-observabilidad/lecture.html">LS6: eBPF y observabilidad →</a>
+</nav>
+
+</div>
+</body>
+</html>

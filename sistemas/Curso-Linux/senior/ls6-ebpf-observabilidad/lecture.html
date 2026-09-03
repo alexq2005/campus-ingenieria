@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS6 — eBPF y observabilidad · Linux Senior</title>
+  <meta name="description" content="Qué es eBPF y por qué el verificador lo hace seguro en producción, dónde se engancha (kprobes, tracepoints, uprobes, XDP, LSM), one-liners de bpftrace que resuelven problemas reales, herramientas de BCC, Falco y Tetragon en seguridad, Cilium en redes, y los trade-offs honestos.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS6</span>
+  <span class="badge">⏱ 35–90 min</span>
+  <span class="badge">🎯 Pre-req: LS1, LS3</span>
+  <span class="badge">🔬 Observabilidad</span>
+</div>
+
+<article>
+
+<h1>LS6 — eBPF y observabilidad</h1>
+
+<h2>LS6.0 Por qué este módulo</h2>
+
+<p>Los logs te dicen <strong>lo que el desarrollador decidió contarte</strong>. Ni una línea más. Cuando el problema está justo en el hueco que nadie instrumentó —una llamada a disco que a veces tarda dos segundos, un proceso que alguien lanza y nadie sabe quién, una conexión de red que se abre y muere— los logs te dejan mirando una pantalla que dice exactamente nada.</p>
+
+<p>Las respuestas clásicas a ese hueco eran malas de dos formas distintas. Una: agregar más logs, redesplegar y esperar a que el problema vuelva —lo que te cuesta un deploy y a veces días de espera. La otra: <code>strace</code>, que sí ve todo pero <strong>distorsiona tanto el proceso que el problema desaparece</strong> mientras mirás, y que en producción puede tumbarte el servicio.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> eBPF te deja preguntarle al kernel <strong>cualquier cosa</strong>, sobre un proceso que ya está corriendo, en producción, <strong>sin reiniciar, sin recompilar y sin redesplegar nada</strong>. Y con un overhead lo bastante bajo como para dejarlo puesto. Eso convierte la observabilidad de un ejercicio de adivinanza sobre logs en un interrogatorio directo al sistema.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>: eBPF dejó de ser un nicho de desarrolladores de kernel. Hoy es <strong>la base de toda una generación de herramientas de observabilidad y seguridad</strong>. <strong>Falco</strong> detecta intrusiones en runtime con eBPF. <strong>Cilium</strong> hace el networking de Kubernetes con eBPF. <strong>Tetragon</strong> aplica políticas de seguridad con eBPF. Si trabajás con infraestructura, ya estás usando eBPF — la pregunta es si lo entendés o si es una caja negra que se rompe sola.</p>
+
+<div class="warn">
+  <strong>Practicá esto en una VM tuya.</strong> Todo lo de este módulo requiere <code>root</code> (o capabilities específicas) y toca el kernel. Levantá una VM con Ubuntu 24.04 o Fedora reciente, hacé el desastre que quieras adentro, y recién después llevá el conocimiento a una máquina que le importe a alguien. <strong>Nunca</strong> tu primer <code>bpftrace</code> es en el servidor de producción de la empresa.
+</div>
+
+<h2>LS6.1 Qué es eBPF: una VM dentro del kernel</h2>
+
+<p>eBPF —<em>extended Berkeley Packet Filter</em>, un nombre que hoy no describe casi nada de lo que hace— es <strong>una máquina virtual dentro del kernel de Linux que ejecuta programas verificados</strong>. Tiene su propio conjunto de instrucciones, once registros de 64 bits y un modelo de memoria muy restringido.</p>
+
+<p>Vos escribís un programa, lo compilás a bytecode eBPF, y se lo entregás al kernel con la syscall <code>bpf(2)</code>. El kernel lo engancha a un evento —una función interna, una syscall, un paquete que llega a la placa de red— y lo ejecuta cada vez que ese evento ocurre. Los resultados vuelven a tu espacio de usuario a través de estructuras compartidas llamadas <strong>mapas</strong>.</p>
+
+<div class="rule">
+  <strong>📌 La pieza que hace que todo esto sea posible es el VERIFICADOR.</strong> Antes de dejarte cargar nada, el kernel analiza tu programa y <strong>demuestra</strong> que termina (no hay loops sin cota), que no lee memoria fuera de rango, que no desreferencia punteros sin chequear que no sean nulos, y que no excede un límite de instrucciones. Si no puede demostrarlo, lo rechaza. No lo carga "a ver qué pasa": lo rechaza.
+</div>
+
+<p>Esa garantía es la diferencia entera con la alternativa histórica. Un <strong>módulo de kernel</strong> también te deja instrumentar lo que quieras, pero corre con permisos totales y sin red de contención: un puntero mal calculado y tenés un <em>kernel panic</em> — el servidor entero se cae. Un programa eBPF que hace lo mismo simplemente no llega a cargarse.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Módulo de kernel</th><th>Programa eBPF</th></tr></thead>
+<tbody>
+<tr><td>¿Puede colgar el kernel?</td><td>✅ Sí, un puntero malo y panic</td><td>❌ No: el verificador lo impide</td></tr>
+<tr><td>¿Requiere reiniciar?</td><td>A veces; siempre <code>insmod</code>/<code>rmmod</code></td><td>❌ Se carga y descarga en caliente</td></tr>
+<tr><td>Loops sin cota</td><td>Permitidos (y peligrosos)</td><td>Rechazados salvo con cota probada</td></tr>
+<tr><td>Portabilidad entre kernels</td><td>Recompilar por versión</td><td>CO-RE/BTF: un binario, muchos kernels</td></tr>
+<tr><td>¿Lo dejarías en producción?</td><td>Solo si lo escribió el fabricante</td><td>Sí — es el caso de uso principal</td></tr>
+</tbody>
+</table>
+
+<h3>El camino completo, de tu código al evento</h3>
+
+<pre><code>   tu programa  (bpftrace, o C restringido con libbpf)
+        │
+        │  clang -target bpf
+        ▼
+   bytecode eBPF ──── bpf(2) ────►  ┌──────────────────────────────┐
+                                    │        VERIFICADOR           │
+                                    │  ¿termina? ¿memoria válida?  │
+                                    │  ¿punteros chequeados?       │
+                                    └───────────┬──────────────────┘
+                                     rechaza    │    acepta
+                              ◄─────────────────┤
+                              (error EINVAL)    ▼
+                                    ┌──────────────────────────────┐
+                                    │   JIT → código máquina       │
+                                    │   nativo del procesador      │
+                                    └───────────┬──────────────────┘
+                                                ▼
+                                    ┌──────────────────────────────┐
+                                    │   HOOK: se engancha a...     │
+                                    │  kprobe · tracepoint         │
+                                    │  uprobe · USDT · XDP · LSM   │
+                                    └───────────┬──────────────────┘
+                                                │  escribe resultados
+                                                ▼
+                       mapas BPF (hash, array, histograma, ring buffer)
+                                                │  los lee
+                                                ▼
+                                    espacio de usuario (tu terminal)</code></pre>
+
+<div class="info">
+  El paso del <strong>JIT</strong> importa más de lo que parece: tu programa no se <em>interpreta</em>, se traduce a instrucciones nativas del procesador. Por eso un hook eBPF cuesta decenas de nanosegundos y no microsegundos. Ese detalle es la razón técnica de que se pueda dejar corriendo bajo carga real.
+</div>
+
+<h2>LS6.2 Dónde se puede enganchar</h2>
+
+<p>Un programa eBPF no sirve de nada solo: vive colgado de un <strong>hook</strong>. Elegir el hook correcto es el 80% del trabajo de escribir una herramienta útil.</p>
+
+<div class="step"><strong>kprobes.</strong> Se enganchan a <em>cualquier</em> función del kernel, por nombre. Máxima libertad y máxima fragilidad: los nombres y las firmas de las funciones internas cambian entre versiones sin previo aviso, porque no son una API pública. Tu script anda en 6.8 y explota en 6.12.</div>
+
+<div class="step"><strong>tracepoints.</strong> Puntos de instrumentación que los desarrolladores del kernel colocaron a propósito y se comprometen a mantener estables. Cubren menos superficie que los kprobes, pero <strong>preferilos siempre que exista uno</strong>: es la diferencia entre una herramienta que sobrevive un upgrade y una que no.</div>
+
+<div class="step"><strong>uprobes.</strong> Igual que los kprobes pero en <strong>espacio de usuario</strong>: se enganchan a funciones de un binario o de una librería compartida. Sí, incluidas <strong>las funciones de tu propia aplicación</strong>. Podés trazar una función de tu API en producción sin haber puesto un solo log adentro.</div>
+
+<div class="step"><strong>USDT</strong> (<em>User Statically Defined Tracing</em>). Puntos de trazado que la aplicación declara explícitamente en su código —los tienen PostgreSQL, Node.js, la JVM, MySQL—. Son los tracepoints del espacio de usuario: estables y con semántica documentada.</div>
+
+<div class="step"><strong>XDP</strong> (<em>eXpress Data Path</em>). El hook más temprano posible de la red: el paquete se procesa <strong>apenas lo entrega el driver de la placa</strong>, antes de que el kernel le arme un <code>sk_buff</code>. Es donde se hace mitigación de DDoS a millones de paquetes por segundo.</div>
+
+<div class="step"><strong>LSM</strong> (<em>Linux Security Modules</em>). Hooks en los puntos de decisión de seguridad del kernel — los mismos que usan SELinux y AppArmor. Un programa eBPF ahí no solo <em>observa</em>: puede <strong>denegar</strong> la operación. Requiere kernel <strong>5.7+</strong> y en la práctica <strong>5.15 o superior</strong> para el soporte que usan las herramientas modernas.</div>
+
+<div class="mistake">
+  <strong>El error clásico del principiante:</strong> escribir todo con kprobes porque son los que aparecen primero en los tutoriales, y descubrir seis meses después que la herramienta se rompió en el upgrade de kernel. Regla: <strong>buscá primero si hay un tracepoint</strong> (<code>bpftrace -l 'tracepoint:*'</code>). Si no lo hay, usá kprobe y dejá escrito en un comentario contra qué versión de kernel lo probaste.
+</div>
+
+<h2>LS6.3 bpftrace: preguntas cortas, respuestas inmediatas</h2>
+
+<p><strong>bpftrace</strong> es un lenguaje de scripting de alto nivel para trazado <em>ad-hoc</em>, con una sintaxis inspirada en <code>awk</code> y en DTrace. Es la herramienta con la que vas a resolver el 90% de los problemas reales, porque te deja escribir una pregunta en una línea y tener la respuesta en cinco segundos.</p>
+
+<pre><code class="lang-bash"># Instalación (Debian/Ubuntu)
+sudo apt install bpftrace
+
+# Instalación (Fedora/RHEL)
+sudo dnf install bpftrace
+
+# ¿Qué puedo trazar en ESTE kernel? (suelen ser decenas de miles)
+sudo bpftrace -l | wc -l
+sudo bpftrace -l 'tracepoint:syscalls:sys_enter_open*'
+sudo bpftrace -l 'kprobe:vfs_*'
+
+# Ver qué argumentos tiene un tracepoint: indispensable antes de escribir nada
+sudo bpftrace -lv 'tracepoint:block:block_rq_issue'</code></pre>
+
+<h3>La sintaxis mínima</h3>
+
+<p>Un programa de bpftrace son bloques con la forma <code>hook /filtro/ { acciones }</code>. Con seis conceptos ya escribís cosas útiles:</p>
+
+<pre><code class="lang-bash"># estructura general:
+#   sonda /predicado opcional/ { acciones }
+#
+#   comm         nombre del proceso actual
+#   pid, tid     identificadores de proceso e hilo
+#   nsecs        reloj en nanosegundos
+#   args-&gt;campo  argumentos de la sonda (los ves con  bpftrace -lv)
+#   @nombre      un MAPA: variable global que persiste entre eventos
+#   @nombre[k]   un mapa indexado por clave (proceso, pid, dispositivo...)
+#
+#   count()      cuenta ocurrencias
+#   hist(v)      histograma de potencias de 2
+#   lhist(v,...) histograma lineal
+#   sum/avg/max  agregaciones
+
+sudo bpftrace -e 'BEGIN { printf("trazando... Ctrl-C para cortar\n"); }'</code></pre>
+
+<div class="tip">
+  Al cortar con <code>Ctrl-C</code>, bpftrace <strong>imprime automáticamente todos los mapas</strong> que hayas usado. Por eso muchos one-liners no tienen ni un <code>printf</code>: acumulás en <code>@</code> y el resumen aparece solo al terminar.
+</div>
+
+<h3>One-liners que resuelven problemas reales</h3>
+
+<p><strong>1. ¿Qué procesos se están ejecutando en este servidor?</strong> La pregunta más útil del mundo cuando algo aparece y desaparece antes de que <code>ps</code> lo vea — un cron, un script de otro equipo, un proceso hijo que muere en 20 ms.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_execve {
+    printf("%-8d %-16s %s\n", pid, comm, str(args-&gt;filename));
+}'</code></pre>
+
+<p><strong>2. ¿Qué archivos está abriendo un proceso concreto?</strong> Con el filtro por PID, para no ahogarte en el ruido de toda la máquina. Sirve para descubrir que tu app lee un archivo de config que nadie sabía que existía.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_openat /pid == 4242/ {
+    printf("%s abrió %s\n", comm, str(args-&gt;filename));
+}'</code></pre>
+
+<p><strong>3. Latencia de I/O por dispositivo, como histograma.</strong> Este es el one-liner que convierte "el disco anda lento" en un número. Mide el tiempo entre que el bloque se pide y se completa.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:block:block_rq_issue {
+    @inicio[args-&gt;dev, args-&gt;sector] = nsecs;
+}
+tracepoint:block:block_rq_complete /@inicio[args-&gt;dev, args-&gt;sector]/ {
+    @us[args-&gt;dev] = hist((nsecs - @inicio[args-&gt;dev, args-&gt;sector]) / 1000);
+    delete(@inicio[args-&gt;dev, args-&gt;sector]);
+}'</code></pre>
+
+<p><strong>4. ¿Cuáles son las syscalls más lentas, y quién las hace?</strong> Cronometra cada syscall y se queda solo con las que superan un umbral — acá, 10 milisegundos.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:raw_syscalls:sys_enter {
+    @t[tid] = nsecs;
+}
+tracepoint:raw_syscalls:sys_exit /@t[tid]/ {
+    $dur = nsecs - @t[tid];
+    delete(@t[tid]);
+    if ($dur &gt; 10000000) {
+        printf("%-16s pid=%-7d syscall=%-4d %d ms\n",
+               comm, pid, args-&gt;id, $dur / 1000000);
+    }
+}'</code></pre>
+
+<p><strong>5. ¿Quién le manda señales a quién?</strong> El one-liner que resuelve el misterio de "el proceso se muere solo". Spoiler: casi nunca se muere solo.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:signal:signal_generate {
+    printf("%s (pid %d) → señal %d → pid %d (%s)\n",
+           comm, pid, args-&gt;sig, args-&gt;pid, str(args-&gt;comm));
+}'</code></pre>
+
+<p><strong>6. ¿Qué está haciendo el kernel cuando el sistema está lento?</strong> Muestrea el stack del kernel 99 veces por segundo en todos los núcleos y te da un ranking. Es un perfilador en una línea.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+profile:hz:99 {
+    @[kstack] = count();
+}'</code></pre>
+
+<p><strong>7. Conteo de syscalls por proceso.</strong> El "¿en qué se le va el día a este servicio?" más barato que existe.</p>
+
+<pre><code class="lang-bash">sudo bpftrace -e '
+tracepoint:raw_syscalls:sys_enter {
+    @[comm] = count();
+}
+interval:s:10 {
+    print(@); clear(@);
+}'</code></pre>
+
+<p><strong>8. Trazar una función de TU aplicación, sin tocar el código.</strong> Acá es donde eBPF deja de parecer una herramienta de sysadmin y pasa a ser una herramienta de desarrollo. Un <code>uprobe</code> sobre el binario, con la función identificada por su símbolo:</p>
+
+<pre><code class="lang-bash"># ¿Qué símbolos exporta el binario?
+nm -C /usr/local/bin/api | grep -i catalogo
+# o, para binarios con símbolos dinámicos:
+objdump -T /usr/local/bin/api | head -40
+
+# Cronometrar esa función en producción, sin recompilar ni redesplegar
+sudo bpftrace -e '
+uprobe:/usr/local/bin/api:consultarCatalogo {
+    @inicio[tid] = nsecs;
+}
+uretprobe:/usr/local/bin/api:consultarCatalogo /@inicio[tid]/ {
+    @ms = hist((nsecs - @inicio[tid]) / 1000000);
+    delete(@inicio[tid]);
+}'</code></pre>
+
+<div class="rule">
+  <strong>📌 Releé el bloque anterior.</strong> Estás midiendo el tiempo de una función de tu propio programa, en un proceso que ya está corriendo, en producción, sin haberlo instrumentado, sin reiniciarlo y sin desplegar nada. Eso es lo que ninguna otra herramienta te da, y es la razón por la que este módulo existe.
+</div>
+
+<h2>LS6.4 BCC: herramientas listas para usar</h2>
+
+<p><strong>BCC</strong> (<em>BPF Compiler Collection</em>) es una colección de herramientas ya escritas, cada una respondiendo una pregunta concreta. Cuando la pregunta es de las frecuentes, no escribas un one-liner: usá la que ya existe y está probada.</p>
+
+<pre><code class="lang-bash">sudo apt install bpfcc-tools     # Debian/Ubuntu
+sudo dnf install bcc-tools       # Fedora/RHEL
+
+# En Debian/Ubuntu quedan con sufijo -bpfcc:
+ls /usr/sbin/*-bpfcc | head -20
+# En Fedora/RHEL suelen quedar en /usr/share/bcc/tools/</code></pre>
+
+<table>
+<thead><tr><th>Herramienta</th><th>La pregunta que contesta</th></tr></thead>
+<tbody>
+<tr><td><code>execsnoop</code></td><td>¿Qué procesos se están lanzando, con qué argumentos y desde qué padre?</td></tr>
+<tr><td><code>opensnoop</code></td><td>¿Qué archivos se abren, quién los abre y cuáles fallan?</td></tr>
+<tr><td><code>biolatency</code></td><td>¿Cuál es la distribución de latencia del disco? ¿Hay una cola larga?</td></tr>
+<tr><td><code>biosnoop</code></td><td>Igual, pero operación por operación, con proceso y latencia individual</td></tr>
+<tr><td><code>tcpconnect</code></td><td>¿A qué IPs y puertos se conecta este servidor?</td></tr>
+<tr><td><code>tcpretrans</code></td><td>¿Hay retransmisiones TCP? (síntoma clásico de pérdida de paquetes)</td></tr>
+<tr><td><code>runqlat</code></td><td>¿Cuánto esperan los procesos en la cola del scheduler antes de correr?</td></tr>
+<tr><td><code>profile</code></td><td>¿Dónde se quema la CPU? (perfilador por muestreo, salida para flamegraph)</td></tr>
+<tr><td><code>funclatency</code></td><td>¿Cuánto tarda una función concreta del kernel o de un binario?</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Todo lo que se ejecuta, con el árbol de padres
+sudo execsnoop-bpfcc
+
+# Archivos abiertos por procesos cuyo nombre contiene "nginx"
+sudo opensnoop-bpfcc -n nginx
+
+# Histograma de latencia de disco, refrescado cada 5 s, en milisegundos
+sudo biolatency-bpfcc -m 5
+
+# Conexiones TCP salientes con el proceso que las origina
+sudo tcpconnect-bpfcc
+
+# Cuánto espera cada proceso para que le den CPU
+sudo runqlat-bpfcc 5 3</code></pre>
+
+<div class="info">
+  <strong>bpftrace vs BCC, la decisión práctica.</strong> BCC cuando la pregunta es estándar (¿latencia de disco? ¿qué se ejecuta?) — está probado y tiene opciones útiles. bpftrace cuando la pregunta es tuya y de nadie más ("cuánto tarda <em>esta</em> función de <em>mi</em> binario cuando el argumento es mayor que 100"). En la práctica el flujo es: empezás con BCC para acotar, y terminás con un one-liner de bpftrace para el disparo final.
+</div>
+
+<h2>LS6.5 strace vs perf vs eBPF: cuál usar y cuándo</h2>
+
+<table>
+<thead><tr><th></th><th><code>strace</code></th><th><code>perf</code></th><th><strong>eBPF</strong></th></tr></thead>
+<tbody>
+<tr><td><strong>Cómo funciona</strong></td><td><code>ptrace</code>: para el proceso en cada syscall</td><td>Muestreo por contadores de hardware</td><td>Código verificado que corre en el kernel</td></tr>
+<tr><td><strong>Overhead típico</strong></td><td><strong>10× a 100× más lento</strong></td><td>1–5% (según frecuencia)</td><td>Desde &lt;1% hasta pocos %</td></tr>
+<tr><td><strong>Qué ve</strong></td><td>Syscalls de UN proceso, todas</td><td>Panorama estadístico del sistema</td><td>Lo que vos definas, filtrado en el kernel</td></tr>
+<tr><td><strong>Filtrado</strong></td><td>En espacio de usuario, después de copiar</td><td>Limitado</td><td><strong>En el kernel</strong>: descartás antes de copiar</td></tr>
+<tr><td><strong>Agregación</strong></td><td>Ninguna: te da texto crudo</td><td>Sí, en el reporte</td><td><strong>En el kernel</strong>: histogramas y contadores</td></tr>
+<tr><td><strong>¿En producción?</strong></td><td>❌ Puede tumbarte el servicio</td><td>✅ Con cuidado</td><td>✅ Es su caso de uso principal</td></tr>
+<tr><td><strong>Cuándo elegirlo</strong></td><td>Debug local de un proceso que ya rompiste</td><td>"¿Dónde se quema la CPU?" a grandes rasgos</td><td>Preguntas quirúrgicas bajo carga real</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El error que puede costarte un incidente.</strong> Correr <code>strace</code> sobre un proceso de producción con tráfico. <code>ptrace</code> detiene el proceso en <em>cada</em> syscall y lo despierta después: en un servicio con miles de syscalls por segundo eso multiplica la latencia por diez o por cien, se llenan las colas, los health checks empiezan a fallar y el orquestador te reinicia el pod. El diagnóstico se convierte en la causa raíz del incidente.
+</div>
+
+<h3>Por qué eBPF puede quedarse corriendo</h3>
+
+<p>La diferencia de overhead no es magia: es <strong>dónde ocurre el trabajo</strong>. <code>strace</code> copia cada evento a espacio de usuario, con cambio de contexto, y recién ahí decide si te interesaba. eBPF filtra y agrega <strong>adentro del kernel</strong>: si pedís un histograma de latencia de disco, lo que cruza a tu terminal son unas pocas decenas de contadores por segundo, no un millón de eventos.</p>
+
+<pre><code class="lang-bash"># Medí el overhead vos mismo, no lo creas porque lo dice un módulo.
+# 1) Línea de base
+time (for i in $(seq 1 20000); do /bin/true; done)
+
+# 2) La misma carga, con un one-liner de eBPF trazando execve en otra terminal
+#    sudo bpftrace -e 'tracepoint:syscalls:sys_enter_execve { @ = count(); }'
+time (for i in $(seq 1 20000); do /bin/true; done)
+
+# 3) La misma carga bajo strace, para ver la diferencia de orden de magnitud
+time strace -f -c -- sh -c 'for i in $(seq 1 20000); do /bin/true; done'</code></pre>
+
+<div class="warn">
+  <strong>Bajo overhead no es overhead cero.</strong> Un hook cuesta decenas de nanosegundos, pero si lo enganchás a un evento que ocurre millones de veces por segundo —cada paquete de red, cada acceso a memoria— eso se nota. Regla práctica: <strong>filtrá lo más temprano posible</strong> (en el predicado, no en la acción) y desconfiá de los hooks sobre funciones muy calientes hasta haber medido.
+</div>
+
+<h2>LS6.6 eBPF en seguridad: Falco y Tetragon</h2>
+
+<p>La visibilidad a nivel de syscall es extraordinariamente buena para detectar intrusiones, y la razón es conceptual: <strong>un atacante puede mentirle a tus logs, pero no puede hacer nada sin llamar al kernel</strong>. Puede borrar el historial de la shell, apagar el logging de la aplicación y limpiar sus huellas del filesystem — pero para leer un archivo tuvo que hacer un <code>openat</code>, y para abrir una reverse shell tuvo que hacer un <code>connect</code>. Esas llamadas pasan sí o sí por el kernel, que es exactamente donde está mirando eBPF.</p>
+
+<div class="concept">
+  <strong>💡 El cambio de modelo.</strong> La detección tradicional lee logs — es decir, lee <em>lo que el sistema eligió contar</em>, después de que pasó, y desde un lugar que el atacante puede modificar. La detección con eBPF observa <em>lo que el sistema hizo</em>, en el momento en que lo hace, desde un lugar al que el atacante no llega sin comprometer el kernel entero.
+</div>
+
+<p><strong>Falco</strong> es el motor de detección de amenazas en runtime de referencia del ecosistema cloud-native. Consume eventos del kernel vía eBPF y los evalúa contra un conjunto de reglas declarativas. Requiere kernel <strong>5.8 como mínimo</strong> para su driver eBPF moderno.</p>
+
+<pre><code class="lang-yaml"># Una regla de Falco: "se abrió una shell dentro de un contenedor"
+# Es el ejemplo canónico porque un contenedor bien construido
+# no tiene ninguna razón legítima para lanzar bash.
+- rule: Shell en contenedor
+  desc: Detecta la ejecución de una shell interactiva dentro de un contenedor
+  condition: &gt;
+    spawned_process
+    and container
+    and shell_procs
+    and proc.tty != 0
+  output: &gt;
+    Shell abierta en contenedor
+    (usuario=%user.name contenedor=%container.name
+     comando=%proc.cmdline padre=%proc.pname)
+  priority: WARNING
+  tags: [container, shell, mitre_execution]</code></pre>
+
+<p><strong>Tetragon</strong> va un paso más allá: además de observar, puede <strong>aplicar políticas</strong> — matar el proceso o denegar la operación en el momento en que ocurre, sin ida y vuelta a espacio de usuario. Para eso usa los hooks LSM, y por eso pide kernel <strong>5.15 o superior</strong>.</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué hace</th><th>Kernel mínimo</th><th>¿Bloquea?</th></tr></thead>
+<tbody>
+<tr><td><strong>Falco</strong></td><td>Detección de intrusiones en runtime por reglas</td><td>5.8</td><td>Alerta (respuesta externa)</td></tr>
+<tr><td><strong>Tetragon</strong></td><td>Observabilidad de seguridad + enforcement</td><td>5.15</td><td>✅ Sí, en el kernel</td></tr>
+<tr><td><strong>Cilium</strong></td><td>Networking y network policies de Kubernetes</td><td>5.8</td><td>✅ A nivel de red</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Este tema se cruza de frente con el <a href="../../../Curso-Ciberseguridad/m10-deteccion-respuesta/lecture.html">M10 del Curso de Ciberseguridad — Detección y respuesta</a>, donde se ve el lado de proceso: qué hacés con la alerta una vez que suena, cómo se escribe una regla que no genere mil falsos positivos y cómo encaja todo esto en un flujo de respuesta a incidentes. eBPF es el sensor; ese módulo es lo que viene después del sensor.
+</div>
+
+<div class="mistake">
+  <strong>Un sensor sin proceso es ruido caro.</strong> El error más común al desplegar Falco es habilitar el ruleset completo el primer día, recibir 4.000 alertas, y en dos semanas tener a todo el equipo ignorándolas. La secuencia correcta es al revés: pocas reglas de alta confianza, ajustadas a tu entorno, y recién ampliar cuando cada alerta que suena significa algo.
+</div>
+
+<h2>LS6.7 eBPF en redes: XDP y Cilium</h2>
+
+<p>El otro gran territorio de eBPF es la red, y ahí el problema que resolvió es concreto: <strong>iptables no escala</strong>. Sus reglas se evalúan de forma esencialmente lineal, así que un clúster de Kubernetes con 5.000 servicios termina recorriendo decenas de miles de reglas por paquete. La latencia crece con el tamaño del clúster, que es exactamente lo que no querés.</p>
+
+<p><strong>Cilium</strong> reemplaza esa cadena por programas eBPF que hacen <em>lookups</em> en mapas tipo hash: el costo es aproximadamente constante, no proporcional a la cantidad de servicios. Esa es la razón técnica —no de moda— por la que se volvió el estándar de facto para networking de Kubernetes a escala. Pide kernel <strong>5.8 como mínimo</strong>.</p>
+
+<table>
+<thead><tr><th></th><th>iptables / kube-proxy</th><th>Cilium (eBPF)</th></tr></thead>
+<tbody>
+<tr><td>Costo por paquete</td><td>Crece con la cantidad de reglas</td><td>Aproximadamente constante (hash)</td></tr>
+<tr><td>Actualizar una regla</td><td>Reescribe cadenas enteras</td><td>Actualiza una entrada del mapa</td></tr>
+<tr><td>Identidad</td><td>Por IP (y las IPs de los pods rotan)</td><td>Por identidad de workload</td></tr>
+<tr><td>Visibilidad</td><td>Contadores por regla</td><td>Flujos con identidad y capa 7</td></tr>
+<tr><td>Policies de capa 7</td><td>❌ No</td><td>✅ HTTP, gRPC, Kafka</td></tr>
+</tbody>
+</table>
+
+<p><strong>XDP</strong> es el extremo del espectro de rendimiento. El programa corre en el driver de la placa, antes de que el kernel arme las estructuras de red, y devuelve un veredicto: pasar, descartar, o reenviar. Descartar un paquete ahí cuesta una fracción de lo que cuesta descartarlo en iptables, y por eso es la base de la mitigación de DDoS a escala de millones de paquetes por segundo.</p>
+
+<pre><code class="lang-c">/* Esqueleto de un programa XDP: se decide y se devuelve un veredicto.
+   Los veredictos posibles son XDP_PASS (seguí al kernel), XDP_DROP
+   (descartá acá mismo), XDP_TX (rebotalo por donde vino)
+   y XDP_REDIRECT (mandalo a otra interfaz o a otra CPU).          */
+
+SEC("xdp")
+int filtro_ddos(struct xdp_md *ctx)
+{
+    void *data     = (void *)(long)ctx-&gt;data;
+    void *data_end = (void *)(long)ctx-&gt;data_end;
+    struct ethhdr *eth = data;
+
+    /* El verificador EXIGE este chequeo de límites: sin él, el
+       programa no se carga. No es una buena práctica opcional,
+       es un requisito para que el kernel acepte el código.        */
+    if ((void *)(eth + 1) &gt; data_end)
+        return XDP_PASS;
+
+    /* ...acá iría el lookup en un mapa de IPs bloqueadas... */
+    return XDP_PASS;
+}</code></pre>
+
+<div class="info">
+  Ese <code>if ((void *)(eth + 1) &gt; data_end)</code> es la esencia del verificador en una línea. No estás siendo prolijo: estás <strong>demostrándole al kernel</strong> que no vas a leer fuera del buffer. Si lo sacás, el programa no se carga, y el mensaje de error te va a decir literalmente que hay un acceso a memoria no probado.
+</div>
+
+<h2>LS6.8 Limitaciones y trade-offs honestos</h2>
+
+<p>eBPF es muy bueno, y también tiene fricciones reales que conviene conocer antes de prometerle a alguien que vas a "instrumentar todo con eBPF el martes".</p>
+
+<div class="step"><strong>1. Versión de kernel.</strong> Es la limitación número uno y no tiene rodeo: si tu producción corre un kernel viejo de una distro enterprise, hay features que directamente no existen. Falco y Cilium quieren <strong>5.8+</strong>; Tetragon y los hooks LSM, <strong>5.15+</strong>. Antes de diseñar nada, andá a mirar qué kernel tenés.</div>
+
+<div class="step"><strong>2. Permisos.</strong> Históricamente todo esto pedía <code>root</code>. Desde 5.8 existe <strong><code>CAP_BPF</code></strong>, que junto con <code>CAP_PERFMON</code> permite dar permisos acotados en vez de la máquina entera. Sigue siendo un privilegio importante: cargar eBPF es una capacidad que un atacante quiere tener, así que trátala como tal.</div>
+
+<div class="step"><strong>3. La curva de aprendizaje.</strong> bpftrace es accesible en una tarde. Escribir programas eBPF en C con <code>libbpf</code> no lo es: exige entender el modelo de memoria, los tipos de mapas, las peculiaridades del verificador y las estructuras internas del kernel que estás leyendo.</div>
+
+<div class="step"><strong>4. El verificador que dice que no.</strong> Va a rechazar programas que a vos te parecen perfectamente correctos, con mensajes densos sobre estados de registros. Loops sin cota probada, punteros sin chequear, demasiadas instrucciones, stack demasiado grande. Es el precio exacto de la garantía de seguridad — y es un precio que se paga en horas de frustración las primeras veces.</div>
+
+<div class="step"><strong>5. Portabilidad: CO-RE y BTF.</strong> Un programa que lee estructuras del kernel está atado a cómo están dispuestas <em>en ese</em> kernel. <strong>CO-RE</strong> (<em>Compile Once, Run Everywhere</em>) resuelve eso usando <strong>BTF</strong>, la información de tipos que el kernel expone de sí mismo: el cargador ajusta los desplazamientos en tiempo de carga. Funciona muy bien — <em>si</em> tu kernel tiene BTF habilitado.</div>
+
+<pre><code class="lang-bash"># Diagnóstico previo: ¿este sistema puede hacer eBPF moderno?
+uname -r                                    # versión de kernel
+
+# ¿Tiene BTF? (indispensable para CO-RE)
+ls -l /sys/kernel/btf/vmlinux
+grep CONFIG_DEBUG_INFO_BTF /boot/config-$(uname -r)
+
+# ¿Están habilitados los subsistemas que hacen falta?
+grep -E 'CONFIG_BPF=|CONFIG_BPF_SYSCALL|CONFIG_BPF_JIT|CONFIG_BPF_LSM' \
+     /boot/config-$(uname -r)
+
+# ¿Qué programas eBPF ya hay cargados en esta máquina?
+sudo bpftool prog show
+sudo bpftool map show
+sudo bpftool prog show --json | head -30</code></pre>
+
+<div class="danger">
+  <strong>⚠️ eBPF es una superficie de ataque, no solo una herramienta.</strong> Quien puede cargar programas eBPF puede leer memoria del kernel e interceptar operaciones. Han existido CVEs de escalada de privilegios que abusan del verificador. Consecuencias prácticas: no repartas <code>CAP_BPF</code> como si fuera nada, no le des <code>privileged: true</code> a contenedores "para que ande la herramienta de observabilidad", y mantené el kernel parcheado. La misma potencia que te sirve a vos le sirve a un atacante.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "la API tiene picos de 2 segundos y los logs no dicen nada"</h2>
+
+<blockquote>Una API responde en 40 ms el 99% del tiempo. Cada tanto —sin patrón claro, unas pocas veces por hora— una request tarda <strong>2 segundos</strong>. Los logs de la aplicación muestran la request entrando y saliendo, con el tiempo total alto y ninguna pista de dónde se fue. Las métricas de CPU y memoria están planas. El equipo lleva dos semanas dando vueltas.</blockquote>
+
+<p><strong>Paso 0 — Encuadrar el problema antes de tocar una tecla.</strong> Dos segundos es una eternidad. Un pico así no es "el código es lento": es <strong>una espera</strong>. Y las cosas por las que un proceso espera son pocas y enumerables: espera CPU, espera disco, espera red, o espera un lock. La estrategia es descartarlas en orden, con evidencia, en vez de opinar.</p>
+
+<p><strong>Paso 1 — ¿Está esperando CPU?</strong> Si el servidor está saturado, el proceso puede estar listo para correr y no recibir tiempo de CPU. <code>runqlat</code> mide exactamente eso: cuánto espera un proceso en la cola del scheduler entre que está listo y que efectivamente corre.</p>
+
+<pre><code class="lang-bash">sudo runqlat-bpfcc 10 6      # 6 muestras de 10 segundos</code></pre>
+
+<pre><code>     usecs               : count     distribution
+         0 -&gt; 1           : 12043    |█████████████████████████████████|
+         2 -&gt; 3           :  3211    |████████                         |
+         4 -&gt; 7           :   842    |██                               |
+         8 -&gt; 15          :   106    |                                 |
+        16 -&gt; 31          :    11    |                                 |
+        32 -&gt; 63          :     2    |                                 |</code></pre>
+
+<p><strong>Cómo se lee:</strong> la columna izquierda son rangos de espera en microsegundos, la derecha cuántas veces cayó en cada rango. La distribución entera termina en <strong>63 microsegundos</strong>. El peor caso medido es 0,000063 segundos y buscamos algo de 2 segundos: hay <strong>cinco órdenes de magnitud</strong> de diferencia. La CPU queda descartada, y no por intuición sino por número.</p>
+
+<p><strong>Paso 2 — ¿Está esperando disco?</strong> Misma lógica, otro recurso. <code>biolatency</code> da la distribución de latencia de las operaciones de bloque.</p>
+
+<pre><code class="lang-bash">sudo biolatency-bpfcc -m 10 6     # en milisegundos</code></pre>
+
+<pre><code>     msecs               : count     distribution
+         0 -&gt; 1           : 45012    |█████████████████████████████████|
+         2 -&gt; 3           :  2103    |█                                |
+         4 -&gt; 7           :   311    |                                 |
+         8 -&gt; 15          :    42    |                                 |
+        16 -&gt; 31          :     8    |                                 |
+       512 -&gt; 1023        :     3    |                                 |
+      1024 -&gt; 2047        :     5    |                                 |</code></pre>
+
+<p><strong>Acá está la firma del problema.</strong> El 99% de las operaciones terminan en menos de 2 ms, pero hay <strong>8 operaciones entre medio segundo y dos segundos</strong>. Ese hueco enorme en el histograma —nada entre 31 ms y 512 ms, y después un grupito arriba— es característico: no es "el disco está lento en promedio", es <strong>un puñado de operaciones patológicas</strong>. Un promedio nunca te habría mostrado esto; lo habría diluido. Por eso se mira la distribución y no la media.</p>
+
+<p><strong>Paso 3 — ¿Quién hace esas operaciones?</strong> Sabemos que hay I/O lento. Falta saber qué parte del código lo dispara. <code>biosnoop</code> muestra operación por operación, con el proceso responsable:</p>
+
+<pre><code class="lang-bash">sudo biosnoop-bpfcc | awk '$7 &gt; 400'   # solo las que tardaron más de 400 ms</code></pre>
+
+<pre><code>TIME(s)     COMM    PID     DISK   T SECTOR      BYTES  LAT(ms)
+14.882000   api     4242    nvme0n1 R 88243712   32768   1104.22
+31.104000   api     4242    nvme0n1 R 91556224   32768    987.44
+52.667000   api     4242    nvme0n1 R 88911360   65536   1830.07</code></pre>
+
+<p>Es nuestro proceso (<code>api</code>, pid 4242), son <strong>lecturas</strong> (<code>T = R</code>) y son chicas. Una lectura de 32 KB que tarda un segundo en un NVMe no es un problema de volumen de datos: es una espera. Ahora sí, la última pregunta: <strong>¿qué función de la aplicación la origina?</strong></p>
+
+<p><strong>Paso 4 — El disparo final: uprobe sobre la app.</strong> Acá es donde eBPF hace lo que ninguna otra herramienta hace. Enganchamos las funciones candidatas del binario y cronometramos cada una, sin tocar el código ni reiniciar el proceso:</p>
+
+<pre><code class="lang-bash"># Primero, qué símbolos hay para enganchar
+nm -C /usr/local/bin/api | grep -iE 'cache|catalogo|render'
+
+# Después, cronometrar TODAS las funciones candidatas de una,
+# y quedarse solo con las llamadas que tardaron más de 300 ms
+sudo bpftrace -e '
+uprobe:/usr/local/bin/api:leerCache,
+uprobe:/usr/local/bin/api:consultarCatalogo,
+uprobe:/usr/local/bin/api:renderPlantilla {
+    @inicio[tid, probe] = nsecs;
+}
+
+uretprobe:/usr/local/bin/api:leerCache,
+uretprobe:/usr/local/bin/api:consultarCatalogo,
+uretprobe:/usr/local/bin/api:renderPlantilla
+/@inicio[tid, probe]/ {
+    $ms = (nsecs - @inicio[tid, probe]) / 1000000;
+    delete(@inicio[tid, probe]);
+    @dist[probe] = hist($ms);
+    if ($ms &gt; 300) {
+        printf("LENTA: %s tardó %d ms (pid %d)\n", probe, $ms, pid);
+    }
+}'</code></pre>
+
+<pre><code>LENTA: uretprobe:/usr/local/bin/api:leerCache tardó 1104 ms (pid 4242)
+LENTA: uretprobe:/usr/local/bin/api:leerCache tardó 1831 ms (pid 4242)
+
+@dist[uretprobe:/usr/local/bin/api:consultarCatalogo]:
+[0]         8912 |█████████████████████████████████████|
+[1]          204 |                                     |
+
+@dist[uretprobe:/usr/local/bin/api:leerCache]:
+[0]         9001 |█████████████████████████████████████|
+[1]           11 |                                     |
+[512, 1K)        3 |                                     |
+[1K, 2K)         5 |                                     |</code></pre>
+
+<p><strong>Encontrado.</strong> Es <code>leerCache</code>. Su distribución tiene la <em>misma forma</em> que la de <code>biolatency</code>: casi todo instantáneo, y un puñado de llamadas de uno o dos segundos. Y la coincidencia de conteos (8 operaciones de disco lentas, 8 llamadas lentas a <code>leerCache</code>) cierra la cadena causal completa: <strong>request lenta → llamada a <code>leerCache</code> lenta → lectura de disco lenta</strong>.</p>
+
+<p>La causa concreta resulta ser previsible una vez que sabés dónde mirar: el "cache" está respaldado en disco y, cuando la entrada expira, algunas peticiones se van a leer el archivo en vez de servirse de memoria. Los logs nunca lo mostraron porque nadie instrumentó una función que "obviamente era rápida".</p>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá biolatency".</strong> Es el método: <strong>descartar recursos en orden, con distribuciones y no con promedios, y bajar de resolución en cada paso</strong> — de todo el sistema, a un subsistema, a un proceso, a una función. Cada paso costó menos de un minuto, ninguno requirió tocar el código, y la conclusión no fue una teoría: fue una cadena de mediciones que coinciden entre sí. Las dos semanas anteriores se perdieron discutiendo hipótesis sin datos.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué es seguro correr eBPF en producción y no lo es cargar un módulo de kernel que hace lo mismo?</summary>
+<p>Por el <strong>verificador</strong>. Antes de cargar nada, el kernel analiza el bytecode y demuestra que el programa termina (no hay loops sin cota probada), que todos los accesos a memoria están dentro de rango, que los punteros se chequean antes de desreferenciarse y que no se excede el límite de instrucciones. Si no puede demostrarlo, rechaza el programa. Un módulo de kernel no pasa por nada de eso: corre con permisos totales, y un puntero mal calculado es un <em>kernel panic</em> que se lleva puesto el servidor entero. Además el programa eBPF pasa por un JIT que lo traduce a código nativo, así que la seguridad no se paga con lentitud.</p></details>
+
+<details><summary>Tenés que elegir entre un kprobe y un tracepoint para lo mismo. ¿Cuál usás y por qué?</summary>
+<p>El <strong>tracepoint</strong>, siempre que exista uno que sirva. Los tracepoints son puntos de instrumentación que los desarrolladores del kernel colocaron a propósito y se comprometen a mantener estables entre versiones. Los kprobes se enganchan a funciones internas del kernel, que <strong>no son una API pública</strong>: su nombre, su firma y hasta su existencia pueden cambiar en cualquier release. Un script basado en kprobes anda hoy y se rompe silenciosamente en el próximo upgrade. El kprobe es el recurso cuando no hay tracepoint para lo que necesitás — y en ese caso conviene dejar anotado contra qué versión de kernel se probó.</p></details>
+
+<details><summary>Tenés un pico de latencia de 2 segundos y ninguna pista. ¿Qué medís primero y por qué en ese orden?</summary>
+<p>Se descartan recursos en orden, del más barato de medir al más específico. Primero <code>runqlat</code>: si el proceso estuviera esperando CPU, todo lo demás es ruido, y se descarta en diez segundos comparando órdenes de magnitud (una espera de microsegundos no explica un pico de segundos). Después <code>biolatency</code> para disco, mirando la <strong>distribución</strong> y no el promedio, porque un puñado de operaciones patológicas entre millones de operaciones rápidas desaparece en una media. Con la firma identificada, se baja de resolución: <code>biosnoop</code> para saber qué proceso las origina, y finalmente un <code>uprobe</code> de bpftrace sobre las funciones candidatas del binario para señalar la llamada exacta. La clave es que cada paso <em>elimina</em> hipótesis con evidencia numérica en vez de agregar opiniones.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>eBPF es una <strong>VM dentro del kernel</strong> que ejecuta programas verificados: se cargan y descargan en caliente, sin reiniciar ni recompilar nada.</li>
+  <li>El <strong>verificador</strong> es lo que lo hace apto para producción: prueba terminación y accesos válidos antes de cargar. Es la diferencia entera con un módulo de kernel.</li>
+  <li>Los hooks disponibles son <strong>kprobes</strong> (potentes pero frágiles), <strong>tracepoints</strong> (estables — preferilos), <strong>uprobes/USDT</strong> (espacio de usuario, incluida tu app), <strong>XDP</strong> (red temprana) y <strong>LSM</strong> (seguridad, puede denegar).</li>
+  <li><strong>bpftrace</strong> para preguntas propias en una línea; <strong>BCC</strong> (<code>execsnoop</code>, <code>opensnoop</code>, <code>biolatency</code>, <code>tcpconnect</code>, <code>runqlat</code>) para las preguntas estándar.</li>
+  <li>Frente a <code>strace</code> (10–100× de overhead, inviable en producción) y <code>perf</code> (muestreo, panorama), eBPF es <strong>quirúrgico, programable y de bajo overhead</strong> porque filtra y agrega <strong>dentro del kernel</strong>.</li>
+  <li>En seguridad: <strong>Falco</strong> (kernel 5.8+) detecta en runtime y <strong>Tetragon</strong> (5.15+) además bloquea. La visibilidad a nivel de syscall funciona porque un atacante puede mentirle a los logs, pero no puede evitar llamar al kernel.</li>
+  <li>En redes: <strong>Cilium</strong> (5.8+) reemplazó a iptables en Kubernetes porque su costo por paquete es constante y no crece con la cantidad de servicios; <strong>XDP</strong> descarta paquetes antes de que el kernel los procese.</li>
+  <li>Los límites reales: <strong>versión de kernel</strong>, permisos (<code>CAP_BPF</code>), curva de aprendizaje de <code>libbpf</code>, el verificador rechazando código que parece correcto, y la portabilidad vía <strong>CO-RE/BTF</strong>.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<p class="mini-ex"><strong>Todo esto va en tu VM</strong>, con un kernel 5.15 o superior. Verificá primero con <code>uname -r</code> y con <code>ls /sys/kernel/btf/vmlinux</code>.</p>
+
+<ol>
+  <li>Corré <code>sudo bpftrace -l | wc -l</code> en tu VM y anotá el número. Después listá los tracepoints de <code>syscalls</code> y de <code>block</code>, elegí tres que no conocías y averiguá con <code>bpftrace -lv</code> qué argumentos exponen.</li>
+  <li>Dejá <code>execsnoop</code> corriendo diez minutos en tu VM mientras hacés tareas normales (instalar un paquete, abrir un editor, correr un build). Armá una lista de al menos cinco procesos que se ejecutaron y que vos no lanzaste conscientemente, y explicá de dónde salió cada uno.</li>
+  <li>Escribí un one-liner de bpftrace que cuente <code>openat</code> por proceso y lo imprima cada cinco segundos, limpiando el mapa entre reportes. Corrélo mientras hacés <code>apt update</code> y explicá el ranking.</li>
+  <li>Medí el overhead vos mismo: cronometrá 20.000 ejecuciones de <code>/bin/true</code> en tres condiciones — sin instrumentar, con un one-liner de eBPF trazando <code>execve</code>, y bajo <code>strace -f</code>. Armá una tabla con tus números reales y calculá el factor de cada uno contra la línea de base.</li>
+  <li>Compilá un programa propio en C o Go con una función que a veces duerma medio segundo. Sin tocar el código después de compilarlo, usá un par <code>uprobe</code>/<code>uretprobe</code> para producir un histograma de su latencia. Explicá cómo encontraste el símbolo de la función.</li>
+  <li>Instalá Falco en tu VM, dejalo con el ruleset por defecto una hora y contá cuántas alertas generó. Elegí las tres más ruidosas, explicá por qué disparan en tu entorno y escribí una excepción para una de ellas justificando por qué es segura.</li>
+  <li>Reproducí el Worked Example: escribí un servicio chico que lea un archivo de disco cada tanto (usá <code>dd</code> o <code>fsync</code> para forzar I/O real) y diagnosticalo de cero con la secuencia <code>runqlat</code> → <code>biolatency</code> → <code>biosnoop</code> → <code>uprobe</code>. Documentá qué descartaste en cada paso y con qué número.</li>
+</ol>
+
+<section class="quiz" id="quizLS6">
+  <style>
+    #quizLS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS6 .q{margin-bottom:1.5rem}
+    #quizLS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS6 .opt:hover{border-color:var(--accent)}
+    #quizLS6 .opt:disabled{cursor:default}
+    #quizLS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS6 .exp.show{display:block}
+    #quizLS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué componente hace que sea razonable cargar un programa eBPF en un servidor de producción con tráfico?</p>
+    <button class="opt">El compilador JIT, porque traduce el bytecode a código máquina nativo</button>
+    <button class="opt">El verificador, porque demuestra que el programa termina y no accede a memoria inválida antes de cargarlo</button>
+    <button class="opt">Los mapas BPF, porque aíslan la memoria del programa de la del kernel</button>
+    <div class="exp">El JIT explica la <em>velocidad</em> y los mapas explican cómo salen los datos, pero lo que explica la <em>seguridad</em> es el verificador: analiza el bytecode antes de cargarlo y prueba que no hay loops sin cota, que todos los accesos a memoria están en rango y que los punteros se chequean. Si no puede demostrarlo, rechaza el programa — no lo carga a ver qué pasa. Esa garantía previa es exactamente lo que un módulo de kernel no te da.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés que diagnosticar por qué un servicio con tráfico real tiene picos de latencia. ¿Por qué <code>strace</code> es mala idea acá?</p>
+    <button class="opt">Porque <code>strace</code> no puede ver syscalls, solo funciones de espacio de usuario</button>
+    <button class="opt">Porque necesita que el proceso se reinicie con un flag especial</button>
+    <button class="opt">Porque usa <code>ptrace</code> y detiene el proceso en cada syscall: multiplica la latencia por 10× o 100× y puede tumbar el servicio</button>
+    <div class="exp">El mecanismo de <code>strace</code> es <code>ptrace</code>: para el proceso en cada entrada y salida de syscall, copia los datos a espacio de usuario y lo despierta. En un servicio con miles de syscalls por segundo eso agrega un overhead de uno o dos órdenes de magnitud: se llenan las colas, fallan los health checks y el orquestador reinicia el pod. El diagnóstico termina siendo la causa del incidente. eBPF evita eso porque filtra y agrega <strong>dentro del kernel</strong>, y solo cruza a espacio de usuario el resultado.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Necesitás medir cuánto tarda una función específica de tu aplicación, que ya está corriendo en producción y no tiene ni un log adentro. ¿Qué hook usás?</p>
+    <button class="opt">Un par <code>uprobe</code>/<code>uretprobe</code> sobre el símbolo de esa función en el binario</button>
+    <button class="opt">Un kprobe, porque es el hook más flexible del kernel</button>
+    <button class="opt">Un tracepoint, porque son los hooks estables y hay que preferirlos siempre</button>
+    <div class="exp">Los kprobes y los tracepoints viven en el <strong>kernel</strong>: no pueden ver funciones de tu aplicación. Para espacio de usuario están los <code>uprobe</code> (entrada) y <code>uretprobe</code> (retorno), que se enganchan a un símbolo de un binario o de una librería compartida. Guardás <code>nsecs</code> en el uprobe, restás en el uretprobe y tenés un histograma de latencia de tu propia función — sin recompilar, sin redesplegar y sin reiniciar el proceso. La regla de "preferí tracepoints" sigue valiendo, pero <em>entre hooks del kernel</em>.</div>
+  </div>
+
+  <div class="score" id="scoreLS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls5-redes/lecture.html">← LS5: Redes a fondo</a>
+  <a href="../ls7-systemd/lecture.html">LS7: systemd a fondo →</a>
+</nav>
+
+</div>
+</body>
+</html>

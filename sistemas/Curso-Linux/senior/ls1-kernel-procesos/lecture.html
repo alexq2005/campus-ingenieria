@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS1 — El kernel por dentro: syscalls, procesos y scheduler · Linux Senior</title>
+  <meta name="description" content="Espacio de usuario vs kernel, el costo real de una syscall, task_struct y /proc, los estados de un proceso y por qué D no se mata, fork con copy-on-write, zombies y PID 1, el scheduler EEVDF, señales y qué mide realmente el load average.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS1</span>
+  <span class="badge">⏱ 35–95 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Linux M00–M13</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>LS1 — El kernel por dentro: syscalls, procesos y scheduler</h1>
+
+<h2>LS1.0 Por qué este módulo</h2>
+
+<p>Hasta acá <em>usaste</em> Linux: sabés moverte, editar, montar, escribir un servicio de systemd. Desde acá vas a poder <strong>diagnosticar por qué la máquina se comporta raro</strong>. Esa diferencia aparece siempre en el mismo momento: son las 3 de la mañana, el load average dice 40, la CPU está al 5%, nadie entiende nada, y hay que decidir algo.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo lo raro que hace un sistema Linux se explica con tres hechos: <strong>(1)</strong> hay una frontera dura entre tu código y el kernel, y cruzarla cuesta; <strong>(2)</strong> un proceso no es una caja negra — el kernel te expone su estado completo en <code>/proc</code>; y <strong>(3)</strong> las métricas clásicas (load average, %CPU) miden cosas distintas de lo que la gente cree. Entendé esos tres y dejás de adivinar.
+</div>
+
+<p>Nada de lo que sigue es teoría de museo. Cada sección tiene el comando que lo comprueba en tu máquina, ahora. Si no lo corrés, no lo aprendiste.</p>
+
+<h2>LS1.1 Espacio de usuario vs espacio de kernel</h2>
+
+<p>Tu programa <strong>no puede tocar el hardware</strong>. No puede leer un disco, no puede mandar un paquete, no puede mirar la memoria de otro proceso. Corre en <em>ring 3</em> del procesador, sin privilegios. El kernel corre en <em>ring 0</em> y puede hacer todo. La única puerta entre ambos mundos es la <strong>llamada al sistema</strong>.</p>
+
+<pre><code class="lang-text">   ESPACIO DE USUARIO   (ring 3 — sin privilegios)
+  ┌──────────────────────────────────────────────────────┐
+  │   bash     nginx     postgres     tu-programa        │
+  │     │                                                │
+  │     │   read(fd, buf, 4096)   ← wrapper de glibc     │
+  └─────┼────────────────────────────────────────────────┘
+        │   instrucción  syscall   (nº de llamada en %rax)
+  ══════╪════════════════════════════════════════════════  frontera
+        ▼
+  ┌──────────────────────────────────────────────────────┐
+  │   entry_SYSCALL_64  →  sys_call_table[__NR_read]     │
+  │        VFS  →  page cache  →  driver  →  disco       │
+  │                                                      │
+  │   ESPACIO DE KERNEL   (ring 0 — acceso total)        │
+  └──────────────────────────────────────────────────────┘</code></pre>
+
+<p>Cada proceso tiene su propio espacio de direcciones virtual, y el kernel está mapeado dentro de <em>todos</em> ellos — pero marcado como inaccesible desde ring 3. Por eso el cambio de contexto es barato en teoría: no hay que cambiar de tablas de páginas, solo de nivel de privilegio.</p>
+
+<div class="info">
+  <strong>Eso era antes de 2018.</strong> Meltdown obligó a introducir <strong>KPTI</strong> (<em>kernel page-table isolation</em>): ahora el kernel se <em>desmapea</em> mientras corre código de usuario, y cada syscall implica cambiar de tablas de páginas y tirar parte del TLB. Una syscall trivial pasó de ~60 ns a 150–500 ns según el CPU y las mitigaciones activas. Mirá las tuyas con <code>grep . /sys/devices/system/cpu/vulnerabilities/*</code>.
+</div>
+
+<h2>LS1.2 Syscalls: qué son y cuánto cuestan</h2>
+
+<p>Una syscall no es una llamada a función: es una <strong>trampa controlada</strong>. Tu código pone el número de llamada en <code>%rax</code>, los argumentos en <code>%rdi %rsi %rdx %r10 %r8 %r9</code>, ejecuta la instrucción <code>syscall</code>, y el procesador salta a una dirección fija del kernel. El kernel valida <em>todo</em> (no confía en vos), hace el trabajo, y vuelve con <code>sysretq</code>.</p>
+
+<p>Verlas en vivo es una línea:</p>
+
+<pre><code class="lang-bash">$ strace -f -e trace=openat,read,close cat /etc/hostname
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0\276\0\1\0\0\0"..., 832) = 832
+close(3)                                = 0
+openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3
+read(3, "srv-prod-01\n", 131072)        = 12
+read(3, "", 131072)                     = 0
+close(3)                                = 0
+srv-prod-01
++++ exited with 0 +++</code></pre>
+
+<div class="rule">
+  <strong>📌 Leé esa salida como una historia.</strong> El programa abrió la caché del linker, mapeó libc, abrió el archivo, leyó 12 bytes, leyó 0 bytes (fin de archivo), cerró. <strong>Cuando un programa "no anda y no dice nada", <code>strace</code> te dice exactamente en qué archivo, socket o permiso se trabó.</strong> Es la herramienta que convierte "no funciona" en "falla con <code>ENOENT</code> en <code>/etc/foo.conf</code>".
+</div>
+
+<p>El modo resumen te da el perfil de syscalls sin leer miles de líneas:</p>
+
+<pre><code class="lang-bash">$ strace -c -f ls -R /usr/share &gt; /dev/null
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 41.02    0.021934           7      2913           getdents64
+ 27.65    0.014784           5      2871           newfstatat
+ 13.30    0.007112           4      1544           openat
+  8.91    0.004763           3      1544           close
+  4.20    0.002246          11       196           write
+  ...
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.053471                   9142        31 total</code></pre>
+
+<p>¿Cuánto cuesta realmente cruzar la frontera? Se mide comparando una syscall real contra una que <strong>no cruza</strong>:</p>
+
+<pre><code class="lang-bash"># getpid() SÍ entra al kernel en cada vuelta
+$ time python3 -c "import os; [os.getpid() for _ in range(1000000)]"
+real    0m0.431s
+
+# time() lo resuelve el vDSO, sin cambiar de anillo
+$ time python3 -c "import time; [time.time() for _ in range(1000000)]"
+real    0m0.086s
+
+# Comprobalo: 0 llamadas a clock_gettime en un millón de time()
+$ strace -c -e trace=clock_gettime python3 -c "import time
+for _ in range(1000000): time.time()" 2&gt;&amp;1 | tail -3</code></pre>
+
+<div class="concept">
+  <strong>💡 El vDSO.</strong> El kernel mapea una biblioteca compartida diminuta (<code>linux-vdso.so.1</code>) dentro del espacio de <em>cada</em> proceso, con implementaciones en modo usuario de <code>clock_gettime</code>, <code>gettimeofday</code>, <code>time</code> y <code>getcpu</code>. Son datos que el kernel actualiza en una página compartida, así que leerlos no requiere permiso especial. Por eso un servidor que timestampea cada request no muere: <strong>esas llamadas nunca cruzan la frontera</strong>. Verificalo con <code>ldd /bin/ls | head -1</code>.
+</div>
+
+<div class="tip">
+  Detalle que separa a un senior: glibc <strong>cacheaba</strong> el resultado de <code>getpid()</code> hasta la versión 2.25. Lo sacaron porque el caché mentía cuando un programa llamaba a <code>clone()</code> directamente sin pasar por glibc. Si leés benchmarks viejos que dicen "getpid es gratis", eran de esa era.
+</div>
+
+<div class="warn">
+  <strong>Cuándo NO usar <code>strace</code>.</strong> Usa <code>ptrace</code>: <em>detiene el proceso dos veces por cada syscall</em>. En un servicio con carga real eso es un 10×–100× de penalidad, y si te desconectás mal podés dejarlo parado. En producción: <code>perf trace</code>, o mejor las herramientas de eBPF que vemos en LS6 (<code>execsnoop</code>, <code>opensnoop</code>, <code>bpftrace</code>), que muestrean sin frenar nada.
+</div>
+
+<h2>LS1.3 Anatomía de un proceso</h2>
+
+<p>Para el kernel, un proceso es una estructura en C llamada <code>task_struct</code> (definida en <code>include/linux/sched.h</code>, unos 10 KB en kernels modernos). Simplificada hasta lo esencial:</p>
+
+<pre><code class="lang-c">struct task_struct {
+    unsigned int        __state;      /* R, S, D, T ... */
+    void               *stack;        /* pila de kernel de esta tarea */
+    pid_t               pid;          /* ¡ID de HILO, no de proceso! */
+    pid_t               tgid;         /* thread group id = el "PID" de userspace */
+    struct task_struct *real_parent;  /* quién lo forkeó */
+    struct mm_struct   *mm;           /* espacio de direcciones (NULL en kernel threads) */
+    struct files_struct *files;       /* tabla de descriptores abiertos */
+    struct sched_entity se;           /* peso, vruntime, deadline: lo que ve el scheduler */
+    struct signal_struct *signal;     /* señales pendientes y handlers */
+    const struct cred  *cred;         /* uid, gid, capabilities */
+    struct nsproxy     *nsproxy;      /* namespaces — LS3 */
+    int                 exit_code;    /* lo que el padre va a leer con wait() */
+};</code></pre>
+
+<div class="rule">
+  <strong>📌 El kernel no distingue procesos de hilos: solo maneja <em>tareas</em>.</strong> Un hilo es una tarea que comparte <code>mm</code>, <code>files</code> y <code>signal</code> con otras. Lo que vos llamás "PID" es el <code>tgid</code>; lo que el kernel llama <code>pid</code> es el ID de hilo. Por eso <code>getpid()</code> devuelve el tgid y <code>gettid()</code> el pid — y por eso <code>top -H</code> muestra números que <code>ps</code> no muestra.
+</div>
+
+<h3>Los cuatro identificadores que importan</h3>
+
+<table>
+<thead><tr><th>ID</th><th>Qué es</th><th>Para qué sirve</th></tr></thead>
+<tbody>
+<tr><td><strong>PID</strong></td><td>El proceso</td><td>Identidad; se recicla hasta <code>kernel.pid_max</code></td></tr>
+<tr><td><strong>PPID</strong></td><td>El padre</td><td>Quién debe hacerle <code>wait()</code>; herencia de entorno</td></tr>
+<tr><td><strong>PGID</strong></td><td>Grupo de procesos</td><td>Un <em>pipeline</em> entero es un grupo. <code>kill -TERM -PGID</code> los mata a todos</td></tr>
+<tr><td><strong>SID</strong></td><td>Sesión</td><td>Ata procesos a una terminal. Al colgarse la terminal, todos reciben <code>SIGHUP</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">$ ps -eo pid,ppid,pgid,sid,tty,stat,comm --forest | head -20
+    PID    PPID    PGID     SID TT       STAT COMMAND
+      1       0       1       1 ?        Ss   systemd
+    412       1     412     412 ?        Ss    \_ systemd-journald
+    891       1     891     891 ?        Ss    \_ sshd
+   2140     891    2140    2140 ?        Ss    |   \_ sshd: alex [priv]
+   2201    2140    2201    2201 pts/0    Ss    |       \_ bash
+   2890    2201    2890    2201 pts/0    R+    |           \_ ps
+
+# El pipeline completo comparte PGID: es UNA unidad de control de trabajos
+$ sleep 300 | cat | wc -l &amp;
+$ ps -eo pid,pgid,sid,comm | grep -E 'sleep|cat|wc'</code></pre>
+
+<h3><code>/proc/[pid]/</code>: la interfaz oficial al <code>task_struct</code></h3>
+
+<p><code>/proc</code> no es un directorio: es un sistema de archivos virtual que el kernel genera al vuelo. Cada lectura ejecuta código de kernel que serializa el estado real. <strong>Esto es lo que leen <code>ps</code>, <code>top</code>, <code>htop</code> y tu agente de monitoreo</strong> — no hay magia adicional.</p>
+
+<pre><code class="lang-bash">$ PID=$(pgrep -n sshd)
+
+$ grep -E '^(Name|State|Tgid|Pid|PPid|Threads|VmRSS|SigCgt|voluntary)' /proc/$PID/status
+Name:	sshd
+State:	S (sleeping)
+Tgid:	891
+Pid:	891
+PPid:	1
+VmRSS:	   7284 kB
+Threads:	1
+SigCgt:	0000000180014005
+voluntary_ctxt_switches:	   31
+nonvoluntary_ctxt_switches:	    2</code></pre>
+
+<table>
+<thead><tr><th>Archivo</th><th>Qué te da</th><th>Cuándo lo usás</th></tr></thead>
+<tbody>
+<tr><td><code>status</code></td><td>Todo legible: estado, memoria, señales, contextos</td><td>Primera parada, siempre</td></tr>
+<tr><td><code>cmdline</code></td><td>Argumentos reales, separados por <code>NUL</code></td><td>Cuando <code>ps</code> trunca la línea</td></tr>
+<tr><td><code>maps</code> / <code>smaps_rollup</code></td><td>Mapeo completo del espacio de direcciones</td><td>Fugas de memoria (LS2)</td></tr>
+<tr><td><code>fd/</code></td><td>Symlinks a cada descriptor abierto</td><td>Fugas de fd, archivos borrados aún abiertos</td></tr>
+<tr><td><code>stack</code></td><td>Traza de la pila <em>de kernel</em> (requiere root)</td><td><strong>Un proceso en estado D</strong></td></tr>
+<tr><td><code>wchan</code></td><td>Nombre de la función de kernel donde duerme</td><td>Ídem, versión de una línea</td></tr>
+<tr><td><code>limits</code></td><td>Límites efectivos, no los de tu shell</td><td>"Too many open files"</td></tr>
+<tr><td><code>io</code></td><td>Bytes leídos/escritos por este proceso</td><td>Encontrar al que satura el disco</td></tr>
+<tr><td><code>task/</code></td><td>Un subdirectorio por hilo</td><td>Apps multihilo</td></tr>
+</tbody>
+</table>
+
+<p>Dos usos que valen el módulo entero. Primero, <strong>saber si un proceso siquiera escucha <code>SIGTERM</code></strong> antes de reiniciarlo:</p>
+
+<pre><code class="lang-bash">$ grep SigCgt /proc/$PID/status
+SigCgt:	0000000180014005
+# Es una máscara de bits: el bit N-1 corresponde a la señal N.
+# ¿Atrapa SIGTERM (15)?  →  bit 14
+$ python3 -c "print(bool(0x180014005 &gt;&gt; 14 &amp; 1))"
+True      # sí: un 'systemctl stop' le va a dar apagado ordenado
+# Si diera False, tu SIGTERM se lo come el default y morís por timeout + SIGKILL.</code></pre>
+
+<p>Segundo, <strong>recuperar un archivo borrado que alguien todavía tiene abierto</strong> (el clásico "borré el log y el disco sigue lleno"):</p>
+
+<pre><code class="lang-bash">$ ls -l /proc/$PID/fd/ | head
+lrwx------ 1 root root 64 sep  3 12:40 0 -&gt; /dev/null
+l-wx------ 1 root root 64 sep  3 12:40 2 -&gt; /var/log/app/error.log (deleted)
+lrwx------ 1 root root 64 sep  3 12:40 6 -&gt; socket:[28471]
+
+# El inodo vive mientras haya un fd abierto: el contenido sigue ahí
+$ cp /proc/$PID/fd/2 /var/tmp/rescatado.log
+
+# ¿Quién retiene espacio de archivos borrados?
+$ sudo lsof -nP +L1 | head</code></pre>
+
+<h2>LS1.4 Estados: R, S, D, Z, T (y por qué D es distinto)</h2>
+
+<table>
+<thead><tr><th>Estado</th><th>Nombre en el kernel</th><th>Significa</th><th>¿Consume CPU?</th></tr></thead>
+<tbody>
+<tr><td><strong>R</strong></td><td><code>TASK_RUNNING</code></td><td>Corriendo <em>o listo para correr</em> en la runqueue</td><td>Sí (o quiere)</td></tr>
+<tr><td><strong>S</strong></td><td><code>TASK_INTERRUPTIBLE</code></td><td>Durmiendo, esperando un evento; las señales lo despiertan</td><td>No</td></tr>
+<tr><td><strong>D</strong></td><td><code>TASK_UNINTERRUPTIBLE</code></td><td>Durmiendo en el kernel, <strong>sordo a las señales</strong></td><td>No, <strong>pero suma al load</strong></td></tr>
+<tr><td><strong>Z</strong></td><td><code>EXIT_ZOMBIE</code></td><td>Terminado; nadie leyó su código de salida</td><td>No</td></tr>
+<tr><td><strong>T</strong></td><td><code>TASK_STOPPED</code></td><td>Detenido por <code>SIGSTOP</code> o control de trabajos</td><td>No</td></tr>
+<tr><td><strong>t</strong></td><td><code>TASK_TRACED</code></td><td>Parado por un depurador (<code>gdb</code>, <code>strace</code>)</td><td>No</td></tr>
+<tr><td><strong>I</strong></td><td><code>TASK_IDLE</code></td><td>Hilo de kernel ocioso (desde 4.14, para no ensuciar el load)</td><td>No</td></tr>
+</tbody>
+</table>
+
+<p>Los modificadores que agrega <code>ps</code>: <code>s</code> líder de sesión, <code>l</code> multihilo, <code>+</code> en primer plano, <code>&lt;</code> prioridad alta, <code>N</code> prioridad baja.</p>
+
+<div class="danger">
+  <strong>⚠️ Un proceso en D no se puede matar. Ni con <code>kill -9</code>.</strong> Y no es un bug: es exactamente lo que pidió. Las señales se entregan solo en dos momentos — cuando la tarea está por volver a espacio de usuario, o cuando duerme de forma interrumpible. Una tarea en <code>TASK_UNINTERRUPTIBLE</code> está en medio del kernel, típicamente sosteniendo locks y con estructuras a medio actualizar; despertarla ahí corrompería datos. Tu <code>SIGKILL</code> se encola en <code>task-&gt;pending</code> y se entrega <em>cuando y si</em> la tarea sale de D.
+</div>
+
+<p>Lo que sí podés hacer es averiguar <strong>dónde</strong> está trabada, que es lo que resuelve el problema:</p>
+
+<pre><code class="lang-bash"># Todos los procesos en D, con la función de kernel donde duermen
+$ ps -eo state,pid,ppid,wchan:32,cmd | awk '$1 ~ /^D/'
+D  4412  4380 folio_wait_bit_common            /usr/bin/rsync ...
+D  4418  4380 rpc_wait_bit_killable            /usr/bin/rsync ...
+
+# La pila de kernel completa (root). Acá está la verdad.
+$ sudo cat /proc/4418/stack
+[&lt;0&gt;] rpc_wait_bit_killable+0x1e/0xa0 [sunrpc]
+[&lt;0&gt;] __rpc_execute+0x1f5/0x3c0 [sunrpc]
+[&lt;0&gt;] nfs4_do_call_sync+0x8b/0xd0 [nfsv4]
+[&lt;0&gt;] nfs4_proc_getattr+0x9c/0x100 [nfsv4]
+
+# El detector de tareas colgadas ya lo venía avisando
+$ dmesg -T | grep -i 'blocked for more than'
+[dom sep  3 03:14] INFO: task rsync:4418 blocked for more than 120 seconds.</code></pre>
+
+<div class="tip">
+  <strong>Matiz importante:</strong> desde 2.6.25 existe <code>TASK_KILLABLE</code>, un estado intermedio que se ve como D en <code>ps</code> pero <em>sí</em> responde a <code>SIGKILL</code>. Si en la pila ves un símbolo terminado en <code>_killable</code> (como el <code>rpc_wait_bit_killable</code> de arriba), <code>kill -9</code> tiene chances reales. Si ves <code>folio_wait_bit_common</code> esperando I/O de disco local, no: ahí solo queda esperar o resolver el dispositivo.
+</div>
+
+<h2>LS1.5 fork, exec, wait: cómo nace un proceso</h2>
+
+<p>Linux no tiene una llamada "crear proceso con este programa". Tiene dos pasos separados, y esa separación es la razón de que los pipes, las redirecciones y <code>setuid</code> antes de <code>exec</code> sean posibles.</p>
+
+<div class="step"><strong>1. <code>fork()</code></strong> — duplica el proceso actual. Devuelve <code>0</code> en el hijo y el PID del hijo en el padre. Internamente es <code>clone()</code> con las banderas por defecto.</div>
+<div class="step"><strong>2. <code>execve()</code></strong> — reemplaza <em>por completo</em> la imagen de memoria por otro programa. El PID no cambia. Los descriptores abiertos sobreviven salvo que tengan <code>FD_CLOEXEC</code> — de ahí sale la redirección del shell.</div>
+<div class="step"><strong>3. <code>wait()</code> / <code>waitpid()</code></strong> — el padre bloquea hasta que el hijo termina y <strong>lee su código de salida</strong>. Sin este paso el hijo queda zombie.</div>
+
+<pre><code class="lang-bash"># Miralo pasar: el shell hace exactamente esto para cada comando
+$ strace -f -e trace=clone,execve,wait4 bash -c 'echo hola &gt; /tmp/x'
+clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|SIGCHLD, ...) = 9931
+[pid  9931] execve("/usr/bin/echo", ["echo", "hola"], 0x55f... ) = 0
+wait4(-1, [{WIFEXITED(s) &amp;&amp; WEXITSTATUS(s) == 0}], 0, NULL) = 9931</code></pre>
+
+<h3>Copy-on-write: por qué forkear 8 GB no copia 8 GB</h3>
+
+<p>Si <code>fork()</code> copiara la memoria, forkear un Postgres de 8 GB tardaría segundos y necesitaría 16 GB libres. No pasa. El kernel <strong>copia solo las tablas de páginas</strong>, marca cada página como <em>read-only</em> en ambos procesos e incrementa su contador de referencias. Los dos leen la misma RAM física. La primera <strong>escritura</strong> provoca un fallo de página, y recién ahí el kernel duplica <em>esa</em> página.</p>
+
+<pre><code class="lang-bash"># Un proceso que reserva ~1 GB y forkea. Mirá la RSS "compartida".
+$ python3 - &lt;&lt;'EOF'
+import os, time
+datos = bytearray(1024*1024*1024)      # 1 GB tocado
+if os.fork() == 0:
+    time.sleep(30); os._exit(0)
+time.sleep(30)
+EOF
+
+# En otra terminal: dos procesos de 1 GB de RSS... y ~1 GB de RAM real usada
+$ ps -eo pid,rss,comm | grep python3
+$ grep -E 'Rss|Shared_Clean|Private_Dirty' /proc/&lt;PID_HIJO&gt;/smaps_rollup
+
+# El contador de fallos de página menores = copias hechas por COW
+$ ps -eo pid,min_flt,maj_flt,comm | grep python3</code></pre>
+
+<div class="mistake">
+  <strong>COW no es gratis, y ahí está la trampa.</strong> Forkear un proceso de 8 GB sí copia las <em>tablas</em> de páginas: con páginas de 4 KB son 2 millones de PTEs, unos 16 MB de estructuras — decenas de milisegundos de pausa. Peor: con <code>vm.overcommit_memory=2</code> el kernel exige poder respaldar el peor caso y <code>fork()</code> falla con <code>ENOMEM</code> aunque nunca vayas a escribir. Es el motivo clásico de que una JVM enorme no pueda lanzar un <code>ls</code>. La solución es no forkear: <code>posix_spawn()</code> (que usa <code>vfork</code>/<code>CLONE_VM</code>) o un proceso ayudante chico lanzado al arranque.
+</div>
+
+<h2>LS1.6 Zombies y huérfanos</h2>
+
+<p>Un <strong>zombie</strong> no es un proceso colgado: es un proceso <em>muerto</em> del que solo queda el recibo. Liberó su memoria, sus fds y su pila; el kernel conserva su <code>task_struct</code> y su <code>exit_code</code> porque <strong>alguien tiene derecho a saber cómo terminó</strong>. Ese alguien es el padre, y el trámite es <code>wait()</code>.</p>
+
+<pre><code class="lang-bash"># Fabricá uno: el padre duerme sin cosechar
+$ python3 -c "
+import os, time
+if os.fork() == 0: os._exit(3)   # el hijo muere ya
+time.sleep(60)                    # el padre NO llama a wait()
+" &amp;
+
+$ ps -eo pid,ppid,stat,comm | grep -E 'Z|defunct'
+  10233   10232 Z+   python3 &lt;defunct&gt;
+
+# Contarlos en todo el sistema
+$ ps -eo stat | grep -c '^Z'</code></pre>
+
+<div class="rule">
+  <strong>📌 A un zombie no lo matás: ya está muerto.</strong> <code>kill -9</code> sobre un zombie no hace absolutamente nada. Se arregla del otro lado: mandale <code>SIGCHLD</code> al padre para que cosecha, o matá al padre. Cuando el padre muere, el zombie queda huérfano y lo adopta el reaper, que sí hace <code>wait()</code>.
+</div>
+
+<p>Un <strong>huérfano</strong> es el caso inverso: el padre murió primero. El kernel reasigna el hijo al <strong>PID 1</strong> — o, si hay un ancestro que se registró con <code>prctl(PR_SET_CHILD_SUBREAPER)</code>, a ese (es lo que hace <code>systemd --user</code> para no perder de vista tus servicios).</p>
+
+<pre><code class="lang-bash">$ setsid sleep 500 &amp;        # el shell no es su padre: nace huérfano
+$ ps -eo pid,ppid,comm | grep 'sleep'
+  11420       1 sleep       # PPID 1: lo adoptó el init</code></pre>
+
+<h3>El bug real: PID 1 en contenedores</h3>
+
+<div class="danger">
+  <strong>⚠️ PID 1 tiene dos superpoderes que casi nadie sabe que existen — y los dos rompen contenedores.</strong>
+  <strong>(1)</strong> Hereda a todos los huérfanos, así que <em>debe</em> hacer <code>wait()</code> o el contenedor acumula zombies hasta agotar los PIDs.
+  <strong>(2)</strong> El kernel <strong>no le entrega señales para las que no instaló un handler</strong>. Un <code>SIGTERM</code> a un PID 1 sin handler simplemente se descarta. Por eso <code>docker stop</code> "no hace nada" durante 10 segundos y después mata a lo bestia con <code>SIGKILL</code>: nunca hubo apagado ordenado.
+</div>
+
+<pre><code class="lang-bash"># ¿Tu PID 1 atrapa SIGTERM? Preguntáselo al kernel, no al README.
+$ docker exec mi-app grep SigCgt /proc/1/status
+SigCgt:	0000000000000000        # cero handlers: NADA lo va a apagar bien
+
+# ¿Se están acumulando zombies adentro?
+$ docker exec mi-app ps -eo stat,comm | grep -c '^Z'
+183
+
+# Las tres correcciones, en orden de preferencia:
+#  a) que tu app maneje SIGTERM y coseche (lo correcto)
+#  b) forma exec en el Dockerfile: CMD ["node","server.js"]  ← NO la de shell,
+#     que deja a /bin/sh como PID 1 y se traga la señal
+#  c) un init mínimo que reenvíe señales y cosecha:
+$ docker run --init mi-imagen        # inyecta tini como PID 1</code></pre>
+
+<h2>LS1.7 El scheduler: de CFS a EEVDF</h2>
+
+<p>El planificador decide qué tarea de la runqueue corre en cada núcleo. Desde 2007 y durante quince años fue <strong>CFS</strong> (<em>Completely Fair Scheduler</em>): un árbol rojo-negro ordenado por <code>vruntime</code>, el tiempo de CPU consumido <em>ponderado por el nice</em>. Se elegía siempre el nodo más a la izquierda — el que menos había corrido en términos ponderados.</p>
+
+<div class="concept">
+  <strong>💡 Lo que cambió en el kernel 6.6.</strong> CFS fue reemplazado por <strong>EEVDF</strong> (<em>Earliest Eligible Virtual Deadline First</em>) como planificador por defecto. La idea: además del <code>vruntime</code>, cada tarea tiene un <strong>lag</strong> (cuánto servicio se le debe) y una <strong>deadline virtual</strong> calculada a partir del tamaño de rodaja que pidió. Entre las tareas <em>elegibles</em> (lag ≥ 0) se corre la de deadline más cercana. El resultado es que una tarea sensible a latencia puede pedir rodajas <strong>cortas</strong> y ser atendida antes, sin robarle CPU a nadie — algo que en CFS se conseguía con una pila de heurísticas de despertar que EEVDF eliminó junto con varios <em>tunables</em>.
+</div>
+
+<pre><code class="lang-bash">$ uname -r
+6.8.0-45-generic
+
+# EEVDF reemplazó sched_latency_ns/sched_min_granularity_ns por base_slice_ns
+$ sudo ls /sys/kernel/debug/sched/
+base_slice_ns  debug  domains  features  latency_warn_ms  verbose  ...
+$ sudo cat /sys/kernel/debug/sched/base_slice_ns
+3000000                    # 3 ms de rodaja base
+
+# El estado del scheduler para un proceso concreto
+$ grep -E 'se.vruntime|nr_switches|nr_involuntary' /proc/$$/sched</code></pre>
+
+<h3>Lo que sí podés controlar</h3>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué cambia</th><th>Rango / política</th><th>Cuidado</th></tr></thead>
+<tbody>
+<tr><td><code>nice</code> / <code>renice</code></td><td>Peso relativo dentro de SCHED_OTHER</td><td>−20 (más CPU) a 19</td><td>Cada nivel ≈ 1,25× de peso (~10% de CPU)</td></tr>
+<tr><td><code>chrt -f</code> (SCHED_FIFO)</td><td>Tiempo real: corre hasta ceder</td><td>prio 1–99</td><td>Un bucle infinito <strong>cuelga el núcleo</strong></td></tr>
+<tr><td><code>chrt -r</code> (SCHED_RR)</td><td>Igual pero con rodajas entre iguales</td><td>prio 1–99</td><td>Ídem</td></tr>
+<tr><td><code>chrt -d</code> (SCHED_DEADLINE)</td><td>Runtime/deadline/período explícitos</td><td>EDF + CBS</td><td>El kernel rechaza si no hay margen</td></tr>
+<tr><td><code>chrt -i</code> (SCHED_IDLE)</td><td>Solo corre si nadie más quiere</td><td>—</td><td>Ideal para batch de fondo</td></tr>
+<tr><td><code>taskset</code></td><td>Afinidad a núcleos concretos</td><td>máscara de CPUs</td><td>Puede empeorar todo si te equivocás</td></tr>
+<tr><td><code>cpu.weight</code> / <code>cpu.max</code></td><td>Reparto y tope por cgroup</td><td>cgroup v2 (LS3)</td><td><strong>Manda sobre tu nice</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">$ chrt -p 1
+pid 1's current scheduling policy: SCHED_OTHER
+pid 1's current scheduling priority: 0
+
+# Un daemon de audio de baja latencia, en tiempo real
+$ sudo chrt -f 50 ./mi-daemon
+
+# La red de seguridad del kernel contra un FIFO que se vuelve loco:
+$ sysctl kernel.sched_rt_runtime_us kernel.sched_rt_period_us
+kernel.sched_rt_runtime_us = 950000
+kernel.sched_rt_period_us  = 1000000
+# 95% como techo para TODAS las tareas RT: siempre queda 5% para recuperar la máquina
+
+# Demostrá que nice hace algo (dos cargas iguales, distinto nice)
+$ nice -n 19 sha256sum /dev/zero &amp; nice -n 0 sha256sum /dev/zero &amp;
+$ pidstat -C sha256sum 1 5</code></pre>
+
+<div class="mistake">
+  <strong>Lo que NO podés controlar, y se intenta igual.</strong> <code>nice</code> no crea CPU: si tu cuello de botella es el disco, la red o un <em>lock</em> de aplicación, bajar el nice de otros no cambia nada. Adentro de un contenedor, <code>cpu.max</code> del cgroup te tira <em>throttling</em> sin importar tu prioridad — y en <code>/sys/fs/cgroup/&lt;grupo&gt;/cpu.stat</code> vas a ver <code>nr_throttled</code> subir mientras el %CPU parece bajo. Y <code>SCHED_FIFO</code> en una app que puede quedarse girando es la forma más rápida y elegante de colgar un servidor de producción entero.
+</div>
+
+<h2>LS1.8 Señales: la tabla que importa</h2>
+
+<table>
+<thead><tr><th>Señal</th><th>Nº (x86-64)</th><th>Acción por defecto</th><th>¿Atrapable?</th><th>Uso real</th></tr></thead>
+<tbody>
+<tr><td><code>SIGHUP</code></td><td>1</td><td>Terminar</td><td>Sí</td><td>Terminal colgada; por convención, <strong>"recargá tu config"</strong></td></tr>
+<tr><td><code>SIGINT</code></td><td>2</td><td>Terminar</td><td>Sí</td><td>Ctrl-C</td></tr>
+<tr><td><code>SIGQUIT</code></td><td>3</td><td>Terminar + core</td><td>Sí</td><td>Ctrl-\ ; en la JVM dispara un <em>thread dump</em></td></tr>
+<tr><td><code>SIGKILL</code></td><td>9</td><td>Terminar</td><td><strong>NO</strong></td><td>Último recurso. La ejecuta el kernel, no el proceso</td></tr>
+<tr><td><code>SIGUSR1</code></td><td>10</td><td>Terminar</td><td>Sí</td><td>Libre para la app: nginx reabre los logs</td></tr>
+<tr><td><code>SIGSEGV</code></td><td>11</td><td>Terminar + core</td><td>Sí</td><td>Acceso inválido a memoria</td></tr>
+<tr><td><code>SIGPIPE</code></td><td>13</td><td>Terminar</td><td>Sí</td><td>Escribir en un pipe cerrado (por eso <code>| head</code> "rompe" scripts)</td></tr>
+<tr><td><code>SIGTERM</code></td><td>15</td><td>Terminar</td><td>Sí</td><td><strong>El default de <code>kill</code>.</strong> El apagado ordenado</td></tr>
+<tr><td><code>SIGCHLD</code></td><td>17</td><td>Ignorar</td><td>Sí</td><td>"Un hijo terminó": disparador para <code>wait()</code></td></tr>
+<tr><td><code>SIGCONT</code></td><td>18</td><td>Continuar</td><td>Sí</td><td><code>fg</code>, <code>bg</code></td></tr>
+<tr><td><code>SIGSTOP</code></td><td>19</td><td>Detener</td><td><strong>NO</strong></td><td>Congelar sin matar (Ctrl-Z manda <code>SIGTSTP</code>, que sí se atrapa)</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Los <strong>números cambian según la arquitectura</strong> (<code>SIGUSR1</code> es 10 en x86-64 pero 16 en MIPS). Escribí siempre <code>kill -TERM</code>, nunca <code>kill -15</code>. Los tuyos: <code>kill -l</code>.
+</div>
+
+<pre><code class="lang-bash"># Un handler en bash: limpieza garantizada aunque te interrumpan
+$ cat &gt; /tmp/demo.sh &lt;&lt;'EOF'
+#!/bin/bash
+tmp=$(mktemp)
+limpiar() { echo "recibí la señal, borrando $tmp"; rm -f "$tmp"; exit 0; }
+trap limpiar TERM INT HUP
+echo "PID $$ trabajando con $tmp"
+while true; do sleep 1; done
+EOF
+$ chmod +x /tmp/demo.sh &amp;&amp; /tmp/demo.sh &amp;
+
+$ kill -TERM %1        # ordenado: corre limpiar(), borra el temporal
+$ kill -KILL %1        # brutal: el temporal queda huérfano para siempre</code></pre>
+
+<div class="mistake">
+  <strong><code>kill -9</code> como primer recurso es un error, y siempre por el mismo motivo:</strong> <code>SIGKILL</code> <em>nunca llega al proceso</em> — lo ejecuta el kernel por encima de él. Eso significa: buffers sin vaciar, transacciones sin cerrar, archivos temporales y sockets colgados, <em>lockfiles</em> y PID files que quedan mintiendo, locks distribuidos que nadie libera hasta que expiran, segmentos de memoria compartida huérfanos (<code>ipcs -m</code>) y, en una base de datos, un arranque siguiente con recuperación. Encima <strong>ni siquiera funciona</strong> contra un proceso en estado D. El orden correcto es <code>TERM</code> → esperar → <code>TERM</code> otra vez → recién ahí <code>KILL</code>, y preguntarse por qué hizo falta.
+</div>
+
+<h2>LS1.9 Load average: qué mide REALMENTE</h2>
+
+<p>Es la métrica más citada y peor entendida de Linux. En casi todo Unix, el load average cuenta tareas ejecutables. <strong>En Linux cuenta tareas en <code>TASK_RUNNING</code> más tareas en <code>TASK_UNINTERRUPTIBLE</code></strong> — es decir, R <em>y</em> D.</p>
+
+<div class="analogy">
+  El cambio viene de un parche de 1993: el argumento fue que una máquina paralizada esperando disco está tan "cargada" como una paralizada calculando, y un número que las distinguiera engañaría al operador. Es una decisión defendible, pero convirtió al load average en <strong>un índice de demanda insatisfecha, no en un medidor de CPU</strong>. Un termómetro que además suma la humedad.
+</div>
+
+<pre><code class="lang-bash">$ cat /proc/loadavg
+0.52 0.74 0.61 2/1482 28914
+#  1m   5m   15m  |     |
+#                 |     └─ último PID asignado
+#                 └─ tareas ejecutables / tareas totales
+
+$ nproc
+16</code></pre>
+
+<table>
+<thead><tr><th>Situación</th><th>Load</th><th>Núcleos</th><th>¿Problema?</th></tr></thead>
+<tbody>
+<tr><td>8 builds de C++ en paralelo</td><td>8,0</td><td>16</td><td>❌ No: mitad de la capacidad, es exactamente lo que pediste</td></tr>
+<tr><td>Un web server ocioso</td><td>8,0</td><td>2</td><td>✅ Sí: 4× sobresuscripción, latencia por las nubes</td></tr>
+<tr><td>NFS caído</td><td>40,0</td><td>16</td><td>✅ Sí, pero <strong>no de CPU</strong>: son 38 tareas en D</td></tr>
+<tr><td>Backup nocturno a disco lento</td><td>12,0</td><td>4</td><td>⚠️ Depende: si la latencia de usuario no sufre, es ruido</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No alertes sobre load average.</strong> No tiene unidades comparables entre máquinas, mezcla dos causas distintas y se suaviza tanto que llega tarde. Desde el kernel 4.20 existe algo mucho mejor: <strong>PSI</strong> (<em>Pressure Stall Information</em>), que mide directamente <em>qué porcentaje del tiempo hubo tareas frenadas</em> por CPU, memoria o I/O.
+</div>
+
+<pre><code class="lang-bash">$ cat /proc/pressure/io
+some avg10=0.31 avg60=0.28 avg300=0.17 total=194823117
+full avg10=0.12 avg60=0.09 avg300=0.05 total=71204882
+# some = al menos una tarea frenada esperando I/O
+# full = TODAS frenadas: la máquina no avanza nada. Sobre esto sí se alerta.
+
+$ cat /proc/pressure/cpu /proc/pressure/memory</code></pre>
+
+<h2>LS1.10 Herramientas de diagnóstico</h2>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué responde</th><th>Costo</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>ps -eo ...</code></td><td>Foto exacta: estado, wchan, PGID, memoria</td><td>Nulo</td><td>Siempre primero. Es scriptable</td></tr>
+<tr><td><code>top</code> / <code>htop</code></td><td>Película: quién sube, quién baja</td><td>Bajo</td><td>Triage inicial; <code>top -H</code> para hilos</td></tr>
+<tr><td><code>vmstat 1</code></td><td>Columnas <code>r</code> (ejecutables) y <code>b</code> (bloqueados)</td><td>Nulo</td><td><strong>Separar CPU de I/O en 5 segundos</strong></td></tr>
+<tr><td><code>pidstat -d -p PID 1</code></td><td>CPU, I/O y cambios de contexto <em>por proceso</em></td><td>Bajo</td><td>Encontrar al culpable concreto</td></tr>
+<tr><td><code>strace</code></td><td>Cada syscall, con argumentos y errores</td><td><strong>Muy alto</strong></td><td>Desarrollo y staging; nunca en un proceso caliente</td></tr>
+<tr><td><code>perf top</code> / <code>perf record</code></td><td>Dónde se quema la CPU, kernel incluido</td><td>Bajo (muestreo)</td><td>Producción, cuando el %CPU sí es alto</td></tr>
+<tr><td><code>perf trace</code></td><td>Como strace, pero muestreando</td><td>Medio</td><td>El reemplazo de strace en producción</td></tr>
+<tr><td><code>/proc/PID/stack</code></td><td>Dónde duerme <em>dentro del kernel</em></td><td>Nulo</td><td>La única respuesta para un proceso en D</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># El comando de triage que separa CPU de I/O antes de teorizar
+$ vmstat 1 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2 38      0 812344  18932 2048112    0    0     8   112 1204 2390  3  2 55 40  0
+ 1 38      0 812104  18932 2048112    0    0     0     0 1189 2288  2  3 55 40  0
+#  ↑  ↑
+#  │  └─ 38 tareas BLOQUEADAS: esto es I/O, no CPU
+#  └─ solo 2 ejecutables: los núcleos están libres
+
+# Dónde se quema la CPU cuando SÍ es CPU
+$ sudo perf top -g --sort comm,dso</code></pre>
+
+<h2>🧑‍🎓 Worked Example — "el load average está en 40 y la CPU al 5%"</h2>
+
+<blockquote>3 AM. Alerta: <code>load average &gt; 20</code> en un servidor de aplicaciones de 16 núcleos. Entrás por SSH (tarda), <code>top</code> muestra la CPU casi ociosa y ningún proceso arriba del 2%. El equipo empieza a decir "hay que reiniciar". ¿Qué hacés?</blockquote>
+
+<p><strong>Paso 1 — Confirmar el número y ponerlo en contexto.</strong> El load solo significa algo contra la cantidad de núcleos.</p>
+
+<pre><code class="lang-bash">$ cat /proc/loadavg; nproc
+40.12 39.80 35.24 2/1913 33471
+16
+# 40 sobre 16 núcleos. Pero '2/1913': solo DOS tareas ejecutables.
+# Si fuera carga de CPU, ese primer número sería ~40. No lo es.</code></pre>
+
+<p><strong>Paso 2 — Separar CPU de I/O.</strong> <code>vmstat</code> lo resuelve sin ambigüedad: la columna <code>r</code> son ejecutables (R), la <code>b</code> son bloqueados (D).</p>
+
+<pre><code class="lang-bash">$ vmstat 1 3
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2 38      0 6104332  9124 812004    0    0     0     0  842 1503  1  4 95  0  0
+ 1 39      0 6104088  9124 812004    0    0     0     0  801 1444  1  3 96  0  0
+
+# 38-39 bloqueados, ~1% de usuario, 95% ocioso, y wa=0.
+# La máquina NO está trabajando. Está esperando algo que nunca llega.</code></pre>
+
+<div class="info">
+  Que <code>wa</code> (iowait) esté en 0 desconcierta a mucha gente. <code>iowait</code> es un <em>subestado del tiempo ocioso de cada CPU</em> con I/O local pendiente; con 16 núcleos y esperas de red, se diluye o no se contabiliza. <strong>Nunca uses <code>wa</code> como prueba de que hay o no hay problema de I/O.</strong> La columna <code>b</code> y el conteo de procesos en D no mienten.
+</div>
+
+<p><strong>Paso 3 — Nombrar a los bloqueados.</strong> El load son 38 tareas en D: hay que ver <em>cuáles</em> y, sobre todo, <em>dónde</em>.</p>
+
+<pre><code class="lang-bash">$ ps -eo state,pid,ppid,wchan:34,cmd | awk '$1 ~ /^D/' | head
+D  9012     1 rpc_wait_bit_killable   /usr/bin/php-fpm: pool www
+D  9017     1 rpc_wait_bit_killable   /usr/bin/php-fpm: pool www
+D  9031     1 rpc_wait_bit_killable   /usr/bin/php-fpm: pool www
+...
+$ ps -eo state | grep -c '^D'
+38
+
+# Todos en el mismo lugar. Eso nunca es casualidad: es un recurso compartido.</code></pre>
+
+<p><strong>Paso 4 — Leer la pila de kernel.</strong> Acá termina la adivinanza y empieza el diagnóstico.</p>
+
+<pre><code class="lang-bash">$ sudo cat /proc/9012/stack
+[&lt;0&gt;] rpc_wait_bit_killable+0x1e/0xa0   [sunrpc]
+[&lt;0&gt;] __rpc_execute+0x1f5/0x3c0         [sunrpc]
+[&lt;0&gt;] rpc_execute+0x64/0xa0            [sunrpc]
+[&lt;0&gt;] nfs4_do_call_sync+0x8b/0xd0      [nfsv4]
+[&lt;0&gt;] nfs4_proc_getattr+0x9c/0x100     [nfsv4]
+[&lt;0&gt;] __nfs_revalidate_inode+0x1f2/0x3a0 [nfs]
+
+# sunrpc + nfsv4 = están esperando respuesta de un servidor NFS.</code></pre>
+
+<p><strong>Paso 5 — Confirmar contra el sistema.</strong> Nunca cerrar un diagnóstico con una sola fuente.</p>
+
+<pre><code class="lang-bash">$ dmesg -T | grep -i nfs | tail -3
+[dom sep  3 03:02] nfs: server nas-prod not responding, still trying
+[dom sep  3 03:04] INFO: task php-fpm:9012 blocked for more than 120 seconds.
+
+$ mount | grep nfs
+nas-prod:/exports/media on /mnt/media type nfs4 (rw,relatime,hard,proto=tcp,timeo=600,...)
+#                                                            ^^^^ montaje HARD:
+#   reintenta para siempre. Es correcto para no corromper datos, y es
+#   exactamente lo que genera 38 tareas en D cuando el servidor desaparece.
+
+$ ping -c2 nas-prod            # sin respuesta
+$ ss -tn dst :2049             # conexiones al puerto NFS, todas colgadas</code></pre>
+
+<p><strong>Paso 6 — Actuar, sabiendo qué se puede y qué no.</strong></p>
+
+<table>
+<thead><tr><th>Acción</th><th>¿Funciona?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Reiniciar el servidor de app</td><td>❌</td><td>Vuelve a levantar y se cuelga igual en el primer acceso a <code>/mnt/media</code></td></tr>
+<tr><td><code>kill -9</code> a los php-fpm</td><td>⚠️ A veces</td><td>La pila dice <code>rpc_wait_bit_<strong>killable</strong></code>: es <code>TASK_KILLABLE</code>, así que <code>SIGKILL</code> puede entrar. Con <code>folio_wait_bit_common</code> no entraría</td></tr>
+<tr><td><code>umount -f -l /mnt/media</code></td><td>⚠️ Parcial</td><td>El <em>lazy</em> despega el árbol y deja que los nuevos accesos fallen rápido; los ya trabados siguen ahí</td></tr>
+<tr><td>Recuperar el NAS</td><td>✅</td><td>Las 38 tareas salen de D solas y el load se desploma. Es la única cura real</td></tr>
+<tr><td>Remontar <code>soft,timeo=50,retrans=2</code></td><td>⚠️ Con costo</td><td>Devuelve <code>EIO</code> en vez de colgarse — <strong>y puede corromper una escritura a medias</strong>. Aceptable para lectura, peligroso para datos</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección no es "era NFS".</strong> Es que <strong>el load average de Linux mide demanda insatisfecha, no CPU</strong>, y que la secuencia <code>loadavg</code> → <code>vmstat</code> (columna <code>b</code>) → <code>ps</code> con <code>wchan</code> → <code>/proc/PID/stack</code> te lleva del síntoma al recurso exacto en menos de dos minutos, sin reiniciar nada. Y que el arreglo permanente no es un script: es <strong>alertar sobre <code>/proc/pressure/io</code> y sobre el conteo de procesos en D</strong>, no sobre un número que mezcla dos cosas distintas.
+</div>
+
+<pre><code class="lang-bash"># La métrica que debería haber disparado la alerta 20 minutos antes
+$ awk '/^some/{print "io some avg60:", $3}' /proc/pressure/io
+$ echo "procesos en D: $(ps -eo state | grep -c '^D')"</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>kill -9</code> no mata un proceso en estado D, si SIGKILL "no se puede atrapar"?</summary>
+<p>Son dos cosas distintas. Que <code>SIGKILL</code> no se pueda <em>atrapar</em> significa que el proceso no puede instalar un handler para ignorarla. Pero una señal solo se <em>entrega</em> en dos momentos: cuando la tarea está por volver a espacio de usuario, o cuando duerme de forma interrumpible. Una tarea en <code>TASK_UNINTERRUPTIBLE</code> está dentro del kernel, normalmente con locks tomados y estructuras a medio actualizar, y jamás revisa su cola de señales. Tu <code>SIGKILL</code> queda encolado en <code>task-&gt;pending</code> y se aplica cuando —y si— la tarea sale de D. La excepción es <code>TASK_KILLABLE</code>: se ve igual en <code>ps</code>, pero sí atiende <code>SIGKILL</code>. Lo distinguís mirando <code>/proc/PID/stack</code>: si el símbolo termina en <code>_killable</code>, tenés chance.</p></details>
+
+<details><summary>Un contenedor tarda siempre exactamente 10 segundos en pararse. ¿Qué está pasando y cómo lo confirmás?</summary>
+<p>Diez segundos es el timeout por defecto de <code>docker stop</code> entre <code>SIGTERM</code> y <code>SIGKILL</code>. Que se agote <em>siempre</em> significa que nadie atendió el <code>SIGTERM</code>. La causa habitual: el PID 1 del contenedor es un <code>/bin/sh</code> (por usar la forma de shell en <code>CMD</code>) que no reenvía señales, o la app es PID 1 pero no instaló handler — y el kernel <strong>no entrega señales por defecto a PID 1</strong>, así que se descartan silenciosamente. Se confirma en una línea: <code>docker exec app grep SigCgt /proc/1/status</code>; si el bit 14 está en cero, no atrapa <code>SIGTERM</code>. Se arregla con la forma exec en el Dockerfile, manejando la señal en la app, o con <code>docker run --init</code>.</p></details>
+
+<details><summary>Load average 8,0 en dos máquinas distintas. ¿En cuál te preocupás?</summary>
+<p>En ninguna todavía: el número solo no dice nada. Necesitás tres datos más. <strong>Cuántos núcleos</strong>: 8 sobre 16 es media máquina, 8 sobre 2 es cuatro veces sobresuscripta. <strong>Qué lo compone</strong>: la columna <code>r</code> de <code>vmstat</code> (ejecutables, demanda de CPU) contra la <code>b</code> (bloqueados en D, demanda de I/O) — son problemas y soluciones completamente distintos. Y <strong>si alguien lo está sufriendo</strong>: un build paralelo con load 8 es un uso correcto del hardware; un servicio con latencia p99 disparada y load 8 es un incidente. Por eso se alerta sobre PSI y sobre latencia de usuario, no sobre el load.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>La frontera <strong>usuario/kernel</strong> es real y cuesta: entre 150 y 500 ns por syscall con las mitigaciones post-Meltdown. El <strong>vDSO</strong> existe para que las llamadas más frecuentes (tiempo) no la crucen nunca.</li>
+  <li>Para el kernel todo es una <strong>tarea</strong> (<code>task_struct</code>). "Proceso" es <code>tgid</code>, "hilo" es <code>pid</code>. <code>/proc/[pid]/</code> es la interfaz oficial a esa estructura, y es de donde sacan todo <code>ps</code>, <code>top</code> y tu monitoreo.</li>
+  <li><strong>D no se mata</strong>: las señales solo se entregan al volver a espacio de usuario o desde un sueño interrumpible. Un proceso en D se diagnostica con <code>wchan</code> y <code>/proc/PID/stack</code>, no se combate con <code>kill</code>.</li>
+  <li><code>fork()</code> usa <strong>copy-on-write</strong>: copia tablas de páginas, no páginas. Pero esas tablas cuestan, y con <em>overcommit</em> estricto un fork gigante puede fallar con <code>ENOMEM</code> sin haber escrito un byte.</li>
+  <li><strong>Zombies</strong> = códigos de salida sin cosechar; se arregla en el padre. <strong>PID 1</strong> hereda huérfanos y no recibe señales sin handler: son las dos causas de que un contenedor no se apague bien ni limpie sus hijos.</li>
+  <li>El scheduler pasó de <strong>CFS a EEVDF en el kernel 6.6</strong>: <em>lag</em> + deadline virtual en lugar de heurísticas de despertar. Controlás <code>nice</code>, <code>chrt</code> y afinidad — pero dentro de un cgroup manda <code>cpu.max</code>.</li>
+  <li><code>kill -9</code> primero es un error: la ejecuta el kernel, así que no hay flush, ni cierre de transacciones, ni liberación de locks — y contra un proceso en D ni siquiera funciona.</li>
+  <li>El <strong>load average de Linux incluye D</strong>. Es un índice de demanda insatisfecha, no un medidor de CPU. Para alertar existe <strong>PSI</strong> (<code>/proc/pressure/*</code>).</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>strace -c ls -R /usr/share &gt; /dev/null</code> y armá una tabla con las cinco syscalls más frecuentes en <em>tu</em> máquina. Después repetilo con <code>find /usr/share -type f</code> y explicá por qué el perfil cambia.</li>
+  <li>Medí el costo de cruzar la frontera: cronometrá un millón de <code>os.getpid()</code> contra un millón de <code>time.time()</code>. Calculá los nanosegundos por llamada de cada uno y verificá con <code>strace -c</code> que el segundo no genera syscalls.</li>
+  <li>Elegí el PID de un servicio real y recorré <code>/proc/[pid]/</code>: sacá su estado, sus límites efectivos, cuántos fds tiene abiertos, sus bytes de I/O y si atrapa <code>SIGTERM</code> decodificando <code>SigCgt</code>. Escribí un script de una línea que responda "¿este servicio se apaga limpio?".</li>
+  <li>Provocá un estado D reproducible sin romper nada: montá un NFS o un <code>sshfs</code> contra un host inexistente con <code>hard</code>, tocá un archivo adentro y observá <code>ps -eo state,wchan</code>, <code>/proc/PID/stack</code> y el load average. Intentá <code>kill -9</code> y documentá qué pasó y por qué.</li>
+  <li>Fabricá un zombie con un padre que no llame a <code>wait()</code>. Comprobá que <code>kill -9</code> sobre el zombie no hace nada y que matar al padre sí lo limpia. Explicá quién lo cosechó al final.</li>
+  <li>Comprobá copy-on-write con números: un proceso que reserva 1 GB y forkea. Compará la suma de RSS de los dos procesos contra la RAM realmente usada (<code>free -m</code>) y contra <code>Private_Dirty</code> en <code>smaps_rollup</code>. Después hacé que el hijo escriba en la mitad del buffer y volvé a medir.</li>
+  <li>Lanzá dos cargas de CPU idénticas con <code>nice 0</code> y <code>nice 19</code>, medí el reparto real con <code>pidstat 1 10</code> y compará el resultado con el ~10% por nivel de la teoría. Repetí el experimento dentro de un cgroup con <code>cpu.max</code> limitado y explicá cuál de los dos controles ganó.</li>
+</ol>
+
+<section class="quiz" id="quizLS1">
+  <style>
+    #quizLS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS1 .q{margin-bottom:1.5rem}
+    #quizLS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS1 .opt:hover{border-color:var(--accent)}
+    #quizLS1 .opt:disabled{cursor:default}
+    #quizLS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS1 .exp.show{display:block}
+    #quizLS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Load average 40 en una máquina de 16 núcleos, CPU al 5% y <code>vmstat</code> muestra <code>r=2</code>, <code>b=38</code>. ¿Qué está pasando?</p>
+    <button class="opt">La CPU está saturada pero <code>top</code> lo reporta mal</button>
+    <button class="opt">38 tareas están en estado D esperando I/O; el load de Linux las cuenta aunque no usen CPU</button>
+    <button class="opt">Hay 40 procesos zombie inflando el contador</button>
+    <div class="exp">El load average de Linux suma <code>TASK_RUNNING</code> <strong>y</strong> <code>TASK_UNINTERRUPTIBLE</code> — una decisión de 1993 para que una máquina paralizada por disco no pareciera ociosa. Con <code>r=2</code> los núcleos están libres: los 38 de la columna <code>b</code> son el load. El siguiente paso es <code>ps -eo state,wchan</code> y <code>/proc/PID/stack</code> para ver qué recurso los tiene trabados. Los zombies, por cierto, no suman al load: están en <code>EXIT_ZOMBIE</code>, no en R ni en D.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Un proceso lleva 20 minutos en estado D y <code>kill -9</code> no lo toca. ¿Por qué?</p>
+    <button class="opt">Porque instaló un handler que ignora SIGKILL</button>
+    <button class="opt">Porque corre como root y root es inmune a las señales</button>
+    <button class="opt">Porque las señales solo se entregan al volver a espacio de usuario o desde un sueño interrumpible, y una tarea en D no revisa su cola</button>
+    <div class="exp"><code>SIGKILL</code> efectivamente no se puede atrapar ni ignorar — pero eso es distinto de que se pueda <em>entregar</em>. Una tarea en <code>TASK_UNINTERRUPTIBLE</code> está dentro del kernel, típicamente con locks tomados, y no verifica señales pendientes; el <code>SIGKILL</code> queda encolado en <code>task-&gt;pending</code> hasta que salga de D. La respuesta no es insistir con <code>kill</code>, es leer <code>/proc/PID/stack</code> para ver qué recurso la tiene bloqueada. Si el símbolo termina en <code>_killable</code> (<code>TASK_KILLABLE</code>), ahí sí <code>SIGKILL</code> puede entrar.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu contenedor tarda exactamente 10 segundos en parar con <code>docker stop</code>, siempre. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">El PID 1 no tiene handler de SIGTERM, y el kernel no entrega señales por defecto a PID 1: se agota el timeout y llega el SIGKILL</button>
+    <button class="opt">La imagen es demasiado grande y el runtime tarda en desmontar las capas</button>
+    <button class="opt">Docker siempre espera 10 segundos antes de parar cualquier contenedor</button>
+    <div class="exp">Diez segundos clavados es el timeout por defecto entre <code>SIGTERM</code> y <code>SIGKILL</code>: que se agote <em>siempre</em> significa que nadie atendió el <code>SIGTERM</code>. PID 1 tiene un tratamiento especial en el kernel — las señales sin handler instalado no se le entregan, así que se descartan en silencio. La causa típica es un <code>CMD</code> en forma de shell que deja a <code>/bin/sh</code> como PID 1 sin reenviar nada. Se confirma con <code>grep SigCgt /proc/1/status</code> y se arregla con la forma exec, un handler en la app, o <code>docker run --init</code>.</div>
+  </div>
+
+  <div class="score" id="scoreLS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../ls2-memoria/lecture.html">LS2: Memoria →</a>
+</nav>
+
+</div>
+</body>
+</html>

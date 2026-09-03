@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS3 — Namespaces y cgroups: un contenedor a mano · Linux Senior</title>
+  <meta name="description" content="Los ocho namespaces y qué aísla cada uno, cgroups v2 con jerarquía unificada y PSI, user namespaces y rootless, y cómo armar un contenedor funcional a mano con unshare, pivot_root y un cgroup con límite de memoria.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS3</span>
+  <span class="badge">⏱ 40–115 min</span>
+  <span class="badge">🎯 Pre-req: LS1, LS2</span>
+  <span class="badge">📦 Contenedores</span>
+</div>
+
+<article>
+
+<h1>LS3 — Namespaces y cgroups: un contenedor a mano</h1>
+
+<h2>LS3.0 Por qué este módulo</h2>
+
+<p>Abrí el código fuente del kernel de Linux y buscá la llamada al sistema que crea un contenedor. No está. No hay <code>create_container()</code>, no hay <code>struct container</code>, no hay un subsistema de contenedores. El kernel no sabe qué es un contenedor.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un <strong>contenedor no es una primitiva del kernel</strong>: es una <strong>construcción de espacio de usuario</strong> armada sobre dos primitivas que sí existen. Los <strong>namespaces</strong> deciden <strong>qué ve</strong> un proceso. Los <strong>cgroups</strong> deciden <strong>cuánto puede usar</strong>. Todo lo demás —imágenes, capas, registries, <code>Dockerfile</code>, Kubernetes— es empaquetado y ergonomía por encima de esas dos ideas.
+</div>
+
+<p>Esto no es trivia. Cambia dos cosas muy concretas de tu trabajo:</p>
+
+<div class="step"><strong>Cómo los depurás.</strong> Cuando un contenedor "no tiene red" o "se cae solo sin logs", no estás debuggeando Docker: estás debuggeando un net namespace o un cgroup. Si sabés dónde viven esos objetos en <code>/proc</code> y <code>/sys</code>, mirás el estado real en treinta segundos, aun cuando la imagen sea <em>distroless</em> y no tenga ni <code>sh</code> adentro.</div>
+
+<div class="step"><strong>Cómo los asegurás.</strong> Si creés que un contenedor es "como una máquina virtual chiquita", vas a tomar decisiones de seguridad equivocadas. El kernel es <strong>compartido</strong>. Entender exactamente qué se aísla y qué no es la diferencia entre una arquitectura defendible y una que solo parece segura.</div>
+
+<div class="warn">
+  <strong>⚠️ Práctica en VM, no en tu máquina de trabajo.</strong> Casi todo este módulo requiere <strong>root</strong> (<code>sudo</code>) y toca la tabla de montajes, la red y los límites de recursos del sistema. Un <code>pivot_root</code> o un <code>umount</code> mal hecho puede dejarte la sesión inutilizable, y escribir en <code>/sys/fs/cgroup</code> puede frenar servicios reales. Levantá una VM (Ubuntu 24.04, Debian 12 o Fedora 40 en adelante), sacá un <em>snapshot</em> antes de empezar, y rompé todo lo que quieras ahí.
+</div>
+
+<h2>LS3.1 La idea central: qué ve vs. cuánto usa</h2>
+
+<p>Guardá estas dos frases porque el resto del módulo se deduce de ellas:</p>
+
+<div class="rule">
+  <strong>📌 Namespaces = visibilidad. cgroups = contabilidad.</strong> Un namespace responde "¿qué PIDs existen?, ¿qué interfaces de red hay?, ¿cómo se llama esta máquina?". Un cgroup responde "¿cuánta RAM podés tocar?, ¿cuántos ciclos de CPU te tocan?, ¿cuántas IOPS?". Son <strong>ortogonales</strong>: podés tener namespaces sin límites, límites sin namespaces, o —lo que llamamos contenedor— las dos cosas juntas.
+</div>
+
+<p>Del lado del kernel, la superficie de la API es sorprendentemente chica. Tres llamadas al sistema para namespaces, y un sistema de archivos virtual para cgroups:</p>
+
+<pre><code class="lang-c">// El kernel no ofrece "crear contenedor". Ofrece esto:
+
+pid_t clone(fn, stack, CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | ..., arg);
+//  crea un proceso NUEVO ya adentro de namespaces nuevos
+
+int unshare(CLONE_NEWNS | CLONE_NEWUTS);
+//  el proceso ACTUAL se separa de los namespaces que compartía
+
+int setns(int fd, CLONE_NEWNET);
+//  el proceso actual ENTRA a un namespace existente (fd de /proc/PID/ns/net)
+
+// Y los cgroups no tienen syscall propia: son archivos.
+//   mkdir  /sys/fs/cgroup/mi-grupo
+//   echo 100M &gt; /sys/fs/cgroup/mi-grupo/memory.max
+//   echo $PID &gt; /sys/fs/cgroup/mi-grupo/cgroup.procs</code></pre>
+
+<div class="analogy">
+  <strong>Analogía.</strong> Pensá en una oficina compartida. Los <strong>namespaces</strong> son las <em>paredes y las ventanas</em>: definen a quién ves y a quién no, qué escritorio es "el escritorio" desde tu silla. Los <strong>cgroups</strong> son la <em>factura de la luz y el ancho de banda contratado</em>: podés ver todo lo que quieras, pero no podés consumir más de lo asignado. Docker es la inmobiliaria que te alquila el paquete completo con las llaves ya cortadas.
+</div>
+
+<h2>LS3.2 Los ocho namespaces, uno por uno</h2>
+
+<p>Linux tiene ocho tipos de namespace. Cada proceso pertenece a exactamente uno de cada tipo, y por defecto todos comparten los del sistema (los <em>namespaces iniciales</em>). Un contenedor típico crea seis o siete de estos:</p>
+
+<table>
+<thead><tr><th>Namespace</th><th>Flag</th><th>Kernel</th><th>Qué aísla</th></tr></thead>
+<tbody>
+<tr><td><strong>mnt</strong></td><td><code>CLONE_NEWNS</code></td><td>2.4.19</td><td>La <strong>tabla de montajes</strong>. Cada uno ve su propio árbol de archivos. Es el que hace posible que "adentro" haya otro <code>/</code>.</td></tr>
+<tr><td><strong>uts</strong></td><td><code>CLONE_NEWUTS</code></td><td>2.6.19</td><td><code>hostname</code> y <code>domainname</code>. El más chiquito y el que explica por qué tu contenedor se llama <code>a3f9c1b2</code>.</td></tr>
+<tr><td><strong>ipc</strong></td><td><code>CLONE_NEWIPC</code></td><td>2.6.19</td><td>IPC de System V (memoria compartida, semáforos) y colas de mensajes POSIX.</td></tr>
+<tr><td><strong>pid</strong></td><td><code>CLONE_NEWPID</code></td><td>2.6.24</td><td>La <strong>numeración de PIDs</strong>. Adentro hay un PID 1 propio y no se ven los procesos del host. Anidable.</td></tr>
+<tr><td><strong>net</strong></td><td><code>CLONE_NEWNET</code></td><td>2.6.29</td><td>Interfaces, direcciones IP, tabla de rutas, reglas de firewall, <strong>puertos</strong>, sockets. Dos contenedores pueden escuchar en el 8080 sin chocarse.</td></tr>
+<tr><td><strong>user</strong></td><td><code>CLONE_NEWUSER</code></td><td>3.8</td><td>El <strong>mapeo de UID/GID</strong> y las <em>capabilities</em>. El único que un usuario sin privilegios puede crear. La base de rootless.</td></tr>
+<tr><td><strong>cgroup</strong></td><td><code>CLONE_NEWCGROUP</code></td><td>4.6</td><td>La <strong>vista de la raíz</strong> de la jerarquía de cgroups: adentro tu cgroup parece ser <code>/</code>, no <code>/system.slice/docker-a3f9.scope</code>.</td></tr>
+<tr><td><strong>time</strong></td><td><code>CLONE_NEWTIME</code></td><td>5.6</td><td><em>Offsets</em> de <code>CLOCK_MONOTONIC</code> y <code>CLOCK_BOOTTIME</code>. Sirve para migración en vivo (CRIU). <strong>No</strong> aísla <code>CLOCK_REALTIME</code>.</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Lo que NINGÚN namespace aísla</strong> —y esto es la mitad del valor del módulo:
+  <ul>
+    <li>El <strong>kernel</strong>. Es uno solo. Un <em>panic</em>, un módulo cargado o una vulnerabilidad del kernel afectan a todos por igual.</li>
+    <li>La <strong>hora del reloj de pared</strong>. Ni con <code>time ns</code>: solo se desplazan los relojes monótonos.</li>
+    <li>La mayoría de <code>/proc/sys</code> (parámetros <em>sysctl</em>). Solo un subconjunto está "namespaceado" (por ejemplo <code>net.*</code> lo está con un net ns; <code>vm.*</code> y <code>kernel.*</code> en general no).</li>
+    <li>Los <strong>límites de recursos</strong>. Un namespace no impide que un proceso se coma toda la RAM: para eso están los cgroups. Es el error conceptual más común.</li>
+    <li>El acceso a <strong>dispositivos</strong>, las <strong>capabilities</strong> y las llamadas al sistema permitidas. Eso lo restringen otros mecanismos (cgroup device / eBPF, <code>capset</code>, seccomp, LSM).</li>
+  </ul>
+</div>
+
+<h2>LS3.3 Construir un contenedor a mano con <code>unshare</code></h2>
+
+<p>Esta sección es el corazón del módulo. <code>unshare(1)</code> —parte de <code>util-linux</code>, ya instalado en cualquier distro— es un envoltorio directo de la syscall del mismo nombre. Con él vas a armar, pieza por pieza, lo que Docker arma de una.</p>
+
+<h3>Pieza 1 — UTS: un hostname propio</h3>
+
+<p>Empezamos por el más simple para ver el mecanismo sin ruido:</p>
+
+<pre><code class="lang-bash">hostname                      # laptop-alex   (el host)
+
+sudo unshare --uts /bin/bash  # requiere root
+
+  hostname mini-contenedor    # cambiamos el hostname... ¿de quién?
+  hostname
+  # mini-contenedor
+  exit
+
+hostname                      # laptop-alex   -&gt; el host quedó INTACTO</code></pre>
+
+<p>Ese <code>hostname</code> que "cambiaste" solo existió dentro del namespace. Cuando el último proceso del namespace murió, el namespace se destruyó y el cambio se evaporó. Ese es exactamente el modelo de vida de todo namespace: <strong>existe mientras haya alguien adentro</strong> (o mientras alguien mantenga abierto un descriptor a su archivo en <code>/proc</code>).</p>
+
+<h3>Pieza 2 — PID: tu shell es el PID 1</h3>
+
+<pre><code class="lang-bash">sudo unshare --pid --fork --mount-proc /bin/bash
+
+  echo $$        # 1        <span class="prompt">&lt;- sos el init de este namespace</span>
+  ps aux         # solo bash y ps. El host no existe acá adentro.
+  ls /proc | head
+  # 1  9  self  ...        -&gt; /proc refleja la numeración nueva</code></pre>
+
+<div class="warn">
+  <strong>⚠️ Los dos flags que parecen ruido y no lo son.</strong>
+  <br><strong><code>--fork</code></strong>: <code>unshare(CLONE_NEWPID)</code> <em>no mueve</em> al proceso que la llama al namespace nuevo — no podés cambiarle el PID a un proceso vivo. Lo que hace es que el <strong>próximo hijo</strong> nazca adentro y sea el PID 1. Sin <code>--fork</code>, tu shell queda afuera y ves los PIDs del host.
+  <br><strong><code>--mount-proc</code></strong>: <code>ps</code> y <code>top</code> no le preguntan al kernel, <strong>leen <code>/proc</code></strong>. Si no creás también un mount namespace y remontás <code>/proc</code>, seguís viendo el <code>/proc</code> del host y <code>ps</code> te miente. Este flag hace las dos cosas de una.
+</div>
+
+<div class="info">
+  <strong>El PID 1 no es un PID cualquiera.</strong> Hereda dos responsabilidades del <code>init</code> del sistema: <strong>(1)</strong> adopta a los huérfanos y tiene que hacerles <code>wait()</code>, o se acumulan zombies; <strong>(2)</strong> el kernel le da <em>inmunidad</em> a las señales sin manejador (un <code>SIGTERM</code> a un PID 1 que no lo maneja no hace nada). Si el PID 1 muere, el kernel manda <code>SIGKILL</code> a <strong>todo</strong> el namespace. Por eso existen <code>tini</code>, <code>dumb-init</code> y el flag <code>docker run --init</code>: tu aplicación casi nunca está escrita para ser un <code>init</code>, y el síntoma es "el contenedor ignora <code>docker stop</code> y tarda 10 segundos en morir" o "se llena de procesos <code>&lt;defunct&gt;</code>".
+</div>
+
+<h3>Pieza 3 — NET: un contenedor sin red</h3>
+
+<pre><code class="lang-bash">sudo unshare --net /bin/bash
+
+  ip link
+  # 1: lo: &lt;LOOPBACK&gt; mtu 65536 state DOWN     <span class="prompt">&lt;- ni siquiera loopback arriba</span>
+  ip addr                 # vacío
+  ip route                # vacío
+  ping -c1 1.1.1.1
+  # ping: connect: Network is unreachable
+
+  ip link set lo up       # ahora al menos hablás con vos mismo
+  ping -c1 127.0.0.1      # OK</code></pre>
+
+<p>Eso es literalmente <code>docker run --network none</code>. Para darle red de verdad hay que tender un cable virtual desde el host: un <strong>par veth</strong>, que funciona como un cable con dos puntas, una en cada namespace.</p>
+
+<pre><code class="lang-bash"># --- en el HOST, con el namespace ya creado y "persistido" ---
+sudo ip netns add lab                      # namespace de red con nombre
+sudo ip netns exec lab ip link set lo up
+
+sudo ip link add veth-host type veth peer name veth-lab   # el "cable"
+sudo ip link set veth-lab netns lab                       # una punta adentro
+
+sudo ip addr add 10.200.0.1/24 dev veth-host
+sudo ip link set veth-host up
+
+sudo ip netns exec lab ip addr add 10.200.0.2/24 dev veth-lab
+sudo ip netns exec lab ip link set veth-lab up
+sudo ip netns exec lab ip route add default via 10.200.0.1
+
+ping -c1 10.200.0.2                        # el host llega al "contenedor"
+sudo ip netns exec lab ping -c1 10.200.0.1 # y al revés</code></pre>
+
+<div class="tip">
+  Multiplicá esto por N contenedores, agregá un <em>bridge</em> (<code>docker0</code>) donde enchufar todas las puntas del host y una regla de <code>MASQUERADE</code> en <code>nftables</code> para salir a Internet, y ya reconstruiste el modo <em>bridge</em> de Docker completo. Ese es todo el misterio. Las redes de contenedores se ven en profundidad en <strong>LS5</strong>.
+</div>
+
+<h3>Pieza 4 — MNT: su propio árbol de archivos</h3>
+
+<pre><code class="lang-bash">sudo unshare --mount /bin/bash
+
+  mount -t tmpfs tmpfs /mnt          # un tmpfs que SOLO existe acá
+  echo "invisible" &gt; /mnt/prueba
+  ls /mnt                            # prueba
+  exit
+
+ls /mnt                              # vacío: el montaje nunca existió para el host</code></pre>
+
+<div class="mini-ex">
+  <strong>Detalle fino que muerde en producción: la propagación de montajes.</strong> Un mount namespace nuevo <em>copia</em> la tabla de montajes, pero por defecto los montajes son <code>shared</code>, así que ciertos cambios se propagan de vuelta al padre. Por eso los runtimes hacen <code>mount --make-rprivate /</code> apenas entran. Es también la razón por la que montar el socket de Docker o un directorio del host dentro de un contenedor puede tener efectos que no esperabas hacia afuera.
+</div>
+
+<h3>Todo junto: seis namespaces de una</h3>
+
+<pre><code class="lang-bash">sudo unshare --pid --fork --mount-proc --uts --ipc --net --mount --cgroup /bin/bash
+
+  hostname mini
+  echo $$          # 1
+  ps aux           # 2 procesos
+  ip link          # solo lo, DOWN
+  ls /             # ...todavía el rootfs del host: falta pivot_root (Worked Example)</code></pre>
+
+<div class="rule">
+  <strong>📌 Ese comando ya es el 80% de un contenedor.</strong> Lo que falta son tres cosas, y ninguna es un namespace: un <strong>rootfs</strong> propio (LS3.WE), un <strong>cgroup</strong> con límites (LS3.6–LS3.7) y una capa de <strong>restricción de privilegios</strong> —seccomp, capabilities, LSM— (LS3.9).
+</div>
+
+<h2>LS3.4 Ver los namespaces de un proceso, y entrar</h2>
+
+<p>Cada namespace es un objeto del kernel con un <strong>número de inodo</strong>, expuesto como un enlace simbólico mágico en <code>/proc/[pid]/ns/</code>:</p>
+
+<pre><code class="lang-bash">ls -l /proc/self/ns/
+# lrwxrwxrwx ... cgroup -&gt; 'cgroup:[4026531835]'
+# lrwxrwxrwx ... ipc    -&gt; 'ipc:[4026531839]'
+# lrwxrwxrwx ... mnt    -&gt; 'mnt:[4026531841]'
+# lrwxrwxrwx ... net    -&gt; 'net:[4026531992]'
+# lrwxrwxrwx ... pid    -&gt; 'pid:[4026531836]'
+# lrwxrwxrwx ... time   -&gt; 'time:[4026531834]'
+# lrwxrwxrwx ... user   -&gt; 'user:[4026531837]'
+# lrwxrwxrwx ... uts    -&gt; 'uts:[4026531838]'</code></pre>
+
+<div class="rule">
+  <strong>📌 Mismo inodo = mismo namespace.</strong> Es la comprobación objetiva, y no necesita adivinanza:
+</div>
+
+<pre><code class="lang-bash"># ¿este contenedor comparte la red con el host?
+PID=$(docker inspect -f '{{.State.Pid}}' mi-app)
+
+readlink /proc/self/ns/net     # net:[4026531992]   (el host)
+sudo readlink /proc/$PID/ns/net # net:[4026532601]  -&gt; DISTINTO: red aislada
+sudo readlink /proc/$PID/ns/pid # pid:[4026532599]  -&gt; DISTINTO: PIDs aislados
+
+# Con --network host los dos números serían IGUALES. Así se verifica, no se supone.
+
+lsns                            # todos los namespaces del sistema, con su dueño
+lsns -t net                     # solo los de red</code></pre>
+
+<p>Y para <strong>entrar</strong> a los namespaces de un proceso que ya está corriendo, está <code>nsenter</code>, que es un envoltorio de <code>setns(2)</code>:</p>
+
+<pre><code class="lang-bash">sudo nsenter --target $PID --pid --mount --net --uts --ipc /bin/bash
+# o abreviado:
+sudo nsenter -t $PID -a /bin/bash        # -a = todos los namespaces disponibles</code></pre>
+
+<div class="tip">
+  <strong>🔧 El truco de producción que justifica todo el módulo.</strong> Tu imagen es <em>distroless</em>: no tiene <code>sh</code>, ni <code>curl</code>, ni <code>tcpdump</code>, y <code>docker exec</code> es inútil. Pero el <strong>host</strong> sí tiene herramientas. Entrás <em>solo</em> al namespace que te interesa y usás el binario del host adentro:
+</div>
+
+<pre><code class="lang-bash">PID=$(docker inspect -f '{{.State.Pid}}' mi-app)
+
+# capturar el tráfico del contenedor con el tcpdump del HOST
+sudo nsenter -t $PID -n tcpdump -i eth0 -nn -c 50
+
+# ver sus sockets y puertos, sin nada instalado adentro
+sudo nsenter -t $PID -n ss -tulpn
+
+# ver su tabla de rutas y su DNS efectivo
+sudo nsenter -t $PID -n ip route
+sudo nsenter -t $PID -m cat /etc/resolv.conf</code></pre>
+
+<h2>LS3.5 User namespaces y contenedores rootless</h2>
+
+<p>El user namespace es el más raro de los ocho, y el más importante en términos de seguridad. Es el <strong>único que un usuario sin privilegios puede crear</strong>, y adentro de él, <em>tus UIDs se renumeran</em>.</p>
+
+<pre><code class="lang-bash">id
+# uid=1000(alex) gid=1000(alex) ...
+
+unshare --user --map-root-user /bin/bash    # ¡SIN sudo!
+
+  id
+  # uid=0(root) gid=0(root) ...             <span class="prompt">&lt;- sos root... adentro</span>
+
+  cat /proc/self/uid_map
+  #          0       1000          1
+  #   ^ UID adentro   ^ UID afuera  ^ tamaño del rango
+
+  touch /root/prueba
+  # touch: cannot touch '/root/prueba': Permission denied
+  # -&gt; el kernel te ve como el UID 1000 real. "root" acá no vale nada afuera.</code></pre>
+
+<div class="concept">
+  <strong>💡 Qué significa realmente ese mapeo.</strong> Cuando el proceso pide escribir un archivo, el kernel traduce: "el UID 0 <em>de este namespace</em> es el UID 1000 del sistema" y aplica los permisos de <strong>1000</strong>. Adentro tenés <em>capabilities</em> completas (podés montar un tmpfs, cambiar el hostname, crear más namespaces), pero solo sobre los recursos que pertenecen a ese namespace. Sos rey de un reino que no incluye nada del host.
+</div>
+
+<p>Para un contenedor real no alcanza con un solo UID: necesitás un rango, para que el <code>root</code>, el <code>www-data</code> y el <code>postgres</code> de adentro caigan cada uno en un UID distinto e inofensivo de afuera. Eso lo declaran <code>/etc/subuid</code> y <code>/etc/subgid</code>:</p>
+
+<pre><code class="lang-bash">cat /etc/subuid
+# alex:100000:65536      -&gt; a alex le pertenecen los UID 100000..165535
+
+cat /etc/subgid
+# alex:100000:65536
+
+# los helpers setuid que escriben el mapeo (parte de uidmap / shadow-utils)
+ls -l /usr/bin/newuidmap /usr/bin/newgidmap
+# -rwsr-xr-x ... /usr/bin/newuidmap
+
+# Podman rootless usa exactamente esto:
+podman unshare cat /proc/self/uid_map
+#          0       1000          1
+#          1     100000      65536
+# -&gt; root(0) adentro = alex(1000) afuera; los demás UID caen en 100000+</code></pre>
+
+<pre><code class="lang-bash"># comprobación concreta de lo que gana el host
+podman run --rm -d --name web -p 8080:80 docker.io/library/nginx
+ps -o pid,user,comm -p $(pgrep -f "nginx: master" | head -1)
+#   PID USER  COMMAND
+# 48213 alex  nginx        <span class="prompt">&lt;- el "root" del contenedor es alex en el host</span>
+
+ls -ln ~/.local/share/containers/storage/overlay | head -3
+# los archivos del rootfs son propiedad de UIDs 100000+, no de root</code></pre>
+
+<div class="rule">
+  <strong>📌 Por qué es la mejora de seguridad más grande de la década.</strong> Antes, un escape del contenedor te dejaba como <strong>root en el host</strong>: partida terminada. Con user namespaces, ese mismo escape te deja como un <strong>UID sin privilegios y sin dueño de nada</strong> (100000, digamos), que no puede leer <code>/etc/shadow</code>, ni cargar módulos, ni tocar archivos de otros usuarios. No elimina el riesgo: <em>degrada la consecuencia</em> de un compromiso total a uno molesto. Es defensa en profundidad en su forma más pura.
+</div>
+
+<div class="danger">
+  <strong>⚠️ El contrapeso honesto.</strong> Los user namespaces también <strong>ampliaron la superficie de ataque del kernel</strong>: código que antes solo alcanzaba <code>root</code> (partes de la pila de red, de <code>overlayfs</code>, del subsistema de montaje) ahora lo alcanza cualquier usuario a través de un user ns. Varias CVEs de escalada local salieron justamente por ahí. Por eso hay distros y organizaciones que los restringen:
+  <pre><code class="lang-bash">sysctl user.max_user_namespaces            # 0 = deshabilitados para no-root
+sysctl kernel.unprivileged_userns_clone    # Debian/Ubuntu: 0 = bloqueados</code></pre>
+  Decidir si los habilitás es un <em>trade-off</em> real, no una casilla que se tilda: rootless reduce el impacto de un escape del contenedor, y a la vez agranda la superficie del kernel expuesta a usuarios locales. En un servidor de contenedores multi-inquilino casi siempre gana rootless; en un <em>bastion host</em> con usuarios humanos, no tanto.
+</div>
+
+<h2>LS3.6 cgroups v2: la jerarquía unificada</h2>
+
+<p>Los <em>control groups</em> son la otra mitad. La v1 (2008) creció por acumulación: <strong>una jerarquía de directorios independiente por cada controlador</strong>. Un proceso podía estar en <code>/sys/fs/cgroup/memory/grupo-a</code> y a la vez en <code>/sys/fs/cgroup/cpu/otro-grupo</code>. El resultado fue inmanejable: el kernel no podía coordinar memoria y E/S (que están profundamente relacionadas, porque la <em>writeback</em> es las dos cosas), y la delegación segura a un usuario no root era imposible.</p>
+
+<div class="concept">
+  <strong>💡 cgroups v2.</strong> Llegó en el <strong>kernel 4.5</strong> (2016) y es el <strong>default desde el 5.15</strong>. Trae tres cambios estructurales: <strong>(1) jerarquía única unificada</strong> — un proceso pertenece a <em>exactamente un</em> cgroup y todos los controladores se aplican ahí; <strong>(2) delegación segura</strong> de un subárbol a un usuario sin privilegios, lo que hace posible systemd por usuario y los contenedores rootless; <strong>(3) PSI</strong>, la métrica de presión que ves en LS3.8.
+</div>
+
+<p>A septiembre de 2026, v2 es lo que vas a encontrar por defecto en <strong>Fedora 31+</strong>, <strong>Debian 11+</strong>, <strong>Ubuntu 21.10+</strong>, <strong>RHEL 9+</strong> y <strong>Arch</strong>. Verificalo antes de suponer:</p>
+
+<pre><code class="lang-bash">stat -fc %T /sys/fs/cgroup/
+# cgroup2fs   -&gt; v2 puro (unified)
+# tmpfs       -&gt; v1, o modo híbrido
+
+mount | grep cgroup
+# cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate)
+
+cat /proc/self/cgroup
+# 0::/user.slice/user-1000.slice/session-3.scope
+#  ^ en v2 hay UNA sola línea que empieza con "0::". En v1 hay una por controlador.
+
+systemd-cgls | head -20      # el árbol tal como lo organiza systemd
+systemd-cgtop                # "top" por cgroup: CPU, memoria e I/O reales</code></pre>
+
+<h3>Los dos archivos que gobiernan todo</h3>
+
+<pre><code class="lang-bash">cat /sys/fs/cgroup/cgroup.controllers
+# cpuset cpu io memory hugetlb pids rdma misc
+#  ^ los controladores DISPONIBLES en este cgroup
+
+cat /sys/fs/cgroup/cgroup.subtree_control
+# cpu io memory pids
+#  ^ los que este cgroup HABILITA para sus HIJOS</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla que confunde a todo el mundo la primera vez.</strong> Un controlador solo está disponible en un cgroup si el <strong>padre</strong> lo escribió en su <code>cgroup.subtree_control</code>. Habilitar de arriba hacia abajo es tu responsabilidad: si creás <code>/sys/fs/cgroup/lab</code> y su <code>memory.max</code> no existe, no es un bug — es que la raíz no delegó <code>memory</code> hacia abajo. Se arregla con <code>echo "+memory" &gt; /sys/fs/cgroup/cgroup.subtree_control</code>.
+</div>
+
+<div class="info">
+  <strong>Regla de "no procesos internos".</strong> En v2, un cgroup que tiene controladores habilitados para sus hijos <strong>no puede contener procesos propios</strong> (la raíz es la única excepción). Los procesos van siempre en las <em>hojas</em>. Suena arbitrario, pero es lo que hace que la contabilidad no sea ambigua: un recurso o lo consume un hijo o lo consume el grupo, nunca las dos cosas a la vez.
+</div>
+
+<h3>Delegación</h3>
+
+<pre><code class="lang-bash"># Darle a un usuario sin privilegios el control de un subárbol completo:
+sudo mkdir -p /sys/fs/cgroup/proyecto-x
+sudo chown -R alex:alex /sys/fs/cgroup/proyecto-x
+# y los tres archivos de la frontera, en el cgroup PADRE:
+sudo chown alex /sys/fs/cgroup/proyecto-x/cgroup.procs \
+                /sys/fs/cgroup/proyecto-x/cgroup.subtree_control \
+                /sys/fs/cgroup/proyecto-x/cgroup.threads
+
+# alex ahora puede crear subgrupos y mover SUS procesos ahí, pero NO puede
+# aflojar el límite que le puso root arriba: la delegación es hacia abajo.</code></pre>
+
+<pre><code class="lang-ini"># En la práctica esto no se hace a mano: se declara en una unit de systemd.
+# /etc/systemd/system/mi-app.service
+[Service]
+ExecStart=/usr/bin/mi-app
+Delegate=yes                 # el servicio administra su propio subárbol
+MemoryMax=2G                 # -&gt; memory.max
+MemoryHigh=1500M             # -&gt; memory.high
+CPUQuota=150%                # -&gt; cpu.max  "150000 100000"
+CPUWeight=200                # -&gt; cpu.weight
+TasksMax=512                 # -&gt; pids.max
+IOReadBandwidthMax=/dev/sda 50M</code></pre>
+
+<h2>LS3.7 Los controladores en la práctica</h2>
+
+<p>Vamos a crear un cgroup a mano, limitarlo y meterle un proceso. Todo es <code>mkdir</code> y <code>echo</code>: no hay API, no hay herramienta obligatoria.</p>
+
+<pre><code class="lang-bash"># 1. habilitar los controladores para los hijos de la raíz
+echo "+memory +cpu +pids +io" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+
+# 2. crear el grupo (basta con mkdir: el kernel puebla los archivos solo)
+sudo mkdir -p /sys/fs/cgroup/demo
+ls /sys/fs/cgroup/demo/
+# cgroup.controllers  cpu.max  cpu.stat  io.max  memory.current  memory.events
+# memory.high  memory.max  memory.pressure  pids.max  pids.current  ...
+
+# 3. poner límites
+echo 100M           | sudo tee /sys/fs/cgroup/demo/memory.max    # techo duro
+echo 80M            | sudo tee /sys/fs/cgroup/demo/memory.high   # throttling
+echo "50000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max       # 0.5 CPU
+echo 64             | sudo tee /sys/fs/cgroup/demo/pids.max      # anti fork-bomb
+
+# 4. meter un proceso (por PID, uno por línea)
+echo $$ | sudo tee /sys/fs/cgroup/demo/cgroup.procs   # esta misma shell
+cat /proc/self/cgroup
+# 0::/demo                                            <span class="prompt">&lt;- confirmado</span>
+
+# 5. mirar el consumo en vivo
+cat /sys/fs/cgroup/demo/memory.current    # bytes en uso AHORA
+cat /sys/fs/cgroup/demo/pids.current</code></pre>
+
+<h3><code>memory.max</code> vs <code>memory.high</code>: la distinción que salva servicios</h3>
+
+<table>
+<thead><tr><th>Archivo</th><th>Qué hace el kernel al llegar</th><th>Consecuencia</th></tr></thead>
+<tbody>
+<tr><td><code>memory.max</code></td><td>Intenta recuperar memoria; si no puede, invoca el <strong>OOM killer del cgroup</strong></td><td><strong>Mata</strong> un proceso. Abrupto, sin gracia. Es lo que hace <code>docker run --memory</code>.</td></tr>
+<tr><td><code>memory.high</code></td><td><strong>Frena</strong> al proceso (throttling): lo hace dormir mientras recupera páginas</td><td>El servicio se pone <strong>lento pero sigue vivo</strong>. Te deja tiempo de reaccionar.</td></tr>
+<tr><td><code>memory.low</code></td><td>Protección blanda: bajo presión, el kernel prefiere no reclamarle a este grupo</td><td>Reserva "best effort" para el servicio crítico.</td></tr>
+<tr><td><code>memory.min</code></td><td>Protección dura: esta memoria <strong>nunca</strong> se le reclama</td><td>Garantía real. Usar con cuidado: puede empujar el OOM a otro lado.</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Patrón recomendado:</strong> poné <code>memory.high</code> ~20–25% por debajo de <code>memory.max</code>. El <code>high</code> es tu alarma temprana y tu freno; el <code>max</code> es la red de seguridad para que un <em>leak</em> no se lleve puesto al host. Un servicio que solo tiene <code>max</code> no tiene aviso previo: pasa de "todo bien" a "muerto" sin transición.
+</div>
+
+<h3>Los archivos de evidencia</h3>
+
+<pre><code class="lang-bash">cat /sys/fs/cgroup/demo/memory.events
+# low 0
+# high 137          <span class="prompt">&lt;- 137 veces se pasó de memory.high (fue frenado)</span>
+# max 42            <span class="prompt">&lt;- 42 veces tocó el techo</span>
+# oom 3
+# oom_kill 2        <span class="prompt">&lt;- 2 procesos MUERTOS por el OOM killer del cgroup</span>
+
+cat /sys/fs/cgroup/demo/cpu.stat
+# usage_usec 8123456
+# nr_periods 4210
+# nr_throttled 388          <span class="prompt">&lt;- fue frenado en 388 períodos</span>
+# throttled_usec 2450000    <span class="prompt">&lt;- 2,45 s perdidos esperando cuota</span>
+
+cat /sys/fs/cgroup/demo/memory.stat | head -8
+# anon 41943040        (heap y stacks: lo que "no se puede tirar")
+# file 12582912        (page cache: descartable)
+# slab 2097152
+# ...</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>oom_kill</code> y <code>nr_throttled</code> son las dos métricas que convierten una discusión en un hecho.</strong> "La app se cae sola y no deja logs" se responde con <code>memory.events → oom_kill</code>: si es &gt; 0, no se cayó, <strong>la mataron</strong>, y el límite está mal calculado. "La latencia p99 es horrible pero la CPU del nodo está al 40%" se responde con <code>cpu.stat → nr_throttled</code>: el nodo está tranquilo, tu <em>cgroup</em> es el que está estrangulado por su propia cuota. Exportá esos dos contadores a tu sistema de métricas y la mitad de los incidentes se diagnostican solos.
+</div>
+
+<h3><code>cpu.max</code> vs <code>cpu.weight</code>, e <code>io.max</code></h3>
+
+<pre><code class="lang-bash"># cpu.max = "CUOTA PERIODO", en microsegundos. Es un TECHO ABSOLUTO.
+echo "max 100000"    | sudo tee /sys/fs/cgroup/demo/cpu.max  # sin límite (default)
+echo "50000 100000"  | sudo tee /sys/fs/cgroup/demo/cpu.max  # 0.5 núcleos
+echo "200000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max  # 2 núcleos
+
+# cpu.weight = peso RELATIVO (1..10000, default 100). Solo importa si hay pelea.
+# Sin contención, un peso 10 puede usar el 100% de la máquina.
+echo 400 | sudo tee /sys/fs/cgroup/demo/cpu.weight   # 4x la prioridad estándar
+
+# io.max se expresa por dispositivo: "MAJOR:MINOR clave=valor"
+lsblk -o NAME,MAJ:MIN
+# nvme0n1  259:0
+
+echo "259:0 rbps=10485760 wbps=5242880 riops=1000 wiops=500" \
+  | sudo tee /sys/fs/cgroup/demo/io.max     # 10 MB/s lectura, 5 MB/s escritura
+
+cat /sys/fs/cgroup/demo/io.stat             # bytes e IOPS reales por dispositivo</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico con <code>cpu.max</code>:</strong> ponerle una cuota agresiva a un servicio con muchos hilos. Con <code>"100000 100000"</code> (1 CPU) y 16 hilos activos, los 16 consumen la cuota entera en los primeros milisegundos del período y después <strong>todos duermen</strong> hasta el período siguiente. La CPU promedio se ve baja, y la latencia p99 se dispara en escalones de 100 ms. Se ve clarísimo en <code>nr_throttled</code>. La solución no suele ser subir la cuota: es reducir la concurrencia interna (el <em>pool</em> de hilos) para que coincida con la cuota, o pasar a <code>cpu.weight</code> si lo que querías era prioridad y no un techo.
+</div>
+
+<h2>LS3.8 PSI: saber que el servicio sufre <em>antes</em> del OOM</h2>
+
+<p><strong>Pressure Stall Information</strong> es la métrica más útil que llegó al kernel en años, y casi nadie la usa. Está en <code>/proc/pressure/</code> a nivel sistema y —lo importante— <strong>por cgroup</strong>:</p>
+
+<pre><code class="lang-bash">cat /sys/fs/cgroup/demo/memory.pressure
+# some avg10=12.43 avg60=8.11 avg300=3.02 total=48219341
+# full avg10=4.77  avg60=2.90 avg300=0.98 total=18820113
+
+cat /sys/fs/cgroup/demo/cpu.pressure
+cat /sys/fs/cgroup/demo/io.pressure
+
+# a nivel de todo el sistema:
+cat /proc/pressure/memory
+cat /proc/pressure/io</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Significado</th></tr></thead>
+<tbody>
+<tr><td><code>some</code></td><td>% del tiempo en que <strong>al menos una</strong> tarea estuvo estancada esperando el recurso. Es el <strong>indicador temprano</strong>.</td></tr>
+<tr><td><code>full</code></td><td>% del tiempo en que <strong>todas</strong> las tareas estuvieron estancadas: nadie avanzó. Es dolor real y presente.</td></tr>
+<tr><td><code>avg10 / avg60 / avg300</code></td><td>Promedios móviles sobre 10 s, 60 s y 300 s.</td></tr>
+<tr><td><code>total</code></td><td>Microsegundos acumulados de estancamiento. El campo bueno para derivar tasas en Prometheus.</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué PSI le gana a "uso de memoria al 90%".</strong> El porcentaje de memoria usada <strong>no dice nada</strong>: Linux llena la RAM libre con page cache a propósito, así que un sistema sano casi siempre se ve "al 95%". PSI no mide ocupación, mide <strong>tiempo perdido</strong>: cuántos milisegundos tus procesos estuvieron parados esperando una página, un turno de CPU o un bloque de disco. Eso <em>sí</em> se corresponde con lo que el usuario percibe como lentitud.
+</div>
+
+<div class="rule">
+  <strong>📌 Umbrales operativos para empezar (después calibralos con tus datos):</strong>
+  <ul>
+    <li><code>memory.pressure some avg60 &gt; 10</code> sostenido → el servicio está <em>thrashing</em>: recupera páginas y las vuelve a pedir. Todavía no hay OOM, pero ya está degradado. <strong>Acá se alerta.</strong></li>
+    <li><code>memory.pressure full avg10 &gt; 20</code> → el OOM está cerca. Es tu ventana para escalar o reiniciar de forma ordenada.</li>
+    <li><code>cpu.pressure some avg60 &gt; 20</code> → hay más trabajo listo que CPU disponible: revisá <code>cpu.max</code> y <code>nr_throttled</code> antes de agregar nodos.</li>
+    <li><code>io.pressure full</code> alto con CPU baja → el cuello es el disco, no el cómputo. Mirá <code>io.stat</code> y LS4.</li>
+  </ul>
+</div>
+
+<div class="info">
+  PSI requiere <code>CONFIG_PSI=y</code> (activo en Debian, Ubuntu, Fedora y RHEL 9+). Si los archivos no existen o dan cero constante, revisá si el kernel arrancó con <code>psi=0</code>: <code>cat /proc/cmdline</code>. En kernels con <code>CONFIG_PSI_DEFAULT_DISABLED</code> hay que agregar <code>psi=1</code> a los parámetros de arranque. El daemon <code>oomd</code> de Facebook —y <code>systemd-oomd</code>, que viene por defecto en Fedora y Ubuntu— toman decisiones de matar procesos basándose exactamente en estos números, en espacio de usuario y antes de que el OOM killer del kernel tenga que actuar.
+</div>
+
+<h2>LS3.9 Qué NO aísla un contenedor</h2>
+
+<div class="danger">
+  <strong>⚠️ El kernel es uno solo y es compartido.</strong> Los namespaces cambian <em>lo que ves</em> a través de las llamadas al sistema, pero las llamadas al sistema son <strong>las mismas</strong>, atendidas por <strong>el mismo kernel</strong>, con el <strong>mismo espacio de memoria privilegiado</strong>. Un contenedor no es una frontera de seguridad tan fuerte como una VM. Es una frontera <em>razonable</em> que hay que reforzar a propósito.
+</div>
+
+<p>Las consecuencias concretas:</p>
+
+<div class="step"><strong>Una vulnerabilidad del kernel es un escape.</strong> <em>Dirty COW</em> (CVE-2016-5195), <em>Dirty Pipe</em> (CVE-2022-0847) y varias fallas en <code>overlayfs</code> y en el subsistema de <code>io_uring</code> permitieron escribir fuera del contenedor. Ninguna cantidad de configuración de Docker las hubiera evitado: el bug estaba abajo de todo.</div>
+
+<div class="step"><strong>El runtime también es superficie.</strong> CVE-2019-5736 en <code>runc</code> permitía a un contenedor sobrescribir el binario del propio runtime en el host y ejecutar código como root en el próximo <code>exec</code>. Los runtimes son software y tienen bugs.</div>
+
+<div class="step"><strong><code>--privileged</code> anula todo.</strong> Da todas las capabilities, desactiva seccomp y AppArmor, y expone los dispositivos del host. Un contenedor privilegiado es, en la práctica, un proceso root del host con un <code>chroot</code> decorativo. Si montás además <code>/var/run/docker.sock</code>, cualquiera adentro puede lanzar otro contenedor con el host montado en <code>/</code>: es root sin esfuerzo.</div>
+
+<div class="step"><strong>Namespaces compartidos son puertas.</strong> <code>--pid host</code> permite ver y señalizar procesos del host; <code>--network host</code> pone al contenedor en la red del host, con acceso a servicios que escuchan en <code>127.0.0.1</code> y que nadie pensó que había que proteger.</div>
+
+<p>Las mitigaciones de verdad no son namespaces ni cgroups: son un <strong>tercer conjunto de mecanismos</strong>, y hay que activarlos explícitamente.</p>
+
+<table>
+<thead><tr><th>Mecanismo</th><th>Qué restringe</th><th>Cómo se activa</th></tr></thead>
+<tbody>
+<tr><td><strong>seccomp-bpf</strong></td><td>Qué syscalls puede invocar el proceso</td><td>Perfil por defecto de Docker/Podman (bloquea ~44); <code>--security-opt seccomp=perfil.json</code></td></tr>
+<tr><td><strong>capabilities</strong></td><td>Qué privilegios de root tiene realmente</td><td><code>--cap-drop=ALL --cap-add=NET_BIND_SERVICE</code></td></tr>
+<tr><td><strong>LSM</strong> (AppArmor / SELinux)</td><td>Acceso obligatorio a archivos, red y capacidades</td><td>Perfil por contenedor; <code>:z</code>/<code>:Z</code> en los montajes con SELinux</td></tr>
+<tr><td><strong>user namespaces</strong></td><td>El daño posible tras un escape</td><td>Rootless (Podman) o <code>userns-remap</code> (Docker)</td></tr>
+<tr><td><strong>rootfs de solo lectura</strong></td><td>Persistencia del atacante</td><td><code>--read-only</code> + <code>--tmpfs /tmp</code></td></tr>
+<tr><td><strong>no-new-privileges</strong></td><td>Escalada vía binarios <code>setuid</code></td><td><code>--security-opt no-new-privileges</code></td></tr>
+<tr><td><strong>Kernel separado</strong></td><td>Todo lo anterior, de raíz</td><td>gVisor, Kata Containers, Firecracker (microVM)</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  🔐 El <em>hardening</em> de contenedores, los perfiles de seccomp, el modelo de capabilities y las políticas de admisión en Kubernetes se tratan en profundidad en el curso hermano: <a href="../../../Curso-Ciberseguridad/m06-hardening/lecture.html">Ciberseguridad · M06 — Hardening de sistemas</a>. Este módulo te da el <em>mecanismo</em>; ese te da la <em>política</em>.
+</div>
+
+<h2>LS3.10 Contenedor vs. máquina virtual vs. proceso normal</h2>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Proceso normal</th><th>Contenedor</th><th>VM / microVM</th></tr></thead>
+<tbody>
+<tr><td><strong>Aislamiento de vista</strong></td><td>Ninguno (ve todos los PIDs, toda la red)</td><td>Namespaces: PIDs, red, montajes, hostname</td><td>Total: hardware virtual completo</td></tr>
+<tr><td><strong>Límite de recursos</strong></td><td><code>ulimit</code>, <code>nice</code> — flojo y por proceso</td><td>cgroups v2: memoria, CPU, E/S, PIDs — preciso y por grupo</td><td>Asignación fija de vCPU y RAM al arrancar</td></tr>
+<tr><td><strong>Kernel</strong></td><td>Compartido</td><td><strong>Compartido</strong></td><td><strong>Propio</strong> (aislamiento por hipervisor)</td></tr>
+<tr><td><strong>Arranque</strong></td><td>&lt; 1 ms</td><td>~50–200 ms</td><td>~1–30 s (microVM: ~125 ms)</td></tr>
+<tr><td><strong>Overhead de memoria</strong></td><td>0</td><td>~1–10 MB (metadatos del runtime)</td><td>~50–500 MB (kernel + userland del huésped)</td></tr>
+<tr><td><strong>Densidad por host</strong></td><td>Miles</td><td><strong>Cientos</strong></td><td>Decenas</td></tr>
+<tr><td><strong>Superficie de ataque</strong></td><td>Todo el kernel</td><td>Todo el kernel, filtrada por seccomp/LSM</td><td>La del hipervisor: mucho más chica</td></tr>
+<tr><td><strong>Sistema operativo</strong></td><td>El del host</td><td>Cualquier distro Linux, mismo kernel</td><td>Cualquier SO, incluido Windows o BSD</td></tr>
+<tr><td><strong>Buen encaje para</strong></td><td>Servicios del sistema, <em>daemons</em></td><td>Microservicios, CI, entornos reproducibles</td><td>Multi-inquilino no confiable, código de terceros, otro SO</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio de decisión, en una línea:</strong> si ejecutás <strong>tu propio</strong> código, el contenedor alcanza y te da densidad y velocidad. Si ejecutás código <strong>de terceros que no controlás</strong> —un runner de CI público, funciones de clientes, notebooks de usuarios— el aislamiento del kernel compartido no es suficiente y necesitás una frontera de hipervisor: Firecracker, Kata o gVisor. Esa es exactamente la razón por la que AWS Lambda corre sobre Firecracker y no sobre <code>runc</code>.
+</div>
+
+<h2>🧑‍🎓 Worked Example — un contenedor funcional en 20 líneas de shell</h2>
+
+<blockquote>Objetivo: armar un contenedor que corra un shell de Alpine, con su propio rootfs, sus propios PIDs, sin red, y con un límite duro de 64 MB de RAM. Después comprobar que el límite se respeta —que el proceso <strong>se muere</strong> al pasarse— y comparar el resultado con lo que hace <code>docker run --memory</code>. Todo en una VM.</blockquote>
+
+<p><strong>Paso 1 — Un rootfs.</strong> Un contenedor necesita un árbol de archivos propio. No hay magia: es un directorio con un <code>/bin</code>, un <code>/etc</code> y un <code>/lib</code>.</p>
+
+<pre><code class="lang-bash">mkdir -p ~/lab/rootfs &amp;&amp; cd ~/lab
+
+# opción A: minirootfs de Alpine, ~3 MB
+curl -sL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz \
+  | sudo tar -xz -C rootfs
+
+# opción B: sacarlo de una imagen que ya tenés (una imagen ES un tar de un rootfs)
+docker export $(docker create alpine:3.20) | sudo tar -x -C rootfs
+
+# opción C, sin Docker ni internet en la VM:
+sudo debootstrap --variant=minbase stable rootfs http://deb.debian.org/debian
+
+ls rootfs/
+# bin  dev  etc  home  lib  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var</code></pre>
+
+<div class="info">
+  Ese <code>ls</code> es la revelación de la semana: <strong>una imagen de contenedor es un tarball de un directorio</strong>. Las capas, el <code>Dockerfile</code>, el registry y el hash <code>sha256:</code> son gestión de versiones y transporte alrededor de esto. Nada de eso lo entiende el kernel.
+</div>
+
+<p><strong>Paso 2 — El cgroup con el límite.</strong> Lo creamos <em>antes</em> de arrancar, para que el proceso nazca ya limitado.</p>
+
+<pre><code class="lang-bash">echo "+memory +pids +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+sudo mkdir -p /sys/fs/cgroup/lab
+
+echo 64M            | sudo tee /sys/fs/cgroup/lab/memory.max   # techo duro
+echo 48M            | sudo tee /sys/fs/cgroup/lab/memory.high  # freno previo
+echo 64             | sudo tee /sys/fs/cgroup/lab/pids.max     # anti fork-bomb
+echo "20000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # 0.2 núcleos
+
+cat /sys/fs/cgroup/lab/memory.max        # 67108864 bytes = 64 MiB</code></pre>
+
+<p><strong>Paso 3 — El "runtime".</strong> Todo el runtime cabe en un script. Ojo con <code>pivot_root</code>: es lo que distingue esto de un <code>chroot</code>.</p>
+
+<pre><code class="lang-bash">cat &gt; ~/lab/mini-run.sh &lt;&lt;'EOF'
+#!/bin/sh
+set -e
+ROOT=/home/alex/lab/rootfs
+
+# 1. entrar al cgroup ANTES de nada: nacemos ya limitados
+echo $$ &gt; /sys/fs/cgroup/lab/cgroup.procs
+
+# 2. cortar la propagación de montajes hacia el host
+mount --make-rprivate /
+
+# 3. la nueva raíz tiene que ser un punto de montaje
+mount --bind "$ROOT" "$ROOT"
+mkdir -p "$ROOT/.oldroot"
+
+# 4. cambiar de raíz de verdad
+pivot_root "$ROOT" "$ROOT/.oldroot"
+cd /
+
+# 5. montar los pseudo-sistemas de archivos que el userland espera
+mount -t proc  proc  /proc
+mount -t sysfs sys   /sys
+mount -t tmpfs tmpfs /tmp
+
+# 6. soltar el último hilo hacia el host: se va la raíz vieja
+umount -l /.oldroot
+rmdir /.oldroot 2&gt;/dev/null || true
+
+hostname mini
+exec /bin/sh
+EOF
+chmod +x ~/lab/mini-run.sh</code></pre>
+
+<div class="mistake">
+  <strong><code>chroot</code> no alcanza y por eso usamos <code>pivot_root</code>.</strong> <code>chroot</code> solo cambia el puntero a la raíz del proceso, pero la raíz vieja <strong>sigue montada y sigue siendo alcanzable</strong>. El escape clásico es de cuatro líneas en C: un proceso con <code>CAP_SYS_CHROOT</code> abre un descriptor a un directorio, hace <code>chroot</code> a otro lado, hace <code>fchdir()</code> a ese descriptor viejo y sube con <code>cd ..</code> hasta la raíz real. <code>pivot_root</code> + <code>umount -l</code> <strong>desmonta la raíz anterior</strong>: no queda referencia a la que volver. Los runtimes serios usan <code>pivot_root</code> (o <code>MS_MOVE</code> + <code>chroot</code> cuando no se puede).
+</div>
+
+<p><strong>Paso 4 — Arrancarlo.</strong></p>
+
+<pre><code class="lang-bash">sudo unshare --pid --fork --mount --uts --ipc --net --cgroup ~/lab/mini-run.sh</code></pre>
+
+<pre><code class="lang-bash"># ---- YA ESTÁS ADENTRO ----
+/ # echo $$
+1                                      # sos el init de este namespace
+/ # hostname
+mini
+/ # cat /etc/alpine-release
+3.20.3                                 # el rootfs de Alpine, no el de la VM
+/ # ls /home                           # vacío: el /home del host no existe acá
+/ # ip link
+1: lo: &lt;LOOPBACK&gt; mtu 65536 state DOWN  # sin red, como --network none
+/ # ps
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    5 root      0:00 ps                # dos procesos en todo el "sistema"
+/ # cat /sys/fs/cgroup/memory.max
+67108864                               # con --cgroup, TU cgroup se ve como la raíz</code></pre>
+
+<p><strong>Paso 5 — Comprobar que el límite es real.</strong> Dos formas, ambas dentro del contenedor:</p>
+
+<pre><code class="lang-bash"># A) llenar el tmpfs: las páginas de tmpfs se cargan al cgroup
+/ # dd if=/dev/zero of=/tmp/relleno bs=1M count=200
+Killed
+
+# B) el clásico: tail bufferea un archivo infinito buscando el final
+/ # tail /dev/zero
+Killed</code></pre>
+
+<p><strong>Paso 6 — La evidencia, desde el host.</strong> No alcanza con ver "Killed": hay que poder demostrar <em>quién</em> lo mató y <em>por qué</em>.</p>
+
+<pre><code class="lang-bash">cat /sys/fs/cgroup/lab/memory.events
+# low 0
+# high 89
+# max 214
+# oom 1
+# oom_kill 1            <span class="prompt">&lt;- el OOM killer DEL CGROUP mató 1 proceso</span>
+
+cat /sys/fs/cgroup/lab/memory.peak     # el máximo histórico alcanzado
+# 67108864                             -&gt; tocó exactamente el techo
+
+sudo dmesg | tail -4
+# Memory cgroup out of memory: Killed process 48213 (dd)
+#   total-vm:205044kB, anon-rss:63120kB, file-rss:1280kB,
+#   oom_score_adj:0, cgroup=/lab
+
+cat /sys/fs/cgroup/lab/memory.pressure
+# some avg10=61.20 avg60=24.83 ...     -&gt; PSI vio venir el problema antes del OOM</code></pre>
+
+<div class="rule">
+  <strong>📌 Esas cuatro líneas de <code>dmesg</code> son la respuesta a "la app se cae sola sin logs".</strong> No se cayó: el <strong>cgroup OOM killer</strong> la mató porque pidió más de <code>memory.max</code>. La app no ve nada —recibe <code>SIGKILL</code>, que no se puede manejar—, por eso no hay <em>stack trace</em> ni línea en el log. La evidencia siempre está afuera: en <code>memory.events</code> y en <code>dmesg</code>.
+</div>
+
+<p><strong>Paso 7 — La comparación con Docker.</strong> Ahora corramos lo mismo con el runtime real y miremos qué hizo por debajo:</p>
+
+<pre><code class="lang-bash">CID=$(docker run -d --memory=64m --memory-reservation=48m \
+                    --cpus=0.2 --pids-limit=64 \
+                    --network none --hostname mini \
+                    alpine:3.20 sleep 999)
+
+# ¿dónde está su cgroup? En el MISMO árbol, con otro nombre:
+find /sys/fs/cgroup -name "*${CID:0:12}*" -maxdepth 3
+# /sys/fs/cgroup/system.slice/docker-a3f9c1b2....scope
+
+CG=/sys/fs/cgroup/system.slice/docker-$CID.scope
+cat $CG/memory.max     # 67108864          <span class="prompt">&lt;- idéntico a lo nuestro</span>
+cat $CG/memory.high    # 50331648
+cat $CG/cpu.max        # 20000 100000
+cat $CG/pids.max       # 64
+
+# ¿y sus namespaces? Los mismos ocho enlaces de siempre:
+PID=$(docker inspect -f '{{.State.Pid}}' $CID)
+sudo ls -l /proc/$PID/ns/
+docker rm -f $CID</code></pre>
+
+<p>La traducción completa, flag por flag:</p>
+
+<table>
+<thead><tr><th>Flag de Docker</th><th>Qué hace realmente el kernel</th></tr></thead>
+<tbody>
+<tr><td><code>--memory=64m</code></td><td><code>memory.max = 67108864</code></td></tr>
+<tr><td><code>--memory-reservation=48m</code></td><td><code>memory.high</code> (frena, no mata)</td></tr>
+<tr><td><code>--cpus=0.2</code></td><td><code>cpu.max = "20000 100000"</code></td></tr>
+<tr><td><code>--cpu-shares=512</code></td><td><code>cpu.weight</code> (peso relativo, no techo)</td></tr>
+<tr><td><code>--pids-limit=64</code></td><td><code>pids.max = 64</code></td></tr>
+<tr><td><code>--hostname mini</code></td><td><code>CLONE_NEWUTS</code> + <code>sethostname()</code></td></tr>
+<tr><td><code>--network none</code></td><td><code>CLONE_NEWNET</code> y nada adentro</td></tr>
+<tr><td><code>--network host</code></td><td><strong>NO</strong> crea net namespace</td></tr>
+<tr><td><code>--pid host</code></td><td><strong>NO</strong> crea pid namespace</td></tr>
+<tr><td>la imagen (<code>alpine:3.20</code>)</td><td>rootfs armado con <code>overlayfs</code> + <code>pivot_root</code> dentro de un mount ns</td></tr>
+<tr><td><code>--read-only</code></td><td>remontaje del rootfs en modo <code>ro</code></td></tr>
+<tr><td><code>--userns-remap</code> / rootless</td><td><code>CLONE_NEWUSER</code> + <code>uid_map</code> / <code>gid_map</code></td></tr>
+<tr><td><code>--cap-drop</code>, <code>--security-opt</code></td><td><strong>Ni namespaces ni cgroups</strong>: capabilities, seccomp y LSM</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La conclusión del ejercicio.</strong> Docker no hizo nada que vos no hayas hecho en veinte líneas de shell. Lo que aporta es <strong>ergonomía sobre estas dos primitivas</strong>: distribución de imágenes con capas y deduplicación, un formato reproducible para construirlas, gestión del ciclo de vida y los logs, redes declarativas, y —esto es importante— <strong>valores por defecto sensatos en la parte que no es namespaces ni cgroups</strong>: perfil de seccomp, <code>cap-drop</code> de casi todo, AppArmor. Esa última fila de la tabla es la que más gente ignora, y es la que decide si tu contenedor es seguro o solamente aislado.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>unshare --pid</code> sin <code>--fork</code> no hace lo que esperás, y por qué encima hace falta <code>--mount-proc</code>?</summary>
+<p>Por dos razones distintas. Primero: <code>unshare(CLONE_NEWPID)</code> <strong>no reubica al proceso que la llama</strong>. El PID de un proceso vivo es inmutable —hay estructuras del kernel y procesos padres que ya lo referencian—, así que el kernel aplica el namespace nuevo a los <em>hijos</em>. Sin <code>--fork</code>, tu shell sigue en el namespace viejo y los PIDs no cambian; con <code>--fork</code>, <code>unshare</code> crea un hijo que nace adentro y es el PID 1.</p>
+<p>Segundo: aunque estés bien adentro, <code>ps</code>, <code>top</code> y <code>pgrep</code> no le preguntan al kernel por los procesos, <strong>leen los directorios de <code>/proc</code></strong>. Si no creás también un mount namespace y montás un <code>/proc</code> nuevo, seguís mirando el <code>/proc</code> del host y <code>ps</code> te lista todos los procesos del sistema. <code>--mount-proc</code> hace exactamente eso: crea el mount ns y remonta <code>/proc</code>. Moraleja general: el aislamiento del kernel es real, pero las herramientas de espacio de usuario informan lo que <em>ven</em> en el sistema de archivos — hay que aislar las dos capas.</p></details>
+
+<details><summary>Un servicio en producción tiene <code>memory.max</code> = 512M y "se cae solo, sin logs y sin stack trace". ¿Dónde mirás, en qué orden?</summary>
+<p><strong>1.</strong> <code>cat &lt;cgroup&gt;/memory.events</code>. Si <code>oom_kill</code> es mayor que cero, no se cayó: lo mató el OOM killer del cgroup. No hay <em>stack trace</em> porque recibió <code>SIGKILL</code>, que no se puede interceptar ni loggear desde el proceso.</p>
+<p><strong>2.</strong> <code>dmesg | grep -i "out of memory"</code> para confirmar cuál proceso, cuánta RSS tenía y de qué cgroup era. Fijate también en <code>memory.peak</code>.</p>
+<p><strong>3.</strong> <code>memory.pressure</code> y el histórico de <code>memory.events → high</code>: si el contador de <code>high</code> venía subiendo hace horas, tenías aviso y nadie lo estaba mirando. Ese es el hallazgo real del incidente.</p>
+<p><strong>4.</strong> Recién ahora se decide: ¿el límite es demasiado bajo para la carga legítima, o hay un <em>leak</em>? <code>memory.stat</code> te separa <code>anon</code> (heap: no se puede tirar, sospechá leak) de <code>file</code> (page cache: descartable, casi nunca es el problema). Subir el límite sin responder esta pregunta solo corre el incidente unos días.</p>
+<p><strong>5.</strong> Prevención: agregar <code>memory.high</code> un 20% por debajo del <code>max</code>, y alertar sobre <code>memory.pressure some avg60</code>, no sobre "porcentaje de memoria usada" —que con el page cache está siempre alto y no significa nada.</p></details>
+
+<details><summary>Si un contenedor rootless comparte el mismo kernel que uno normal, ¿por qué se dice que es más seguro?</summary>
+<p>Porque no cambia la <em>probabilidad</em> del escape, cambia su <strong>consecuencia</strong>. En un contenedor tradicional, el <code>root</code> de adentro es el UID 0 de verdad del host: si un bug del kernel o del runtime permite salir, el atacante es root en la máquina y la partida terminó. Con un user namespace, ese <code>root</code> está mapeado a un UID sin privilegios —1000, o uno del rango de <code>/etc/subuid</code>—, así que el mismo escape deja al atacante como un usuario que no puede leer <code>/etc/shadow</code>, ni cargar módulos, ni tocar archivos ajenos, ni escribir en <code>/usr</code>. Además, las <em>capabilities</em> que tiene adentro son sobre su propio namespace, no sobre el host.</p>
+<p>La contrapartida hay que decirla: habilitar user namespaces sin privilegios <strong>expone más código del kernel</strong> a usuarios locales comunes, y de ahí salieron varias CVEs de escalada. Es un intercambio, no una mejora gratuita: en un host multi-inquilino que corre contenedores casi siempre conviene, y en una máquina con usuarios humanos con shell hay que pensarlo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un <strong>contenedor no existe en el kernel</strong>: es espacio de usuario combinando <strong>namespaces</strong> (qué ve un proceso) y <strong>cgroups</strong> (cuánto puede usar). Todo lo demás es empaquetado.</li>
+  <li>Hay <strong>ocho namespaces</strong>: mnt, uts, ipc, pid, net, user, cgroup, time. Se ven en <code>/proc/[pid]/ns/</code>, se comparan por inodo y se entra con <code>nsenter</code>. <code>lsns</code> los lista todos.</li>
+  <li>Con <code>unshare --pid --fork --mount-proc --uts --ipc --net --mount</code> tenés el 80% de un contenedor. Faltan el rootfs (<code>pivot_root</code>, nunca <code>chroot</code> solo) y los límites.</li>
+  <li>Los <strong>user namespaces</strong> mapean el root de adentro a un UID sin privilegios de afuera. Es la base de rootless y la mayor mejora de seguridad de la década — con el costo real de exponer más kernel a usuarios locales.</li>
+  <li><strong>cgroups v2</strong>: kernel 4.5, <strong>default desde el 5.15</strong>, ya universal en Fedora 31+, Debian 11+, Ubuntu 21.10+, RHEL 9+ y Arch. Jerarquía <strong>única</strong>, delegación segura y PSI. Se maneja con <code>mkdir</code> y <code>echo</code>: <code>cgroup.controllers</code> y <code>cgroup.subtree_control</code> gobiernan todo.</li>
+  <li><code>memory.max</code> <strong>mata</strong>; <code>memory.high</code> <strong>frena</strong>. Poné los dos. <code>memory.events → oom_kill</code> y <code>cpu.stat → nr_throttled</code> son la evidencia que cierra la mitad de los incidentes.</li>
+  <li><strong>PSI</strong> (<code>memory.pressure</code>, <code>cpu.pressure</code>, <code>io.pressure</code>) mide <em>tiempo perdido</em>, no ocupación. Alertá sobre <code>some avg60</code> y vas a enterarte <em>antes</em> del OOM, no después.</li>
+  <li>El <strong>kernel es compartido</strong>: los namespaces no son una frontera de seguridad fuerte. La seguridad real la ponen seccomp, capabilities, LSM y user namespaces — y si el código es de terceros no confiables, un hipervisor (Firecracker, Kata, gVisor).</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<div class="warn">Todos en una VM con <em>snapshot</em> previo. Varios requieren <code>sudo</code> y modifican montajes, red o límites del sistema.</div>
+
+<ol>
+  <li>Listá <code>/proc/self/ns/</code> en tu shell y en un shell dentro de <code>unshare --pid --fork --mount-proc --net --uts</code>. Armá una tabla con los ocho inodos en cada caso y marcá cuáles cambiaron y cuáles no. Explicá por qué los que no cambiaron siguen iguales.</li>
+  <li>Levantá un contenedor cualquiera con <code>docker run --network host</code> y otro sin ese flag. Demostrá con <code>readlink /proc/PID/ns/net</code> —no con <code>docker inspect</code>— cuál comparte la red del host. Después repetí el ejercicio con <code>--pid host</code>.</li>
+  <li>Creá un par <code>veth</code> entre el host y un net namespace con nombre, asignale IPs y lográ que el namespace haga <code>ping</code> a Internet (necesitás <code>ip route add default</code>, <code>net.ipv4.ip_forward=1</code> y una regla de <code>MASQUERADE</code>). Documentá cada comando y qué rompe si lo omitís.</li>
+  <li>Creá un cgroup con <code>memory.max=100M</code> y <strong>sin</strong> <code>memory.high</code>. Corré un proceso que crezca de a 10 MB por segundo y registrá el momento del <code>oom_kill</code>. Repetí con <code>memory.high=75M</code> y compará: cuánto tardó en morir, cuántos eventos <code>high</code> hubo, y cómo evolucionó <code>memory.pressure</code> en cada caso.</li>
+  <li>Ponele <code>cpu.max = "100000 100000"</code> (1 CPU) a un programa con 8 hilos ocupados y medí su latencia p99. Mirá <code>cpu.stat → nr_throttled</code> y <code>throttled_usec</code>. Después bajá el <em>pool</em> de hilos a 1 manteniendo la misma cuota y volvé a medir. Explicá el resultado.</li>
+  <li>Completá el Worked Example de punta a punta y extendelo: agregale al contenedor un par <code>veth</code> con salida a Internet, y montale un directorio del host en modo solo lectura con <code>mount --bind -o ro</code>. Verificá desde adentro que no podés escribir en ese directorio.</li>
+  <li>Corré el mismo contenedor con Docker (root) y con Podman (rootless). Comparé <code>ps -o pid,user,comm</code> en el host para el proceso principal, el contenido de <code>/proc/PID/uid_map</code>, y el dueño de los archivos del rootfs en disco. Escribí en tres oraciones qué cambia para un atacante que logra escapar en cada caso.</li>
+</ol>
+
+<section class="quiz" id="quizLS3">
+  <style>
+    #quizLS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS3 .q{margin-bottom:1.5rem}
+    #quizLS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS3 .opt:hover{border-color:var(--accent)}
+    #quizLS3 .opt:disabled{cursor:default}
+    #quizLS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS3 .exp.show{display:block}
+    #quizLS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Un servicio en un contenedor con <code>--memory=512m</code> desaparece cada tantas horas sin dejar ninguna línea en su log. ¿Cuál es la primera comprobación?</p>
+    <button class="opt">Revisar el porcentaje de memoria usada del nodo con <code>free -h</code></button>
+    <button class="opt"><code>memory.events</code> del cgroup: si <code>oom_kill</code> &gt; 0, lo mató el OOM killer del cgroup</button>
+    <button class="opt">Aumentar el límite a 1G y ver si el problema desaparece</button>
+    <div class="exp">El proceso recibió <code>SIGKILL</code>, que no se puede interceptar ni loggear: por eso no hay <em>stack trace</em>. La evidencia está afuera, en <code>memory.events → oom_kill</code> y en <code>dmesg</code> (que además te dice qué proceso y cuánta RSS tenía). <code>free -h</code> no sirve: el nodo puede estar tranquilo, el que se quedó sin memoria fue el <em>cgroup</em>. Y subir el límite a ciegas solo posterga el incidente sin distinguir un límite mal calculado de un <em>leak</em> — para eso está <code>memory.stat</code>, que separa <code>anon</code> de <code>file</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Qué agrega un <strong>user namespace</strong> a la seguridad de un contenedor, si el kernel sigue siendo compartido?</p>
+    <button class="opt">Impide que las vulnerabilidades del kernel afecten al contenedor</button>
+    <button class="opt">Limita cuánta memoria y CPU puede consumir el proceso</button>
+    <button class="opt">Mapea el root de adentro a un UID sin privilegios del host: no baja la probabilidad del escape, degrada su consecuencia</button>
+    <div class="exp">Un escape sigue siendo posible —el kernel es el mismo—, pero el atacante aterriza como un UID común (1000, o uno del rango de <code>/etc/subuid</code>) en vez de como root: no puede leer <code>/etc/shadow</code>, cargar módulos ni tocar archivos ajenos. Los límites de memoria y CPU son cosa de <strong>cgroups</strong>, no de namespaces: confundir las dos primitivas es el error conceptual más común del tema. Y el contrapeso honesto es que habilitar user namespaces sin privilegios expone más código del kernel a usuarios locales.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tenés que ejecutar código arbitrario subido por clientes que no controlás. ¿Alcanza con contenedores bien configurados —seccomp, <code>cap-drop=ALL</code>, rootless, read-only?</p>
+    <button class="opt">No: el kernel es compartido, así que hace falta una frontera de hipervisor (Firecracker, Kata, gVisor)</button>
+    <button class="opt">Sí: con <code>cap-drop=ALL</code> y seccomp el contenedor es equivalente a una VM</button>
+    <button class="opt">Sí, siempre que además le pongas límites estrictos de cgroups</button>
+    <div class="exp">Ese <em>hardening</em> es necesario y sube mucho el costo del ataque, pero no cambia el hecho estructural: las syscalls las atiende <strong>el mismo kernel</strong>, y una vulnerabilidad ahí (Dirty COW, Dirty Pipe, fallas de <code>overlayfs</code>) atraviesa cualquier configuración. Los cgroups son contabilidad de recursos, no aislamiento de seguridad: evitan que te tiren el nodo por consumo, no que te escapen. Para código de terceros no confiables se necesita un kernel separado — y es exactamente por eso que AWS Lambda corre sobre Firecracker y no sobre <code>runc</code>.</div>
+  </div>
+
+  <div class="score" id="scoreLS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls2-memoria/lecture.html">← LS2: Memoria</a>
+  <a href="../ls4-almacenamiento/lecture.html">LS4: Almacenamiento →</a>
+</nav>
+
+</div>
+</body>
+</html>

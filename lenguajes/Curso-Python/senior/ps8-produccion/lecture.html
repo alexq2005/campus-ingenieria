@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS8 — Python en producción · Python Senior</title>
+  <meta name="description" content="Empaquetado con uv y contenedores multi-stage, configuración tipada, logging estructurado, OpenTelemetry, métricas de cola, py-spy en vivo, shutdown ordenado, timeouts y reintentos, PyO3 + maturin, y cuándo Python no es la respuesta.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS8</span>
+  <span class="badge">⏱ 40–100 min</span>
+  <span class="badge">🎯 Pre-req: PS1–PS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>PS8 — Python en producción</h1>
+
+<h2>PS8.0 Por qué este módulo</h2>
+
+<p>El código que funciona en tu máquina y el código que aguanta producción se parecen mucho menos de lo que uno cree. En tu máquina el disco es rápido, la red no falla, hay un solo usuario, el proceso vive mientras vos mirás la terminal y, si algo se rompe, lo ves en el momento. En producción nada de eso es cierto: la red se corta a la mitad de una respuesta, el orquestador te manda un <code>SIGTERM</code> con 30 segundos de aviso, hay 400 requests concurrentes de los cuales tres son patológicos, y cuando algo se rompe te enterás por un gráfico media hora después.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Producción no es un lugar: es un <strong>conjunto de propiedades</strong> que tu proceso tiene que cumplir. Arranca de forma reproducible, falla ruidosamente al configurarse mal, cuenta lo que hace en un formato que una máquina puede leer, sobrevive a que sus dependencias se porten mal, y termina de forma ordenada cuando le avisan. Ninguna de esas cinco propiedades aparece sola: se escriben a mano, y casi todas se escriben <em>antes</em> del primer incidente o se escriben con el sitio caído.
+</div>
+
+<p>Este módulo cierra el track. PS1–PS5 fueron sobre entender el lenguaje; PS6 y PS7 sobre construir con él; PS8 es sobre <strong>entregarlo y sostenerlo</strong>. Es también donde Python deja de ser el protagonista: buena parte del trabajo senior consiste en decidir dónde Python es la herramienta correcta, dónde conviene bajar a código nativo, y dónde directamente conviene otra cosa.</p>
+
+<h2>PS8.1 Empaquetado: del wheel al contenedor</h2>
+
+<p>Hay dos formatos de entrega y sirven para cosas distintas. El <strong>wheel</strong> (<code>.whl</code>) es un artefacto de <em>librería</em>: código ya construido, sin paso de compilación en destino, instalable con <code>uv pip install</code> o <code>pip</code>. El <strong>contenedor</strong> es un artefacto de <em>servicio</em>: incluye el intérprete, las dependencias nativas del sistema y el entrypoint.</p>
+
+<pre><code class="lang-bash"># Wheel: para lo que otros van a importar (una librería, un SDK interno)
+uv build                      # deja dist/paquete-1.4.2-py3-none-any.whl y el sdist
+uv publish --index interno    # a tu índice privado
+
+# Contenedor: para lo que se despliega y corre
+docker build -t servicio:1.4.2 .</code></pre>
+
+<div class="rule">
+  <strong>📌 Nunca instales en producción desde el repositorio.</strong> Ni <code>git clone</code>, ni <code>uv sync</code> contra un <code>pyproject.toml</code> sin lock. El artefacto que probaste en CI tiene que ser <strong>bit a bit</strong> el que corre en producción. Todo lo demás es una apuesta a que nadie publicó una versión nueva de una transitiva entre el test y el deploy.
+</div>
+
+<h3>El Dockerfile multi-stage con uv</h3>
+
+<p>La idea del multi-stage es simple: una etapa <em>construye</em> (con compiladores, headers, herramientas) y otra etapa <em>corre</em> (solo el runtime). Lo que quedó en la primera no viaja a la imagen final.</p>
+
+<pre><code class="lang-dockerfile"># ── Etapa 1: build ────────────────────────────────────────────────
+FROM python:3.13-slim-bookworm AS builder
+
+# uv como binario estático, versionado. Nada de "curl | sh" sin pin.
+COPY --from=ghcr.io/astral-sh/uv:0.9.2 /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
+WORKDIR /app
+
+# Primero SOLO los manifiestos: si no cambian, esta capa sale de caché
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# Recién ahora el código, que cambia en cada commit
+COPY src/ ./src/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# ── Etapa 2: runtime ──────────────────────────────────────────────
+FROM python:3.13-slim-bookworm
+
+RUN groupadd --gid 10001 app \
+ &amp;&amp; useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --from=builder --chown=app:app /app/src   /app/src
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:api", "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "25"]</code></pre>
+
+<div class="tip">
+  <strong>El orden de los <code>COPY</code> es la optimización más rentable del archivo.</strong> Copiar <code>pyproject.toml</code> + <code>uv.lock</code> antes que el código hace que la capa de dependencias —la cara, la de 300 MB— solo se reconstruya cuando cambian las dependencias. Un cambio de una línea en tu código pasa de un build de 90 segundos a uno de 8. Y <code>--mount=type=cache</code> le da a uv su caché entre builds sin meterla en la imagen.
+</div>
+
+<h3>Base mínima: slim vs distroless</h3>
+
+<table>
+<thead><tr><th>Base</th><th>Tamaño típico</th><th>Tiene shell</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><code>python:3.13</code></td><td>~1.0 GB</td><td>Sí, y compiladores</td><td>Nunca en producción. Sirve para el stage de build.</td></tr>
+<tr><td><code>python:3.13-slim</code></td><td>~150 MB</td><td>Sí (<code>bash</code>, <code>apt</code>)</td><td>El default sensato. Podés entrar a depurar.</td></tr>
+<tr><td><code>distroless/python3</code></td><td>~55 MB</td><td>No</td><td>Superficie de ataque mínima; sin shell no hay <code>exec</code> de emergencia.</td></tr>
+<tr><td><code>alpine</code></td><td>~60 MB</td><td>Sí</td><td>⚠️ musl en vez de glibc: muchos wheels no aplican y se compilan de cero.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-dockerfile"># Variante distroless del runtime: sin shell, sin gestor de paquetes, sin root
+FROM gcr.io/distroless/python3-debian12:nonroot
+
+WORKDIR /app
+COPY --from=builder /app/.venv/lib/python3.13/site-packages /app/deps
+COPY --from=builder /app/src /app/src
+
+ENV PYTHONPATH="/app/deps:/app/src" PYTHONUNBUFFERED=1
+# distroless no tiene shell: el ENTRYPOINT es exec form obligatorio
+ENTRYPOINT ["python", "-m", "uvicorn", "app.main:api", "--host", "0.0.0.0"]</code></pre>
+
+<div class="warn">
+  <strong>Distroless no es gratis.</strong> Sin shell no podés hacer <code>kubectl exec</code> y mirar. El precio se paga el día del incidente. La contrapartida moderna son los <em>ephemeral debug containers</em> (<code>kubectl debug</code>), que te adjuntan un contenedor con herramientas al pod sin modificar la imagen. Si no tenés eso disponible en tu plataforma, quedate en <code>slim</code>.
+</div>
+
+<div class="info">
+  <strong>Por qué importa el tamaño, más allá del ego.</strong> No es el disco: es el <strong>pull</strong>. Una imagen de 1 GB en un escalado de emergencia a 40 pods son 40 GB de tráfico y minutos de latencia antes de servir la primera request — justo cuando estás escalando porque te estás cayendo. Y cada paquete de más es una CVE potencial que alguien te va a reportar. Un <code>.dockerignore</code> con <code>.git</code>, <code>.venv</code>, <code>tests/</code> y <code>__pycache__</code> suele sacar más peso que cualquier truco elaborado.
+</div>
+
+<h2>PS8.2 Configuración: fallar al arrancar, no en la primera request</h2>
+
+<p>La configuración viene del entorno (<em>12-factor</em>), no de un archivo versionado. Pero leer <code>os.environ["DB_URL"]</code> desperdigado por el código tiene tres problemas: no sabés qué variables necesita el servicio hasta que explota, todo es <code>str</code>, y el error aparece en la request 1 en vez de en el arranque.</p>
+
+<pre><code class="lang-python"># app/settings.py
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, PostgresDsn, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",            # solo para desarrollo local
+        env_prefix="APP_",
+        extra="forbid",             # una variable APP_* desconocida es un error
+        frozen=True,                # inmutable: nadie la muta en caliente
+    )
+
+    entorno: Literal["dev", "staging", "prod"] = "dev"
+    db_url: PostgresDsn                                   # sin default: OBLIGATORIA
+    api_key_pagos: str = Field(min_length=32, repr=False) # repr=False: no se imprime
+    timeout_http_s: float = Field(default=5.0, gt=0, le=30)
+    max_reintentos: int = Field(default=3, ge=0, le=5)
+    drenaje_s: float = Field(default=5.0, ge=0)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    @field_validator("log_level")
+    @classmethod
+    def prod_no_debuguea(cls, v: str, info) -&gt; str:
+        if info.data.get("entorno") == "prod" and v == "DEBUG":
+            raise ValueError("DEBUG en prod filtra payloads enteros a los logs")
+        return v
+
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()          # type: ignore[call-arg]</code></pre>
+
+<p>Lo importante no es pydantic: es <strong>dónde se llama</strong>. Si <code>get_settings()</code> se invoca en el módulo de arranque, un typo en una variable de entorno mata el proceso en el segundo cero y el orquestador nunca lo pone en rotación. Si se invoca perezosamente dentro de un handler, el pod arranca "sano", recibe tráfico y devuelve 500 a usuarios reales.</p>
+
+<pre><code class="lang-python"># app/main.py — la validación ocurre ANTES de abrir el puerto
+import sys
+from pydantic import ValidationError
+
+try:
+    settings = get_settings()
+except ValidationError as e:
+    # A stderr y en texto legible: esto lo lee un humano mirando `kubectl logs`
+    print("Configuración inválida — el servicio NO arranca:", file=sys.stderr)
+    print(e, file=sys.stderr)
+    raise SystemExit(78)        # EX_CONFIG de sysexits.h</code></pre>
+
+<div class="mistake">
+  <strong>El antipatrón clásico:</strong> <code>os.getenv("TIMEOUT", "5")</code> repartido por diez archivos. Cada <em>default silencioso</em> es un bug que no vas a ver: el día que alguien escribe <code>TIMEOOUT=30</code> en el manifiesto, el servicio sigue usando 5 y nadie se entera hasta que se cae por timeouts. Por eso <code>extra="forbid"</code>: una variable con prefijo <code>APP_</code> que el modelo no conoce es un error de arranque, no un silencio.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Secretos: no van acá.</strong> Una variable de entorno es visible en <code>/proc/&lt;pid&gt;/environ</code>, en un <code>docker inspect</code>, en un core dump y en el manifiesto que alguien pegó en un chat. Para credenciales reales lo que corresponde es un gestor (Vault, AWS Secrets Manager, SOPS, External Secrets) montado como archivo con rotación, y <strong>nunca</strong> un secreto en la imagen ni en el repo. El tema completo —incluida la firma de artefactos y el riesgo de <em>supply chain</em> de tus propias dependencias— está en <a href="../../../../sistemas/Curso-Ciberseguridad/m07-secretos-supply-chain/lecture.html">M07 · Secretos y supply chain</a> del Curso de Ciberseguridad. Leelo antes de tu primer deploy real.
+</div>
+
+<h2>PS8.3 Logging estructurado</h2>
+
+<p>Un log en texto libre es cómodo para vos y un problema para todos los demás. <code>"usuario 4821 falló al pagar: timeout"</code> obliga a que la herramienta de observabilidad adivine con expresiones regulares. Un log estructurado emite <strong>un objeto JSON por evento</strong>, y todo campo se vuelve consultable, agregable y alertable.</p>
+
+<pre><code class="lang-python"># app/logging_setup.py
+import logging
+import structlog
+from opentelemetry import trace
+
+
+def agregar_traza(_, __, evento: dict) -&gt; dict:
+    """Cose cada log a la traza distribuida que lo originó (PS8.4)."""
+    ctx = trace.get_current_span().get_span_context()
+    if ctx.is_valid:
+        evento["trace_id"] = format(ctx.trace_id, "032x")
+        evento["span_id"] = format(ctx.span_id, "016x")
+    return evento
+
+
+def configurar(nivel: str, json: bool) -&gt; None:
+    procesadores = [
+        structlog.contextvars.merge_contextvars,   # contexto por request
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        agregar_traza,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    procesadores.append(
+        structlog.processors.JSONRenderer() if json
+        else structlog.dev.ConsoleRenderer()      # coloreado, para tu terminal
+    )
+    structlog.configure(
+        processors=procesadores,
+        wrapper_class=structlog.make_filtering_bound_logger(
+            logging.getLevelName(nivel)
+        ),
+        cache_logger_on_first_use=True,
+    )</code></pre>
+
+<p>El <strong>id de correlación</strong> es lo que convierte cien líneas sueltas en la historia de una request. Se genera (o se hereda de un header) una vez, se guarda en un <code>contextvar</code> y aparece solo en todos los logs de esa request, incluidos los de las corrutinas hijas:</p>
+
+<pre><code class="lang-python">import uuid
+import structlog
+from starlette.middleware.base import BaseHTTPMiddleware
+
+log = structlog.get_logger()
+
+
+class ContextoRequest(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        structlog.contextvars.clear_contextvars()
+        rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+        structlog.contextvars.bind_contextvars(
+            request_id=rid,
+            ruta=request.url.path,
+            metodo=request.method,
+        )
+        respuesta = await call_next(request)
+        respuesta.headers["x-request-id"] = rid   # se lo devolvemos al cliente
+        return respuesta</code></pre>
+
+<pre><code class="lang-json">{"event":"pago_rechazado","level":"warning","timestamp":"2026-09-03T14:22:10.418Z",
+ "request_id":"9f3c…","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736",
+ "ruta":"/checkout","metodo":"POST","usuario_id":4821,
+ "proveedor":"stripe","codigo":"card_declined","latencia_ms":312}</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué NO loguear, nunca.</strong> Contraseñas, tokens, cookies de sesión, headers <code>Authorization</code>, números de tarjeta, el cuerpo completo de un request de autenticación. Y —esto se olvida— datos personales: nombre, mail, teléfono, dirección. Un log es un almacén de datos con retención larga, acceso amplio y respaldos: todo lo que entra ahí queda bajo el mismo régimen legal que tu base de datos. Loguéa <em>identificadores</em> (<code>usuario_id=4821</code>), no <em>identidades</em>.
+</div>
+
+<div class="tip">
+  Reforzalo con código, no con disciplina: un procesador de structlog que recorra el evento y reemplace por <code>"***"</code> cualquier clave que matchee <code>password|token|secret|authorization|card</code>. Cuesta quince líneas y te cubre del día que alguien loguee un <code>dict</code> entero "para depurar rápido".
+</div>
+
+<h2>PS8.4 OpenTelemetry: un estándar para las tres señales</h2>
+
+<p>Durante años cada señal tuvo su herramienta y su formato: métricas en un lado, trazas en otro, logs en un tercero, y ninguna forma de cruzarlas. <strong>OpenTelemetry</strong> (OTel) es el estándar que unifica <em>trazas, métricas y logs</em> bajo un mismo modelo de datos, un mismo protocolo (OTLP) y una misma noción de contexto — de modo que un log, una métrica y un span de la misma operación comparten <code>trace_id</code>.</p>
+
+<div class="analogy">
+  <strong>La analogía útil.</strong> Las <strong>métricas</strong> son el tablero del auto: te dicen que algo anda mal (temperatura alta) y son baratas de guardar por años. Las <strong>trazas</strong> son abrir el capó de <em>un</em> viaje concreto: te muestran exactamente dónde se fue el tiempo. Los <strong>logs</strong> son lo que el conductor anotó en ese momento. Vas de la métrica a la traza a los logs, en ese orden. Empezar por los logs es abrir el capó de un auto al azar.
+</div>
+
+<p>La instrumentación <strong>automática</strong> no requiere tocar tu código: envuelve las librerías conocidas (FastAPI, httpx, SQLAlchemy, redis, psycopg) y produce spans para cada request entrante, cada query y cada llamada saliente.</p>
+
+<pre><code class="lang-bash">uv add opentelemetry-distro opentelemetry-exporter-otlp
+uv run opentelemetry-bootstrap -a install     # detecta tus libs e instala sus instrumentaciones
+
+# Se activa envolviendo el comando; el código no cambia
+OTEL_SERVICE_NAME=checkout \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+OTEL_RESOURCE_ATTRIBUTES="service.version=1.4.2,deployment.environment=prod" \
+OTEL_TRACES_SAMPLER=parentbased_traceidratio \
+OTEL_TRACES_SAMPLER_ARG=0.1 \
+  uv run opentelemetry-instrument uvicorn app.main:api --host 0.0.0.0</code></pre>
+
+<p>La <strong>manual</strong> es para lo que solo vos sabés que existe: una etapa de negocio, un cálculo caro, una decisión. La regla es instrumentar las <em>fronteras semánticas</em>, no cada función.</p>
+
+<pre><code class="lang-python">from opentelemetry import trace
+
+tracer = trace.get_tracer("app.checkout")
+
+
+async def cobrar(orden_id: str, monto_centavos: int) -&gt; Resultado:
+    with tracer.start_as_current_span("checkout.cobrar") as span:
+        span.set_attribute("orden.id", orden_id)
+        span.set_attribute("orden.monto_centavos", monto_centavos)
+        try:
+            resultado = await proveedor.cargar(orden_id, monto_centavos)
+        except TimeoutError as e:
+            span.record_exception(e)
+            span.set_status(trace.StatusCode.ERROR, "timeout del proveedor")
+            raise
+        span.set_attribute("pago.proveedor_id", resultado.id)
+        return resultado</code></pre>
+
+<div class="warn">
+  <strong>Cardinalidad: el error caro.</strong> Un atributo de span puede ser único por request (<code>orden.id</code>) sin problema. Una <strong>etiqueta de métrica</strong> no: cada combinación distinta de etiquetas crea una serie temporal nueva. Poner <code>usuario_id</code> como label de un contador es la forma canónica de multiplicar por diez la factura del backend de métricas y tumbarlo. Alta cardinalidad va en trazas y logs; en métricas van solo dimensiones acotadas (<code>ruta</code>, <code>metodo</code>, <code>status</code>).
+</div>
+
+<div class="step"><strong>Qué mirar primero cuando algo va lento.</strong> (1) El gráfico de latencia por percentil: ¿subió el p50 —todo está lento— o solo el p99 —una minoría sufre—? (2) Una traza <em>lenta</em> de ese período, no una cualquiera: la mayoría de los backends te dejan filtrar por duración. (3) En esa traza, el span más ancho: ahí está el tiempo. (4) Los logs de ese <code>trace_id</code>. Cuatro pasos, cinco minutos. Sin trazas, el mismo diagnóstico son dos horas de leer logs.</div>
+
+<h2>PS8.5 Las métricas que importan</h2>
+
+<p>Se pueden medir mil cosas. Tres explican casi todos los incidentes, y son las del <strong>método RED</strong>: <em>Rate</em> (requests por segundo), <em>Errors</em> (proporción de fallos) y <em>Duration</em> (latencia, en percentiles).</p>
+
+<pre><code class="lang-python">from opentelemetry import metrics
+
+meter = metrics.get_meter("app.http")
+
+duracion = meter.create_histogram(
+    "http.server.request.duration",     # nombre de la convención semántica de OTel
+    unit="s",
+    description="Latencia de las requests atendidas",
+)
+
+async def middleware_metricas(request, call_next):
+    t0 = time.perf_counter()
+    status = 500
+    try:
+        respuesta = await call_next(request)
+        status = respuesta.status_code
+        return respuesta
+    finally:
+        duracion.record(
+            time.perf_counter() - t0,
+            # baja cardinalidad: la PLANTILLA de ruta, no la ruta con el id adentro
+            {"http.route": request.scope.get("route_path", "desconocida"),
+             "http.request.method": request.method,
+             "http.response.status_code": status},
+        )</code></pre>
+
+<h3>Por qué el promedio miente</h3>
+
+<p>Supongamos mil requests: 990 tardan 50 ms y 10 tardan 5 segundos. El promedio da <strong>99 ms</strong> y parece excelente. La realidad es que uno de cada cien usuarios espera cinco segundos.</p>
+
+<table>
+<thead><tr><th>Medida</th><th>Valor</th><th>Qué te dice de verdad</th></tr></thead>
+<tbody>
+<tr><td>Promedio</td><td>99 ms</td><td>Casi nada: un solo outlier lo mueve, y esconde la cola entera.</td></tr>
+<tr><td>p50 (mediana)</td><td>50 ms</td><td>La experiencia típica. Si sube, <strong>todo</strong> está lento.</td></tr>
+<tr><td>p95</td><td>50 ms</td><td>Sigue sano: el problema afecta a menos del 5%.</td></tr>
+<tr><td>p99</td><td>5 s</td><td>Ahí está. 1 de cada 100 requests es inaceptable.</td></tr>
+<tr><td>p99.9</td><td>5 s</td><td>Lo que sufre tu usuario más activo, que hace 1000 requests por sesión.</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La cola es la experiencia real.</strong> Si una pantalla dispara 20 llamadas al backend, la probabilidad de que <em>al menos una</em> caiga en el p99 es 1 − 0.99²⁰ ≈ <strong>18%</strong>. Es decir: el "1% de requests lentas" se convierte en "casi 1 de cada 5 cargas de pantalla lentas". Por eso los SLO se escriben sobre percentiles altos y no sobre promedios.
+</div>
+
+<p>La tercera señal es la <strong>saturación</strong>: qué tan cerca del límite está el recurso más escaso. En un servicio Python asíncrono los sospechosos habituales son el pool de conexiones a la base (¿cuántas esperando?), la profundidad de la cola del event loop, la memoria RSS contra el límite del contenedor, y —si usás procesos— cuántos workers están ocupados. La saturación es la única de las tres que te avisa <em>antes</em> del incidente: la latencia y los errores llegan cuando ya está pasando.</p>
+
+<div class="mistake">
+  <strong>No promedies percentiles.</strong> Sacar el promedio del p99 de diez pods no da el p99 del sistema — matemáticamente no significa nada. Los percentiles se calculan agregando los <em>histogramas</em>, que es exactamente lo que hacen Prometheus y OTel. Si tu tablero hace <code>avg(p99)</code>, está mintiendo con precisión decimal.
+</div>
+
+<h2>PS8.6 Profiling en producción con py-spy</h2>
+
+<p>El perfilador que aprendiste en PS2 sirve mientras podés reproducir el problema. Cuando la lentitud solo ocurre con tráfico real, a las 3 de la tarde, en un pod específico, necesitás otra cosa: <code>py-spy</code> lee la memoria de un proceso <strong>vivo</strong> desde afuera, sin reiniciarlo, sin instrumentarlo y sin que el proceso sepa que existe.</p>
+
+<pre><code class="lang-bash"># Qué está ejecutando AHORA, actualizado como `top`
+py-spy top --pid 1
+
+# Volcado instantáneo del stack de cada hilo: ideal para un cuelgue o un deadlock
+py-spy dump --pid 1
+
+# 60 segundos de muestreo -&gt; flamegraph interactivo
+py-spy record --pid 1 --duration 60 --format speedscope --output perfil.json
+
+# Corrutinas de asyncio: sin --idle solo ves el event loop esperando
+py-spy dump --pid 1 --locals
+py-spy top  --pid 1 --idle</code></pre>
+
+<div class="info">
+  <strong>Para que funcione dentro de un contenedor</strong> hace falta <code>SYS_PTRACE</code>. En Docker es <code>--cap-add=SYS_PTRACE</code>; en Kubernetes, o bien la capability en el <code>securityContext</code>, o bien —lo preferible— un contenedor efímero de debug: <code>kubectl debug -it pod/checkout-7f9 --image=ghcr.io/benfred/py-spy --target=app --profile=general</code>. Así no aflojás los permisos del pod de producción de forma permanente.
+</div>
+
+<div class="rule">
+  <strong>📌 El overhead de <code>py-spy</code> sobre el proceso observado es prácticamente nulo</strong> porque muestrea desde otro proceso: no instala <em>tracing hooks</em> en el intérprete. Esa es la diferencia con <code>cProfile</code>, que puede duplicar el tiempo de ejecución y por eso jamás va a producción. Regla: <code>cProfile</code> para reproducir en tu máquina, <code>py-spy</code> para diagnosticar en la de verdad.
+</div>
+
+<h2>PS8.7 Salud del proceso: probes y apagado ordenado</h2>
+
+<p>El orquestador necesita responder dos preguntas distintas, y confundirlas causa incidentes propios.</p>
+
+<table>
+<thead><tr><th>Probe</th><th>Pregunta</th><th>Si falla…</th><th>Qué debe chequear</th></tr></thead>
+<tbody>
+<tr><td><strong>liveness</strong></td><td>¿El proceso está vivo o colgado?</td><td>Lo <strong>matan y reinician</strong></td><td>Casi nada: que el event loop responda. Nada de dependencias.</td></tr>
+<tr><td><strong>readiness</strong></td><td>¿Puede atender tráfico ahora?</td><td>Lo <strong>sacan de rotación</strong> (sigue vivo)</td><td>Pool de DB abierto, caché caliente, migraciones aplicadas.</td></tr>
+<tr><td><strong>startup</strong></td><td>¿Terminó de arrancar?</td><td>Se posterga liveness</td><td>Lo mismo que readiness, con más paciencia.</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El error que tira toda la flota.</strong> Poner el chequeo de la base de datos en el <em>liveness</em>. Si la base tiene un hipo de 40 segundos, <strong>todos</strong> los pods fallan liveness al mismo tiempo, Kubernetes los mata a todos, todos reintentan conectarse a la vez contra una base ya sufriente y el hipo se convierte en una caída total con efecto rebaño. Liveness responde "estoy vivo"; readiness responde "puedo trabajar". Nunca al revés.
+</div>
+
+<pre><code class="lang-python">from fastapi import FastAPI, Response
+
+api = FastAPI(lifespan=ciclo_de_vida)
+
+
+@api.get("/livez", include_in_schema=False)
+async def livez() -&gt; Response:
+    # Si el event loop está bloqueado esto ni siquiera se ejecuta: eso ya es la señal
+    return Response(status_code=200)
+
+
+@api.get("/readyz", include_in_schema=False)
+async def readyz(response: Response) -&gt; dict:
+    if not api.state.listo:
+        response.status_code = 503
+        return {"listo": False, "motivo": "drenando o arrancando"}
+    try:
+        await asyncio.wait_for(pool.execute("SELECT 1"), timeout=1.0)
+    except Exception:
+        response.status_code = 503
+        return {"listo": False, "motivo": "base inalcanzable"}
+    return {"listo": True}</code></pre>
+
+<pre><code class="lang-yaml">livenessProbe:
+  httpGet: { path: /livez, port: 8000 }
+  periodSeconds: 10
+  failureThreshold: 3          # 30 s de gracia antes de matar
+readinessProbe:
+  httpGet: { path: /readyz, port: 8000 }
+  periodSeconds: 5
+  failureThreshold: 2
+startupProbe:
+  httpGet: { path: /readyz, port: 8000 }
+  periodSeconds: 5
+  failureThreshold: 30         # hasta 150 s para arrancar sin que lo maten
+
+terminationGracePeriodSeconds: 40
+lifecycle:
+  preStop:
+    exec: { command: ["sleep", "5"] }   # deja que el LB se entere antes del SIGTERM</code></pre>
+
+<h3>Shutdown ordenado ante SIGTERM</h3>
+
+<p>Cuando Kubernetes quiere terminar un pod manda <code>SIGTERM</code> y arranca un cronómetro; al vencer <code>terminationGracePeriodSeconds</code> manda <code>SIGKILL</code>, que no se puede atrapar. Todo lo que estuvieras haciendo se corta a la mitad. El detalle incómodo: el <code>SIGTERM</code> y la baja del endpoint del balanceador ocurren <strong>en paralelo</strong>, no en orden, así que durante uno o dos segundos te siguen llegando requests nuevas después de que te avisaron que te vas.</p>
+
+<pre><code class="lang-python">import asyncio
+from contextlib import asynccontextmanager
+
+import httpx
+
+
+@asynccontextmanager
+async def ciclo_de_vida(app: FastAPI):
+    # ── arranque ──
+    app.state.http = httpx.AsyncClient(timeout=TIMEOUTS, limits=LIMITES)
+    app.state.pool = await crear_pool(settings.db_url)
+    app.state.listo = True
+    log.info("servicio_listo", version=settings.version)
+
+    yield                       # acá el servicio atiende tráfico
+
+    # ── apagado (llega con SIGTERM) ──
+    app.state.listo = False     # 1. /readyz empieza a devolver 503
+    log.info("drenando", segundos=settings.drenaje_s)
+    await asyncio.sleep(settings.drenaje_s)   # 2. el LB nos saca de rotación
+
+    # 3. uvicorn ya dejó de aceptar conexiones y espera a las en vuelo
+    #    (--timeout-graceful-shutdown 25, menor que los 40 s de gracia del pod)
+    await app.state.http.aclose()             # 4. cerrar salientes
+    await app.state.pool.close()              # 5. devolver conexiones a la base
+    log.info("apagado_limpio")</code></pre>
+
+<div class="rule">
+  <strong>📌 La aritmética del apagado.</strong> <code>drenaje (5 s) + graceful shutdown de uvicorn (25 s) &lt; terminationGracePeriodSeconds (40 s)</code>. Si el interior tarda más que el exterior, llega el <code>SIGKILL</code> y perdés justo las requests que estabas intentando terminar bien. Y ojo con el PID 1: si tu <code>CMD</code> arranca a través de un shell (<code>CMD python app.py</code> en <em>shell form</em>), la señal se la come el shell y tu proceso nunca la ve. Usá siempre la forma <code>exec</code>: <code>CMD ["python", "app.py"]</code>.
+</div>
+
+<h2>PS8.8 Errores y resiliencia</h2>
+
+<p>En producción tus dependencias no fallan: se ponen <em>lentas</em>. Y una dependencia lenta es peor que una caída, porque una caída libera recursos y una lentitud los retiene hasta que se agotan. De ahí la regla que ordena todo este apartado.</p>
+
+<div class="rule">
+  <strong>📌 Toda llamada de red lleva timeout. Toda. Sin excepción.</strong> Un cliente HTTP sin timeout explícito puede esperar indefinidamente. Cien requests esperando indefinidamente es tu pool de conexiones agotado, tu event loop lleno de tareas zombis y tu servicio caído por culpa de <em>otro</em> servicio. El timeout no es una optimización: es el mecanismo que evita que la falla ajena se vuelva tuya.
+</div>
+
+<pre><code class="lang-python">import httpx
+
+TIMEOUTS = httpx.Timeout(
+    connect=2.0,    # abrir el socket: si tarda más, el destino no está sano
+    read=5.0,       # esperar cada chunk de respuesta
+    write=5.0,
+    pool=1.0,       # esperar un slot libre del pool: ESTE es el que se olvida
+)
+LIMITES = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+
+# Un cliente por proceso, reutilizado. Crear uno por request tira el keep-alive
+# a la basura y te hace pagar el handshake TLS en cada llamada.
+cliente = httpx.AsyncClient(timeout=TIMEOUTS, limits=LIMITES)</code></pre>
+
+<h3>Reintentos: backoff exponencial y jitter</h3>
+
+<p>Reintentar sin pensar es una forma elegante de tirarte el sistema. Si mil clientes fallan al mismo tiempo y todos reintentan a los 100 ms, generás un pico sincronizado que garantiza que el segundo intento también falle — el <em>thundering herd</em>. La solución tiene dos partes: esperar cada vez más (exponencial) y <strong>desordenar</strong> esas esperas (jitter).</p>
+
+<pre><code class="lang-python">from tenacity import (
+    retry, retry_if_exception_type, stop_after_attempt,
+    wait_exponential_jitter, before_sleep_log,
+)
+
+TRANSITORIOS = (httpx.ConnectError, httpx.ReadTimeout, httpx.PoolTimeout)
+
+
+@retry(
+    retry=retry_if_exception_type(TRANSITORIOS),
+    wait=wait_exponential_jitter(initial=0.2, max=4.0, jitter=0.3),
+    stop=stop_after_attempt(3),          # 3 intentos, no "hasta que salga"
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def consultar_inventario(sku: str) -&gt; int:
+    r = await cliente.get(f"/inventario/{sku}")
+    r.raise_for_status()
+    return r.json()["disponible"]</code></pre>
+
+<div class="mistake">
+  <strong>Qué NO reintentar.</strong> Un <code>400</code>, un <code>401</code>, un <code>404</code>, un <code>422</code>: el pedido está mal, repetirlo lo va a seguir estando. Reintentar solo errores <em>transitorios</em> (fallo de conexión, timeout, <code>429</code>, <code>503</code> con <code>Retry-After</code>). Y jamás reintentar una operación <strong>no idempotente</strong> sin protección: un <code>POST /pagos</code> que sufrió timeout puede haberse ejecutado del otro lado, y el reintento cobra dos veces.
+</div>
+
+<pre><code class="lang-python"># Idempotencia: la clave la genera el CLIENTE y viaja con el pedido.
+# El servidor la guarda con la respuesta; si la vuelve a ver, devuelve la misma.
+async def cobrar_idempotente(orden_id: str, monto: int, clave: str) -&gt; Resultado:
+    if (previa := await cache.get(f"idem:{clave}")) is not None:
+        log.info("idempotencia_hit", clave=clave)
+        return Resultado.model_validate_json(previa)
+
+    resultado = await cliente.post(
+        "/cargos",
+        json={"orden": orden_id, "monto": monto},
+        headers={"Idempotency-Key": clave},   # el proveedor serio también la respeta
+    )
+    await cache.set(f"idem:{clave}", resultado.text, ex=86_400)
+    return Resultado.model_validate_json(resultado.text)</code></pre>
+
+<h3>Circuit breaker</h3>
+
+<p>El reintento asume que la falla es puntual. Cuando la dependencia está realmente caída, reintentar solo agrega carga a algo que ya no puede responder y consume tus propios recursos esperando. El <em>circuit breaker</em> corta: después de N fallos consecutivos abre el circuito y falla <strong>de inmediato</strong>, sin siquiera intentar, durante un período; después deja pasar una request de prueba.</p>
+
+<pre><code class="lang-python">import time
+from enum import Enum
+
+
+class Estado(Enum):
+    CERRADO = "cerrado"        # todo normal, las llamadas pasan
+    ABIERTO = "abierto"        # falla rápido, no se llama a nadie
+    SEMIABIERTO = "semi"       # deja pasar UNA para ver si se recuperó
+
+
+class CircuitBreaker:
+    def __init__(self, umbral: int = 5, reposo_s: float = 30.0):
+        self.umbral, self.reposo_s = umbral, reposo_s
+        self.fallos = 0
+        self.estado = Estado.CERRADO
+        self.abierto_desde = 0.0
+
+    async def llamar(self, fn, *args):
+        if self.estado is Estado.ABIERTO:
+            if time.monotonic() - self.abierto_desde &lt; self.reposo_s:
+                raise CircuitoAbierto("proveedor marcado como caído")
+            self.estado = Estado.SEMIABIERTO       # una sonda
+
+        try:
+            resultado = await fn(*args)
+        except TRANSITORIOS:
+            self.fallos += 1
+            if self.fallos &gt;= self.umbral or self.estado is Estado.SEMIABIERTO:
+                self.estado, self.abierto_desde = Estado.ABIERTO, time.monotonic()
+                log.error("circuito_abierto", fallos=self.fallos)
+            raise
+        else:
+            self.fallos, self.estado = 0, Estado.CERRADO
+            return resultado</code></pre>
+
+<div class="tip">
+  <strong>Fallar rápido es una feature.</strong> Un <code>CircuitoAbierto</code> en 0 ms que devuelve un resultado degradado —el precio cacheado, una lista vacía con un aviso— es infinitamente mejor para el usuario que un spinner de 30 segundos que termina en error. El diseño de la <em>degradación</em> es tan parte del servicio como el camino feliz, y casi nunca se especifica.
+</div>
+
+<h2>PS8.9 Cuándo bajar a código nativo: PyO3 + maturin</h2>
+
+<p>Llega un punto en que el perfil dice, sin ambigüedad, que el 80% del tiempo está en una función tuya de Python puro y que ya la vectorizaste todo lo que se podía. Ahí la respuesta es sacar esa función del intérprete. <strong>PyO3</strong> permite escribir una extensión en Rust que Python importa como un módulo cualquiera, y <strong>maturin</strong> se encarga de compilarla y empaquetarla en un wheel.</p>
+
+<pre><code class="lang-bash">uv add --dev maturin
+maturin new -b pyo3 distancias      # esqueleto: Cargo.toml + pyproject.toml + src/lib.rs
+cd distancias
+maturin develop --release           # compila e instala en el venv activo
+# maturin build --release            -&gt; wheel listo para publicar</code></pre>
+
+<pre><code class="lang-toml"># Cargo.toml
+[lib]
+name = "distancias"
+crate-type = ["cdylib"]             # librería dinámica cargable por Python
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py311"] }
+rayon = "1"                         # paralelismo de datos, gratis
+
+# pyproject.toml
+# [build-system]
+# requires = ["maturin&gt;=1.7,&lt;2.0"]
+# build-backend = "maturin"</code></pre>
+
+<pre><code class="lang-rust">// src/lib.rs
+use pyo3::prelude::*;
+use rayon::prelude::*;
+
+fn levenshtein(a: &amp;str, b: &amp;str) -&gt; usize {
+    let (a, b): (Vec&lt;char&gt;, Vec&lt;char&gt;) = (a.chars().collect(), b.chars().collect());
+    let mut fila: Vec&lt;usize&gt; = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut previo = fila[0];
+        fila[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let coste = if ca == cb { 0 } else { 1 };
+            let nuevo = (fila[j + 1] + 1).min(fila[j] + 1).min(previo + coste);
+            previo = fila[j + 1];
+            fila[j + 1] = nuevo;
+        }
+    }
+    fila[b.len()]
+}
+
+/// Distancia de edición entre dos cadenas.
+#[pyfunction]
+fn distancia(a: &amp;str, b: &amp;str) -&gt; usize {
+    levenshtein(a, b)
+}
+
+/// Lote completo, en paralelo real: `allow_threads` SUELTA el GIL,
+/// así que rayon usa todos los núcleos mientras Python espera.
+#[pyfunction]
+fn distancia_lote(py: Python&lt;'_&gt;, pares: Vec&lt;(String, String)&gt;) -&gt; Vec&lt;usize&gt; {
+    py.allow_threads(|| {
+        pares.par_iter().map(|(a, b)| levenshtein(a, b)).collect()
+    })
+}
+
+#[pymodule]
+fn distancias(m: &amp;Bound&lt;'_, PyModule&gt;) -&gt; PyResult&lt;()&gt; {
+    m.add_function(wrap_pyfunction!(distancia, m)?)?;
+    m.add_function(wrap_pyfunction!(distancia_lote, m)?)?;
+    Ok(())
+}</code></pre>
+
+<pre><code class="lang-python"># Desde Python es un módulo más — y ahí está toda la gracia
+import distancias
+
+distancias.distancia("kitten", "sitting")            # 3
+distancias.distancia_lote([("abc", "abd"), ("x", "y")])   # [1, 1]</code></pre>
+
+<div class="info">
+  <strong>Dos detalles que hacen la diferencia.</strong> <code>abi3-py311</code> compila contra la <em>ABI estable</em>: un solo wheel sirve para 3.11, 3.12, 3.13 y las que vengan, en vez de uno por versión. Y <code>py.allow_threads</code> libera el GIL mientras corre Rust — es exactamente el mecanismo que hace que NumPy escale con hilos (PS1.4). Sin esa línea, tu extensión es rápida pero sigue serializando a todos los hilos de Python.
+</div>
+
+<h3>¿Conviene? La tabla honesta</h3>
+
+<table>
+<thead><tr><th>Situación</th><th>¿Bajar a Rust?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>El perfil marca &gt;50% en un loop numérico o de strings tuyo</td><td>✅ Sí</td><td>Es el caso de manual: 10–100× y el borde está bien definido.</td></tr>
+<tr><td>Parseo de un formato binario o de texto a alto volumen</td><td>✅ Sí</td><td>Sin overhead de objetos por token; ganancia enorme y encapsulable.</td></tr>
+<tr><td>Necesitás paralelismo real y el free-threading no está listo</td><td>✅ Sí</td><td><code>allow_threads</code> + rayon escala hoy, sin serializar entre procesos.</td></tr>
+<tr><td>Ya existe una librería nativa que lo hace (NumPy, Polars, orjson, regex)</td><td>❌ No</td><td>Usala. Escribir la tuya es reescribir código ya optimizado y auditado.</td></tr>
+<tr><td>El 90% del tiempo se va esperando la base o la red</td><td>❌ No</td><td>Rust espera exactamente igual de rápido que Python.</td></tr>
+<tr><td>"Va a ser más rápido" sin un perfil que lo respalde</td><td>❌ No</td><td>Sobre-ingeniería. Sumás un toolchain, CI multiplataforma y wheels por arquitectura.</td></tr>
+<tr><td>Nadie más en el equipo sabe Rust</td><td>⚠️ Depende</td><td>El bus factor es un costo real. Un módulo de 200 líneas es asumible; 5.000 no.</td></tr>
+</tbody>
+</table>
+
+<div class="step"><strong>Si esto te interesó, el siguiente paso está en el campus.</strong> El <a href="../../../Curso-Rust/index.html">Curso de Rust</a> cubre ownership, borrowing, traits y concurrencia sin data races — que son justo los conceptos que necesitás para que el código de arriba deje de ser copiar-y-pegar y pase a ser algo que podés escribir y mantener vos.</div>
+
+<h2>PS8.10 Cuándo Python NO es la respuesta</h2>
+
+<p>Parte de la madurez técnica es reconocer los límites de tu herramienta favorita sin defenderla por costumbre. Hay escenarios donde Python es la elección incorrecta y ninguna optimización lo arregla:</p>
+
+<table>
+<thead><tr><th>Escenario</th><th>Por qué Python sufre</th><th>Alternativa razonable</th></tr></thead>
+<tbody>
+<tr><td>Latencia de cola dura sub-milisegundo (trading, ad-serving)</td><td>El GC y el refcounting introducen pausas impredecibles</td><td>Rust, C++, Go</td></tr>
+<tr><td>Miles de procesos chicos, memoria por instancia crítica</td><td>El intérprete + libs son ~40 MB antes de tu primera línea</td><td>Go, Rust (binario estático)</td></tr>
+<tr><td>Distribuir un ejecutable único a usuarios finales</td><td>PyInstaller funciona, pero pesa y es frágil entre plataformas</td><td>Go, Rust</td></tr>
+<tr><td>Cold start extremo en serverless</td><td>Importar el árbol de dependencias cuesta cientos de ms</td><td>Go, o Rust en Lambda</td></tr>
+<tr><td>Embebido / microcontroladores con memoria contada</td><td>MicroPython existe pero limita fuerte</td><td>C, Rust, Zig</td></tr>
+<tr><td>CPU-bound masivo y sostenido, sin librería nativa que aplique</td><td>Aun sin GIL pagás el intérprete por operación</td><td>Rust/C++, o extensión (PS8.9)</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Y qué hacer cuando pasa: casi nunca es "reescribir todo".</strong> El movimiento correcto es identificar el componente que tiene el requisito duro y sacarlo — como servicio aparte, como extensión nativa, como worker en otro lenguaje detrás de una cola. El resto del sistema (la API, la lógica de negocio, el pegamento, el análisis) se queda en Python, donde la velocidad de desarrollo y el ecosistema siguen siendo imbatibles. Un <em>rewrite</em> completo por un cuello de botella del 5% del código es el error de arquitectura más caro y más frecuente de esta categoría.
+</div>
+
+<h2>🧑‍🎓 Worked Example — de "anda en mi máquina" a listo para producción</h2>
+
+<blockquote>Heredás <code>checkout</code>: un servicio FastAPI de 600 líneas que llama a un proveedor de pagos y escribe en Postgres. Corre con <code>uvicorn app.main:api --reload</code>, la configuración está en un <code>config.py</code> con la API key adentro, loguea con <code>print()</code>, y se despliega copiando el repo a una VM. Funciona. Tenés que ponerlo en Kubernetes el viernes.</blockquote>
+
+<p><strong>Paso 1 — Congelar el artefacto.</strong> Antes que nada, reproducibilidad: <code>uv lock</code> genera el lockfile, el Dockerfile multi-stage de PS8.1 construye la imagen, y CI la etiqueta con el SHA del commit. Desde ahora "la versión que está en prod" es una respuesta exacta, no una arqueología de <code>git log</code> en la VM.</p>
+
+<p><strong>Paso 2 — Sacar la configuración del código.</strong> El <code>config.py</code> se convierte en el <code>Settings</code> de PS8.2. La API key sale del repo (y se rota, porque estuvo en el historial de git: asumila comprometida). Las variables se inyectan por entorno; el secreto, montado desde el gestor. Se agrega el <code>try/except ValidationError</code> con <code>SystemExit(78)</code> del arranque.</p>
+
+<p><strong>Paso 3 — Logs que una máquina pueda leer.</strong> Los <code>print()</code> se reemplazan por structlog en JSON, con el middleware de <code>request_id</code>. En el mismo commit se agrega el procesador que redacta claves sensibles: el servicio maneja pagos, y un payload de tarjeta en los logs es un incidente de cumplimiento, no un bug.</p>
+
+<p><strong>Paso 4 — Ver adentro.</strong> <code>opentelemetry-instrument</code> envuelve el arranque: sin tocar el código aparecen spans de FastAPI, httpx y la base. Se agrega a mano el span <code>checkout.cobrar</code> con <code>orden.id</code> y el resultado del proveedor, y el procesador que inyecta <code>trace_id</code> en cada log. Muestreo al 10% con <code>parentbased_traceidratio</code>: suficiente para diagnosticar, barato de guardar.</p>
+
+<p><strong>Paso 5 — Sobrevivir a las dependencias.</strong> Aparece el hallazgo del día: el cliente HTTP del proveedor se creaba dentro de cada handler y sin timeout. Se pasa a un <code>AsyncClient</code> único en el <em>lifespan</em>, con el <code>httpx.Timeout</code> de cuatro campos. La consulta de inventario —idempotente— recibe tenacity con jitter; el cobro —no idempotente— recibe la clave de idempotencia en vez de reintentos ciegos.</p>
+
+<p><strong>Paso 6 — Decirle la verdad al orquestador.</strong> <code>/livez</code> devuelve 200 y nada más. <code>/readyz</code> chequea el pool contra la base con un timeout de 1 s. Las probes del manifiesto usan el endpoint correcto en cada caso, y el <code>startupProbe</code> le da 150 s al arranque para que la migración inicial no dispare reinicios.</p>
+
+<p><strong>Paso 7 — Apagarse bien.</strong> El <code>lifespan</code> hace el drenaje: baja <code>listo</code>, espera 5 s, deja que uvicorn cierre las requests en vuelo (25 s), y recién ahí cierra cliente y pool. El manifiesto le da 40 s de gracia y un <code>preStop</code> de 5 s. El <code>CMD</code> se escribe en forma <code>exec</code> para que el <code>SIGTERM</code> llegue al proceso y no a un shell.</p>
+
+<p><strong>Paso 8 — Verificar cada punto, no confiar en cada punto.</strong> Esta es la parte que separa un deploy de una esperanza:</p>
+
+<table>
+<thead><tr><th>#</th><th>Checklist</th><th>Cómo se verifica</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Build reproducible desde el lock</td><td><code>uv lock --check</code> en CI falla si el lock está desactualizado; dos builds del mismo SHA dan el mismo digest.</td></tr>
+<tr><td>2</td><td>Imagen mínima y sin root</td><td><code>docker image ls</code> (&lt;250 MB) y <code>docker run --rm img id</code> devuelve <code>uid=10001</code>, no 0.</td></tr>
+<tr><td>3</td><td>Sin secretos en la imagen</td><td><code>docker history --no-trunc</code> + un escaneo de secretos en CI. Y <code>docker run -e APP_DB_URL=basura img</code> debe salir con código 78.</td></tr>
+<tr><td>4</td><td>Config incompleta = no arranca</td><td>Test de integración que levanta el contenedor sin <code>APP_API_KEY_PAGOS</code> y espera exit ≠ 0 en menos de 5 s.</td></tr>
+<tr><td>5</td><td>Logs en JSON con <code>trace_id</code></td><td><code>docker logs</code> pasado por <code>jq -e '.trace_id'</code>: si alguna línea no es JSON válido, falla.</td></tr>
+<tr><td>6</td><td>Nada sensible en los logs</td><td>Test que loguea un dict con <code>password</code>/<code>card</code> y afirma que la salida contiene <code>***</code>.</td></tr>
+<tr><td>7</td><td>Trazas llegando al collector</td><td>Una request de humo en staging y buscar su <code>x-request-id</code> en el backend de trazas.</td></tr>
+<tr><td>8</td><td>Todo cliente HTTP con timeout</td><td>Test que arma un servidor que nunca responde y afirma que la llamada corta en &lt;6 s en vez de colgarse.</td></tr>
+<tr><td>9</td><td>Reintentos solo donde corresponde</td><td>Test con <code>respx</code>/mock: 503 → 3 intentos; 400 → 1 intento; POST de cobro → 1 intento + clave de idempotencia.</td></tr>
+<tr><td>10</td><td>readiness ≠ liveness</td><td>Cortar la base en staging: <code>/readyz</code> debe dar 503 y <code>/livez</code> seguir en 200. Si ambos caen, el chequeo está mal puesto.</td></tr>
+<tr><td>11</td><td>Shutdown sin requests perdidas</td><td><code>kubectl delete pod</code> bajo carga con <code>k6</code>/<code>hey</code>: cero errores 502/503 del lado del cliente.</td></tr>
+<tr><td>12</td><td>Se puede perfilar en caliente</td><td><code>kubectl debug</code> con py-spy sobre un pod real y obtener un flamegraph. Probalo un martes, no durante el incidente.</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio.</strong> Ninguno de los doce puntos requirió cambiar la lógica de negocio: el servicio hace exactamente lo mismo que hacía el lunes. Lo que cambió es que ahora <em>se puede operar</em>. Y fijate el patrón de la columna derecha: cada propiedad tiene una <strong>verificación ejecutable</strong>. Una checklist sin esa columna es una lista de buenas intenciones que se degrada en tres sprints; con esa columna es un conjunto de tests que se rompen cuando alguien la degrada.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué es un error grave chequear la base de datos en el <em>liveness probe</em>?</summary>
+<p>Porque las dos probes disparan acciones distintas: readiness te saca de rotación, liveness te <strong>mata</strong>. Si la base tiene una degradación transitoria, un liveness que la consulta hace que todos los pods fallen simultáneamente y sean reiniciados a la vez. Al volver, todos intentan reconectarse al mismo tiempo contra una base que todavía está sufriendo, con las cachés vacías y sin conexiones tibias: un hipo de 40 segundos se convierte en una caída total con efecto rebaño. Liveness solo debe responder "mi proceso no está colgado"; cualquier dependencia externa va en readiness, donde el peor caso es dejar de recibir tráfico un rato.</p></details>
+
+<details><summary>Tu p50 está en 40 ms y tu p99 en 3 s. ¿Dónde buscás y por qué el promedio no te sirvió?</summary>
+<p>El p50 sano dice que el camino normal está bien: no es un problema global de CPU, de código ni de una query que empeoró para todos. La cola alta apunta a algo que afecta a una minoría de requests: contención por un lock o por el pool de conexiones (busca saturación), un caso de datos particular —un usuario con 10.000 ítems—, un reintento que agrega segundos, o un <em>garbage collect</em>/una recarga de caché que golpea de a ratos. El promedio no sirvió porque mezcla las dos poblaciones en un número que no describe a ninguna: con 99% en 40 ms y 1% en 3 s el promedio da ~70 ms y parece excelente. El diagnóstico concreto sale de filtrar trazas por duración &gt;1 s y comparar sus spans contra los de una traza rápida.</p></details>
+
+<details><summary>Vas a reintentar una llamada que falló por timeout. ¿Qué tenés que preguntarte antes?</summary>
+<p>Si la operación es idempotente. Un timeout significa "no sé qué pasó", no "no pasó": el pedido pudo haber llegado y ejecutado, y perderse solo la respuesta. Reintentar un <code>GET</code> o un <code>PUT</code> es seguro; reintentar un <code>POST /cobros</code> puede cobrarle dos veces al usuario. Si no es idempotente, hay tres caminos: mandar una clave de idempotencia que el servidor respete y deduplique, consultar el estado antes de reintentar, o no reintentar y devolver un error accionable. Y en todos los casos el reintento lleva backoff exponencial con jitter y un tope de intentos, porque sin jitter mil clientes fallando juntos reintentan juntos y garantizan el segundo fallo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Empaquetá el artefacto, no el repo.</strong> Multi-stage con uv, lock congelado, usuario no root, base <code>slim</code> por defecto y distroless solo si tenés cómo depurar sin shell. El orden de los <code>COPY</code> es lo que hace rápido al build.</li>
+  <li><strong>La configuración se valida al arrancar.</strong> Settings tipadas con <code>extra="forbid"</code> y salida con código de error si falta algo. Nada de defaults silenciosos. Los secretos van en un gestor, nunca en la imagen ni en el repo.</li>
+  <li><strong>Logs en JSON con contexto e id de correlación</strong>, cosidos al <code>trace_id</code>. Nunca secretos ni PII: identificadores, no identidades — y hacelo cumplir con un procesador, no con disciplina.</li>
+  <li><strong>OpenTelemetry</strong> unifica trazas, métricas y logs. Instrumentación automática para las librerías, manual para las fronteras de negocio. Cuidado con la cardinalidad en métricas.</li>
+  <li><strong>Percentiles, no promedios.</strong> p50 para la experiencia típica, p99 para la real. Con 20 llamadas por pantalla, un p99 del 1% se vuelve 18% de pantallas lentas. Y la saturación es la única señal que avisa antes.</li>
+  <li><strong><code>py-spy</code></strong> perfila un proceso vivo en producción sin reiniciarlo y con overhead nulo. Probá el procedimiento antes de necesitarlo.</li>
+  <li><strong>Liveness ≠ readiness.</strong> Liveness no toca dependencias. El apagado es: bajar readiness → drenar → cerrar en vuelo → cerrar recursos, y todo eso más rápido que el <code>terminationGracePeriodSeconds</code>.</li>
+  <li><strong>Timeout en toda llamada de red.</strong> Reintentos exponenciales con jitter, solo sobre errores transitorios y operaciones idempotentes. Circuit breaker para fallar rápido y degradar con gracia.</li>
+  <li><strong>PyO3 + maturin</strong> cuando el perfil —no la intuición— señala un hot spot acotado; <code>abi3</code> para un wheel por plataforma y <code>allow_threads</code> para soltar el GIL. Si ya existe una librería nativa que lo hace, usala.</li>
+  <li><strong>Reconocé cuándo Python no es la herramienta</strong> y sacá solo el componente con el requisito duro. Un rewrite completo por un cuello de botella del 5% es el error más caro de esta lista.</li>
+</ul>
+
+<h2>Cierre del track — qué estudiar después</h2>
+
+<p>Ocho módulos atrás Python era un lenguaje que usabas. Ahora sabés cómo representa sus objetos, cómo administra memoria, cómo concurre, cómo se tipa, cómo se prueba y cómo se opera. Eso es la base de un perfil senior: no un catálogo de trucos, sino un <strong>modelo mental</strong> que te deja predecir el comportamiento del sistema y explicar por qué elegiste lo que elegiste.</p>
+
+<div class="step"><strong>1. Sistemas distribuidos.</strong> Todo lo de PS8.8 —timeouts, reintentos, idempotencia, degradación— es la punta del iceberg. Consistencia eventual, particiones, colas, exactly-once (y por qué no existe). Es el techo real de la mayoría de las carreras backend.</div>
+
+<div class="step"><strong>2. Bases de datos por dentro.</strong> Índices, planes de ejecución, niveles de aislamiento, locks. Nueve de cada diez servicios Python son lentos por la base, no por Python — y ese diagnóstico no aparece en ningún perfilador del intérprete.</div>
+
+<div class="step"><strong>3. <a href="../../../Curso-Rust/index.html">Rust</a>, en serio.</strong> No para reescribir todo: para tener la opción de PS8.9 disponible de verdad, y porque su modelo de ownership te va a hacer escribir mejor Python concurrente aunque nunca despliegues una línea de Rust.</div>
+
+<div class="step"><strong>4. <a href="../../../../sistemas/Curso-Ciberseguridad/index.html">Seguridad</a> más allá de los secretos.</strong> Modelado de amenazas, dependencias y supply chain, autenticación y autorización bien hechas. En producción la seguridad no es una feature: es una propiedad del sistema, igual que las cinco de PS8.0.</div>
+
+<div class="step"><strong>5. Y lo más importante: operá algo real.</strong> Poné un servicio tuyo en producción, aunque no lo use nadie más que vos. La primera vez que te despierte una alerta a las 3 AM vas a aprender más sobre observabilidad que en cualquier módulo — incluido este.</div>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá cualquier servicio tuyo y escribile el Dockerfile multi-stage con uv. Medí tres cosas: tamaño final, tiempo de build en frío y tiempo de rebuild tras cambiar una línea de código. Después movés los <code>COPY</code> al orden ingenuo (código antes que manifiestos) y volvés a medir el rebuild. Documentá la diferencia.</li>
+  <li>Convertí la configuración de un proyecto a <code>pydantic-settings</code> con <code>extra="forbid"</code>. Escribí un test que levante el contenedor sin una variable obligatoria y afirme que muere en menos de 5 segundos con código distinto de 0.</li>
+  <li>Agregá structlog en JSON con id de correlación. Después escribí el procesador que redacta claves sensibles y un test que loguee un <code>dict</code> con <code>password</code>, <code>token</code> y <code>card_number</code> y verifique que ninguno aparece en la salida.</li>
+  <li>Instrumentá el servicio con <code>opentelemetry-instrument</code> apuntando a un collector local (Jaeger o el OTel Collector sirven en un <code>docker compose</code>). Agregá un span manual en una operación de negocio y encontrá su traza a partir del <code>x-request-id</code> que devolviste al cliente.</li>
+  <li>Generá carga con <code>k6</code> o <code>hey</code> y armá una tabla con promedio, p50, p95, p99 y p99.9. Después meté un <code>sleep</code> de 2 s en el 1% de las requests y repetí: mostrá cuál de las cinco métricas se movió y cuál no se enteró.</li>
+  <li>Perfilá con <code>py-spy record</code> un proceso <strong>en marcha</strong> mientras recibe carga —no un script suelto— y sacá el flamegraph. Si corre en contenedor, hacelo funcionar con <code>SYS_PTRACE</code> o <code>kubectl debug</code>: el objetivo del ejercicio es que el procedimiento te funcione <em>antes</em> de necesitarlo.</li>
+  <li>Implementá el drenaje del <em>lifespan</em> y verificalo empíricamente: mandá carga sostenida, matá el proceso con <code>SIGTERM</code> y contá cuántas requests fallaron. Repetí sin el drenaje y compará los dos números.</li>
+  <li><strong>(Largo)</strong> Buscá con <code>py-spy</code> la función más caliente de algún código tuyo, reescribila con PyO3 + maturin y medí el <em>speedup</em> real de punta a punta —no el de la función aislada—. Después decidí, con la tabla de PS8.9 en la mano, si la mantendrías en un proyecto de equipo y escribí en dos líneas por qué.</li>
+</ol>
+
+<section class="quiz" id="quizPS8">
+  <style>
+    #quizPS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS8 .q{margin-bottom:1.5rem}
+    #quizPS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS8 .opt:hover{border-color:var(--accent)}
+    #quizPS8 .opt:disabled{cursor:default}
+    #quizPS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS8 .exp.show{display:block}
+    #quizPS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu servicio arranca sano y recién en la primera request devuelve 500 porque falta una variable de entorno. ¿Cuál es el arreglo estructural?</p>
+    <button class="opt">Agregar un <code>try/except</code> en el handler que devuelva un 503 más prolijo</button>
+    <button class="opt">Poner un default razonable con <code>os.getenv("VAR", "valor")</code> para que nunca falte</button>
+    <button class="opt">Validar toda la configuración con un modelo tipado en el arranque y salir con error si falta algo</button>
+    <div class="exp">Si la config se valida antes de abrir el puerto, el proceso muere en el segundo cero, el orquestador nunca lo pone en rotación y ningún usuario ve el error: el deploy simplemente no avanza. El <code>try/except</code> en el handler convierte un error de deploy en un error del usuario, y el default silencioso es peor todavía — enmascara el problema hasta que alguien lo descubre semanas después investigando otra cosa. Por eso además <code>extra="forbid"</code>: un <code>APP_TIMEOOUT</code> mal tipeado tiene que ser un error de arranque, no un silencio.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un proveedor externo empieza a tardar 30 segundos en responder en vez de fallar. ¿Cuál es el riesgo mayor para <em>tu</em> servicio?</p>
+    <button class="opt">Que sin timeouts se te agoten conexiones y workers esperando, y caiga tu servicio entero por culpa del ajeno</button>
+    <button class="opt">Que los logs crezcan demasiado por la cantidad de reintentos</button>
+    <button class="opt">Que el p50 suba y los tableros queden feos</button>
+    <div class="exp">Una dependencia lenta es peor que una caída: una caída libera recursos rápido, la lentitud los <strong>retiene</strong>. Cada request colgada ocupa una conexión del pool, una tarea del event loop y memoria; cuando se agotan, tu servicio deja de atender también todo lo que no dependía del proveedor. Por eso el timeout no es una optimización sino el mecanismo que impide que la falla ajena se vuelva propia — y por eso el paso siguiente es el circuit breaker, que deja de intentar y degrada con gracia en vez de esperar.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. El perfil de <code>py-spy</code> muestra que el 85% del tiempo se va esperando respuestas de la base de datos. ¿Qué esperás ganar reescribiendo el hot spot con PyO3 + maturin?</p>
+    <button class="opt">Entre 10× y 100×, que es la ganancia típica de bajar a Rust</button>
+    <button class="opt">Prácticamente nada: Rust espera a la base exactamente igual de rápido que Python</button>
+    <button class="opt">Un 30–40%, porque Rust también optimiza el I/O</button>
+    <div class="exp">Bajar a código nativo acelera <strong>cómputo</strong>, no espera. Si el 85% del tiempo el proceso está bloqueado esperando a la base, la ganancia máxima teórica de optimizar todo el resto es un 15% — y a cambio sumás un toolchain de Rust, CI multiplataforma, wheels por arquitectura y un bus factor nuevo. Es el mismo error de PS1.7 con otro disfraz: optimizar donde no está el tiempo. Acá lo que corresponde es mirar índices, plan de ejecución, N+1 queries y pool de conexiones.</div>
+  </div>
+
+  <div class="score" id="scorePS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track Python Senior.' : '  — repasá las que fallaste y cerrá el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps7-testing-serio/lecture.html">← PS7: Testing serio</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

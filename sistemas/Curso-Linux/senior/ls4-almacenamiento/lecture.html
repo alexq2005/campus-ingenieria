@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LS4 — Almacenamiento: VFS, filesystems y latencia de I/O · Linux Senior</title>
+  <meta name="description" content="El VFS y sus cuatro objetos, inodos y descriptores, el camino real de un write() por la page cache, qué garantizan fsync/fdatasync/O_DIRECT/O_SYNC, comparativa honesta de ext4/XFS/Btrfs/ZFS/overlayfs/tmpfs, journaling, LVM, iostat -x columna por columna, schedulers de I/O y cuotas por cgroup.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Linux Senior</a>
+  <a href="../../index.html">🐧 Curso de Linux</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">LS4</span>
+  <span class="badge">⏱ 40–100 min</span>
+  <span class="badge">🎯 Pre-req: LS1, LS2</span>
+  <span class="badge">💽 Almacenamiento</span>
+</div>
+
+<article>
+
+<h1>LS4 — Almacenamiento: VFS, filesystems y latencia de I/O</h1>
+
+<h2>LS4.0 Por qué este módulo</h2>
+
+<p>La CPU trabaja en nanosegundos. La RAM responde en decenas de nanosegundos. Un NVMe bueno tarda entre 60 y 200 <strong>micro</strong>segundos, y un disco rotativo, entre 5 y 15 <strong>mili</strong>segundos. Entre acceder a la memoria y acceder a un plato girando hay un factor de cien mil. En cualquier sistema que no sea puro cálculo, <strong>el disco es el cuello de botella</strong>, y el resto de la arquitectura existe en buena medida para esconderlo.</p>
+
+<p>El problema es que se esconde <em>demasiado bien</em>. Un <code>write()</code> vuelve en microsegundos y todo parece rápido — hasta que se corta la luz y descubrís que ese "escribí" era una promesa, no un hecho. Un <code>df</code> dice 100% lleno y un <code>du</code> dice que hay la mitad de espacio, y nadie sabe quién miente. Un <code>iostat</code> marca <code>%util</code> al 100% y el equipo compra discos más rápidos que no arreglan nada.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todos los problemas de almacenamiento se explican con tres capas y con la confusión entre ellas: <strong>(1)</strong> el <strong>nombre</strong> de un archivo no es el archivo — el inodo lo es; <strong>(2)</strong> escribir no es persistir — entre tu <code>write()</code> y el medio físico hay page cache, writeback y una cache DRAM dentro del propio disco; <strong>(3)</strong> "el disco está lento" no es un diagnóstico — es una hipótesis que se confirma o se descarta con latencias, no con porcentajes. Entendé esas tres y el 90% de los incidentes de disco dejan de ser misteriosos.
+</div>
+
+<p>Este módulo es de los que más rinde en producción: casi todo lo que ves acá se aplica el mismo día en que un servidor se queda sin espacio a las tres de la mañana.</p>
+
+<h2>LS4.1 El VFS: la capa que hace que todo sea un archivo</h2>
+
+<p>Cuando un proceso llama a <code>read()</code>, no sabe —ni le importa— si detrás hay un ext4 en un NVMe, un XFS en una SAN, un NFS al otro lado de la red, un archivo de <code>/proc</code> que no existe en ningún disco, o un pipe. Esa indiferencia la provee el <strong>Virtual File System</strong>: una capa de abstracción dentro del kernel que define una interfaz común y deja que cada filesystem la implemente a su manera.</p>
+
+<p>El VFS modela todo con cuatro objetos. Confundirlos es la raíz de la mitad de los malentendidos sobre almacenamiento:</p>
+
+<table>
+<thead><tr><th>Objeto</th><th>Qué representa</th><th>Dónde lo ves</th></tr></thead>
+<tbody>
+<tr><td><strong>superblock</strong></td><td>Un filesystem montado: su tipo, tamaño, bloques libres, opciones</td><td><code>df</code>, <code>tune2fs -l</code>, <code>/proc/mounts</code></td></tr>
+<tr><td><strong>inode</strong></td><td><strong>El archivo en sí</strong>: permisos, dueño, timestamps, tamaño, punteros a bloques. <em>No</em> guarda el nombre</td><td><code>stat</code>, <code>ls -i</code>, <code>df -i</code></td></tr>
+<tr><td><strong>dentry</strong></td><td>Una entrada de directorio: la asociación <em>nombre → inodo</em></td><td><code>ls</code>, el <em>dentry cache</em> en <code>slabtop</code></td></tr>
+<tr><td><strong>file</strong></td><td>Un archivo <strong>abierto</strong> por un proceso: el descriptor, su offset, su modo</td><td><code>/proc/PID/fd/</code>, <code>lsof</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El nombre no es el archivo.</strong> Un directorio es simplemente una tabla de <em>nombre → número de inodo</em>. El inodo tiene todo lo demás y no sabe cómo se llama. De ahí se deducen, sin memorizar nada, el comportamiento de los hard links, el de los renombres atómicos y el clásico "borré el log y el disco sigue lleno".
+</div>
+
+<pre><code class="lang-bash">$ stat /var/log/nginx/access.log
+  File: /var/log/nginx/access.log
+  Size: 148283904   Blocks: 289624     IO Block: 4096   regular file
+Device: 253,3   Inode: 1441801     Links: 1
+Access: (0640/-rw-r-----)  Uid: (  101/   nginx)   Gid: (    4/     adm)
+Modify: 2026-09-03 11:59:58.004221781 -0300
+Change: 2026-09-03 11:59:58.004221781 -0300
+
+# Size = tamaño lógico en bytes; Blocks = sectores de 512 B realmente asignados.
+# Links = cuántas entradas de directorio apuntan a este inodo. Cuando llega a 0
+#         Y nadie lo tiene abierto, recién ahí se liberan los bloques.</code></pre>
+
+<h3>Hard links vs symlinks</h3>
+
+<pre><code class="lang-bash">$ echo "original" &gt; datos.txt
+$ ln    datos.txt duro.txt      # hard link: otra entrada al MISMO inodo
+$ ln -s datos.txt blando.txt    # symlink: un archivo nuevo que contiene la RUTA
+
+$ ls -li
+1441801 -rw-r--r-- 2 alex alex   9 sep  3 12:04 datos.txt
+1441801 -rw-r--r-- 2 alex alex   9 sep  3 12:04 duro.txt
+1441802 lrwxrwxrwx 1 alex alex   9 sep  3 12:04 blando.txt -&gt; datos.txt
+        ^                ^
+        |                +-- link count: 2 entradas apuntan al inodo 1441801
+        +-- mismo número de inodo: NO es una copia, es el mismo archivo
+
+$ rm datos.txt
+$ cat duro.txt      # "original"  -&gt; sigue vivo, el inodo tiene 1 link
+$ cat blando.txt    # No such file or directory  -&gt; el symlink quedó colgando</code></pre>
+
+<table>
+<thead><tr><th></th><th>Hard link</th><th>Symlink</th></tr></thead>
+<tbody>
+<tr><td>Qué es</td><td>Otro nombre para el mismo inodo</td><td>Un inodo aparte cuyo contenido es una ruta de texto</td></tr>
+<tr><td>Cruza filesystems</td><td>❌ No (los inodos son locales al FS)</td><td>✅ Sí</td></tr>
+<tr><td>Apunta a directorios</td><td>❌ No (salvo <code>.</code> y <code>..</code>, que crea el kernel)</td><td>✅ Sí</td></tr>
+<tr><td>Puede quedar roto</td><td>❌ Nunca: el dato existe mientras haya un link</td><td>✅ Sí, si el destino desaparece o se mueve</td></tr>
+<tr><td>Se resuelve</td><td>En el momento de crearlo</td><td>En <strong>cada</strong> acceso</td></tr>
+<tr><td>Ocupa espacio de datos</td><td>No: solo una entrada de directorio</td><td>Un inodo (rutas cortas van <em>dentro</em> del inodo)</td></tr>
+</tbody>
+</table>
+
+<h3>El descriptor: por qué borrar un archivo abierto no libera espacio</h3>
+
+<p>Borrar un archivo no se llama "borrar": la syscall es <code>unlink()</code>, y hace exactamente lo que dice — <strong>desata el nombre del inodo</strong>. Baja el link count en uno. El kernel libera los bloques recién cuando se cumplen <em>las dos</em> condiciones:</p>
+
+<div class="step"><strong>link count == 0</strong> — ninguna entrada de directorio apunta al inodo.</div>
+<div class="step"><strong>Y ningún descriptor abierto lo referencia</strong> — ningún proceso lo tiene en su tabla de archivos abiertos.</div>
+
+<pre><code class="lang-bash">$ ls -l /proc/self/fd
+lrwx------ 1 alex alex 64 sep  3 12:10 0 -&gt; /dev/pts/2
+lrwx------ 1 alex alex 64 sep  3 12:10 1 -&gt; /dev/pts/2
+lrwx------ 1 alex alex 64 sep  3 12:10 2 -&gt; /dev/pts/2
+lr-x------ 1 alex alex 64 sep  3 12:10 3 -&gt; /proc/1042/fd
+
+# Un archivo borrado que sigue abierto aparece marcado explícitamente:
+lr-x------ 1 root root 64 sep  3 12:10 27 -&gt; /var/log/app/catalina.out (deleted)</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> el disco se llena, alguien hace <code>rm /var/log/app/enorme.log</code>, y <code>df</code> no baja ni un byte. No falló nada: el proceso sigue con el descriptor abierto y sigue escribiendo en un inodo que ya no tiene nombre. El archivo fantasma <em>crece</em>. Es el caso que resolvemos entero en el Worked Example.
+</div>
+
+<div class="info">
+  Ese comportamiento no es un accidente: es la base del patrón de archivo temporal seguro. Crear un archivo, abrirlo y borrarlo inmediatamente te deja un espacio de trabajo privado que <strong>nadie puede ver ni abrir</strong> y que el kernel limpia solo cuando tu proceso muere, pase lo que pase. Es también cómo funciona <code>O_TMPFILE</code>.
+</div>
+
+<h3>El dentry cache</h3>
+
+<p>Resolver <code>/var/log/nginx/access.log</code> implica leer cuatro directorios del disco. Hacerlo en cada <code>open()</code> sería inviable, así que el kernel cachea las resoluciones nombre → inodo en el <strong>dentry cache</strong>, junto con los inodos mismos:</p>
+
+<pre><code class="lang-bash">$ sudo slabtop -o | head -6
+ OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME
+884736 871203  98%    0.19K  42130       21    168520K dentry
+312480 309112  98%    0.64K  13020       24    208320K ext4_inode_cache
+
+$ grep -E '^(Dirty|Writeback|Cached):' /proc/meminfo
+Cached:         18324992 kB
+Dirty:            412360 kB
+Writeback:             0 kB</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>drop_caches</code> no es una solución, es una herramienta de medición.</strong> <code>echo 3 | sudo tee /proc/sys/vm/drop_caches</code> vacía page cache, dentries e inodos. Sirve para hacer un benchmark "en frío" y para nada más: en producción convierte cada acceso siguiente en I/O real y te genera exactamente el pico de latencia que estabas tratando de evitar. Si alguien lo puso en un cron para "liberar RAM", ese cron es el bug (ver LS2: la RAM cacheada <em>no</em> es RAM perdida).
+</div>
+
+<h2>LS4.2 El camino real de un <code>write()</code></h2>
+
+<p>Un <code>write()</code> a un archivo normal, salvo que pidas lo contrario, <strong>no toca el disco</strong>. Copia tus bytes a una página de la page cache, la marca como <em>dirty</em> (sucia) y vuelve. El dato está en RAM y tu programa cree que escribió.</p>
+
+<pre><code class="lang-bash">write(2)
+  │
+  └─&gt; VFS ──&gt; page cache: la página queda marcada DIRTY   ← el write() ya volvió acá
+                 │                                            (microsegundos)
+                 │  Tres gatillos disparan el writeback:
+                 ├─ vm.dirty_background_ratio  ──&gt; kworker escribe en BACKGROUND
+                 ├─ vm.dirty_ratio             ──&gt; el proceso que escribe SE BLOQUEA
+                 ├─ vm.dirty_expire_centisecs  ──&gt; por antigüedad de la página
+                 │  (y fsync/sync, que fuerzan el vaciado ya mismo)
+                 v
+              capa de bloques: cola + scheduler (none / mq-deadline / bfq)
+                 │
+                 v
+              driver ──&gt; dispositivo ──&gt; cache DRAM interna del disco
+                 │
+                 └─ FLUSH / FUA  ──&gt; medio persistente (NAND, platos)
+                    solo si alguien pidió fsync o una barrera</code></pre>
+
+<pre><code class="lang-bash">$ sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+vm.dirty_expire_centisecs = 3000        # 30 segundos
+
+# Verlo en vivo mientras copiás un archivo grande:
+$ watch -n1 "grep -E '^(Dirty|Writeback):' /proc/meminfo"</code></pre>
+
+<table>
+<thead><tr><th>Parámetro</th><th>Qué hace</th><th>Síntoma cuando está mal</th></tr></thead>
+<tbody>
+<tr><td><code>vm.dirty_background_ratio</code></td><td>% de memoria disponible sucia a partir del cual arranca el writeback en background</td><td>Muy alto: se acumula demasiado y el vaciado llega tarde y de golpe</td></tr>
+<tr><td><code>vm.dirty_ratio</code></td><td>% a partir del cual <strong>el proceso que escribe se bloquea</strong> y escribe él mismo</td><td>Pausas largas e inexplicables en la app: no es la app, es el throttling</td></tr>
+<tr><td><code>vm.dirty_expire_centisecs</code></td><td>Edad máxima de una página sucia antes de forzar su escritura</td><td>Muy alto: ventana de pérdida más grande ante un corte</td></tr>
+<tr><td><code>vm.dirty_bytes</code> / <code>vm.dirty_background_bytes</code></td><td>Lo mismo en valor absoluto (excluyen a los <code>_ratio</code>)</td><td>Es lo que hay que usar en máquinas con mucha RAM</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El 20% por defecto envejeció mal.</strong> En un servidor de 256 GB, <code>dirty_ratio=20</code> autoriza a acumular decenas de GB de datos sucios en RAM. Cuando el kernel finalmente tiene que bajarlos, el dispositivo se satura durante segundos y <em>toda</em> la latencia del sistema se va al techo — el famoso "write cliff". En máquinas grandes se fija en bytes: <code>vm.dirty_background_bytes=268435456</code> (256 MB) y <code>vm.dirty_bytes=1073741824</code> (1 GB) son puntos de partida razonables. Medí antes y después, no lo copies a ciegas.
+</div>
+
+<div class="rule">
+  <strong>📌 Un <code>write()</code> rápido no significa nada sobre durabilidad.</strong> Significa que la copia a RAM salió bien. Si el kernel entra en pánico, se corta la luz o alguien tira del cable en los próximos 30 segundos, esos datos no existieron nunca. Para que existan hay que pedirlo explícitamente, y eso cuesta.
+</div>
+
+<h2>LS4.3 Durabilidad: <code>fsync</code>, <code>fdatasync</code>, <code>O_DIRECT</code>, <code>O_SYNC</code></h2>
+
+<table>
+<thead><tr><th>Mecanismo</th><th>Qué garantiza</th><th>Qué NO garantiza</th><th>Costo típico</th></tr></thead>
+<tbody>
+<tr><td><code>write()</code></td><td>Que el kernel tiene tus bytes</td><td>Absolutamente nada sobre el disco</td><td>~1–10 µs</td></tr>
+<tr><td><code>fsync(fd)</code></td><td>Datos <strong>y</strong> metadata del archivo en medio estable; incluye vaciar la cache del dispositivo</td><td>La <strong>entrada de directorio</strong> si el archivo es nuevo</td><td>0,1–2 ms NVMe · 5–20 ms HDD</td></tr>
+<tr><td><code>fdatasync(fd)</code></td><td>Datos + solo la metadata necesaria para releerlos (el tamaño)</td><td>No actualiza <code>mtime</code> en el journal</td><td>Igual o algo menos que <code>fsync</code></td></tr>
+<tr><td><code>O_SYNC</code> / <code>O_DSYNC</code></td><td>Cada <code>write()</code> se comporta como <code>write+fsync</code> / <code>write+fdatasync</code></td><td>Nada extra; simplemente es implícito</td><td>Malo si escribís de a poco: un flush por write</td></tr>
+<tr><td><code>O_DIRECT</code></td><td>Saltear la page cache: el DMA va de tu buffer al dispositivo</td><td><strong>Durabilidad</strong>: el dato puede quedarse en la DRAM del disco</td><td>Exige alineación; sin cache, cada lectura es I/O real</td></tr>
+<tr><td><code>sync(2)</code> / <code>syncfs(2)</code></td><td>Todo el sistema / un filesystem entero</td><td>Granularidad: arrastra trabajo ajeno</td><td>Impredecible; no es una estrategia</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 <code>O_DIRECT</code> no es "modo rápido" ni "modo seguro".</strong> Es "yo administro mi propio cache, sacá el tuyo del medio". Tiene sentido si sos PostgreSQL, MySQL o un motor de almacenamiento que ya sabe qué páginas conviene retener. En una aplicación normal, sacar la page cache es una pesimización garantizada. Y como no implica durabilidad, sigue haciendo falta <code>fsync</code> (o <code>O_DIRECT|O_DSYNC</code>).
+</div>
+
+<h3>El <code>fsync</code> que todos se olvidan: el del directorio</h3>
+
+<p>El patrón de reemplazo atómico —escribir a un temporal y renombrar— es correcto y es lo que hace todo software serio. Pero está incompleto sin un detalle: <code>rename()</code> modifica el <strong>directorio</strong>, y esa modificación también vive en la page cache.</p>
+
+<pre><code class="lang-c">int fd = open("config.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+write(fd, buf, n);
+fsync(fd);                 /* 1. los DATOS del archivo nuevo, en el medio     */
+close(fd);
+
+rename("config.tmp", "config.json");   /* 2. cambio atómico del nombre        */
+
+int dfd = open(".", O_RDONLY | O_DIRECTORY);
+fsync(dfd);                /* 3. la ENTRADA DE DIRECTORIO. El paso olvidado.  */
+close(dfd);</code></pre>
+
+<div class="mistake">
+  <strong>Sin el paso 3</strong>, un corte de energía puede dejarte un directorio que todavía no conoce el renombre: al volver, <code>config.json</code> es la versión vieja, o directamente no existe y quedó <code>config.tmp</code>. El <code>rename()</code> es atómico <em>respecto de otros procesos</em>, no <em>respecto de un corte de luz</em>. Son dos garantías distintas y se confunden todo el tiempo.
+</div>
+
+<h3>Por qué las bases de datos hacen <code>fsync</code> (y por qué apagarlo es tan tentador)</h3>
+
+<p>Una base de datos promete <strong>durabilidad</strong>: si te dijo "commit ok", el dato sobrevive a un corte. La única forma de cumplirlo es hacer <code>fsync</code> (o <code>fdatasync</code>) del write-ahead log antes de responder. Ese flush es, casi siempre, <strong>el techo de transacciones por segundo</strong> del sistema: si cada commit cuesta 1 ms de flush y no agrupás, no vas a pasar de ~1000 commits/s por conexión, tengas el hardware que tengas.</p>
+
+<p>Por eso todos los motores ofrecen la perilla para apagarlo, y por eso alguien siempre la encuentra:</p>
+
+<table>
+<thead><tr><th>Perilla</th><th>Qué ganás</th><th>Qué perdés ante un corte</th><th>¿Se corrompe?</th></tr></thead>
+<tbody>
+<tr><td>PostgreSQL <code>synchronous_commit=off</code></td><td>Muchísimo throughput de commits</td><td>Las últimas transacciones confirmadas (fracción de segundo)</td><td><strong>No.</strong> La base queda consistente</td></tr>
+<tr><td>PostgreSQL <code>fsync=off</code></td><td>Un poco más</td><td>Todo</td><td><strong>Sí.</strong> Corrupción silenciosa. Nunca</td></tr>
+<tr><td>MySQL <code>innodb_flush_log_at_trx_commit=2</code></td><td>Alto throughput</td><td>~1 s de transacciones si cae el <em>sistema</em> (no si cae solo mysqld)</td><td>No</td></tr>
+<tr><td>Montar con <code>nobarrier</code> / <code>barrier=0</code></td><td>Marginal en hardware moderno</td><td>El orden de escritura del journal</td><td><strong>Sí.</strong> Puede corromper el filesystem entero</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Distinguí las dos capas.</strong> Aflojar durabilidad <em>en la aplicación</em> (<code>synchronous_commit=off</code>) es una decisión de negocio: acordás perder los últimos milisegundos a cambio de rendimiento, y la base sigue íntegra. Aflojarla <em>en el filesystem</em> (<code>nobarrier</code>) rompe las garantías de orden en las que se apoya el journal, y el resultado puede ser un filesystem corrupto. Solo tiene sentido con una controladora con batería (BBU) o SSDs empresariales con protección de pérdida de energía (PLP), que es exactamente el hardware donde la ganancia ya es marginal.
+</div>
+
+<div class="info">
+  <strong>Un <code>fsync</code> que falla no se reintenta.</strong> El incidente que PostgreSQL bautizó <em>fsyncgate</em> (2018) mostró que Linux reportaba el error de escritura una sola vez y dejaba las páginas marcadas como limpias: un segundo <code>fsync</code> devolvía éxito sobre datos que se habían perdido. Se mitigó (los errores hoy se reportan una vez por <em>file description</em>), pero la conclusión operativa quedó: ante un <code>fsync</code> con error, la única respuesta segura es <strong>abortar el proceso</strong> y recuperar desde el log. Si escribís código que llama a <code>fsync</code>, tratá su error como fatal, no como algo que se reintenta en un <code>while</code>.
+</div>
+
+<h2>LS4.4 Filesystems: comparativa honesta</h2>
+
+<table>
+<thead><tr><th>FS</th><th>Modelo</th><th>Snapshots</th><th>Checksums de datos</th><th>Achicar</th><th>Cuándo usarlo</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><strong>ext4</strong></td><td>Journaling, extents</td><td>❌ (vía LVM)</td><td>❌ (solo metadata)</td><td>✅ offline</td><td>Root, VMs, el 80% de los casos. La opción aburrida y correcta</td><td>Nada notable; no escala tan bien a decenas de TB</td></tr>
+<tr><td><strong>XFS</strong></td><td>Journaling, allocation groups</td><td>❌ (vía LVM)</td><td>❌ (solo metadata)</td><td><strong>❌ nunca</strong></td><td>Archivos grandes, mucha concurrencia, filesystems enormes. Default de RHEL</td><td>Decisión irreversible de tamaño; <code>fsck</code> pesado en memoria</td></tr>
+<tr><td><strong>Btrfs</strong></td><td>Copy-on-write</td><td>✅ baratos y nativos</td><td>✅</td><td>✅ online</td><td>Root con rollback (openSUSE, Fedora), backups incrementales con <code>send/receive</code></td><td>Se fragmenta con DB/VMs; <strong>RAID5/6 sigue sin ser confiable</strong></td></tr>
+<tr><td><strong>ZFS</strong></td><td>Copy-on-write + gestor de volúmenes</td><td>✅ excelentes</td><td>✅ end-to-end, con autocuración</td><td>Limitado</td><td>Almacenamiento de datos donde la integridad manda: NAS, archivos, backups</td><td>Fuera del kernel (licencia CDDL) → módulo DKMS; hambriento de RAM (ARC)</td></tr>
+<tr><td><strong>overlayfs</strong></td><td>Unión: capas de solo lectura + una de escritura</td><td>n/a</td><td>❌</td><td>n/a</td><td>Contenedores. No lo elegís: te lo da Docker/containerd</td><td><strong>copy-up</strong>: escribir 1 byte copia el archivo entero</td></tr>
+<tr><td><strong>tmpfs</strong></td><td>En RAM (y swap)</td><td>n/a</td><td>n/a</td><td>✅ en caliente</td><td><code>/run</code>, <code>/dev/shm</code>, scratch efímero, secretos que no deben tocar disco</td><td>Es memoria: cuenta contra el cgroup y puede disparar el OOM killer</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Regla práctica de elección.</strong> ¿No tenés un requerimiento que te empuje? <strong>ext4</strong>. ¿Filesystem enorme, archivos grandes, mucha paralelización, y estás seguro de que nunca vas a necesitar achicarlo? <strong>XFS</strong>. ¿Querés snapshots y rollback del sistema operativo? <strong>Btrfs</strong>. ¿Almacenás datos que no podés permitirte que se pudran en silencio? <strong>ZFS</strong>. Todo lo demás es preferencia, y la preferencia se paga en incidentes.
+</div>
+
+<h3>overlayfs: la que te comés todos los días sin saberlo</h3>
+
+<pre><code class="lang-bash">$ mount | grep -m1 overlay
+overlay on /var/lib/docker/overlay2/9f3c.../merged type overlay
+  (rw,relatime,lowerdir=.../l/XKQ:.../l/PLM,upperdir=.../diff,workdir=.../work)
+
+#   lowerdir  = las capas de la imagen, SOLO LECTURA (apiladas)
+#   upperdir  = la capa de escritura del contenedor
+#   merged    = la vista unificada que ve el proceso adentro</code></pre>
+
+<div class="warn">
+  <strong>El <em>copy-up</em> es la trampa.</strong> Modificar un solo byte de un archivo que vive en una capa inferior obliga a overlayfs a copiar <strong>el archivo completo</strong> al <code>upperdir</code> antes de tocarlo. Si es un dataset de 2 GB de la imagen, el primer <code>write</code> tarda lo que tarda copiar 2 GB. Por eso los datos van en volúmenes (bind mounts o volúmenes nombrados), no en la capa de escritura del contenedor — y por eso una base de datos corriendo sobre overlayfs rinde tan mal.
+</div>
+
+<h3>tmpfs: rápido porque es RAM, peligroso porque es RAM</h3>
+
+<pre><code class="lang-bash">$ df -h /dev/shm /run
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            16G  1,2G   15G   8% /dev/shm
+tmpfs           3,2G  2,1M  3,2G   1% /run
+
+$ mount -t tmpfs -o size=512m,mode=1777 tmpfs /mnt/scratch</code></pre>
+
+<div class="mistake">
+  <code>size=512m</code> es un <strong>límite, no una reserva</strong>: el tmpfs no consume nada hasta que escribís. Y las páginas que escribís se cobran al cgroup de memoria del proceso que las escribió (LS2, LS3). Llenar un tmpfs dentro de un contenedor con límite de memoria no da "disco lleno": dispara el <strong>OOM killer del cgroup</strong>, y el proceso muere sin explicación aparente. Además, el contenido puede terminar en <strong>swap</strong>, así que "no toca disco" solo es cierto si el swap está deshabilitado.
+</div>
+
+<h2>LS4.5 Journaling: qué protege y qué NO</h2>
+
+<p>Un journal es un log circular donde el filesystem anota lo que <em>va</em> a hacer antes de hacerlo. Si el sistema se cae en medio de una operación, al montar se relee el journal y se completan o descartan las transacciones a medias. Eso evita el <code>fsck</code> de horas y, sobre todo, evita que el filesystem quede en un estado imposible.</p>
+
+<pre><code class="lang-bash">$ sudo tune2fs -l /dev/mapper/vg0-lv_var | grep -iE 'features|journal'
+Filesystem features: has_journal ext_attr dir_index filetype extent 64bit
+                     metadata_csum ...
+Journal features:    journal_64bit journal_checksum_v3
+Journal size:        1024M
+
+$ mount | grep ' /var '
+/dev/mapper/vg0-lv_var on /var type ext4 (rw,relatime,data=ordered)</code></pre>
+
+<table>
+<thead><tr><th>Modo de ext4</th><th>Qué va al journal</th><th>Rendimiento</th><th>Riesgo tras un corte</th></tr></thead>
+<tbody>
+<tr><td><code>data=journal</code></td><td>Metadata <strong>y datos</strong></td><td>El más lento: todo se escribe dos veces</td><td>El menor</td></tr>
+<tr><td><code>data=ordered</code> (default)</td><td>Metadata; los datos se escriben <em>antes</em> de commitear la metadata</td><td>Buen equilibrio</td><td>Podés perder escrituras recientes, pero nunca ver basura ajena</td></tr>
+<tr><td><code>data=writeback</code></td><td>Solo metadata, sin ordenar respecto de los datos</td><td>El más rápido</td><td>Un archivo puede quedar con bloques de contenido viejo de otro archivo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El journal protege la consistencia del filesystem, no tus datos.</strong> Tras un corte, la promesa es que el FS monta en un estado coherente y que la metadata no quedó a medio camino. <em>No</em> es una promesa sobre tu archivo: puede quedar truncado, viejo o vacío. Eso no es un bug — es exactamente el contrato, y por eso existe <code>fsync</code>.
+</div>
+
+<p>Lo que el journaling <strong>no</strong> hace, y conviene tener escrito en algún lado:</p>
+
+<ul>
+  <li><strong>No reemplaza a <code>fsync</code>.</strong> Si tu app no lo llamó, sus datos estaban en la page cache y no hay journal que los rescate.</li>
+  <li><strong>No detecta bit rot.</strong> ext4 y XFS validan la metadata con checksums, pero <strong>no los datos</strong>. Un bloque que se degrada en el medio se te devuelve tranquilamente como si nada. Para eso están ZFS y Btrfs.</li>
+  <li><strong>No protege contra un disco que miente.</strong> Si el dispositivo confirma un FLUSH que en realidad no ejecutó —común en SSDs de consumo baratos—, el journal escribe en un orden que el disco no respeta y todas las garantías se caen.</li>
+  <li><strong>No arregla errores de tu lógica.</strong> Sobrescribir el archivo equivocado se commitea igual de bien que sobrescribir el correcto.</li>
+</ul>
+
+<h2>LS4.6 LVM: volúmenes que se pueden mover en caliente</h2>
+
+<p>LVM mete una capa de indirección entre las particiones y los filesystems. Se arma en tres niveles: los <strong>PV</strong> (physical volumes) son discos o particiones; el <strong>VG</strong> (volume group) es la bolsa de espacio que forman entre todos; los <strong>LV</strong> (logical volumes) son los "discos" virtuales que recortás de esa bolsa y sobre los que hacés <code>mkfs</code>.</p>
+
+<pre><code class="lang-bash">$ sudo pvcreate /dev/nvme0n1p3
+$ sudo vgcreate vg0 /dev/nvme0n1p3
+$ sudo lvcreate -L 40G -n lv_var vg0
+$ sudo mkfs.ext4 /dev/vg0/lv_var
+
+$ sudo vgs; sudo lvs
+  VG   #PV #LV #SN Attr   VSize    VFree
+  vg0    1   3   0 wz--n- &lt;465.76g  85.00g
+
+  LV      VG  Attr       LSize  Pool Origin Data%
+  lv_root vg0 -wi-ao----  30.00g
+  lv_var  vg0 -wi-ao----  50.00g
+  lv_data vg0 -wi-ao---- 300.00g</code></pre>
+
+<h3>Extender en caliente: la operación que justifica todo LVM</h3>
+
+<pre><code class="lang-bash"># Paso 1: agrandar el volumen lógico (el "disco")
+$ sudo lvextend -L +20G /dev/vg0/lv_var
+  Size of logical volume vg0/lv_var changed from 50.00 GiB to 70.00 GiB.
+
+# Paso 2: agrandar el FILESYSTEM que vive adentro. Son dos cosas distintas.
+$ sudo resize2fs /dev/vg0/lv_var          # ext4  -&gt; se le pasa el DISPOSITIVO
+$ sudo xfs_growfs /var                    # XFS   -&gt; se le pasa el PUNTO DE MONTAJE
+
+# Atajo: -r (--resizefs) hace los dos pasos y usa la herramienta correcta
+$ sudo lvextend -r -l +100%FREE /dev/vg0/lv_var</code></pre>
+
+<div class="tip">
+  Las dos ampliaciones funcionan <strong>con el filesystem montado y el servicio corriendo</strong>. Es la diferencia entre resolver un disco lleno en dos minutos sin ventana de mantenimiento, o coordinar una parada. Achicar es otra historia: ext4 exige desmontar y <strong>XFS no se puede achicar nunca</strong>. Si dudás del tamaño, empezá corto: crecer es trivial, encoger no.
+</div>
+
+<h3>Snapshots y su costo real</h3>
+
+<pre><code class="lang-bash">$ sudo lvcreate -s -L 10G -n snap_var /dev/vg0/lv_var
+  Logical volume "snap_var" created.
+
+$ sudo mount -o ro /dev/vg0/snap_var /mnt/snap    # backup consistente desde acá
+$ sudo lvs -o lv_name,origin,data_percent vg0
+  LV       Origin  Data%
+  snap_var lv_var   17.42                          # ← vigilar ESTA columna
+
+$ sudo lvremove /dev/vg0/snap_var                  # borrarlo apenas termina el backup</code></pre>
+
+<table>
+<thead><tr><th>Costo</th><th>Detalle</th></tr></thead>
+<tbody>
+<tr><td><strong>Amplificación de escritura</strong></td><td>Cada escritura al <em>origen</em> obliga a leer el bloque viejo y copiarlo al snapshot antes de sobrescribir: hasta <strong>3× el I/O</strong> y latencia notablemente peor mientras el snapshot exista</td></tr>
+<tr><td><strong>Se puede invalidar</strong></td><td>Si el snapshot se llena (<code>Data% = 100</code>), queda <strong>inutilizable</strong> y hay que descartarlo. Se dimensiona por la <em>tasa de cambio</em> esperada, no por el tamaño del origen</td></tr>
+<tr><td><strong>No es un backup</strong></td><td>Vive en el mismo VG, en el mismo disco físico. Un disco que muere se lleva el origen y el snapshot juntos</td></tr>
+<tr><td><strong>Thin pools</strong></td><td><code>lvcreate --thin</code> abarata mucho los snapshots, pero si el pool se agota los LVs pasan a solo lectura o se congelan. Monitoreá <code>lvs -o data_percent,metadata_percent</code> con alertas, no a mano</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Un snapshot LVM clásico dura minutos, no días.</strong> Su único caso de uso sano es congelar el estado el tiempo justo para copiarlo a otro lado, y borrarlo enseguida. Un snapshot que quedó olvidado hace tres semanas es a la vez una degradación permanente de rendimiento y una bomba de tiempo esperando a llenarse.
+</div>
+
+<h2>LS4.7 Latencia de I/O: leer <code>iostat -x</code> de verdad</h2>
+
+<pre><code class="lang-bash">$ iostat -x 1 3        # el PRIMER bloque es el promedio desde el boot: ignoralo
+Linux 6.8.0-45-generic (web-01)   03/09/2026   _x86_64_   (8 CPU)
+
+Device      r/s    rkB/s  rrqm/s  %rrqm r_await rareq-sz     w/s    wkB/s  w_await wareq-sz  aqu-sz  %util
+nvme0n1   12.00   192.00    0.00   0.00    0.18    16.00  980.00 62720.00     1.42    64.00    1.41  62.40
+sda      105.00  4200.00    2.00   1.87   18.60    40.00   60.00  1440.00    42.30    24.00    3.49  99.60</code></pre>
+
+<table>
+<thead><tr><th>Columna</th><th>Qué mide</th><th>Cómo se lee</th></tr></thead>
+<tbody>
+<tr><td><code>r/s</code>, <code>w/s</code></td><td>Operaciones por segundo (IOPS)</td><td>El volumen de pedidos, no su tamaño</td></tr>
+<tr><td><code>rkB/s</code>, <code>wkB/s</code></td><td>Ancho de banda</td><td>Comparalo contra el máximo del dispositivo</td></tr>
+<tr><td><code>rrqm/s</code>, <code>%rrqm</code></td><td>Pedidos fusionados por el kernel antes de mandarlos</td><td>Alto = patrón secuencial y el scheduler está ayudando</td></tr>
+<tr><td><code>rareq-sz</code>, <code>wareq-sz</code></td><td>Tamaño medio de cada pedido, en kB</td><td>4–16 kB = aleatorio. 128 kB+ = secuencial. <strong>Es el mejor indicador del patrón</strong></td></tr>
+<tr><td><strong><code>r_await</code>, <code>w_await</code></strong></td><td><strong>Latencia total en ms, cola incluida</strong></td><td><strong>La métrica que importa.</strong> NVMe sano &lt; 1 ms; SATA SSD &lt; 5 ms; HDD 5–20 ms</td></tr>
+<tr><td><code>aqu-sz</code></td><td>Profundidad media de la cola (Little: IOPS × await ÷ 1000)</td><td>Cuánto trabajo hay simultáneamente en vuelo</td></tr>
+<tr><td><code>%util</code></td><td>% del tiempo con <strong>al menos un</strong> pedido en vuelo</td><td>⚠️ Engañoso en cualquier dispositivo paralelo. Ver abajo</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ <code>%util</code> al 100% NO significa saturado en SSD/NVMe.</strong> La métrica nació para discos rotativos, donde había <em>un</em> brazo: si estaba ocupado el 100% del tiempo, estaba al límite. Un NVMe atiende decenas de pedidos <strong>en paralelo</strong>. Un flujo constante de un solo pedido a la vez lo deja en <code>%util = 100%</code> usando quizá el 3% de su capacidad real. El manual de <code>iostat</code> lo advierte explícitamente. La saturación se diagnostica con <strong><code>await</code> creciendo</strong> y <strong><code>aqu-sz</code> alto</strong>, no con <code>%util</code>.
+</div>
+
+<p>Volvé a mirar la salida de arriba con eso en la cabeza y las dos líneas cuentan historias opuestas:</p>
+
+<div class="step"><strong><code>nvme0n1</code>: <code>%util</code> 62% pero <code>w_await</code> 1,42 ms con <code>aqu-sz</code> 1,41 y pedidos de 64 kB.</strong> Escrituras secuenciales grandes, latencia excelente, cola casi vacía. El dispositivo está aburrido. Cualquiera que mire solo <code>%util</code> diría "va por la mitad"; en realidad hay muchísimo margen.</div>
+
+<div class="step"><strong><code>sda</code>: <code>%util</code> 99,6%, <code>r_await</code> 18,6 ms, <code>aqu-sz</code> 3,49 y pedidos de 40 kB.</strong> Un disco rotativo con lecturas aleatorias: la cola tiene siempre tres o cuatro pedidos esperando y cada uno paga casi 19 ms. <strong>Este sí está saturado</strong>, y ninguna optimización de software lo va a arreglar — o se reduce el I/O aleatorio, o se cambia el medio.</div>
+
+<div class="tip">
+  Complementá con el <em>quién</em>, que <code>iostat</code> no te da: <code>pidstat -d 1</code> y <code>iotop -oPa</code> muestran I/O por proceso. Y ojo con <code>/proc/PID/io</code>: <code>rchar</code>/<code>wchar</code> cuentan bytes que pasaron por las syscalls (incluidos los aciertos de cache), mientras que <code>read_bytes</code>/<code>write_bytes</code> cuentan I/O real contra el dispositivo. Un proceso que "lee 2 GB/s" con <code>read_bytes</code> en cero está leyendo de la page cache y no toca el disco.
+</div>
+
+<h2>LS4.8 I/O schedulers: cuál para cada medio</h2>
+
+<pre><code class="lang-bash">$ cat /sys/block/nvme0n1/queue/scheduler
+[none] mq-deadline kyber bfq                 # el activo va entre corchetes
+
+$ cat /sys/block/sda/queue/rotational
+1                                            # 1 = plato girando, 0 = estado sólido
+
+$ echo bfq | sudo tee /sys/block/sda/queue/scheduler     # cambio inmediato, no persiste</code></pre>
+
+<table>
+<thead><tr><th>Scheduler</th><th>Para qué medio</th><th>Qué aporta</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><code>none</code></td><td><strong>NVMe</strong>, SSDs rápidos, virtio cuyo host ya ordena</td><td>Overhead mínimo de CPU; deja que el dispositivo ordene, que sabe más</td><td>Ninguna equidad: un proceso puede acaparar la cola</td></tr>
+<tr><td><code>mq-deadline</code></td><td>SSD SATA, HDD, cargas mixtas</td><td>Plazos por pedido (lecturas ~500 ms, escrituras ~5 s): evita la inanición de lecturas</td><td>Control fino de equidad, escaso</td></tr>
+<tr><td><code>kyber</code></td><td>NVMe rápidos con objetivo explícito de latencia</td><td>Ajusta la profundidad de cola para sostener un target de latencia</td><td>Poco usado; hay que saber qué target pedir</td></tr>
+<tr><td><code>bfq</code></td><td><strong>Discos rotativos</strong>, escritorio, cuando importa la interactividad</td><td>Equidad proporcional real; integra con los pesos de cgroup</td><td>Consume CPU y baja el throughput pico; a IOPS muy altas es contraproducente</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Persistirlo como corresponde: por udev, según el tipo de dispositivo
+$ sudo tee /etc/udev/rules.d/60-ioschedulers.rules &lt;&lt;'EOF'
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+EOF
+$ sudo udevadm control --reload &amp;&amp; sudo udevadm trigger</code></pre>
+
+<div class="warn">
+  <strong>Cuándo NO tocar el scheduler:</strong> casi siempre. Las distros modernas ya eligen <code>none</code> para NVMe y <code>mq-deadline</code> para el resto, y esa elección es buena. Cambiarlo tiene sentido con un síntoma concreto —por ejemplo, un backup nocturno que deja la interfaz interactiva inutilizable en un servidor con discos rotativos, donde <code>bfq</code> ayuda de verdad— y siempre con un <code>fio</code> antes y después. Sin medición, es superstición.
+</div>
+
+<h2>LS4.9 Cuotas de I/O por cgroup</h2>
+
+<p>El scheduler reparte, pero no limita. Para poner un techo duro está el controlador <code>io</code> de cgroup v2 (LS3), que trabaja por dispositivo identificado con su par mayor:menor:</p>
+
+<pre><code class="lang-bash">$ lsblk -d -o NAME,MAJ:MIN
+NAME    MAJ:MIN
+nvme0n1   259:0
+
+# Techo: 10 MB/s de lectura, 5 MB/s de escritura, 1000 IOPS de lectura
+$ echo "259:0 rbps=10485760 wbps=5242880 riops=1000" \
+    | sudo tee /sys/fs/cgroup/backup.slice/io.max
+
+$ cat /sys/fs/cgroup/backup.slice/io.stat
+259:0 rbytes=8412160 wbytes=4194304 rios=214 wios=98 dbytes=0 dios=0</code></pre>
+
+<pre><code class="lang-bash"># En la práctica se declara en la unidad de systemd, no a mano (ver LS7)
+[Service]
+IOWeight=50                                     # peso relativo, 1-10000
+IOReadBandwidthMax=/dev/nvme0n1 10M
+IOWriteBandwidthMax=/dev/nvme0n1 5M
+IOReadIOPSMax=/dev/nvme0n1 1000</code></pre>
+
+<div class="info">
+  Para que las <strong>escrituras bufferizadas</strong> se cobren al cgroup correcto —y no al <code>kworker</code> que hace el writeback mucho después— hacen falta tres cosas: cgroup <strong>v2</strong>, los controladores <code>memory</code> <em>e</em> <code>io</code> habilitados en el mismo cgroup, y un filesystem con soporte de <em>cgroup writeback</em> (ext4, Btrfs y XFS lo tienen). Si falta alguna, vas a limitar bien las lecturas y las escrituras directas, y las bufferizadas se te van a escapar. Es la causa número uno de "puse <code>io.max</code> y el backup sigue matando al servidor".
+</div>
+
+<div class="tip">
+  <code>IOWeight</code> (proporcional, solo con <code>bfq</code> y bajo contención) casi siempre es mejor idea que <code>IOReadBandwidthMax</code> (techo absoluto). El peso deja que el trabajo de fondo use todo el disco cuando nadie más lo necesita, y lo hace ceder cuando llega tráfico real. Un techo absoluto desperdicia capacidad las 24 horas para protegerte en las dos que importan.
+</div>
+
+<h2>LS4.10 Caja de herramientas de diagnóstico</h2>
+
+<table>
+<thead><tr><th>Pregunta</th><th>Herramienta</th><th>Qué mirar</th></tr></thead>
+<tbody>
+<tr><td>¿Cuánto espacio queda?</td><td><code>df -h</code> · <code>df -i</code></td><td>El FS lo sabe por su superbloque. <code>-i</code> revela inodos agotados</td></tr>
+<tr><td>¿Quién ocupa el espacio?</td><td><code>du -xh --max-depth=1 /</code> · <code>ncdu -x /</code></td><td><code>-x</code> evita cruzar a otros filesystems y contar de más</td></tr>
+<tr><td>¿Hay archivos borrados abiertos?</td><td><code>sudo lsof +L1</code></td><td>Columna <code>NLINK = 0</code> y el sufijo <code>(deleted)</code></td></tr>
+<tr><td>¿Quién genera el I/O?</td><td><code>iotop -oPa</code> · <code>pidstat -d 1</code></td><td>Proceso, lectura/escritura acumulada</td></tr>
+<tr><td>¿Cuánto tarda cada operación?</td><td><code>iostat -x 1</code> · <code>biolatency</code></td><td>Latencia y su <strong>distribución</strong>, no solo el promedio</td></tr>
+<tr><td>¿Qué operación tarda?</td><td><code>biosnoop</code> · <code>bpftrace</code> (LS6)</td><td>Cada pedido con su proceso, sector y latencia</td></tr>
+<tr><td>¿Está fragmentado?</td><td><code>filefrag -v archivo</code></td><td>Cantidad de extents; relevante en rotativo y en Btrfs con CoW</td></tr>
+<tr><td>¿El disco se está muriendo?</td><td><code>smartctl -a /dev/sda</code> · <code>nvme smart-log</code></td><td>Sectores reasignados, errores CRC, <code>percentage_used</code></td></tr>
+</tbody>
+</table>
+
+<h3>Por qué <code>df</code> y <code>du</code> nunca dan lo mismo</h3>
+
+<p>No es que uno esté mal: <strong>miden cosas distintas</strong>. <code>df</code> le pregunta al filesystem cuántos bloques tiene libres. <code>du</code> recorre el árbol de directorios y suma lo que ocupan los archivos <em>que puede alcanzar</em>. Todas las diferencias salen de esa asimetría:</p>
+
+<table>
+<thead><tr><th>Causa</th><th>Efecto</th><th>Cómo confirmarlo</th></tr></thead>
+<tbody>
+<tr><td><strong>Archivos borrados con descriptor abierto</strong></td><td><code>df</code> los cuenta, <code>du</code> no los ve. <strong>La causa más común</strong></td><td><code>sudo lsof +L1</code></td></tr>
+<tr><td>Bloques reservados para root (5% en ext4)</td><td><code>df</code> los descuenta de "Avail"</td><td><code>tune2fs -l /dev/X | grep -i reserved</code></td></tr>
+<tr><td>Archivos ocultos bajo un punto de montaje</td><td>Ocupan espacio pero están tapados y nadie los ve</td><td>Montar el dispositivo padre con <code>mount --bind</code> en otro lado</td></tr>
+<tr><td>Archivos sparse (imágenes de VM, logs preasignados)</td><td><code>du</code> muestra bloques reales; <code>ls -l</code> muestra el tamaño aparente</td><td><code>du --apparent-size -h</code> vs <code>du -h</code></td></tr>
+<tr><td>Hard links</td><td><code>du</code> cuenta el contenido una sola vez</td><td><code>find . -links +1 -type f</code></td></tr>
+<tr><td><code>du</code> sin permisos en algún subdirectorio</td><td>Suma de menos, en silencio</td><td>Correrlo con <code>sudo</code> y mirar el stderr</td></tr>
+<tr><td><strong>Inodos agotados</strong></td><td>"No space left on device" con espacio libre de sobra</td><td><code>df -i</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Distribución de latencia por dispositivo, en producción, con overhead bajo (LS6)
+$ sudo biolatency-bpfcc -D 10 1
+Tracing block device I/O... Hit Ctrl-C to end.
+
+disk = 'nvme0n1'
+     usecs               : count     distribution
+        64 -&gt; 127        : 1204     |****************************************|
+       128 -&gt; 255        :  812     |***************************             |
+       256 -&gt; 511        :  190     |******                                  |
+       512 -&gt; 1023       :   24     |                                        |
+      1024 -&gt; 2047       :    3     |                                        |</code></pre>
+
+<div class="rule">
+  <strong>📌 El promedio de latencia miente; la distribución no.</strong> Un <code>await</code> promedio de 0,3 ms puede esconder una cola de pedidos de 50 ms que son justo los que arruinan tu percentil 99. <code>biolatency</code> muestra el histograma completo, y ahí es donde aparecen los problemas que el promedio disuelve.
+</div>
+
+<h2>LS4.11 Cuándo NO hacer nada de esto</h2>
+
+<p>Este módulo es una caja de herramientas afiladas, y casi todas tienen una forma de cortarte. La lista de "no lo hagas" vale tanto como la de "hacelo":</p>
+
+<div class="step"><strong>No toques <code>vm.dirty_*</code> sin una medición antes y después.</strong> Bajarlos demasiado convierte tus escrituras secuenciales en un goteo síncrono y arruina el throughput que querías proteger.</div>
+
+<div class="step"><strong>No montes con <code>nobarrier</code>.</strong> La ganancia en hardware moderno es marginal y el modo de falla es un filesystem corrupto. Si tenés BBU o PLP, medí primero: probablemente no ganes nada.</div>
+
+<div class="step"><strong>No uses <code>O_DIRECT</code> porque "es más rápido".</strong> Salvo que hayas escrito tu propio administrador de cache, vas a perder contra la page cache del kernel, que lleva treinta años afinándose.</div>
+
+<div class="step"><strong>No dejes snapshots LVM vivos por días</strong>, y no los llames backup. Y si usás thin pools, alertá sobre <code>data_percent</code> antes de llegar al 80%.</div>
+
+<div class="step"><strong>No elijas XFS si hay alguna chance de tener que achicar</strong>, y no elijas Btrfs RAID5/6 para nada que te importe: sigue teniendo el <em>write hole</em> sin resolver.</div>
+
+<div class="step"><strong>No reinicies el servicio como primer reflejo</strong> ante un disco lleno. Suele funcionar, y por eso es tan peligroso: destruye la evidencia y garantiza que el mismo incidente vuelva el mes que viene.</div>
+
+<h2>🧑‍🎓 Worked Example — "<code>df</code> dice 100% lleno pero <code>du</code> suma la mitad"</h2>
+
+<blockquote>02:47. Alerta: <code>/var</code> al 100% en <code>app-prod-03</code>. La aplicación tira errores de escritura. El <code>df</code> dice 47 GB usados de 50; el <code>du</code> del mismo directorio suma 23 GB. Faltan 24 GB que nadie encuentra. El reflejo del equipo es reiniciar Tomcat, y va a funcionar. Vamos a no hacer eso.</blockquote>
+
+<p><strong>Paso 1 — Confirmar la contradicción y descartar lo barato.</strong></p>
+
+<pre><code class="lang-bash">$ df -h /var
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vg0-lv_var     50G   47G     0 100% /var
+
+$ sudo du -sh /var
+23G     /var
+
+$ df -i /var                      # ¿inodos agotados? No: 3% de uso
+Filesystem                Inodes  IUsed    IFree IUse% Mounted on
+/dev/mapper/vg0-lv_var   3276800 104233  3172567    4% /var</code></pre>
+
+<p>Con inodos sanos, quedan tres sospechosos de LS4.10: archivos tapados por un punto de montaje, archivos sparse mal interpretados, o <strong>archivos borrados que siguen abiertos</strong>. Un delta de 24 GB en un servidor de aplicación apunta directo al tercero.</p>
+
+<p><strong>Paso 2 — La pregunta que resuelve el caso.</strong></p>
+
+<pre><code class="lang-bash">$ sudo lsof +L1 /var
+COMMAND    PID   USER   FD   TYPE DEVICE   SIZE/OFF NLINK    NODE NAME
+java     21874 tomcat  27w   REG  253,3 18253611008     0 1441801 /var/log/app/catalina.out (deleted)
+filebeat  1032   root  12r   REG  253,3 18253611008     0 1441801 /var/log/app/catalina.out (deleted)
+rsyslogd   904 syslog   7w   REG  253,3  7516192768     0 1441990 /var/log/syslog.1 (deleted)</code></pre>
+
+<p>Ahí están los 24 GB: <strong>17 GB en un <code>catalina.out</code> borrado</strong> más <strong>7 GB de un <code>syslog.1</code> borrado</strong>. Fijate en dos detalles que confirman todo:</p>
+
+<ul>
+  <li><code>NLINK = 0</code>: ninguna entrada de directorio apunta a esos inodos. Por eso <code>du</code>, que recorre nombres, no los ve.</li>
+  <li><code>java</code> y <code>filebeat</code> comparten el <code>NODE 1441801</code>: <strong>es el mismo inodo</strong>, abierto por dos procesos distintos. Java escribe (<code>27w</code>), filebeat lee (<code>12r</code>).</li>
+</ul>
+
+<p><strong>Paso 3 — La causa, en términos de inodos y descriptores.</strong></p>
+
+<div class="concept">
+  <strong>💡 Lo que pasó.</strong> <code>logrotate</code> renombró <code>catalina.out</code> y después borró la copia vieja, sin avisarle a Tomcat. Pero Tomcat abrió el archivo <em>una vez, al arrancar</em>, y tiene su descriptor 27 apuntando al <strong>inodo</strong>, no al nombre. El <code>unlink()</code> bajó el link count a 0, pero el kernel no puede liberar los bloques porque hay descriptores abiertos. Tomcat sigue escribiendo, feliz, en un archivo que ya no tiene nombre — <strong>y ese archivo fantasma sigue creciendo</strong>. El log "nuevo" que rota logrotate está vacío; todo el volumen se va al fantasma. Por eso el incidente reaparece cada mes: el archivo se recrea invisible después de cada rotación.
+</div>
+
+<p><strong>Paso 4 — Recuperar el espacio sin reiniciar nada.</strong> Hay dos caminos, y el orden importa:</p>
+
+<pre><code class="lang-bash"># ── Opción A (preferida): decirle al proceso que reabra sus logs ────────────
+$ sudo kill -HUP 904                    # rsyslogd reabre sus archivos con SIGHUP
+$ sudo systemctl reload nginx           # nginx: USR1 vía reload
+
+# Tomcat/Java no reabre con una señal. Para eso está la opción B.
+
+# ── Opción B (universal): truncar el archivo A TRAVÉS del descriptor ────────
+$ sudo ls -l /proc/21874/fd/27
+l-wx------ 1 root root 64 sep  3 02:51 /proc/21874/fd/27 -&gt; /var/log/app/catalina.out (deleted)
+
+$ sudo truncate -s 0 /proc/21874/fd/27
+# equivalente:  : | sudo tee /proc/21874/fd/27
+
+$ df -h /var
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vg0-lv_var     50G   6,1G   41G  13% /var</code></pre>
+
+<div class="warn">
+  <strong>El matiz de truncar por <code>/proc</code>.</strong> Si el proceso abrió el archivo con <code>O_APPEND</code> —lo normal en un logger—, la próxima escritura vuelve a arrancar desde el byte 0 y todo queda limpio. Si lo abrió <strong>sin</strong> <code>O_APPEND</code>, su offset interno sigue apuntando a los 17 GB: la siguiente escritura ocurre en esa posición y te deja un archivo <em>sparse</em>, que aparenta 17 GB pero solo ocupa los bloques nuevos. El espacio se recupera igual; solo que el <code>ls -l</code> va a mostrar un número raro hasta la próxima rotación. Y no truques el fd de una base de datos ni de nada que no sea un log: estarías descartando datos que el proceso considera escritos.
+</div>
+
+<p><strong>Paso 5 — Arreglar la causa, no el síntoma.</strong> Recuperar 41 GB a las tres de la mañana no es la solución; es el paréntesis para poder pensar. La corrección real es que la rotación deje de huerfanar inodos:</p>
+
+<pre><code class="lang-bash"># /etc/logrotate.d/app  —  la clave es el bloque postrotate o copytruncate
+/var/log/app/catalina.out {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate          # copia y trunca EL MISMO inodo: el fd sigue siendo válido
+}</code></pre>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Cómo evita el problema</th><th>Qué cuesta</th></tr></thead>
+<tbody>
+<tr><td><code>copytruncate</code></td><td>Nunca borra el inodo: lo copia y lo trunca en el lugar</td><td>Carrera real: se pierden las líneas escritas entre el copy y el truncate. Además duplica el archivo en disco un instante</td></tr>
+<tr><td><code>postrotate</code> + señal</td><td>El proceso reabre y suelta el inodo viejo</td><td>Solo sirve si el proceso sabe reabrir con una señal</td></tr>
+<tr><td><strong>Loguear a stdout</strong> y dejar que journald/el runtime rote (LS7)</td><td>La aplicación deja de administrar archivos: el problema desaparece de raíz</td><td>Requiere tocar el despliegue. Es la respuesta correcta a largo plazo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección no es "usá <code>lsof +L1</code>".</strong> Es que <code>df</code> y <code>du</code> no se contradicen nunca: miden objetos distintos, y la diferencia entre ambos <em>es en sí misma un diagnóstico</em>. Cuando entendés que el nombre y el inodo son cosas separadas, el síntoma deja de ser un misterio y se convierte en una deducción de dos pasos. Y reiniciar el servicio también habría "funcionado" — cerrando los descriptores, borrando la evidencia y garantizando que volvieras a las 02:47 el mes siguiente.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Borraste un archivo de 20 GB y <code>df</code> no cambió. ¿Por qué, y qué hacés?</summary>
+<p>Porque <code>rm</code> no borra datos: llama a <code>unlink()</code>, que solo elimina la asociación <em>nombre → inodo</em> y baja el link count. El kernel libera los bloques cuando el link count llega a cero <strong>y</strong> ningún proceso tiene el archivo abierto. Si un proceso conserva el descriptor —lo típico tras una rotación de logs mal configurada— el inodo sigue vivo, invisible para <code>du</code> (que recorre nombres) pero presente para <code>df</code> (que consulta bloques libres). Se confirma con <code>sudo lsof +L1</code>, mirando <code>NLINK = 0</code>. Se resuelve haciendo que el proceso suelte el descriptor (señal de reapertura, <code>reload</code>) o truncando por <code>/proc/PID/fd/N</code>. La causa de fondo se arregla con <code>copytruncate</code>, con un <code>postrotate</code> que señalice al proceso, o mandando los logs a stdout.</p></details>
+
+<details><summary>¿Qué te garantiza el journaling del filesystem tras un corte de luz, y qué no?</summary>
+<p>Garantiza que la <strong>metadata</strong> queda consistente: el filesystem monta sin estados imposibles y sin un <code>fsck</code> de horas, porque las transacciones a medias se completan o se descartan al releer el journal. <em>No</em> garantiza nada sobre el contenido de tus archivos: si tu aplicación escribió y no llamó a <code>fsync</code>, esos bytes estaban en la page cache y se perdieron; el archivo puede quedar truncado, vacío o con la versión anterior. Tampoco detecta corrupción del medio —ext4 y XFS validan metadata con checksums, pero no los datos— ni te salva de un dispositivo que confirma flushes que no ejecutó. Journal y <code>fsync</code> resuelven problemas distintos y no se sustituyen.</p></details>
+
+<details><summary><code>iostat</code> muestra <code>%util</code> 100% en un NVMe. ¿Cambiás el disco?</summary>
+<p>No, todavía no medís nada útil. <code>%util</code> es el porcentaje del tiempo en que el dispositivo tuvo <strong>al menos un</strong> pedido en vuelo. En un disco rotativo, con un solo brazo, eso equivalía a saturación. Un NVMe atiende decenas de pedidos en paralelo: un flujo continuo de un pedido a la vez lo marca al 100% mientras usa una fracción mínima de su capacidad. La saturación real se ve en <code>w_await</code>/<code>r_await</code> subiendo por encima de la línea base del dispositivo (menos de 1 ms en un NVMe sano) junto con un <code>aqu-sz</code> alto. Si <code>await</code> está bajo y <code>aqu-sz</code> ronda 1, el disco está ocioso y el cuello de botella está en otro lado.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>VFS</strong> modela todo con cuatro objetos: superblock, <strong>inode</strong> (el archivo), <strong>dentry</strong> (el nombre) y <strong>file</strong> (el descriptor). El nombre no es el archivo, y de ahí se deduce casi todo lo demás.</li>
+  <li>Un archivo se libera cuando su <strong>link count llega a 0 <em>y</em> nadie lo tiene abierto</strong>. Por eso <code>df</code> puede decir 100% mientras <code>du</code> dice la mitad: <code>lsof +L1</code> es el desempate.</li>
+  <li>Un <code>write()</code> deja el dato en la <strong>page cache</strong>, marcado <em>dirty</em>. El writeback lo baja después, por umbral (<code>vm.dirty_*</code>) o por antigüedad. Rápido ≠ persistido.</li>
+  <li><strong>Durabilidad</strong>: <code>fsync</code> (datos + metadata + flush del dispositivo), <code>fdatasync</code> (más barato, sin <code>mtime</code>), <code>O_SYNC</code> (implícito por write), <code>O_DIRECT</code> (saltea la cache, <strong>no</strong> da durabilidad). Tras crear un archivo, falta el <code>fsync</code> <strong>del directorio</strong>.</li>
+  <li>Elegir FS: <strong>ext4</strong> por defecto, <strong>XFS</strong> para escala (jamás se achica), <strong>Btrfs</strong> por snapshots y rollback, <strong>ZFS</strong> por integridad de datos, <strong>overlayfs</strong> te lo imponen los contenedores (cuidado con el copy-up), <strong>tmpfs</strong> es RAM y se cobra al cgroup.</li>
+  <li>El <strong>journaling</strong> protege la consistencia de la metadata. No protege tus datos, no detecta bit rot y no reemplaza a <code>fsync</code>.</li>
+  <li><strong>LVM</strong> permite <code>lvextend -r</code> en caliente sin ventana de mantenimiento. Los snapshots clásicos cuestan hasta 3× de I/O, se invalidan si se llenan y no son backups.</li>
+  <li><strong><code>%util</code> no mide saturación</strong> en dispositivos paralelos. Se diagnostica con <code>await</code> y <code>aqu-sz</code>, y se confirma con la <em>distribución</em> de latencia (<code>biolatency</code>), no con el promedio.</li>
+  <li><strong>Schedulers</strong>: <code>none</code> para NVMe, <code>mq-deadline</code> como default sensato, <code>bfq</code> para rotativo cuando importa la interactividad. Cambiarlo sin medir es superstición.</li>
+  <li>Las <strong>cuotas por cgroup</strong> (<code>io.max</code>, <code>IOWeight</code>) solo alcanzan a las escrituras bufferizadas si están <code>memory</code> e <code>io</code> juntos en cgroup v2 sobre un FS con cgroup writeback.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Creá un archivo de 1 GB con <code>dd</code>, abrilo desde otra terminal con <code>tail -f</code>, borralo y comprobá con <code>df</code>, <code>du</code> y <code>lsof +L1</code> que el espacio no se liberó. Recuperalo truncando por <code>/proc/PID/fd/N</code> y documentá cada número que viste.</li>
+  <li>Armá un directorio con un archivo, un hard link y un symlink al mismo contenido. Mostrá con <code>ls -li</code> y <code>stat</code> los números de inodo y los link counts. Borrá el original y explicá, sin ejecutarlo primero, qué le pasa a cada uno.</li>
+  <li>Copiá un archivo de varios GB mientras corrés <code>watch -n1 "grep -E '^(Dirty|Writeback):' /proc/meminfo"</code>. Graficá o describí cómo sube <code>Dirty</code> y cuándo arranca el writeback. Relacioná los valores con tu <code>vm.dirty_background_ratio</code>.</li>
+  <li>Escribí un script que cree 1000 archivos chicos con y sin <code>fsync</code> por archivo (con <code>python</code> o con <code>dd oflag=dsync</code>). Cronometrá ambos, calculá el costo por <code>fsync</code> en tu hardware y compará contra la tabla de LS4.3.</li>
+  <li>Con <code>iostat -x 1</code> corriendo, generá carga secuencial y después aleatoria con <code>fio</code>. Armá una tabla con <code>r/s</code>, <code>rareq-sz</code>, <code>r_await</code>, <code>aqu-sz</code> y <code>%util</code> en ambos casos, y explicá cuál de esas columnas te habría dicho el patrón sin saberlo de antemano.</li>
+  <li>Creá un VG con un archivo de loop (<code>losetup</code>), un LV de 1 GB con ext4 y llenalo al 90%. Extendelo en caliente con <code>lvextend -r</code> sin desmontar y verificá con <code>df</code>. Después sacá un snapshot, escribí en el origen y observá cómo sube <code>Data%</code> en <code>lvs</code>.</li>
+  <li>Poné un <code>io.max</code> a un cgroup con un límite bajo de <code>wbps</code> y comprobá con <code>dd</code> que efectivamente limita la escritura <strong>directa</strong> (<code>oflag=direct</code>). Repetilo sin <code>oflag=direct</code> y explicá la diferencia que veas en términos de writeback y atribución por cgroup.</li>
+</ol>
+
+<section class="quiz" id="quizLS4">
+  <style>
+    #quizLS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizLS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizLS4 .q{margin-bottom:1.5rem}
+    #quizLS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizLS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizLS4 .opt:hover{border-color:var(--accent)}
+    #quizLS4 .opt:disabled{cursor:default}
+    #quizLS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizLS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizLS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizLS4 .exp.show{display:block}
+    #quizLS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. <code>df</code> reporta <code>/var</code> al 100%, <code>du -sh /var</code> suma la mitad y <code>df -i</code> muestra los inodos casi vacíos. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">El filesystem está corrupto y hay que desmontarlo para correr <code>fsck</code></button>
+    <button class="opt">Hay archivos borrados que algún proceso mantiene abiertos: <code>du</code> no los ve porque no tienen nombre</button>
+    <button class="opt"><code>du</code> es más preciso que <code>df</code>, así que el espacio libre real es el que dice <code>du</code></button>
+    <div class="exp">Es el caso clásico del log rotado mal. <code>unlink()</code> quita el nombre, pero el inodo y sus bloques siguen asignados mientras haya un descriptor abierto, y el proceso a veces sigue escribiendo ahí. <code>du</code> recorre nombres y no lo ve; <code>df</code> pregunta por bloques libres y sí. Se confirma con <code>sudo lsof +L1</code> (<code>NLINK = 0</code>) y se resuelve sin reiniciar, señalizando al proceso para que reabra o truncando por <code>/proc/PID/fd/N</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Un NVMe muestra <code>%util</code> 100%, <code>w_await</code> 0,4 ms y <code>aqu-sz</code> 1,1. ¿Qué concluís?</p>
+    <button class="opt">Está saturado: hay que comprar un disco más rápido o repartir la carga</button>
+    <button class="opt">Está saturado, pero se arregla cambiando el scheduler a <code>bfq</code></button>
+    <button class="opt">No está saturado: <code>%util</code> solo dice que siempre hubo un pedido en vuelo, y la latencia baja con cola ≈ 1 confirma que sobra capacidad</button>
+    <div class="exp"><code>%util</code> mide el porcentaje de tiempo con al menos un pedido en vuelo, una métrica pensada para discos de un solo brazo. Un NVMe atiende decenas de pedidos en paralelo, así que un flujo constante de a uno lo deja al 100% usando una fracción de su capacidad. Con <code>await</code> de 0,4 ms y <code>aqu-sz</code> de 1,1 el dispositivo está cómodo: el cuello de botella está en otro lado. Y <code>bfq</code> sobre NVMe normalmente empeora las cosas.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu app escribe <code>config.tmp</code>, le hace <code>fsync</code>, la renombra sobre <code>config.json</code> y se corta la luz. Al volver, <code>config.json</code> tiene la versión vieja. ¿Qué faltó?</p>
+    <button class="opt">Un <code>fsync</code> del <strong>directorio</strong> padre: el <code>rename()</code> modifica la entrada de directorio, que también vive en la page cache</button>
+    <button class="opt">Abrir el archivo con <code>O_DIRECT</code>, que es lo único que garantiza persistencia</button>
+    <button class="opt">Nada: <code>rename()</code> es atómico, así que el archivo tuvo que quedar actualizado sí o sí</button>
+    <div class="exp"><code>rename()</code> es atómico <em>respecto de otros procesos</em> —nadie ve un estado intermedio— pero eso no dice nada sobre un corte de energía. El cambio de nombre es una modificación de metadata del directorio y se queda en la page cache como cualquier otra. Después del <code>rename</code> hay que abrir el directorio con <code>O_DIRECTORY</code> y hacerle <code>fsync</code>. Y <code>O_DIRECT</code> no habría ayudado: saltea la page cache, pero no garantiza durabilidad — el dato puede quedarse en la cache DRAM del dispositivo.</div>
+  </div>
+
+  <div class="score" id="scoreLS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizLS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreLS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con LS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ls3-namespaces-cgroups/lecture.html">← LS3: Namespaces y cgroups</a>
+  <a href="../ls5-redes/lecture.html">LS5: Redes a fondo →</a>
+</nav>
+
+</div>
+</body>
+</html>

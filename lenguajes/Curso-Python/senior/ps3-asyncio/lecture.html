@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS3 — asyncio a fondo · Python Senior</title>
+  <meta name="description" content="El event loop por dentro, corrutinas como generadores, qué hace realmente await, TaskGroup y ExceptionGroup, asyncio.timeout y shield, cancelación correcta, los cuatro errores clásicos, backpressure, testing y shutdown en producción.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS3</span>
+  <span class="badge">⏱ 40–105 min</span>
+  <span class="badge">🎯 Pre-req: PS1</span>
+  <span class="badge">⚡ Concurrencia</span>
+</div>
+
+<article>
+
+<h1>PS3 — asyncio a fondo</h1>
+
+<h2>PS3.0 Por qué: async no es "más rápido", es "más eficiente esperando"</h2>
+
+<p>La frase que arruina más código async del que arregla es <em>"lo pasamos a async para que sea más rápido"</em>. No es lo que hace. Una función <code>async</code> ejecuta exactamente el mismo bytecode que su versión síncrona, y encima paga el costo del intérprete al suspender y reanudar. Si tu programa calcula números, pasarlo a asyncio lo hace <strong>más lento</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> asyncio no acelera el trabajo: <strong>elimina el tiempo muerto</strong>. En un programa bloqueante, mientras esperás una respuesta HTTP de 200 ms, tu hilo está detenido sin hacer nada útil. asyncio te deja usar esos 200 ms para atender otras 500 conexiones. La ganancia no es de CPU, es de <strong>concurrencia por unidad de memoria</strong>: un hilo del sistema operativo cuesta megabytes de stack, una tarea de asyncio cuesta kilobytes.
+</div>
+
+<p>De ahí se deduce todo lo demás. Si la ganancia viene de aprovechar la espera, cualquier cosa que <strong>no ceda el control mientras espera</strong> destruye el modelo entero. Y esa es, casi sin excepciones, la causa raíz de todos los bugs de asyncio que vas a ver en producción.</p>
+
+<div class="analogy">
+  <strong>🍳 Un cocinero, muchas hornallas.</strong> Un cocinero bloqueante pone la olla al fuego y se queda mirándola veinte minutos. Un cocinero async pone la olla, pone un temporizador, y mientras tanto pica cebolla, atiende la puerta y arma tres platos más. No cocina más rápido: <em>no se queda parado</em>. Ahora imaginá que ese mismo cocinero decide pelar cien papas a mano en el medio del servicio: todos los temporizadores siguen sonando y nadie los atiende. Eso es bloquear el event loop.
+</div>
+
+<h2>PS3.1 El event loop por dentro</h2>
+
+<p>El event loop es <strong>un solo hilo que hace una sola cosa a la vez</strong>. No hay paralelismo, no hay preemción, no hay nada que te interrumpa: tu código corre hasta que <em>vos</em> decidís ceder el control. Esa propiedad es la que hace que asyncio sea razonable de auditar — y la que lo vuelve frágil ante una sola línea bloqueante.</p>
+
+<p>El corazón está en <code>BaseEventLoop._run_once()</code>, en <code>asyncio/base_events.py</code>. Simplificado, cada vuelta hace esto:</p>
+
+<pre><code class="lang-text">                        ┌────────────────────────────────────┐
+     ┌─────────────────►│ 1. ¿Hay callbacks pendientes        │
+     │                  │    en la cola _ready?               │
+     │                  └────────────────┬───────────────────┘
+     │              sí │                 │ no
+     │  timeout = 0    │                 │ timeout = próximo timer (o infinito)
+     │                 ▼                 ▼
+     │                  ┌────────────────────────────────────┐
+     │                  │ 2. selector.select(timeout)        │  ← epoll / kqueue / IOCP
+     │                  │    ***EL PROCESO DUERME ACÁ***     │     el SO despierta al
+     │                  └────────────────┬───────────────────┘     llegar un byte
+     │                                   ▼
+     │                  ┌────────────────────────────────────┐
+     │                  │ 3. los fds listos empujan sus       │
+     │                  │    callbacks a la cola _ready       │
+     │                  └────────────────┬───────────────────┘
+     │                                   ▼
+     │                  ┌────────────────────────────────────┐
+     │                  │ 4. los timers vencidos (heap)       │
+     │                  │    también van a _ready             │
+     │                  └────────────────┬───────────────────┘
+     │                                   ▼
+     │                  ┌────────────────────────────────────┐
+     │                  │ 5. ejecutar TODOS los callbacks     │
+     │                  │    que había al empezar el paso 5   │
+     │                  │  ──── acá corre TU código ────      │
+     └──────────────────┴────────────────────────────────────┘
+
+   Cada callback es, típicamente, Task.__step():
+   llamar coro.send(None) y correr la corrutina hasta el próximo await
+   que realmente suspenda. Si tu callback tarda 3 segundos,
+   el paso 2 no vuelve a ejecutarse en 3 segundos. Nada.</code></pre>
+
+<div class="rule">
+  <strong>📌 Todo el modelo se resume en el paso 5.</strong> El loop no puede atender I/O mientras corre tu callback, porque es el mismo hilo. La latencia de cada conexión de tu servidor es, literalmente, la suma de lo que tardan los callbacks de todas las demás. Por eso en asyncio la métrica que importa no es el throughput promedio: es <strong>la duración del callback más largo</strong>.
+</div>
+
+<p>El paso 5 tiene un detalle fino que explica muchas cosas: el loop toma la <em>longitud</em> de <code>_ready</code> antes de empezar y solo corre esa cantidad. Los callbacks que se agreguen durante esa pasada esperan a la siguiente vuelta. Eso evita que una tarea que se re-programa a sí misma con <code>call_soon</code> mate de hambre al I/O — pero no te salva de un <code>while True</code> sin <code>await</code>.</p>
+
+<h2>PS3.2 Corrutinas: generadores con mejor ropa</h2>
+
+<p>Una corrutina no es magia ni un hilo liviano. Es un <strong>objeto con estado suspendible</strong>, exactamente igual que un generador. Compartir la maquinaria es literal: <code>async def</code> produce un objeto con <code>send()</code>, <code>throw()</code> y <code>close()</code>.</p>
+
+<pre><code class="lang-python">async def sumar(a, b):
+    return a + b
+
+c = sumar(2, 3)
+type(c)            # &lt;class 'coroutine'&gt;  — NO se ejecutó nada todavía
+c.cr_frame         # tiene un frame, como un generador
+c.cr_await         # None: no está esperando nada
+
+# Lo corremos "a mano", sin event loop, como un generador:
+try:
+    c.send(None)   # arranca la corrutina
+except StopIteration as fin:
+    fin.value      # 5  &lt;- el return de una corrutina viaja en StopIteration</code></pre>
+
+<div class="info">
+  Una corrutina que nunca se ejecuta emite <code>RuntimeWarning: coroutine 'x' was never awaited</code>. Es el warning más ignorado de Python y casi siempre significa que te olvidaste un <code>await</code> o un <code>create_task</code>. Tratalo como error: <code>python -W error::RuntimeWarning</code>, o <code>filterwarnings = ["error::RuntimeWarning"]</code> en tu configuración de pytest.
+</div>
+
+<h3>Qué hace realmente <code>await</code></h3>
+
+<p>Acá está el malentendido más caro del módulo. <strong><code>await</code> no lanza un hilo, no crea concurrencia y muchas veces ni siquiera cede el control.</strong> <code>await</code> significa: <em>"delegá en este awaitable, y si él suspende, suspendo yo también"</em>. Es la versión con esteroides de <code>yield from</code>.</p>
+
+<p>Se puede demostrar sin librerías. Un objeto es <em>awaitable</em> si define <code>__await__</code> devolviendo un iterador — y lo que ese iterador hace es… <code>yield</code>:</p>
+
+<pre><code class="lang-python">class CedoElControl:
+    """Lo que sale del yield sube hasta la Task, que se lo pasa al loop."""
+    def __await__(self):
+        valor_devuelto = yield "estoy suspendida, despertame vos"
+        return valor_devuelto
+
+async def tarea():
+    print("antes")
+    r = await CedoElControl()     # &lt;-- acá el frame se congela
+    print("después, recibí:", r)
+
+c = tarea()
+print(c.send(None))    # antes / 'estoy suspendida, despertame vos'
+try:
+    c.send("listo")    # después, recibí: listo
+except StopIteration:
+    pass</code></pre>
+
+<div class="concept">
+  <strong>💡 La regla mecánica.</strong> <code>await</code> sobre un <strong>Future no terminado</strong> suspende y devuelve el control al loop. <code>await</code> sobre <strong>otra corrutina</strong> es una llamada de función común y corriente: entra, ejecuta y vuelve, sin pasar por el loop. Si esa corrutina interna nunca toca un Future, el loop <em>jamás</em> tuvo la oportunidad de correr otra cosa.
+</div>
+
+<pre><code class="lang-python">import asyncio, time
+
+async def no_cede_nunca():
+    total = 0
+    for i in range(50_000_000):     # es "async" pero no suspende jamás
+        total += i
+    return total
+
+async def latido():
+    while True:
+        print("vivo", time.strftime("%H:%M:%S"))
+        await asyncio.sleep(1)      # esto SÍ suspende: crea un timer
+
+async def main():
+    asyncio.create_task(latido())
+    await no_cede_nunca()           # el latido se calla ~4 segundos
+
+asyncio.run(main())</code></pre>
+
+<div class="mistake">
+  <strong>La palabra <code>async</code> no hace nada por sí sola.</strong> Marcar una función como <code>async def</code> no la vuelve concurrente, no la manda a otro hilo y no la hace cooperativa. Solo la vuelve <em>suspendible</em>. Si adentro no hay ningún <code>await</code> que llegue a un Future, es código bloqueante con sintaxis moderna.
+</div>
+
+<h2>PS3.3 Tasks vs corrutinas: quién corre y quién solo existe</h2>
+
+<p>Una corrutina, sola, no corre. Es un objeto inerte. Lo que el loop programa y ejecuta es una <strong><code>Task</code></strong>: un envoltorio que es a la vez un <code>Future</code> y un callback (<code>Task.__step</code>) que sabe hacerle <code>send()</code> a la corrutina cada vez que le toca.</p>
+
+<table>
+<thead><tr><th></th><th>Corrutina</th><th><code>Task</code></th></tr></thead>
+<tbody>
+<tr><td>Al crearla</td><td>No pasa nada</td><td>Se programa en el loop <strong>ya mismo</strong></td></tr>
+<tr><td><code>await x</code></td><td>La ejecuta secuencialmente</td><td>Espera el resultado; ya venía corriendo en paralelo</td></tr>
+<tr><td>Se puede cancelar</td><td>No</td><td>Sí: <code>t.cancel()</code></td></tr>
+<tr><td>Sirve para concurrencia</td><td>❌ No</td><td>✅ Sí</td></tr>
+<tr><td>Referencia fuerte</td><td>La tuya</td><td>⚠️ El loop guarda solo una <strong>débil</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">import asyncio, time
+
+async def trabajo(n):
+    await asyncio.sleep(1)
+    return n
+
+async def secuencial():          # 3 segundos: cada await espera al anterior
+    return [await trabajo(i) for i in range(3)]
+
+async def concurrente():         # 1 segundo: las tres arrancaron juntas
+    tareas = [asyncio.create_task(trabajo(i)) for i in range(3)]
+    return [await t for t in tareas]</code></pre>
+
+<div class="tip">
+  Regla de lectura rápida de código ajeno: <strong>si en el archivo no hay ni un <code>create_task</code>, ni un <code>TaskGroup</code>, ni un <code>gather</code>, no hay concurrencia.</strong> Hay un programa secuencial escrito con sintaxis async, que probablemente sea más lento que la versión síncrona. Es muchísimo más común de lo que parece.
+</div>
+
+<h2>PS3.4 <code>TaskGroup</code>: por qué reemplaza a <code>gather</code> en código nuevo</h2>
+
+<p><code>asyncio.gather</code> tiene un problema de diseño que se paga siempre en producción: <strong>cuando una tarea falla, las demás quedan corriendo</strong>. <code>gather</code> te propaga la primera excepción y se desentiende del resto. Esas tareas siguen consumiendo conexiones, escribiendo archivos a medio terminar y, cuando finalmente fallan, te dejan un <code>Task exception was never retrieved</code> en los logs a las tres de la mañana.</p>
+
+<pre><code class="lang-python">import asyncio
+
+async def rapida_y_rota():
+    await asyncio.sleep(0.1)
+    raise ValueError("me rompí")
+
+async def lenta_e_ignorada():
+    try:
+        await asyncio.sleep(5)
+        print("¡seguí corriendo 5 segundos después del error!")
+    finally:
+        print("nadie me esperó, nadie me limpió")
+
+async def main_mala():
+    await asyncio.gather(rapida_y_rota(), lenta_e_ignorada())
+    # ValueError sale a los 0.1s... y lenta_e_ignorada queda huérfana</code></pre>
+
+<p><code>TaskGroup</code> (Python 3.11+) implementa <strong>concurrencia estructurada</strong>: el bloque <code>async with</code> no termina hasta que todas sus tareas terminaron, y si una falla, <strong>cancela a las demás</strong> y espera a que se limpien. Nada sobrevive al bloque. Nunca.</p>
+
+<pre><code class="lang-python">import asyncio
+
+async def main_buena():
+    async with asyncio.TaskGroup() as tg:
+        t1 = tg.create_task(rapida_y_rota())
+        t2 = tg.create_task(lenta_e_ignorada())
+    # Al salir del bloque: t1 falló -&gt; t2 fue cancelada y esperada.
+    # Se levanta un ExceptionGroup con TODO lo que falló de verdad.
+
+# Y se manejan con except* (PEP 654), que filtra por tipo dentro del grupo:
+async def con_manejo():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for url in urls:
+                tg.create_task(bajar(url))
+    except* TimeoutError as eg:
+        log.warning("%d timeouts", len(eg.exceptions))
+    except* PermissionError as eg:
+        log.error("credenciales rotas: %r", eg.exceptions[0])
+        raise</code></pre>
+
+<table>
+<thead><tr><th>Situación</th><th><code>gather</code></th><th><code>TaskGroup</code></th></tr></thead>
+<tbody>
+<tr><td>Una tarea falla</td><td>Las otras siguen huérfanas</td><td>Las otras se cancelan y se esperan</td></tr>
+<tr><td>Varias fallan a la vez</td><td>Ves solo la primera</td><td><code>ExceptionGroup</code> con todas</td></tr>
+<tr><td>Referencias a las tasks</td><td>Las tenés que guardar vos</td><td>Las guarda el grupo</td></tr>
+<tr><td>Al salir del bloque</td><td>No hay bloque</td><td>Garantía: no queda nada vivo</td></tr>
+<tr><td>Agregar tareas dinámicamente</td><td>No</td><td>Sí, desde adentro del grupo</td></tr>
+<tr><td>Sigue teniendo sentido</td><td>Solo con <code>return_exceptions=True</code> y resultados posicionales</td><td>Todo lo demás</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Código nuevo: <code>TaskGroup</code>.</strong> <code>gather</code> queda para el caso puntual de "quiero los N resultados en orden, y los errores como valores" (<code>return_exceptions=True</code>). Todo lo que sea "lanzá estas cosas y que no quede nada colgado" es <code>TaskGroup</code>. La diferencia no es estética: es la diferencia entre un apagado limpio y un proceso que hay que matar con <code>-9</code>.
+</div>
+
+<h2>PS3.5 Timeouts: <code>asyncio.timeout</code> vs <code>wait_for</code>, y <code>shield</code></h2>
+
+<p><code>asyncio.wait_for(coro, t)</code> envuelve <strong>un solo awaitable</strong>. <code>asyncio.timeout(t)</code> (3.11+) es un <strong>context manager</strong> que le pone plazo a <em>un bloque entero</em>, incluyendo lo que armaste antes y después del <code>await</code> principal:</p>
+
+<pre><code class="lang-python">import asyncio
+
+# wait_for: solo cubre la llamada. Si el parseo tarda, no lo cubre nadie.
+datos = await asyncio.wait_for(cliente.get(url), timeout=5)
+parseado = parsear(datos)                      # fuera del plazo
+
+# timeout: cubre TODO el bloque, con el mismo presupuesto de tiempo.
+async with asyncio.timeout(5):
+    datos = await cliente.get(url)
+    parseado = await procesar(datos)           # dentro del plazo
+    await guardar(parseado)
+
+# Plazo absoluto (útil para un deadline de request end-to-end):
+async with asyncio.timeout_at(loop.time() + presupuesto_restante):
+    ...</code></pre>
+
+<p>El mecanismo es el mismo en los dos casos y conviene tenerlo claro: <strong>el timeout no "corta" nada, cancela</strong>. Programa un timer que llama a <code>task.cancel()</code>, y cuando el <code>CancelledError</code> vuelve, lo traduce a <code>TimeoutError</code>.</p>
+
+<div class="info">
+  Acá aparece un detalle fino de 3.11 que resuelve un bug histórico: <code>Task.cancelling()</code> y <code>Task.uncancel()</code>. <code>asyncio.timeout</code> los usa para distinguir <em>"te cancelé yo por mi plazo"</em> de <em>"llegó una cancelación de afuera mientras tanto"</em>. Sin eso, un timeout interno se comía la cancelación del padre y la tarea seguía viva. Si escribís tus propios helpers que cancelan, es la API que tenés que respetar.
+</div>
+
+<pre><code class="lang-python">import asyncio
+
+async def con_reintentos(coro_factory, intentos=3, plazo=2.0):
+    for n in range(intentos):
+        try:
+            async with asyncio.timeout(plazo):
+                return await coro_factory()
+        except TimeoutError:                 # desde 3.11 es el builtin
+            if n == intentos - 1:
+                raise
+            await asyncio.sleep(2 ** n)      # backoff exponencial</code></pre>
+
+<h3><code>shield</code>: la excepción, no la regla</h3>
+
+<p><code>asyncio.shield(aw)</code> protege un awaitable de una cancelación que venga <em>de afuera</em>. Se justifica en un solo escenario: <strong>una operación que no se puede repetir ni dejar a medias</strong> — confirmar un pago, commitear una transacción, mandar un ACK.</p>
+
+<pre><code class="lang-python">import asyncio
+
+async def manejar_pedido(pago):
+    # Si el cliente corta la conexión, NO queremos abortar el cobro a medias.
+    tarea = asyncio.create_task(confirmar_cobro(pago))
+    try:
+        return await asyncio.shield(tarea)
+    except asyncio.CancelledError:
+        # A NOSOTROS nos cancelaron; el cobro sigue. Hay que esperarlo igual.
+        await tarea            # si no, queda huérfano y el proceso muere antes
+        raise</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La trampa de <code>shield</code>.</strong> El escudo protege a la <em>tarea interna</em>, no a vos. Si te cancelan, vos recibís <code>CancelledError</code> igual y la tarea protegida <strong>sigue corriendo sin dueño</strong>. Si no la esperás explícitamente, el apagado del proceso la va a matar en el peor momento posible. <code>shield</code> sin un <code>await tarea</code> en el <code>except</code> es casi siempre un bug disfrazado de precaución.
+</div>
+
+<h2>PS3.6 Cancelación: <code>CancelledError</code> no es un error común</h2>
+
+<p>Cancelar en asyncio no mata nada: <strong>inyecta una excepción</strong> en el punto donde la corrutina está suspendida. Tu código la ve como cualquier otra excepción, corre sus <code>finally</code>, y debe dejarla salir.</p>
+
+<pre><code class="lang-python">import asyncio
+
+# Desde Python 3.8, CancelledError hereda de BaseException, NO de Exception.
+issubclass(asyncio.CancelledError, Exception)       # False
+issubclass(asyncio.CancelledError, BaseException)   # True</code></pre>
+
+<div class="rule">
+  <strong>📌 Ese cambio de jerarquía es intencional y es tu red de contención.</strong> Un <code>except Exception:</code> genérico —el que todos escribimos alrededor de un handler— <strong>no</strong> se traga la cancelación. Lo que sí se la traga es un <code>except BaseException:</code>, un <code>except:</code> pelado o un <code>except asyncio.CancelledError:</code> que no re-lanza. Esos tres son bugs.
+</div>
+
+<pre><code class="lang-python">import asyncio, logging
+
+# ❌ MAL: se come la cancelación. La tarea "se niega" a morir y el
+#         apagado se cuelga hasta que alguien la mate a la fuerza.
+async def worker_malo(q):
+    while True:
+        try:
+            item = await q.get()
+            await procesar(item)
+        except Exception:
+            logging.exception("error procesando")
+        except asyncio.CancelledError:
+            logging.info("me cancelaron")     # ...y sigue el while True
+
+# ✅ BIEN: limpiar en finally, dejar salir la cancelación.
+async def worker_bueno(q, conexion):
+    try:
+        while True:
+            item = await q.get()
+            try:
+                await procesar(item)
+            except Exception:
+                logging.exception("item %r falló, sigo", item)
+    except asyncio.CancelledError:
+        logging.info("cancelado: cerrando prolijo")
+        raise                                  # ← IMPRESCINDIBLE
+    finally:
+        await conexion.close()                 # ver el aviso de abajo</code></pre>
+
+<div class="warn">
+  <strong>Cuidado con los <code>await</code> dentro de <code>finally</code> durante una cancelación.</strong> Si tardan, retrasan todo el apagado; y si vuelven a ser cancelados (segunda señal, o el timeout del orquestador), tu limpieza queda a medias. Para limpiezas que <em>tienen</em> que completarse, envolvelas: <code>async with asyncio.timeout(2): await conexion.close()</code>, y si hace falta protegerlas de la cancelación en curso, <code>await asyncio.shield(...)</code> con el cuidado de PS3.5. Lo ideal es que el cierre sea rápido y no dependa de la red.
+</div>
+
+<h2>PS3.7 Los cuatro errores clásicos</h2>
+
+<h3>1. Bloquear el loop con código síncrono</h3>
+
+<p>El error número uno, por lejos. Una llamada bloqueante en un handler y toda la aplicación se congela para <em>todos</em> los usuarios, no solo para el que la disparó.</p>
+
+<pre><code class="lang-python">import asyncio, requests, hashlib, json
+
+# ❌ Cada uno de estos congela el loop entero mientras dura:
+async def handler_malo(path, url):
+    r = requests.get(url)                       # cliente HTTP síncrono
+    with open(path) as f:                       # I/O de archivo síncrona
+        datos = json.load(f)
+    clave = hashlib.pbkdf2_hmac("sha256", pw, salt, 600_000)   # CPU pesada
+    return r.text
+
+# ✅ Cada cosa a su lugar:
+async def handler_bueno(path, url, cliente):
+    r = await cliente.get(url)                                  # httpx/aiohttp
+    datos = json.loads(await asyncio.to_thread(leer_texto, path))
+    clave = await asyncio.to_thread(
+        hashlib.pbkdf2_hmac, "sha256", pw, salt, 600_000)       # 3.9+
+    return r.text</code></pre>
+
+<div class="mistake">
+  <strong>La biblioteca estándar es casi toda bloqueante.</strong> <code>open()</code>, <code>socket</code>, <code>subprocess.run</code>, <code>time.sleep</code>, <code>sqlite3</code>, <code>requests</code>, <code>boto3</code>, casi todo driver de base de datos "clásico", <code>PIL</code>, <code>json.loads</code> sobre un archivo de 200 MB. Que estén dentro de un <code>async def</code> no cambia absolutamente nada. La pregunta correcta al revisar código no es "¿es async?" sino <strong>"¿esta línea puede tardar sin ceder?"</strong>.
+</div>
+
+<h3>2. Crear una task y no guardar la referencia</h3>
+
+<p>Este es de los que aparecen solo bajo carga, en producción, y una de cada mil veces. <code>asyncio.create_task</code> devuelve una <code>Task</code>, pero el loop la guarda en un <strong><code>WeakSet</code></strong>. Si vos no guardás una referencia fuerte, el recolector puede llevársela <em>en medio de la ejecución</em>.</p>
+
+<pre><code class="lang-python">import asyncio
+
+# ❌ La task puede desaparecer sin terminar, sin error, sin log.
+async def handler_malo(evento):
+    asyncio.create_task(auditar(evento))    # "fire and forget"
+    return "ok"
+
+# ✅ Referencia fuerte hasta que termine, y errores que se ven.
+_en_vuelo: set[asyncio.Task] = set()
+
+def lanzar_en_fondo(coro, *, nombre=None) -&gt; asyncio.Task:
+    tarea = asyncio.create_task(coro, name=nombre)
+    _en_vuelo.add(tarea)
+    tarea.add_done_callback(_en_vuelo.discard)
+    tarea.add_done_callback(_reportar_si_falla)
+    return tarea
+
+def _reportar_si_falla(t: asyncio.Task) -&gt; None:
+    if t.cancelled():
+        return
+    if (exc := t.exception()) is not None:
+        logging.error("tarea de fondo %s falló", t.get_name(), exc_info=exc)</code></pre>
+
+<div class="tip">
+  El <code>add_done_callback</code> que reporta errores es tan importante como el que mantiene la referencia. Sin él, una task de fondo que explota no rompe nada visible: el <code>Task exception was never retrieved</code> aparece cuando el GC la recoge, con un stack sin contexto y a veces mucho después. En una aplicación con <code>TaskGroup</code> de largo aliento, todo esto te lo da el grupo gratis — es otra razón para preferirlo.
+</div>
+
+<h3>3. <code>await</code> adentro de un lock, mal usado</h3>
+
+<p>Hay dos versiones de este error y conviene distinguirlas, porque una es un deadlock y la otra es una pérdida silenciosa de concurrencia.</p>
+
+<pre><code class="lang-python">import asyncio, threading
+
+# ❌ (a) DEADLOCK: threading.Lock en código async.
+#        La tarea A adquiere y hace await -&gt; se suspende SIN soltar.
+#        La tarea B intenta adquirir -&gt; .acquire() BLOQUEA EL HILO.
+#        Ese hilo es el event loop, así que A nunca se reanuda. Cuelgue total.
+candado_malo = threading.Lock()
+async def a():
+    with candado_malo:
+        await asyncio.sleep(1)
+
+# ❌ (b) SERIALIZACIÓN: asyncio.Lock correcto, pero sostenido de más.
+#        Las 500 tareas hacen la llamada HTTP de a una. Chau concurrencia.
+candado = asyncio.Lock()
+async def b(cliente, url, cache):
+    async with candado:
+        r = await cliente.get(url)          # 200 ms sosteniendo el candado
+        cache[url] = r.text
+
+# ✅ El candado protege SOLO la sección crítica (que no hace I/O).
+async def b_bien(cliente, url, cache):
+    r = await cliente.get(url)              # sin candado: concurrente
+    async with candado:
+        cache[url] = r.text                 # microsegundos</code></pre>
+
+<div class="warn">
+  <strong><code>asyncio.Lock</code> no es reentrante.</strong> Si una función que ya tiene el candado llama a un helper que también lo pide, se cuelga para siempre — y no hay detección de deadlock que te avise. Además, en un loop de un solo hilo <strong>muchas veces no necesitás candado</strong>: entre dos <code>await</code> consecutivos nadie más corre, así que un <code>contador += 1</code> es atómico. El candado hace falta cuando la sección crítica <em>tiene</em> un <code>await</code> en el medio y el estado quedaría inconsistente.
+</div>
+
+<h3>4. <code>time.sleep</code> en vez de <code>asyncio.sleep</code></h3>
+
+<pre><code class="lang-python">import asyncio, time
+
+async def reintentar_mal():
+    time.sleep(1)          # congela el loop 1 segundo: TODAS las conexiones
+    ...
+
+async def reintentar_bien():
+    await asyncio.sleep(1) # programa un timer y cede el control</code></pre>
+
+<div class="info">
+  <code>await asyncio.sleep(0)</code> es un caso especial y útil: no espera nada, pero <strong>cede el control una vuelta del loop</strong>. Sirve para meter un punto de suspensión en un cálculo largo que no podés mover a un hilo, y en tests para forzar que una task recién creada llegue a arrancar. No lo uses como parche crónico: si necesitás salpicar <code>sleep(0)</code> por todo un algoritmo, ese algoritmo va a un <code>to_thread</code>.
+</div>
+
+<h2>PS3.8 Detectar que el loop está bloqueado</h2>
+
+<p>El síntoma de un loop bloqueado es engañoso: no hay errores, no hay excepciones, la CPU está al 100% en un solo núcleo y las latencias p99 se van a la luna. Hay tres herramientas y conviene usarlas en este orden.</p>
+
+<pre><code class="lang-python">import asyncio, logging
+
+async def main():
+    ...
+
+# 1) Modo debug: avisa qué callback tardó de más y desde dónde se creó.
+logging.basicConfig(level=logging.DEBUG)
+asyncio.run(main(), debug=True)
+
+# Equivalente sin tocar el código: PYTHONASYNCIODEBUG=1 python app.py
+# Salida típica:
+#   Executing &lt;Task pending name='Task-7' coro=&lt;handler() at api.py:42&gt;
+#   created at api.py:88&gt; took 1.831 seconds
+
+# 2) Bajar el umbral (por defecto 0.1 s) para cazar bloqueos más chicos:
+loop = asyncio.get_running_loop()
+loop.slow_callback_duration = 0.02      # avisame si un callback pasa 20 ms</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El modo debug no va a producción.</strong> Activa el rastreo del origen de cada corrutina, chequeos extra y logging denso: te cuesta rendimiento y ruido. Es una herramienta de diagnóstico en staging o en local con carga sintética. En producción, lo que dejás puesto es un <em>watchdog</em> de latencia del loop, que cuesta prácticamente nada.
+</div>
+
+<pre><code class="lang-python">import asyncio, time, logging
+
+async def watchdog_del_loop(intervalo=0.25, umbral=0.15):
+    """Si dormir 0.25 s tardó 3 segundos, el loop estuvo bloqueado 2.75 s."""
+    while True:
+        t0 = time.perf_counter()
+        await asyncio.sleep(intervalo)
+        retraso = time.perf_counter() - t0 - intervalo
+        if retraso &gt; umbral:
+            logging.warning("event loop bloqueado %.0f ms", retraso * 1000)
+            metricas.observe("loop_lag_ms", retraso * 1000)</code></pre>
+
+<p>La tercera herramienta es la más nueva. <strong>Python 3.14</strong> incorporó introspección de asyncio: podés imprimir el árbol de llamadas de las corrutinas vivas, incluso <em>desde afuera</em>, contra un proceso que ya está corriendo y colgado.</p>
+
+<pre><code class="lang-bash"># Desde adentro del proceso
+python -c "import asyncio; asyncio.print_call_graph()"
+
+# Desde afuera, contra un PID en producción (3.14+)
+python -m asyncio ps 12345        # tabla de tasks vivas
+python -m asyncio pstree 12345    # árbol de quién espera a quién</code></pre>
+
+<h3>Sacar el trabajo del loop</h3>
+
+<pre><code class="lang-python">import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+# I/O bloqueante o CPU moderada -&gt; un hilo. El GIL se libera en I/O (PS1).
+texto = await asyncio.to_thread(pathlib.Path("informe.csv").read_text)
+
+# CPU pesada en Python puro -&gt; un proceso. El GIL NO se libera acá.
+loop = asyncio.get_running_loop()
+with ProcessPoolExecutor(max_workers=4) as pool:
+    resultado = await loop.run_in_executor(pool, calcular_pesado, datos)</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>to_thread</code> no es gratis y tiene techo.</strong> Usa un <code>ThreadPoolExecutor</code> compartido con un límite por defecto de <code>min(32, cpu_count + 4)</code>. Si mandás mil llamadas bloqueantes ahí, se encolan: convertiste un cuello de botella en otro, y encima invisible. Para carga sostenida, creá tu propio executor con un tamaño pensado y medí su cola.
+</div>
+
+<h2>PS3.9 Tabla de decisión: asyncio, hilos, procesos o free-threading</h2>
+
+<p>En PS1 vimos por qué el GIL limita solo al CPU-bound en Python puro, y que el <strong>PEP 779</strong> volvió oficial el build free-threaded en <strong>3.14</strong>. Con eso, la decisión ya no es binaria:</p>
+
+<table>
+<thead><tr><th>Perfil de la carga</th><th>Elegí</th><th>Por qué</th><th>Lo que pagás</th></tr></thead>
+<tbody>
+<tr><td>Miles de conexiones de red simultáneas</td><td><strong>asyncio</strong></td><td>~KB por tarea en vez de MB por hilo; un solo hilo, sin cambios de contexto del SO</td><td>Todo el stack tiene que ser async; una línea bloqueante rompe todo</td></tr>
+<tr><td>Decenas de llamadas a librerías síncronas (drivers viejos, SDKs)</td><td><strong>Hilos</strong> (<code>to_thread</code>)</td><td>No reescribís nada; el GIL se libera durante el I/O</td><td>~8 MB de stack por hilo; techo práctico en cientos</td></tr>
+<tr><td>CPU puro en Python (parseo, criptografía a mano, simulación)</td><td><strong>Procesos</strong></td><td>Único paralelismo real garantizado en cualquier build</td><td>Serializar entrada y salida; memoria × N; arranque lento</td></tr>
+<tr><td>Ídem, y verificaste que tus dependencias nativas lo soportan</td><td><strong>Free-threading 3.14t</strong></td><td>Paralelismo real <em>sin</em> serializar: comparten memoria</td><td>−5/10 % en un hilo; <code>sys._is_gil_enabled()</code> obligatorio (PS1); carreras que antes "andaban"</td></tr>
+<tr><td>CPU dentro de NumPy, Polars, Pillow, compresión</td><td><strong>Hilos</strong></td><td>La extensión ya libera el GIL en su bucle en C</td><td>Casi nada; verificá que la librería realmente lo libere</td></tr>
+<tr><td>I/O masivo + un cálculo pesado puntual</td><td><strong>asyncio + <code>run_in_executor</code></strong></td><td>Cada parte con la herramienta correcta</td><td>Dos modelos mentales en el mismo archivo</td></tr>
+<tr><td>Un script que hace 12 requests y termina</td><td><strong>Código síncrono</strong></td><td>La complejidad de async no se amortiza</td><td>Nada. Es la respuesta correcta más ignorada</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Cuándo NO usar asyncio.</strong> (1) Cuando la concurrencia que necesitás cabe en un <code>ThreadPoolExecutor</code> de 20 hilos: es menos código y menos formas de romperlo. (2) Cuando tu dependencia crítica —el ORM, el driver, el SDK del proveedor— solo existe en versión bloqueante: vas a terminar con <code>to_thread</code> en todos lados y la peor parte de los dos mundos. (3) Cuando el equipo no tiene experiencia y el sistema toca dinero: los bugs de asyncio son de concurrencia, y los bugs de concurrencia no se reproducen en el debugger. (4) Cuando el cuello de botella es CPU. Free-threading (PS1) hoy resuelve más problemas reales de rendimiento que reescribir a async.
+</div>
+
+<h2>PS3.10 Backpressure: por qué 10.000 tasks es un bug</h2>
+
+<p>La operación más fácil de escribir en asyncio es también la más peligrosa: crear una task por cada ítem de una lista. Con 50 ítems anda perfecto. Con 50.000 tenés un incidente.</p>
+
+<pre><code class="lang-python">import asyncio
+
+# ❌ 10.000 tasks vivas al mismo tiempo
+async def bajar_todo(urls, cliente):
+    async with asyncio.TaskGroup() as tg:
+        for u in urls:                       # 10.000 iteraciones
+            tg.create_task(bajar(cliente, u))</code></pre>
+
+<p>Qué se rompe exactamente, en orden de aparición:</p>
+
+<div class="step"><strong>1. Memoria.</strong> Cada task es un objeto Python + un frame de corrutina + su Future + lo que la corrutina tenga capturado. Multiplicá por diez mil y sumale las respuestas que se van acumulando en RAM porque nadie las consumió todavía.</div>
+
+<div class="step"><strong>2. El pool de conexiones.</strong> Tu cliente HTTP tiene un límite (httpx: 100 conexiones por defecto). Las 9.900 tasks restantes quedan encoladas <em>esperando una conexión</em>. Ese límite es real, pero ahora es invisible: pagaste diez mil tasks para tener cien en vuelo.</div>
+
+<div class="step"><strong>3. Los timeouts, todos juntos.</strong> Cada task arrancó su plazo de 10 s al crearse, no al conseguir conexión. Las últimas de la fila se vencen sin haber mandado un solo byte. Vas a ver una avalancha de <code>TimeoutError</code> que no tienen nada que ver con el servidor.</div>
+
+<div class="step"><strong>4. El otro lado.</strong> Si por casualidad <em>sí</em> conseguís mandar diez mil requests, le hiciste una denegación de servicio a tu proveedor. Te va a devolver 429, o te va a bloquear la IP, o —peor— va a andar y vas a repetirlo con cien mil.</div>
+
+<div class="rule">
+  <strong>📌 La cantidad de trabajo en vuelo es un parámetro de diseño, no una consecuencia del tamaño de la entrada.</strong> Si tu concurrencia depende de <code>len(entrada)</code>, no tenés un sistema: tenés una bomba con temporizador esperando el día que la entrada crezca 100×.
+</div>
+
+<h3>Las dos formas de acotar</h3>
+
+<pre><code class="lang-python">import asyncio
+
+# A) Semáforo: simple, sirve cuando la lista de entrada entra en memoria.
+async def bajar_acotado(urls, cliente, limite=50):
+    sem = asyncio.Semaphore(limite)
+    resultados = {}
+
+    async def uno(u):
+        async with sem:                      # nunca más de 50 adentro
+            resultados[u] = await bajar(cliente, u)
+
+    async with asyncio.TaskGroup() as tg:
+        for u in urls:
+            tg.create_task(uno(u))
+    return resultados</code></pre>
+
+<pre><code class="lang-python">import asyncio
+
+# B) Cola acotada + N workers: memoria constante aunque la entrada sea infinita
+#    (un stream, una tabla de 50 millones de filas, una cola de mensajes).
+async def pipeline(fuente, cliente, workers=50, cola_max=200):
+    cola: asyncio.Queue[str] = asyncio.Queue(maxsize=cola_max)
+
+    async def worker():
+        while True:
+            url = await cola.get()
+            try:
+                await bajar(cliente, url)
+            finally:
+                cola.task_done()
+
+    async with asyncio.TaskGroup() as tg:
+        consumidores = [tg.create_task(worker()) for _ in range(workers)]
+        async for url in fuente:
+            await cola.put(url)      # ← si la cola está llena, ACÁ frena
+        await cola.join()            #   eso es backpressure de verdad
+        for c in consumidores:
+            c.cancel()</code></pre>
+
+<div class="concept">
+  <strong>💡 La diferencia clave está en el <code>await cola.put(...)</code>.</strong> Con el semáforo, las 10.000 tasks existen igual — solo que 9.950 están dormidas. Con la cola acotada, el productor <strong>se frena</strong> cuando el consumidor no da abasto, y la memoria del proceso no depende del tamaño de la entrada. Eso es <em>backpressure</em>: la presión viaja hacia atrás hasta la fuente. El semáforo limita concurrencia; la cola limita concurrencia <strong>y</strong> memoria.
+</div>
+
+<div class="info">
+  Un semáforo limita <strong>concurrencia</strong> (cuántas a la vez), no <strong>tasa</strong> (cuántas por segundo). Si el proveedor te pide "máximo 20 req/s", con 50 en paralelo y respuestas de 100 ms vas a 500 req/s y te bloquea igual. Para tasa necesitás un <em>token bucket</em>, o respetar el header <code>Retry-After</code> de los 429. Son dos límites distintos y casi siempre hacen falta los dos.
+</div>
+
+<h2>PS3.11 Testear código async</h2>
+
+<p>pytest no ejecuta corrutinas por su cuenta: sin un plugin, un test <code>async def</code> se salta con un warning y te queda una suite verde que no probó nada. Las dos opciones son <code>pytest-asyncio</code> y <code>anyio</code>.</p>
+
+<pre><code class="lang-toml"># pyproject.toml — con pytest-asyncio, el modo auto evita decorar cada test
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = ["error::RuntimeWarning"]   # caza las corrutinas sin await</code></pre>
+
+<pre><code class="lang-python">import asyncio, pytest
+
+# --- Testear la CANCELACIÓN: que limpie y que re-lance ---
+async def test_worker_limpia_al_cancelar(conexion_falsa):
+    tarea = asyncio.create_task(worker_bueno(asyncio.Queue(), conexion_falsa))
+    await asyncio.sleep(0)              # dejar que arranque de verdad
+
+    tarea.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tarea                     # debe PROPAGAR, no tragarse
+
+    assert conexion_falsa.cerrada       # y debe haber limpiado en finally
+
+# --- Testear TIMEOUTS sin dormir de verdad ---
+async def test_timeout_dispara():
+    nunca = asyncio.Event()             # un Event que nadie setea
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await nunca.wait()
+
+# --- Testear el LÍMITE de concurrencia, que es lo que la gente no testea ---
+async def test_nunca_mas_de_50_en_vuelo(monkeypatch):
+    en_vuelo = 0
+    pico = 0
+
+    async def bajar_espia(_cliente, _url):
+        nonlocal en_vuelo, pico
+        en_vuelo += 1
+        pico = max(pico, en_vuelo)
+        await asyncio.sleep(0)          # punto de suspensión
+        en_vuelo -= 1
+
+    monkeypatch.setattr("scraper.bajar", bajar_espia)
+    await bajar_acotado([f"u{i}" for i in range(500)], None, limite=50)
+    assert pico &lt;= 50</code></pre>
+
+<div class="tip">
+  <code>anyio</code> es la alternativa cuando querés que tu librería corra también sobre Trio, o cuando preferís su modelo de <em>cancel scopes</em>. Se testea con <code>@pytest.mark.anyio</code> y una fixture <code>anyio_backend</code>. Para una aplicación que solo va a usar asyncio, <code>pytest-asyncio</code> en modo <code>auto</code> alcanza y sobra.
+</div>
+
+<div class="mistake">
+  <strong>No pongas <code>await asyncio.sleep(0.5)</code> en los tests para "esperar a que pase algo".</strong> Es la receta de una suite lenta y con fallos intermitentes en CI (que siempre es más lenta que tu máquina). Sincronizá con lo que realmente representa el evento: un <code>asyncio.Event</code>, un <code>await cola.join()</code>, o <code>await tarea</code>. <code>sleep(0)</code> para ceder una vuelta es legítimo; <code>sleep(0.5)</code> como sincronización es deuda.
+</div>
+
+<h2>PS3.12 Producción: apagar sin romper nada</h2>
+
+<p><code>asyncio.run()</code> hace más de lo que parece al terminar: cancela todas las tasks pendientes, las espera, cierra los generadores asíncronos y apaga el executor por defecto. El problema es que hace todo eso <strong>de golpe y sin plazo de gracia</strong>. Un servicio serio necesita controlar esa secuencia.</p>
+
+<pre><code class="lang-python">import asyncio, contextlib, logging, signal
+
+async def main():
+    apagar = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    # En Unix, la forma correcta: el handler corre EN el loop, sin race conditions.
+    # (En Windows add_signal_handler no existe: usar signal.signal + call_soon_threadsafe)
+    for s in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(s, apagar.set)
+
+    async with asyncio.TaskGroup() as tg:        # supervisor de por vida
+        tg.create_task(watchdog_del_loop())
+        tg.create_task(consumidor_de_cola())
+        servidor = await arrancar_http()
+
+        await apagar.wait()                      # bloquea hasta SIGTERM
+
+        logging.info("apagando: dejo de aceptar conexiones")
+        await servidor.dejar_de_aceptar()        # 1. cerrar la puerta
+        await drenar_en_vuelo(plazo=25)          # 2. terminar lo empezado
+        raise asyncio.CancelledError             # 3. cancelar lo de fondo
+
+asyncio.run(main())</code></pre>
+
+<div class="rule">
+  <strong>📌 El orden del apagado no es negociable.</strong> Primero dejás de aceptar trabajo nuevo, después drenás lo que ya está en vuelo con un plazo, y recién al final cancelás las tareas de fondo. Al revés —cancelar primero— matás pedidos que el cliente ya considera aceptados. Ese plazo tiene que ser menor que el <code>terminationGracePeriodSeconds</code> de tu orquestador, o el <code>SIGKILL</code> llega antes de que termines y todo el trabajo prolijo fue decorativo.
+</div>
+
+<div class="warn">
+  <strong>Las tareas de fondo son el punto débil de todo servicio async.</strong> Al apagar, cualquiera que no esté supervisada por un <code>TaskGroup</code> o por tu conjunto de referencias fuertes (PS3.7) simplemente desaparece con el proceso: a mitad de una escritura, con una transacción abierta, sin haber mandado el ACK. La regla es que <strong>toda</strong> task tenga un dueño identificable. Si no sabés quién espera a una task, esa task no existe en el apagado.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el scraper de 5.000 URLs</h2>
+
+<blockquote>Hay que bajar 5.000 páginas de producto de un proveedor, extraer tres campos y guardarlos. La primera versión "funcionaba en las pruebas" con 40 URLs. Con las 5.000 reales revienta a los 38 segundos y no deja nada usable.</blockquote>
+
+<p><strong>Paso 1 — La versión ingenua.</strong> Es exactamente lo que escribiría cualquiera que aprendió asyncio en un tutorial:</p>
+
+<pre><code class="lang-python">import asyncio, httpx
+
+async def bajar(cliente, url):
+    r = await cliente.get(url)
+    r.raise_for_status()
+    return extraer(r.text)
+
+async def main(urls):
+    async with httpx.AsyncClient() as cliente:
+        return await asyncio.gather(*(bajar(cliente, u) for u in urls))
+
+asyncio.run(main(urls_5000))</code></pre>
+
+<p><strong>Paso 2 — Qué pasó, con números.</strong> No "se rompió": se rompió de cuatro maneras distintas y cada una tiene una causa distinta.</p>
+
+<table>
+<thead><tr><th>Síntoma observado</th><th>Causa real</th></tr></thead>
+<tbody>
+<tr><td>RSS del proceso: 180 MB → <strong>1,4 GB</strong></td><td>5.000 tasks vivas + 5.000 respuestas acumuladas en RAM sin consumir</td></tr>
+<tr><td><strong>812</strong> respuestas <code>429 Too Many Requests</code></td><td>Le mandamos todo de una; el proveedor limita a ~40 req/s</td></tr>
+<tr><td><code>httpx.PoolTimeout</code> en <strong>1.240</strong> URLs</td><td>El pool tiene 100 conexiones; 4.900 tasks esperando turno agotaron el plazo del pool sin mandar un byte</td></tr>
+<tr><td>A los 38 s: <code>HTTPStatusError</code> y el proceso muere sin guardar nada</td><td><code>gather</code> propaga la primera excepción; las otras 4.999 quedan huérfanas y se pierden los ~2.100 resultados que <em>sí</em> estaban listos</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 3 — Diagnóstico.</strong> El error de fondo es uno solo: <strong>la concurrencia quedó atada al tamaño de la entrada</strong>. Todo lo demás es consecuencia. El límite real del sistema (100 conexiones, ~40 req/s del proveedor) ya existía; lo único que logramos con 5.000 tasks fue hacerlo invisible y pagarlo en memoria y en timeouts falsos.</p>
+
+<p><strong>Paso 4 — La versión que va a producción.</strong> Cada pieza corrige un síntoma concreto de la tabla de arriba:</p>
+
+<pre><code class="lang-python">import asyncio, random, httpx, logging
+from dataclasses import dataclass
+
+CONCURRENCIA = 40          # ≤ pool de conexiones y ≤ tasa que tolera el proveedor
+PLAZO_POR_URL = 10.0
+INTENTOS = 3
+
+@dataclass(slots=True)
+class Resultado:
+    url: str
+    datos: dict | None = None
+    error: str | None = None
+
+async def bajar_con_reintentos(cliente, url, sem) -&gt; Resultado:
+    for intento in range(INTENTOS):
+        try:
+            async with sem:                             # ← límite de concurrencia
+                async with asyncio.timeout(PLAZO_POR_URL):   # ← plazo por ítem
+                    r = await cliente.get(url)
+                    if r.status_code == 429:
+                        raise httpx.HTTPStatusError("429", request=r.request,
+                                                    response=r)
+                    r.raise_for_status()
+                    return Resultado(url, extraer(r.text))
+
+        except asyncio.CancelledError:
+            raise                                       # ← NUNCA la atrapamos
+        except (httpx.HTTPError, TimeoutError) as e:
+            if intento == INTENTOS - 1:
+                return Resultado(url, error=repr(e))    # ← el fallo es un DATO
+            espera = min(2 ** intento, 8) + random.random()   # backoff + jitter
+            logging.info("reintento %d de %s en %.1fs", intento + 1, url, espera)
+            await asyncio.sleep(espera)
+
+async def main(urls) -&gt; list[Resultado]:
+    sem = asyncio.Semaphore(CONCURRENCIA)
+    limites = httpx.Limits(max_connections=CONCURRENCIA + 10)
+    resultados: list[Resultado] = []
+
+    async with httpx.AsyncClient(limits=limites, timeout=None) as cliente:
+        async with asyncio.TaskGroup() as tg:           # ← nada queda huérfano
+            tareas = [tg.create_task(bajar_con_reintentos(cliente, u, sem))
+                      for u in urls]
+        resultados = [t.result() for t in tareas]
+
+    ok = sum(r.error is None for r in resultados)
+    logging.info("%d/%d OK, %d con error", ok, len(urls), len(urls) - ok)
+    return resultados</code></pre>
+
+<p><strong>Paso 5 — Qué mejoró cada cambio.</strong> Esta tabla es el entregable real del ejercicio: cada línea es una decisión defendible, no una receta copiada.</p>
+
+<table>
+<thead><tr><th>Cambio</th><th>Qué síntoma ataca</th><th>Resultado medido</th></tr></thead>
+<tbody>
+<tr><td><code>Semaphore(40)</code></td><td>RAM, 429 y PoolTimeout</td><td>Pico de RAM 1,4 GB → <strong>190 MB</strong>; 812 → <strong>0</strong> respuestas 429; 1.240 → <strong>0</strong> PoolTimeout</td></tr>
+<tr><td><code>asyncio.timeout</code> por URL <em>dentro</em> del semáforo</td><td>Timeouts falsos por esperar turno</td><td>El plazo cuenta desde que la URL empieza de verdad; 4 URLs colgadas dejan de retener un lugar del semáforo</td></tr>
+<tr><td><code>TaskGroup</code> en vez de <code>gather</code></td><td>Tasks huérfanas al fallar</td><td>0 <code>Task exception was never retrieved</code>; apagado con Ctrl-C limpio en &lt;1 s</td></tr>
+<tr><td>Reintentos con backoff + <strong>jitter</strong></td><td>Errores transitorios y 5xx</td><td>4.987/5.000 al primer o segundo intento. El jitter evita que los 40 reintenten en el mismo milisegundo</td></tr>
+<tr><td><code>Resultado</code> con campo <code>error</code></td><td>Todo o nada</td><td><strong>5.000/5.000</strong> procesadas: 4.987 con datos, 13 marcadas para revisar. Se guarda el trabajo útil</td></tr>
+<tr><td><code>except CancelledError: raise</code></td><td>Ctrl-C / SIGTERM ignorados</td><td>El proceso responde a la señal en vez de terminar los 5.000 igual</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La decisión más importante del ejercicio es la que menos parece código.</strong> Es <code>Resultado(url, error=...)</code>: convertir el fallo de un ítem en un <em>dato</em> en vez de una excepción. El fail-fast de <code>TaskGroup</code> es exactamente lo que querés cuando las tareas son partes de una operación indivisible (armar una respuesta, escribir una transacción) — si una falla, las demás no sirven. Pero en un lote de 5.000 ítems independientes, abortar todo porque el ítem 3.412 dio 404 es la política equivocada. Por eso el <code>TaskGroup</code> queda reservado para lo que <strong>sí</strong> es fatal: se cayó la autenticación, se llenó el disco. Elegir dónde poner esa frontera es el trabajo senior; el resto es sintaxis.
+</div>
+
+<div class="info">
+  Con 5 millones de URLs, esta versión también se cae: la lista de tareas y la de resultados no entran en memoria. Ahí el patrón correcto es el de la cola acotada de PS3.10 —N workers consumiendo un stream, escribiendo cada resultado a disco o a una base a medida que llega— y la memoria deja de depender de la entrada. Vale la pena notar que <em>ese</em> cambio no es una optimización: es un cambio de arquitectura, y conviene saber de antemano en qué orden de magnitud te toca hacerlo.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés <code>await procesar(x)</code> dentro de un handler y el servidor igual se cuelga. ¿Cómo puede ser, si hay un <code>await</code>?</summary>
+<p>Porque <code>await</code> sobre otra corrutina no cede el control: es una llamada de función que entra, ejecuta y vuelve. El control vuelve al loop <strong>solo</strong> cuando se llega a un <code>await</code> sobre un Future que todavía no terminó — un socket, un timer, un Event. Si <code>procesar</code> es <code>async def</code> pero adentro solo hace cálculo, o llama a <code>requests.get</code>, o abre un archivo con <code>open</code>, el loop no corrió nada más en todo ese tiempo. Se confirma en un minuto con <code>asyncio.run(main(), debug=True)</code>, que te va a decir qué callback tardó y en qué línea se creó.</p></details>
+
+<details><summary>¿Por qué <code>TaskGroup</code> es mejor que <code>gather</code> aunque tu código "no falle nunca"?</summary>
+<p>Porque la diferencia aparece justo cuando sí falla, que es cuando menos margen tenés. Con <code>gather</code>, la primera excepción sale y las demás tareas <strong>siguen corriendo sin dueño</strong>: mantienen conexiones abiertas, escriben archivos a medias y sus errores aparecen después como <code>Task exception was never retrieved</code> sin contexto. Con <code>TaskGroup</code>, al salir del bloque tenés la garantía estructural de que no quedó nada vivo, y si fallaron tres tareas ves las tres en un <code>ExceptionGroup</code>, no solo la primera. Además el grupo mantiene las referencias fuertes por vos, así que desaparece el bug del GC comiéndose una task.</p></details>
+
+<details><summary>Tu scraper con <code>Semaphore(50)</code> igual recibe 429. ¿Qué te falta?</summary>
+<p>Un semáforo limita <strong>concurrencia</strong>, no <strong>tasa</strong>. Con 50 en vuelo y respuestas de 100 ms estás emitiendo ~500 req/s; si el proveedor tolera 40 req/s, te bloquea igual. Son dos límites distintos: para la tasa necesitás un <em>token bucket</em> (o simplemente respetar el header <code>Retry-After</code> que viene en el 429 y hacer backoff con jitter). Y conviene medir cuál de los dos te está mordiendo antes de bajar el semáforo a ciegas, porque bajarlo mucho te deja el pool de conexiones ocioso y multiplicás el tiempo total sin ganar nada.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>asyncio no acelera el trabajo: <strong>elimina el tiempo muerto de espera</strong> y consigue miles de operaciones concurrentes con la memoria de un hilo. Si el cuello de botella es CPU, empeora las cosas.</li>
+  <li>El event loop es <strong>un hilo, un callback a la vez</strong>: duerme en <code>select()</code> y despierta a correr callbacks. La latencia de todos depende del callback más largo.</li>
+  <li>Las corrutinas son generadores mejorados y <code>await</code> es <code>yield</code> disfrazado. <code>await</code> sobre otra corrutina <strong>no cede el control</strong>; solo lo cede un Future pendiente.</li>
+  <li>Una corrutina no corre sola: la que el loop programa es la <strong><code>Task</code></strong>. Sin <code>create_task</code>, <code>TaskGroup</code> o <code>gather</code>, no hay concurrencia.</li>
+  <li><strong><code>TaskGroup</code> (3.11+) reemplaza a <code>gather</code></strong> en código nuevo: cancelación estructurada, <code>ExceptionGroup</code> con <code>except*</code>, y la garantía de que nada queda huérfano.</li>
+  <li><code>asyncio.timeout</code> le pone plazo a un <em>bloque</em>, no a una llamada. <code>shield</code> solo para operaciones no repetibles — y siempre esperando la tarea protegida.</li>
+  <li><strong><code>CancelledError</code> hereda de <code>BaseException</code>: se limpia en <code>finally</code> y se re-lanza.</strong> Atraparla sin re-lanzar es un servicio que no se apaga.</li>
+  <li>Los cuatro errores clásicos: bloquear el loop, no guardar la referencia de una task, sostener un lock a través de un <code>await</code>, y <code>time.sleep</code>.</li>
+  <li>Diagnóstico: <code>debug=True</code> y <code>slow_callback_duration</code> en staging, watchdog de latencia en producción, y <code>python -m asyncio pstree PID</code> desde <strong>3.14</strong>. El trabajo pesado sale con <code>to_thread</code> o <code>run_in_executor</code>.</li>
+  <li><strong>La concurrencia es un parámetro de diseño, no <code>len(entrada)</code>.</strong> Semáforo para acotar concurrencia; cola acotada para acotar además la memoria.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí una corrutina y ejecutala <strong>sin event loop</strong>, a mano, con <code>send(None)</code>. Capturá el <code>StopIteration</code> y sacá el valor de retorno. Después implementá un awaitable propio con <code>__await__</code> que haga <code>yield</code> una vez, y demostrá con prints en qué orden corre todo.</li>
+  <li>Armá un programa con una tarea de latido (<code>print</code> cada 100 ms) y otra que haga un cálculo de 3 segundos sin ceder. Medí el intervalo real entre latidos. Después arreglalo con <code>asyncio.to_thread</code> y volvé a medir.</li>
+  <li>Reproducí el bug de la task recolectada: creá 10.000 tasks sin guardar la referencia, forzá <code>gc.collect()</code> y contá cuántas terminaron de verdad. Corregilo con el patrón del conjunto de referencias fuertes.</li>
+  <li>Escribí la misma operación con <code>gather</code> y con <code>TaskGroup</code>, donde una de tres tareas falla a los 0,1 s y otra tarda 5 s. Mostrá con logs qué pasa con la tarea lenta en cada caso, y cuánto tarda el programa en terminar.</li>
+  <li>Implementá <code>worker</code> con limpieza en <code>finally</code>. Escribí un test que lo cancele y verifique tres cosas: que propaga <code>CancelledError</code>, que cerró el recurso, y que no tardó más de 100 ms en hacerlo.</li>
+  <li>Tomá el scraper del Worked Example y agregale un limitador de <strong>tasa</strong> (token bucket) además del semáforo. Medí req/s reales con y sin él contra un servidor local que registre timestamps.</li>
+  <li>Reescribí el scraper con el patrón de cola acotada de PS3.10 para que la memoria no dependa del tamaño de la entrada. Comparé el RSS del proceso con 5.000 y con 500.000 URLs en las dos versiones.</li>
+  <li>Instrumentá cualquier servicio async tuyo con el watchdog de latencia del loop. Dejalo corriendo bajo carga y encontrá el bloqueo más largo. Documentá qué línea era y cómo lo sacaste del loop.</li>
+</ol>
+
+<section class="quiz" id="quizPS3">
+  <style>
+    #quizPS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS3 .q{margin-bottom:1.5rem}
+    #quizPS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS3 .opt:hover{border-color:var(--accent)}
+    #quizPS3 .opt:disabled{cursor:default}
+    #quizPS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS3 .exp.show{display:block}
+    #quizPS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un handler hace <code>await calcular(x)</code>, donde <code>calcular</code> es <code>async def</code> y adentro suma diez millones de números. ¿Qué pasa con el resto de las conexiones?</p>
+    <button class="opt">Nada: el <code>await</code> cede el control y las otras conexiones siguen atendiéndose</button>
+    <button class="opt">asyncio mueve automáticamente el cálculo a otro hilo del pool por defecto</button>
+    <button class="opt">Quedan congeladas: <code>await</code> sobre una corrutina no cede el control, solo lo hace un Future pendiente</button>
+    <div class="exp"><code>await</code> sobre otra corrutina es delegación —entra, ejecuta, vuelve— igual que <code>yield from</code>. El control vuelve al loop únicamente cuando se llega a un <code>await</code> sobre un Future que todavía no terminó (un socket, un timer, un <code>Event</code>). Como <code>calcular</code> nunca toca uno, el loop no ejecuta ningún otro callback durante todo ese tiempo. La palabra <code>async</code> vuelve una función <em>suspendible</em>, no concurrente. La solución es <code>await asyncio.to_thread(...)</code>, o un <code>ProcessPoolExecutor</code> si es CPU pesada en Python puro (PS1).</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. En un worker de larga vida escribís <code>except asyncio.CancelledError: log.info("chau")</code> y seguís con el <code>while True</code>. ¿Cuál es la consecuencia?</p>
+    <button class="opt">El servicio deja de apagarse de forma ordenada: la tarea ignora la cancelación y hay que matarla a la fuerza</button>
+    <button class="opt">Ninguna: loguear la cancelación es la forma recomendada de manejarla</button>
+    <button class="opt">Python lo detecta y vuelve a lanzar <code>CancelledError</code> automáticamente al salir del <code>except</code></button>
+    <div class="exp">Cancelar es <em>inyectar</em> una excepción, no matar la tarea: si la atrapás y no la re-lanzás, la tarea sigue viva. Ahí <code>TaskGroup</code>, <code>asyncio.timeout</code> y el apagado de <code>asyncio.run</code> quedan esperando a alguien que nunca termina, y el proceso se cuelga hasta que llegue el <code>SIGKILL</code> del orquestador — con transacciones abiertas y escrituras a medias. El patrón correcto es limpiar en <code>finally</code> (con plazo, si la limpieza toca la red) y hacer <code>raise</code> al final del <code>except</code>. Que <code>CancelledError</code> herede de <code>BaseException</code> desde 3.8 es justamente para que tu <code>except Exception</code> genérico no la atrape sin querer.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tenés 5.000 URLs y las lanzás con <code>gather</code>, una task por URL. El pool del cliente HTTP tiene 100 conexiones. ¿Cuál es el problema de fondo?</p>
+    <button class="opt">Que <code>gather</code> no soporta más de 1.000 awaitables y hay que dividir en lotes</button>
+    <button class="opt">Que la concurrencia quedó atada a <code>len(entrada)</code>: pagás memoria por 5.000 tasks para tener 100 en vuelo, y los timeouts corren mientras esperan turno</button>
+    <button class="opt">Que las corrutinas son más lentas que los hilos para I/O de red</button>
+    <div class="exp">El límite real (100 conexiones, más la tasa que tolere el proveedor) ya existía; las 5.000 tasks solo lo volvieron invisible y caro. Pagás RAM por 4.900 tasks dormidas, sus plazos empiezan a correr al crearse y no al conseguir conexión —así aparece una avalancha de <code>TimeoutError</code> falsos—, y encima <code>gather</code> deja huérfanas a las 4.999 restantes cuando una falla, perdiendo el trabajo ya completado. La corrección es un <code>Semaphore</code> del tamaño del pool más <code>TaskGroup</code> y un timeout por ítem <em>dentro</em> del semáforo; y si la entrada puede crecer sin techo, una cola acotada con N workers para que la memoria deje de depender de ella.</div>
+  </div>
+
+  <div class="score" id="scorePS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps2-memoria-performance/lecture.html">← PS2: Memoria y performance</a>
+  <a href="../ps4-modelo-de-datos/lecture.html">PS4: El modelo de datos →</a>
+</nav>
+
+</div>
+</body>
+</html>

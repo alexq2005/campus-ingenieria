@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PS7 — Testing serio · Python Senior</title>
+  <meta name="description" content="pytest avanzado (fixtures, scopes, conftest, parametrize), property-based testing con hypothesis y shrinking, mutation testing, la trampa de la cobertura, test doubles, testcontainers, velocidad con xdist y testing de código async.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Python Senior</a>
+  <a href="../../index.html">🐍 Curso de Python</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">PS7</span>
+  <span class="badge">⏱ 30–110 min</span>
+  <span class="badge">🎯 Pre-req: PS6</span>
+  <span class="badge">🧪 Testing</span>
+</div>
+
+<article>
+
+<h1>PS7 — Testing serio</h1>
+
+<h2>PS7.0 Por qué este módulo</h2>
+
+<p>Casi todos los proyectos empiezan con tests. Muy pocos los conservan. El patrón de muerte es siempre el mismo: la suite tarda ocho minutos, alguien la saca del hook de pre-commit "por ahora", después dos tests empiezan a fallar de a ratos, se marcan como <code>skip</code> "hasta que los arreglemos", y seis meses más tarde nadie confía en lo que dice el CI. <strong>Un test suite lento o frágil se termina desactivando</strong>, y a partir de ese día tenés todo el costo de mantener tests y ninguno de sus beneficios.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El objetivo de testear no es la cobertura. Es <strong>confianza para cambiar código</strong>. Un test sirve si, cuando lo rompés, te enteraste de algo que te importaba; y si, cuando pasa, podés hacer deploy sin revisar a mano. Todo lo que sigue —<em>hypothesis</em>, <em>mutation testing</em>, <em>testcontainers</em>— son formas de responder una sola pregunta: <em>¿mis tests se romperían si el código estuviera mal?</em>
+</div>
+
+<p>Esa pregunta es más incómoda de lo que parece, porque la métrica que todo el mundo mira —la cobertura— <strong>no la responde</strong>. Se puede tener 100% de líneas cubiertas y una suite que no detecta absolutamente nada. En PS7.6 vamos a construir exactamente ese caso y romperlo.</p>
+
+<p>Todo lo de esta lección se instala con el toolchain de PS6:</p>
+
+<pre><code class="lang-bash">uv add --dev pytest pytest-cov pytest-xdist pytest-asyncio anyio hypothesis mutmut testcontainers
+uv run pytest -q</code></pre>
+
+<h2>PS7.1 Fixtures: el modelo mental correcto</h2>
+
+<p>Una fixture no es "código que corre antes del test". Es una <strong>dependencia declarada por nombre</strong>: el test pide <code>db</code> y pytest se encarga de construirla, cachearla según su <em>scope</em> y destruirla. Es inyección de dependencias, no <code>setUp()</code>.</p>
+
+<pre><code class="lang-python">import pytest
+
+@pytest.fixture
+def carrito():
+    return Carrito(usuario="ana")
+
+def test_carrito_arranca_vacio(carrito):     # pide "carrito" por nombre
+    assert carrito.total() == 0
+
+def test_agregar_suma(carrito):              # recibe uno NUEVO, no el de arriba
+    carrito.agregar("libro", 1000)
+    assert carrito.total() == 1000</code></pre>
+
+<h3>Setup y teardown con <code>yield</code></h3>
+
+<p>Si la fixture usa <code>yield</code> en vez de <code>return</code>, todo lo que va después del <code>yield</code> es el teardown, y corre <strong>aunque el test falle</strong>:</p>
+
+<pre><code class="lang-python">import pytest, tempfile, shutil
+from pathlib import Path
+
+@pytest.fixture
+def dir_temporal():
+    ruta = Path(tempfile.mkdtemp())
+    yield ruta                     # el test corre acá
+    shutil.rmtree(ruta)            # se limpia SIEMPRE, pase o falle</code></pre>
+
+<div class="tip">
+  Para archivos temporales no escribas eso: pytest ya trae <code>tmp_path</code> (un <code>Path</code> por test), <code>tmp_path_factory</code> (compartido), <code>monkeypatch</code>, <code>capsys</code> y <code>caplog</code>. Antes de escribir una fixture, revisá si ya existe — vale la regla de <em>Verify Before Creating</em>.
+</div>
+
+<h3>Scopes: dónde se paga el tiempo</h3>
+
+<table>
+<thead><tr><th>Scope</th><th>Se construye</th><th>Usalo para</th><th>Riesgo</th></tr></thead>
+<tbody>
+<tr><td><code>function</code> (default)</td><td>Una vez por test</td><td>Datos, objetos baratos</td><td>Ninguno; es el correcto por defecto</td></tr>
+<tr><td><code>class</code></td><td>Una vez por clase de tests</td><td>Agrupar tests que comparten un estado caro</td><td>Orden implícito entre tests</td></tr>
+<tr><td><code>module</code></td><td>Una vez por archivo</td><td>Un cliente HTTP, un parser costoso</td><td>Un test puede ensuciar al siguiente</td></tr>
+<tr><td><code>session</code></td><td>Una vez por corrida</td><td>Levantar Postgres, compilar, entrenar un modelo chico</td><td>Alto: estado global; y con <code>xdist</code> se crea <strong>una por worker</strong></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla:</strong> el scope más caro para el recurso, el más barato para los datos. Levantá el contenedor de Postgres en <code>session</code>, pero abrí una <strong>transacción por test</strong> que se revierte al final. Así pagás el arranque una vez y conservás el aislamiento.
+</div>
+
+<pre><code class="lang-python">@pytest.fixture(scope="session")
+def motor():                       # caro: una sola vez en toda la corrida
+    return crear_engine(URL_TEST)
+
+@pytest.fixture                    # barato: uno por test, y se deshace
+def sesion(motor):
+    conn = motor.connect()
+    trx = conn.begin()
+    yield Sesion(bind=conn)
+    trx.rollback()                 # el test no deja rastro en la base
+    conn.close()</code></pre>
+
+<h3>Fixtures como factories</h3>
+
+<p>El error más común de fixtures es que devuelvan <em>un</em> objeto fijo. En cuanto necesitás dos usuarios distintos, la fixture no sirve. La solución es que la fixture devuelva una <strong>función</strong>:</p>
+
+<pre><code class="lang-python">@pytest.fixture
+def hacer_usuario(sesion):
+    creados = []
+
+    def _hacer(nombre="ana", saldo=0, activo=True):
+        u = Usuario(nombre=nombre, saldo=saldo, activo=activo)
+        sesion.add(u)
+        creados.append(u)
+        return u
+
+    yield _hacer                          # el test recibe la FÁBRICA
+    for u in creados:                     # y el teardown sabe qué limpiar
+        sesion.delete(u)
+
+def test_transferencia(hacer_usuario):
+    origen  = hacer_usuario("ana", saldo=1000)
+    destino = hacer_usuario("beto", saldo=0)
+    transferir(origen, destino, 400)
+    assert (origen.saldo, destino.saldo) == (600, 400)</code></pre>
+
+<h3><code>conftest.py</code> y su jerarquía</h3>
+
+<p><code>conftest.py</code> es el archivo donde viven las fixtures compartidas. No se importa: pytest lo descubre solo, y lo hace <strong>por directorio</strong>. Las fixtures de un <code>conftest.py</code> están disponibles para ese directorio y todos sus hijos, y un hijo puede <strong>redefinir</strong> el nombre de una fixture del padre.</p>
+
+<pre><code class="lang-text">tests/
+├─ conftest.py            # fixtures globales: config, factories, marks
+├─ unit/
+│  └─ test_precios.py     # ve las de tests/
+└─ integracion/
+   ├─ conftest.py         # fixtures de infra: postgres, redis
+   └─ test_ordenes.py     # ve las de tests/ Y las de integracion/</code></pre>
+
+<div class="mistake">
+  <strong>El <code>conftest.py</code> gigante es una señal de alarma.</strong> Cuando el de la raíz pasa de 300 líneas y empieza a importar la mitad de la app, dejó de ser configuración y se volvió un módulo de producción sin tests. Partilo por directorio: la fixture de Postgres no tiene por qué existir cuando corrés solo los unitarios.
+</div>
+
+<h3><code>request</code>: la fixture que describe al test</h3>
+
+<pre><code class="lang-python">@pytest.fixture
+def cliente(request):
+    # 1) leer marks que el test se puso a sí mismo
+    marca = request.node.get_closest_marker("timeout_ms")
+    ms = marca.args[0] if marca else 1000
+
+    # 2) saber quién te pidió
+    print("me pidió:", request.node.name)
+
+    # 3) pedir OTRA fixture dinámicamente, por nombre
+    backend = request.getfixturevalue("motor")
+
+    yield Cliente(backend, timeout_ms=ms)
+
+@pytest.mark.timeout_ms(50)
+def test_falla_rapido(cliente):
+    ...</code></pre>
+
+<h3>Fixtures parametrizadas</h3>
+
+<p>Con <code>params=</code>, <strong>cada test que use la fixture se multiplica</strong>. Es la forma de correr toda una carpeta contra dos backends sin tocar ni un test:</p>
+
+<pre><code class="lang-python">@pytest.fixture(params=["sqlite", "postgres"], ids=["sqlite", "pg"])
+def repo(request):
+    if request.param == "sqlite":
+        yield RepoSQLite(":memory:")
+    else:
+        yield RepoPostgres(os.environ["PG_URL"])
+
+# este único test corre DOS veces: test_guardar[sqlite] y test_guardar[pg]
+def test_guardar(repo):
+    repo.guardar(Orden(id=1))
+    assert repo.buscar(1) is not None</code></pre>
+
+<div class="warn">
+  Ojo con el efecto multiplicativo: una fixture con 3 params usada por otra con 4 params genera 12 combinaciones <em>por test</em>. Es la causa número uno de suites que pasan de 40 segundos a 9 minutos sin que nadie se dé cuenta.
+</div>
+
+<h2>PS7.2 <code>parametrize</code>, y el <code>ids=</code> que casi nadie usa</h2>
+
+<p>Un <code>for</code> adentro de un test es un antipatrón: si falla la tercera iteración, el test se corta y no sabés nada de las otras. <code>parametrize</code> genera <strong>N tests independientes</strong>.</p>
+
+<pre><code class="lang-python">import pytest
+from tienda import precio_final
+
+@pytest.mark.parametrize(
+    ("monto", "esperado"),
+    [
+        (0,        0.0),
+        (999.99,   999.99),
+        (1_000,    950.0),
+        (9_999,    9_499.05),
+        (10_000,   8_500.0),
+    ],
+)
+def test_precio_por_escalon(monto, esperado):
+    assert precio_final(monto) == pytest.approx(esperado)</code></pre>
+
+<p>Sin <code>ids</code>, el fallo dice <code>test_precio_por_escalon[3]</code>. Con <code>ids</code>, dice lo que rompiste:</p>
+
+<pre><code class="lang-python">@pytest.mark.parametrize(
+    ("monto", "esperado"),
+    [
+        pytest.param(999.99, 999.99,   id="justo-abajo-del-primer-escalon"),
+        pytest.param(1_000,  950.0,    id="borde-exacto-primer-escalon"),
+        pytest.param(9_999,  9_499.05, id="justo-abajo-del-segundo"),
+        pytest.param(10_000, 8_500.0,  id="borde-exacto-segundo-escalon"),
+        pytest.param(-1,     None,     id="monto-negativo",
+                     marks=pytest.mark.xfail(raises=ValueError, strict=True)),
+    ],
+)
+def test_precio_por_escalon(monto, esperado):
+    assert precio_final(monto) == pytest.approx(esperado)</code></pre>
+
+<div class="rule">
+  <strong>📌 El id no es cosmética.</strong> Es lo único que vas a ver en el log de CI a las 2 AM. <code>FAILED test_precio[borde-exacto-segundo-escalon]</code> te dice qué invariante se rompió; <code>FAILED test_precio[3]</code> te obliga a abrir el archivo y contar. Y como bonus: <code>pytest -k "borde-exacto"</code> corre justo esos.
+</div>
+
+<h2>PS7.3 pytest en el día a día</h2>
+
+<p>La diferencia entre alguien que "tiene tests" y alguien que <em>usa</em> tests está casi entera en estos flags:</p>
+
+<table>
+<thead><tr><th>Comando</th><th>Qué hace</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>pytest -x</code></td><td>Para en el primer fallo</td><td>Cuando rompiste algo grande y no querés 400 líneas de traceback</td></tr>
+<tr><td><code>pytest --lf</code></td><td>Corre solo los que fallaron la vez pasada</td><td>El loop de arreglar un bug. Es el flag más rentable de todos</td></tr>
+<tr><td><code>pytest --ff</code></td><td>Corre todos, pero los que fallaron primero</td><td>Verificación final del fix</td></tr>
+<tr><td><code>pytest -k "orden and not lento"</code></td><td>Filtra por subcadena del nombre</td><td>Iterar sobre un área sin conocer los marks</td></tr>
+<tr><td><code>pytest -m integracion</code></td><td>Filtra por <em>mark</em></td><td>Separar unitarios de integración en CI</td></tr>
+<tr><td><code>pytest --sw</code></td><td><em>Stepwise</em>: para, y al volver arranca ahí</td><td>Migraciones grandes con 30 tests rotos</td></tr>
+<tr><td><code>pytest -q --durations=10</code></td><td>Muestra los 10 tests más lentos</td><td>Antes de cualquier queja sobre "la suite tarda"</td></tr>
+</tbody>
+</table>
+
+<p>Los marks se declaran en la config para que un typo sea un error y no un test que silenciosamente no corre nunca:</p>
+
+<pre><code class="lang-toml"># pyproject.toml
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+  "lento: tarda mas de 1s",
+  "integracion: necesita infra real (docker)",
+]
+filterwarnings = ["error"]        # un DeprecationWarning nuevo rompe el build</code></pre>
+
+<div class="tip">
+  <code>--strict-markers</code> es obligatorio. Sin él, <code>@pytest.mark.integracon</code> (con el typo) es un mark válido que no matchea nada: el test queda excluido de <code>-m integracion</code> y de <code>-m "not integracion"</code> a la vez. Nadie lo nota durante meses.
+</div>
+
+<h2>PS7.4 Property-based testing con <code>hypothesis</code></h2>
+
+<p>Los tests por ejemplo verifican los casos <strong>que se te ocurrieron</strong>. El problema es que los bugs viven, casi por definición, en los casos que no se te ocurrieron. El property-based testing invierte el planteo: en vez de escribir 20 ejemplos, describís una <strong>propiedad que siempre debe valer</strong> y la librería busca un contraejemplo.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> Un test por ejemplo es un control de calidad que revisa cinco piezas elegidas a mano. Una propiedad es la <em>especificación</em> de la pieza, y hypothesis es un inspector que genera piezas raras a propósito —el string vacío, el <code>NaN</code>, el entero de 400 dígitos, la lista con dos elementos iguales— buscando una que viole la spec.
+</div>
+
+<pre><code class="lang-python">from hypothesis import given, strategies as st
+
+@given(st.lists(st.integers()))
+def test_ordenar_es_idempotente(xs):
+    assert sorted(sorted(xs)) == sorted(xs)
+
+@given(st.text())
+def test_json_roundtrip(s):
+    assert json.loads(json.dumps(s)) == s
+
+@given(st.lists(st.integers(), min_size=1))
+def test_el_maximo_esta_en_la_lista(xs):
+    assert max(xs) in xs</code></pre>
+
+<h3>Las propiedades que sirven</h3>
+
+<table>
+<thead><tr><th>Patrón</th><th>Forma</th><th>Ejemplo típico</th></tr></thead>
+<tbody>
+<tr><td><strong>Round-trip</strong></td><td><code>decode(encode(x)) == x</code></td><td>Serializadores, parsers, compresión, ORM</td></tr>
+<tr><td><strong>Invariante</strong></td><td>Algo que siempre vale del resultado</td><td>Un saldo nunca es negativo; el total = suma de ítems</td></tr>
+<tr><td><strong>Oráculo</strong></td><td><code>rapido(x) == lento_obvio(x)</code></td><td>Comparar tu versión optimizada con la ingenua</td></tr>
+<tr><td><strong>Monotonía</strong></td><td><code>a &lt;= b</code> implica <code>f(a) &lt;= f(b)</code></td><td>Precios, rankings, scores, escalones</td></tr>
+<tr><td><strong>Idempotencia</strong></td><td><code>f(f(x)) == f(x)</code></td><td>Normalizar, deduplicar, migraciones, <code>PUT</code></td></tr>
+<tr><td><strong>Nunca explota</strong></td><td>La función no lanza excepciones inesperadas</td><td>Parsers de entrada del usuario</td></tr>
+</tbody>
+</table>
+
+<h3><code>assume</code>: descartar entradas sin sentido</h3>
+
+<pre><code class="lang-python">from hypothesis import given, assume, strategies as st
+
+@given(st.integers(), st.integers())
+def test_division(a, b):
+    assume(b != 0)                # descarta el caso, no lo falla
+    assert (a // b) * b + (a % b) == a</code></pre>
+
+<div class="warn">
+  <code>assume</code> tira entradas a la basura. Si descartás demasiadas, hypothesis aborta con <code>FailedHealthCheck: filter_too_much</code>, y tiene razón: si el 95% de lo que genera no sirve, el problema es la <strong>estrategia</strong>, no el filtro. Construí la estrategia correcta con <code>.map()</code>, <code>.filter()</code> liviano o <code>st.builds()</code> en vez de generar basura y descartarla.
+</div>
+
+<pre><code class="lang-python"># mal: genera cualquier cosa y descarta casi todo
+@given(st.text())
+def test_email(s):
+    assume("@" in s and "." in s.split("@")[-1])   # descarta el 99.9%
+    ...
+
+# bien: la estrategia solo produce cosas válidas
+emails = st.builds(
+    "{}@{}.com".format,
+    st.text(st.characters(whitelist_categories=("Ll", "Nd")), min_size=1, max_size=20),
+    st.sampled_from(["ejemplo", "test", "correo"]),
+)
+
+@given(emails)
+def test_email(e):
+    assert parsear_email(e).dominio.endswith(".com")</code></pre>
+
+<h3>Shrinking: por qué el contraejemplo es tan chiquito</h3>
+
+<p>Esto es lo que separa a hypothesis de un simple generador aleatorio. Cuando encuentra un fallo, <strong>no te lo reporta</strong>: primero lo reduce. Prueba versiones sistemáticamente más simples del contraejemplo (listas más cortas, números más cercanos a cero, strings más cortos) mientras el test siga fallando.</p>
+
+<pre><code class="lang-text">Falsifying example: test_promedio(
+    xs=[0, 0],
+)
+</code></pre>
+
+<p>El fallo original quizá fue <code>xs=[-914, 22, 0, 8871, -3, 0, 5]</code>. Después de decenas de intentos, hypothesis descubre que ninguno de esos números importa: lo único necesario es que la suma dé cero. <strong>El contraejemplo mínimo es el diagnóstico.</strong> No te dice solo "falla", te dice <em>qué</em> hace fallar.</p>
+
+<div class="info">
+  Hypothesis guarda los contraejemplos que encontró en <code>.hypothesis/examples/</code> y los <strong>vuelve a probar primero</strong> en cada corrida. Un bug que encontró una vez no vuelve a colarse. Ese directorio va en <code>.gitignore</code>; el caso que valga la pena se congela a mano con <code>@example(...)</code>.
+</div>
+
+<pre><code class="lang-python">from hypothesis import given, example, strategies as st
+
+@given(st.floats(allow_nan=False, allow_infinity=False))
+@example(0.0)              # casos que ya nos mordieron: siempre se prueban
+@example(-0.0)
+def test_formato_moneda(x):
+    assert formatear(x).startswith("$")</code></pre>
+
+<h2>PS7.5 Ejemplos vs propiedades: qué encuentra cada uno</h2>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Tests por ejemplo</th><th>Property-based</th></tr></thead>
+<tbody>
+<tr><td>Qué encuentra</td><td>Regresiones en casos conocidos</td><td>Bordes que nadie imaginó: vacío, cero, <code>NaN</code>, unicode, duplicados, overflow</td></tr>
+<tr><td>Qué NO encuentra</td><td>Todo lo que no se te ocurrió</td><td>Que la <em>especificación</em> esté mal (si la propiedad es incorrecta, valida el bug)</td></tr>
+<tr><td>Legibilidad</td><td>Alta: se lee como documentación</td><td>Media: exige pensar en abstracto</td></tr>
+<tr><td>Costo de escribir</td><td>Bajo por caso, alto en total</td><td>Alto el primero, casi cero los siguientes</td></tr>
+<tr><td>Velocidad</td><td>Milisegundos</td><td>100× más lento (corre ~100 ejemplos por test)</td></tr>
+<tr><td>Al fallar</td><td>Sabés exactamente qué entrada</td><td>Sabés la entrada <strong>mínima</strong> — mejor diagnóstico</td></tr>
+<tr><td>Determinismo</td><td>Total</td><td>Con semilla, reproducible; sin ella puede fallar recién en la corrida 40</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No se elige: se combinan.</strong> Ejemplos para los casos de negocio que un humano tiene que poder leer ("un socio con cupón paga 14.000"). Propiedades para las leyes que el sistema no puede violar nunca ("el precio nunca es negativo", "gastar más nunca sale más barato"). Cada uno cubre exactamente el punto ciego del otro.
+</div>
+
+<h2>PS7.6 La cobertura es una métrica engañosa</h2>
+
+<p>La cobertura mide qué líneas <strong>se ejecutaron</strong>. No mide si alguien verificó el resultado. Este test da 100%:</p>
+
+<pre><code class="lang-python">def test_no_explota():
+    for m in (500, 2_000, 20_000):
+        precio_final(m)        # 100% de lineas. CERO asserts. CERO valor.</code></pre>
+
+<p>Y hay una segunda trampa, más sutil: la cobertura de <strong>líneas</strong> no es la de <strong>ramas</strong>.</p>
+
+<pre><code class="lang-python">def envio(monto, urgente=False):
+    costo = 500
+    if monto &gt; 5_000:
+        costo = 0
+    if urgente:
+        costo += 800
+    return costo
+
+# Con dos tests -- envio(10_000) y envio(1_000, urgente=True) -- todas las
+# lineas se ejecutan: cobertura de lineas 100%.
+# Pero la combinacion (monto alto + urgente) nunca se probo.</code></pre>
+
+<pre><code class="lang-bash">uv run pytest --cov=tienda --cov-branch --cov-report=term-missing
+# la columna "Missing" con --cov-branch muestra "12-&gt;15", o sea:
+# la rama que va de la linea 12 a la 15 nunca se tomo</code></pre>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué garantiza</th><th>Qué NO garantiza</th></tr></thead>
+<tbody>
+<tr><td>Cobertura de líneas</td><td>La línea se ejecutó</td><td>Que alguien haya verificado nada</td></tr>
+<tr><td>Cobertura de ramas</td><td>Cada <code>if</code> se tomó por los dos lados</td><td>Las <em>combinaciones</em> de condiciones</td></tr>
+<tr><td>Mutation score</td><td>Que romper el código <strong>rompe un test</strong></td><td>Que hayas escrito los tests que faltan</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El antipatrón del 100% obligatorio.</strong> Poner <code>fail_under = 100</code> no produce mejores tests: produce tests escritos para tocar líneas. La gente empieza a testear <code>__repr__</code> y getters porque son baratos, y sigue sin testear el cálculo de facturación porque es difícil. Un piso razonable (70–80%) más <strong>100% en los módulos que tocan plata, seguridad o datos del usuario</strong> refleja mucho mejor el riesgo real.
+</div>
+
+<h2>PS7.7 Mutation testing: la única forma de saber si tus tests sirven</h2>
+
+<div class="concept">
+  <strong>💡 La idea.</strong> La herramienta introduce un bug artificial en tu código (cambia un <code>&gt;=</code> por <code>&gt;</code>, un <code>+</code> por <code>-</code>, un <code>True</code> por <code>False</code>), corre tu suite y observa. Si <strong>algún test falla</strong>, el mutante fue <em>matado</em>: tus tests detectan ese error. Si <strong>todos pasan</strong>, el mutante <em>sobrevive</em>: acabás de descubrir un cambio que podés hacer en producción sin que nadie se entere.
+</div>
+
+<pre><code class="lang-bash">uv add --dev mutmut
+uv run mutmut run
+uv run mutmut results          # lista de mutantes sobrevivientes
+uv run mutmut show 7           # el diff exacto del mutante 7</code></pre>
+
+<pre><code class="lang-text">--- tienda/precios.py
++++ tienda/precios.py
+@@ -8,7 +8,7 @@
+-    if monto &gt;= 10_000:
++    if monto &gt; 10_000:
+
+Mutante 7: SOBREVIVIO
+Ningun test cambia de resultado con este diff.</code></pre>
+
+<p>Ese diff es una acusación concreta: <strong>nadie probó el valor exacto 10.000</strong>. No es un consejo de estilo, es una línea de código que podés cambiar sin consecuencias.</p>
+
+<table>
+<thead><tr><th>Estado del mutante</th><th>Significa</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>🟢 Matado</td><td>Un test lo detectó</td><td>Nada. Así se ve un test que sirve</td></tr>
+<tr><td>🔴 Sobrevivió</td><td>Ningún test nota la diferencia</td><td>Escribir el test que falta, o borrar el código si nadie lo necesita</td></tr>
+<tr><td>⏱ Timeout</td><td>El mutante hizo un loop infinito</td><td>Cuenta como matado</td></tr>
+<tr><td>⚠️ Equivalente</td><td>El mutante es funcionalmente idéntico al original</td><td>Ignorarlo. Es ruido inevitable, no un test faltante</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Cuándo NO hacer mutation testing.</strong> Es carísimo: corre tu suite entera una vez por mutante, así que un proyecto mediano puede tardar horas. No va en el CI de cada PR. Corrélo (1) sobre los módulos críticos, no sobre todo el repo — <code>mutmut run --paths-to-mutate tienda/precios.py</code>; (2) en un job nocturno o semanal; (3) una vez, a mano, cuando querés saber si la suite que heredaste vale algo. Y no persigas el 100% de mutation score: los mutantes equivalentes hacen que sea inalcanzable.
+</div>
+
+<h2>PS7.8 Test doubles: cinco cosas distintas que todos llaman "mock"</h2>
+
+<table>
+<thead><tr><th>Doble</th><th>Qué hace</th><th>Ejemplo</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><strong>Dummy</strong></td><td>Rellena un parámetro que nunca se usa</td><td><code>None</code>, <code>object()</code></td><td>La firma lo exige y el test no lo toca</td></tr>
+<tr><td><strong>Stub</strong></td><td>Devuelve respuestas fijas</td><td><code>lambda: {"precio": 100}</code></td><td>Querés controlar la <em>entrada</em> del código bajo test</td></tr>
+<tr><td><strong>Spy</strong></td><td>Es real, pero registra las llamadas</td><td>Wrapper que guarda args</td><td>Verificar un efecto sin cambiar el comportamiento</td></tr>
+<tr><td><strong>Mock</strong></td><td>Espera llamadas específicas y falla si no ocurren</td><td><code>unittest.mock.Mock</code></td><td>Cuando el efecto <em>es</em> el requisito (se envió el mail)</td></tr>
+<tr><td><strong>Fake</strong></td><td>Implementación real pero simplificada</td><td>SQLite en memoria, <code>fakeredis</code>, repo en <code>dict</code></td><td>Casi siempre la mejor opción</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># FAKE: una implementacion completa y honesta, en 8 lineas
+class RepoEnMemoria:
+    def __init__(self):
+        self._datos: dict[int, Orden] = {}
+
+    def guardar(self, orden):
+        self._datos[orden.id] = orden
+
+    def buscar(self, id_):
+        return self._datos.get(id_)
+
+def test_confirmar_orden():
+    repo = RepoEnMemoria()                  # sin mocks, sin magia
+    repo.guardar(Orden(id=1, estado="nueva"))
+    confirmar(repo, 1)
+    assert repo.buscar(1).estado == "confirmada"</code></pre>
+
+<pre><code class="lang-python"># MOCK: correcto cuando el efecto ES el requisito
+from unittest.mock import Mock
+
+def test_se_notifica_al_confirmar():
+    notificador = Mock()
+    confirmar(RepoEnMemoria(), 1, notificador=notificador)
+    notificador.enviar.assert_called_once_with(orden_id=1, plantilla="confirmada")</code></pre>
+
+<h3>Cuándo mockear <em>es</em> el bug</h3>
+
+<div class="danger">
+  <strong>⚠️ No mockees lo que no es tuyo.</strong> Si mockeás el SDK de Stripe, de boto3 o el driver de Postgres, tu test no verifica que tu código funcione contra esa librería: verifica que funcione contra <strong>tu idea</strong> de esa librería. El día que la API real devuelve un campo distinto, hace paginación, o lanza una excepción que no previste, tu suite sigue en verde y producción se cae. Es el modo de fallo más caro del testing: cobertura alta, confianza alta, protección cero.
+</div>
+
+<pre><code class="lang-python"># ❌ Este test pasa para siempre, incluso si la API cambia por completo
+def test_cobro(monkeypatch):
+    fake = Mock()
+    fake.Charge.create.return_value = {"status": "succeeded"}   # ¿seguro?
+    monkeypatch.setattr("mi_app.pagos.stripe", fake)
+    assert cobrar(1000) is True</code></pre>
+
+<table>
+<thead><tr><th>En vez de mockear...</th><th>Usá</th></tr></thead>
+<tbody>
+<tr><td>Un SDK de nube (AWS)</td><td><code>moto</code> / <code>localstack</code>: el fake oficial que sigue la API real</td></tr>
+<tr><td>Un cliente HTTP de terceros</td><td><code>respx</code> / <code>vcrpy</code>: respuestas HTTP <strong>grabadas de la API real</strong></td></tr>
+<tr><td>La base de datos</td><td>Testcontainers (PS7.9): el motor de verdad</td></tr>
+<tr><td>Redis</td><td><code>fakeredis</code>, o un contenedor</td></tr>
+<tr><td>El reloj (<code>datetime.now</code>)</td><td><code>time-machine</code> / <code>freezegun</code>, o mejor: inyectar el reloj como dependencia</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla operativa:</strong> mockeá <strong>en tu frontera</strong>, no en la del otro. Envolvé el SDK en una clase tuya (<code>PasarelaDePagos</code>), testeá esa clase contra el servicio real o su fake oficial, y en el resto de la app mockeá <em>tu</em> interfaz. Ese wrapper es el único lugar del código que tiene que saber cómo se llaman los campos de Stripe.
+</div>
+
+<h2>PS7.9 Testcontainers: la base de datos de verdad</h2>
+
+<p>El mock de base de datos miente por construcción: no valida constraints, no tiene transacciones reales, no falla por deadlock, no aplica tus migraciones y no conoce el dialecto SQL de tu motor. Testcontainers levanta el Postgres real en Docker, y lo apaga solo.</p>
+
+<pre><code class="lang-python"># tests/integracion/conftest.py
+import pytest
+from testcontainers.postgres import PostgresContainer
+
+@pytest.fixture(scope="session")
+def pg_url():
+    with PostgresContainer("postgres:17-alpine") as pg:
+        url = pg.get_connection_url()
+        aplicar_migraciones(url)        # tus migraciones REALES, sobre el motor REAL
+        yield url
+
+@pytest.fixture
+def sesion(pg_url):
+    conn = crear_engine(pg_url).connect()
+    trx = conn.begin()
+    yield Sesion(bind=conn)
+    trx.rollback()                      # aislamiento por test, sin recrear la base
+
+@pytest.mark.integracion
+def test_no_permite_email_duplicado(sesion):
+    sesion.add(Usuario(email="a@b.com")); sesion.commit()
+    with pytest.raises(IntegrityError):          # el UNIQUE de verdad
+        sesion.add(Usuario(email="a@b.com")); sesion.commit()</code></pre>
+
+<div class="tip">
+  Ese test es imposible con SQLite en memoria y con cualquier mock: el constraint <code>UNIQUE</code> lo aplica el motor, no tu código. Los bugs que aparecen solo en producción viven casi todos en esta categoría — tipos, zonas horarias, <code>ON DELETE CASCADE</code>, colaciones, <code>NULL</code> en índices únicos.
+</div>
+
+<div class="warn">
+  <strong>El costo.</strong> Necesitás Docker disponible (en tu máquina y en el CI), el primer arranque tarda unos segundos y descarga imágenes. Por eso van marcados: <code>pytest -m "not integracion"</code> para el loop rápido de desarrollo, y la suite completa en CI. La imagen se <strong>pinea por versión</strong> (<code>postgres:17-alpine</code>, nunca <code>latest</code>) o tus tests se rompen solos un martes cualquiera.
+</div>
+
+<h2>PS7.10 Velocidad: la suite que nadie apaga</h2>
+
+<p>Antes de paralelizar, medí. Casi siempre el 80% del tiempo está en el 3% de los tests:</p>
+
+<pre><code class="lang-bash">uv run pytest --durations=15
+# 42.10s call     tests/test_reportes.py::test_reporte_anual
+#  8.30s setup    tests/integracion/conftest.py::pg_url
+#  1.02s call     tests/test_api.py::test_login
+# ...</code></pre>
+
+<pre><code class="lang-bash"># xdist: un proceso por nucleo
+uv run pytest -n auto
+
+# reparte por archivo: los tests de un mismo modulo caen en el mismo worker
+uv run pytest -n auto --dist loadfile</code></pre>
+
+<table>
+<thead><tr><th>Situación</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td>Muchos tests rápidos e independientes</td><td><code>-n auto</code>. Ganancia casi lineal</td></tr>
+<tr><td>Pocos tests, todos rápidos</td><td>Nada: el arranque de los workers cuesta más que la ganancia</td></tr>
+<tr><td>Tests que comparten una base</td><td><code>--dist loadgroup</code> + <code>@pytest.mark.xdist_group</code>, o una base por worker</td></tr>
+<tr><td>Un test de 40s que domina el total</td><td>Optimizá ese test. Paralelizar no lo hace más corto</td></tr>
+<tr><td>Fixtures <code>session</code> caras</td><td>Ojo: con N workers se construyen <strong>N veces</strong></td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Paralelizar destapa tests que dependían del orden.</strong> Si al poner <code>-n auto</code> aparecen fallos "raros", no es culpa de xdist: esos tests siempre estuvieron acoplados por estado global —un singleton, una variable de módulo, un archivo en disco, la misma fila en la base— y el orden secuencial los tapaba. Verificalo antes con <code>pytest -p no:randomly --tb=short</code> o instalando <code>pytest-randomly</code>, que ordena los tests al azar a propósito.
+</div>
+
+<h2>PS7.11 Testear código async</h2>
+
+<p>Lo que aprendiste en PS3 hay que poder probarlo. La configuración mínima con <code>pytest-asyncio</code> en modo automático:</p>
+
+<pre><code class="lang-toml">[tool.pytest.ini_options]
+asyncio_mode = "auto"           # no hace falta marcar cada test</code></pre>
+
+<pre><code class="lang-python">async def test_trae_usuario(cliente_http):
+    u = await cliente_http.get_usuario(1)
+    assert u.nombre == "ana"</code></pre>
+
+<p>Pero el camino feliz es la parte fácil. Lo que rompe en producción es la <strong>cancelación</strong> y los <strong>timeouts</strong>: recursos que quedan abiertos cuando una tarea se corta a la mitad.</p>
+
+<pre><code class="lang-python">import anyio, pytest
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+@pytest.mark.anyio
+async def test_libera_el_recurso_aunque_lo_cancelen():
+    liberado = False
+
+    async def trabajo():
+        nonlocal liberado
+        try:
+            await anyio.sleep(10)          # simula una operacion lenta
+        finally:
+            liberado = True                # el cleanup DEBE correr igual
+
+    with anyio.move_on_after(0.05) as scope:
+        await trabajo()
+
+    assert scope.cancelled_caught          # efectivamente se canceló
+    assert liberado                        # y el finally corrió
+
+@pytest.mark.anyio
+async def test_el_timeout_se_respeta():
+    with pytest.raises(TimeoutError):
+        with anyio.fail_after(0.1):
+            await operacion_lenta()</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El bug clásico del testing async: el falso verde.</strong> Si te olvidás el <code>await</code>, muchas suites mal configuradas no fallan — el test termina, la corrutina nunca se ejecuta y solo queda un <code>RuntimeWarning: coroutine was never awaited</code> perdido en el output. Por eso <code>filterwarnings = ["error"]</code> en el <code>pyproject.toml</code> de PS7.3 no es paranoia: convierte ese warning en un fallo.
+</div>
+
+<h2>PS7.12 Qué NO testear</h2>
+
+<p>Cada test que escribís es código que hay que mantener. Los que no aportan información igual cuestan tiempo de CI y frenan refactors.</p>
+
+<table>
+<thead><tr><th>No testees</th><th>Por qué</th><th>Excepción</th></tr></thead>
+<tbody>
+<tr><td>Getters y setters triviales</td><td>Testean el lenguaje, no tu lógica</td><td>Si tienen validación o cálculo adentro</td></tr>
+<tr><td>La librería de terceros</td><td>Ya tiene sus tests; no es tu trabajo</td><td>Un test que documente <em>cómo la usás</em> en tu frontera</td></tr>
+<tr><td>El framework</td><td>Testear que Django rutea es testear Django</td><td>Tu configuración de rutas, permisos o middleware propio</td></tr>
+<tr><td><code>__repr__</code>, <code>__str__</code></td><td>Cambian por estética y rompen tests por nada</td><td>Si el formato es un contrato (logs parseados, CLI)</td></tr>
+<tr><td>Detalles privados (<code>_helper</code>)</td><td>Congelan la implementación y bloquean el refactor</td><td>Un algoritmo complejo aislado que merece sus propios tests</td></tr>
+<tr><td>Constantes de configuración</td><td><code>assert TASA == 0.21</code> duplica el código, no lo verifica</td><td>Reglas de negocio con consecuencias legales</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El filtro de una línea:</strong> si este test se pusiera rojo, ¿me enteraría de algo que me importa, o solo de que cambié la forma del código? Si es lo segundo, no es un test: es cemento.
+</div>
+
+<h2>🧑‍🎓 Worked Example — 100% de cobertura y un bug vivo</h2>
+
+<blockquote>Un e-commerce cobra de menos. Contabilidad reporta que en algunos casos aumentar el monto del carrito <em>baja</em> el total a pagar. El módulo de precios tiene 100% de cobertura, cinco tests y ningún fallo en seis meses.</blockquote>
+
+<p><strong>El código bajo sospecha:</strong></p>
+
+<pre><code class="lang-python"># tienda/precios.py
+TOPE = 0.30
+CUPONES = {"BIENVENIDA": 0.10, "AMIGO": 0.05}
+
+def precio_final(monto: float, cupon: str | None = None, socio: bool = False) -&gt; float:
+    if monto &lt; 0:
+        raise ValueError("monto negativo")
+
+    desc = 0.0
+    if monto &gt;= 10_000:          # escalon 2
+        desc = 0.15
+    elif monto &gt;= 1_000:         # escalon 1
+        desc = 0.05
+
+    desc += CUPONES.get(cupon, 0.0)
+    if socio:
+        desc += 0.10
+    if desc &gt; TOPE:
+        desc = TOPE
+
+    return round(monto * (1 - desc), 2)</code></pre>
+
+<p><strong>Los tests que "cubren" todo:</strong></p>
+
+<pre><code class="lang-python"># tests/test_precios.py
+import pytest
+from tienda.precios import precio_final
+
+def test_sin_descuento():   assert precio_final(500)            == 500.0
+def test_escalon_1():       assert precio_final(2_000)          == 1_900.0
+def test_escalon_2():       assert precio_final(20_000)         == 17_000.0
+def test_cupon():           assert precio_final(500, "AMIGO")   == 475.0
+def test_tope():            assert precio_final(20_000, "BIENVENIDA", socio=True) == 14_000.0
+def test_negativo():
+    with pytest.raises(ValueError):
+        precio_final(-1)</code></pre>
+
+<pre><code class="lang-bash">uv run pytest --cov=tienda.precios --cov-branch
+# Name                 Stmts   Miss Branch BrPart  Cover
+# tienda/precios.py       13      0      8      0   100%
+# 6 passed in 0.04s</code></pre>
+
+<p><strong>Paso 1 — Preguntarle al mutation testing si esos tests sirven.</strong></p>
+
+<pre><code class="lang-bash">uv run mutmut run --paths-to-mutate tienda/precios.py
+# 21/21  🎉 18  🙁 3
+
+uv run mutmut results
+# Mutantes sobrevivientes: 7, 12, 19</code></pre>
+
+<pre><code class="lang-text">mutmut show 7                    mutmut show 12                mutmut show 19
+-  if monto &gt;= 10_000:           -  if desc &gt; TOPE:            -  return round(x, 2)
++  if monto &gt;  10_000:           +  if desc &gt;= TOPE:           +  return round(x, 3)</code></pre>
+
+<p>Tres acusaciones concretas. El mutante 12 y el 19 son ruido menor (equivalente y de formato). <strong>El mutante 7 es la pista</strong>: nadie probó nunca el valor <em>exacto</em> 10.000, ni sus vecinos. Los tests saltan de 2.000 a 20.000 y el borde queda a oscuras.</p>
+
+<div class="concept">
+  <strong>💡 Precisión importante.</strong> El mutation testing <strong>no encontró el bug</strong>: no sabe qué debería hacer tu función. Encontró que <em>tus tests no miran ese borde</em>. Y como los bugs viven en los bordes, te llevó exactamente a la puerta correcta.
+</div>
+
+<p><strong>Paso 2 — Escribir la propiedad, no más ejemplos.</strong> La regla de negocio que contabilidad describió es una propiedad de monotonía: gastar más nunca puede salir más barato.</p>
+
+<pre><code class="lang-python"># tests/test_precios_props.py
+from hypothesis import given, strategies as st
+from tienda.precios import precio_final
+
+montos = st.floats(min_value=0, max_value=1_000_000,
+                   allow_nan=False, allow_infinity=False)
+
+@given(a=montos, b=montos)
+def test_gastar_mas_nunca_paga_menos(a, b):
+    a, b = min(a, b), max(a, b)
+    assert precio_final(a) &lt;= precio_final(b) + 0.01   # tolerancia de redondeo</code></pre>
+
+<pre><code class="lang-text">Falsifying example: test_gastar_mas_nunca_paga_menos(
+    a=9999.0,
+    b=10000.0,
+)
+assert 9499.05 &lt;= 8500.0 + 0.01</code></pre>
+
+<p><strong>El bug, en una línea:</strong> con 9.999 pesos el cliente paga 9.499,05; agregando un peso al carrito paga 8.500. Hay un acantilado de 999 pesos en el escalón. Cualquier cliente que lo descubra —o cualquier script que optimice el carrito— cobra de menos, y el sistema jamás se queja.</p>
+
+<div class="info">
+  Fijate el <strong>shrinking</strong> en acción. El primer contraejemplo que encontró hypothesis fue probablemente algo como <code>a=7431.88…, b=42918.03…</code>. Reduciendo, descubrió que ni los decimales ni la distancia importaban: lo mínimo necesario es un peso a cada lado de 10.000. El contraejemplo mínimo <em>es</em> el diagnóstico.
+</div>
+
+<p><strong>Paso 3 — El fix.</strong> El descuento por escalón es discontinuo por diseño. La corrección es hacerlo <strong>marginal</strong>, como los tramos del impuesto a las ganancias: cada peso recibe la tasa de su tramo, y la función se vuelve continua y monótona.</p>
+
+<pre><code class="lang-python">TRAMOS = [(10_000, 0.15), (1_000, 0.05), (0, 0.0)]   # (piso, tasa), de mayor a menor
+
+def _ahorro_por_tramos(monto: float) -&gt; float:
+    ahorro, restante = 0.0, monto
+    for piso, tasa in TRAMOS:
+        if restante &gt; piso:
+            ahorro += (restante - piso) * tasa       # solo el EXCEDENTE del tramo
+            restante = piso
+    return ahorro
+
+def precio_final(monto: float, cupon: str | None = None, socio: bool = False) -&gt; float:
+    if monto &lt; 0:
+        raise ValueError("monto negativo")
+
+    extra = min(CUPONES.get(cupon, 0.0) + (0.10 if socio else 0.0), TOPE)
+    ahorro = _ahorro_por_tramos(monto) + monto * extra
+    return round(monto - min(ahorro, monto * TOPE), 2)</code></pre>
+
+<p>Ahora la propiedad pasa con 100 ejemplos, con 1.000 y con los contraejemplos guardados en <code>.hypothesis/</code>. Y —esto es lo importante— <strong>los tests por ejemplo también hay que actualizarlos</strong>: <code>precio_final(20_000)</code> ya no da 17.000. Ese cambio en los números es la conversación con negocio que el bug estaba tapando.</p>
+
+<p><strong>Paso 4 — El costo de cada enfoque, con números.</strong></p>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Costo de escribir</th><th>Costo por corrida</th><th>¿Habría encontrado el bug?</th></tr></thead>
+<tbody>
+<tr><td>6 tests por ejemplo</td><td>~15 min</td><td>0,04 s</td><td>❌ No. Ninguno tocaba el borde</td></tr>
+<tr><td>+ cobertura de ramas</td><td>~2 min (un flag)</td><td>+0,3 s</td><td>❌ No. Ya daba 100%</td></tr>
+<tr><td>+ mutation testing</td><td>~5 min de setup</td><td>~40 s (nocturno)</td><td>⚠️ Señaló el borde sin test. No dijo cuál era el bug</td></tr>
+<tr><td>+ 1 propiedad con hypothesis</td><td>~10 min</td><td>~0,8 s</td><td>✅ Sí, con el contraejemplo mínimo servido</td></tr>
+<tr><td>Revisión manual del código</td><td>~30 min por revisión</td><td>—</td><td>🤷 Depende de quién revise y de qué día tenga</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección no es "usá hypothesis".</strong> Es la secuencia: <strong>mutation testing te dice dónde tus tests no miran</strong> (una vez, en frío, sobre el módulo crítico), y <strong>una propiedad convierte esa zona ciega en un test permanente</strong> que cuesta menos de un segundo por corrida. La cobertura no participó de nada de esto — estuvo en 100% desde el principio y durante todo el bug.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés 100% de cobertura de ramas. ¿Qué garantiza y qué no?</summary>
+<p>Garantiza que cada línea se ejecutó y que cada <code>if</code> se tomó por los dos lados durante la corrida. No garantiza nada sobre los <em>asserts</em>: un test que solo llama funciones sin verificar resultados da 100%. Tampoco cubre las <strong>combinaciones</strong> de condiciones ni los <strong>valores de borde</strong> dentro de una rama —que es justo donde estaba el bug del worked example: la rama <code>monto &gt;= 10_000</code> se ejecutaba con 20.000, así que figuraba cubierta, mientras el valor 10.000 nunca se probó. Para responder "¿mis tests detectarían un error acá?" la métrica correcta es el <strong>mutation score</strong>, no la cobertura.</p></details>
+
+<details><summary>¿Por qué el contraejemplo de hypothesis es tan chico, y por qué eso importa?</summary>
+<p>Por el <strong>shrinking</strong>. Cuando encuentra un fallo, hypothesis no te lo reporta: primero busca versiones sistemáticamente más simples de esa entrada —listas más cortas, números más cerca de cero, strings más chicos— que sigan fallando, y te devuelve la mínima. Importa porque cambia el trabajo que te queda: con <code>xs=[-914, 22, 0, 8871, -3]</code> tenés que investigar cuál de los cinco números es el culpable; con <code>xs=[0, 0]</code> el diagnóstico ya está hecho —el problema es la suma cero—. El contraejemplo mínimo no es un fallo prolijo: es la explicación de la causa.</p></details>
+
+<details><summary>¿Cuándo mockear es directamente el bug?</summary>
+<p>Cuando mockeás algo que no controlás: el SDK de Stripe, boto3, el driver de la base. Tu test deja de verificar que el código funciona contra la librería real y pasa a verificar que funciona contra <em>tu idea</em> de la librería — una idea escrita el día que leíste la doc y que nadie actualiza. Cuando la API real cambia un campo, agrega paginación o lanza una excepción nueva, la suite sigue verde y producción se cae. La alternativa: envolver el servicio externo en una interfaz propia, testear <em>esa</em> capa contra el servicio real (testcontainers), su fake oficial (<code>moto</code>) o respuestas grabadas (<code>vcrpy</code>), y mockear solo tu propia interfaz en el resto de la app.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El objetivo no es la cobertura: es <strong>confianza para cambiar código</strong>. Una suite lenta o frágil se termina desactivando, y entonces cuesta todo y no protege nada.</li>
+  <li><strong>Fixtures</strong> = inyección de dependencias. Scope caro para recursos (<code>session</code> + contenedor), scope barato para datos (<code>function</code> + transacción que se revierte). Si necesitás varios objetos, la fixture devuelve una <strong>factory</strong>.</li>
+  <li><code>parametrize</code> con <code>ids=</code>: el nombre del caso es lo único que vas a leer en el log de CI. Y <code>--strict-markers</code> siempre, o un typo silencia un test para siempre.</li>
+  <li><strong>Hypothesis</strong> testea propiedades (round-trip, invariante, oráculo, monotonía, idempotencia) y el <strong>shrinking</strong> te devuelve el contraejemplo mínimo, que ya es el diagnóstico. Ejemplos y propiedades se combinan: cubren puntos ciegos opuestos.</li>
+  <li>La <strong>cobertura</strong> mide ejecución, no verificación. Se puede tener 100% con cero asserts. Ramas &gt; líneas, y el <strong>mutation score</strong> &gt; ambas: es la única métrica que responde "¿mis tests fallarían si el código estuviera mal?".</li>
+  <li><strong>Mutation testing</strong> es caro: módulos críticos, job nocturno, nunca en cada PR — y el 100% es inalcanzable por los mutantes equivalentes.</li>
+  <li>De los cinco <strong>test doubles</strong>, el <em>fake</em> suele ser el mejor. <strong>Mockear lo que no es tuyo</strong> produce el peor de los mundos: cobertura alta y protección cero. Mockeá en tu frontera.</li>
+  <li><strong>Testcontainers</strong> para integración: constraints, tipos y transacciones reales. Imagen pineada, marcada, fuera del loop rápido.</li>
+  <li><strong>Velocidad</strong>: primero <code>--durations</code>, después <code>-n auto</code>. Si paralelizar rompe tests, esos tests ya estaban acoplados por estado global.</li>
+  <li>En <strong>async</strong>, probá cancelación y timeouts, no solo el camino feliz — y poné <code>filterwarnings = ["error"]</code> para que un <code>await</code> olvidado no pase como verde.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá el <code>precio_final</code> con bug del worked example, escribí los 6 tests por ejemplo y verificá que dan 100% con <code>--cov-branch</code>. Después corré <code>mutmut</code> y anotá cuántos mutantes sobreviven y cuál te lleva al borde.</li>
+  <li>Escribí la propiedad de monotonía con <code>hypothesis</code> y guardá el contraejemplo exacto que te devuelve. Corrélo tres veces: ¿es siempre el mismo par de números? Explicá por qué (pista: <code>.hypothesis/examples/</code>).</li>
+  <li>Aplicá el fix de tramos marginales y actualizá los tests por ejemplo. Documentá en un comentario qué números cambiaron y por qué — esa es la conversación con negocio.</li>
+  <li>Convertí una fixture tuya que devuelve un objeto fijo en una <strong>factory</strong> con teardown que registre lo creado. Escribí un test que necesite tres instancias distintas.</li>
+  <li>Agregá una fixture parametrizada con <code>params=["memoria", "sqlite"]</code> a un repositorio propio y comprobá que <strong>los mismos tests</strong> corren contra los dos backends sin modificarlos.</li>
+  <li>Levantá Postgres con <code>testcontainers</code> y escribí un test que solo pueda fallar contra el motor real (un <code>UNIQUE</code>, un <code>CHECK</code>, un <code>ON DELETE CASCADE</code> o un tipo <code>timestamptz</code>). Verificá que ese mismo test pasa —incorrectamente— con SQLite en memoria.</li>
+  <li>Corré tu suite con <code>--durations=15</code>, identificá el test más lento y bajalo a la mitad sin borrar asserts. Después probá <code>-n auto</code>: si aparecen fallos nuevos, encontrá cuál es el estado global compartido.</li>
+</ol>
+
+<section class="quiz" id="quizPS7">
+  <style>
+    #quizPS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizPS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizPS7 .q{margin-bottom:1.5rem}
+    #quizPS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizPS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizPS7 .opt:hover{border-color:var(--accent)}
+    #quizPS7 .opt:disabled{cursor:default}
+    #quizPS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizPS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizPS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizPS7 .exp.show{display:block}
+    #quizPS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu módulo de facturación tiene 100% de cobertura de ramas y ningún test falló en seis meses, pero seguís teniendo bugs de cálculo en producción. ¿Qué medís para saber si los tests sirven?</p>
+    <button class="opt">Subir el umbral de cobertura a 100% también en los módulos vecinos</button>
+    <button class="opt">Agregar más tests por ejemplo hasta que aparezca el bug</button>
+    <button class="opt">El mutation score: mutar el código y ver si algún test falla</button>
+    <div class="exp">La cobertura mide ejecución, no verificación: un test sin un solo <code>assert</code> da 100%. El mutation testing hace la pregunta correcta —"si rompo esta línea, ¿alguien se entera?"— y cada mutante sobreviviente es un cambio que podés hacer en producción sin que la suite reaccione. En el worked example, el mutante <code>&gt;=</code> → <code>&gt;</code> señaló exactamente el borde donde vivía el bug, con la cobertura en 100% todo el tiempo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tenés una fixture <code>session</code> que levanta Postgres con testcontainers. Corrés <code>pytest -n auto</code> en una máquina de 8 núcleos y el CI se queda sin memoria. ¿Qué pasó?</p>
+    <button class="opt">Cada worker de xdist es un proceso independiente: se levantaron 8 contenedores, uno por worker</button>
+    <button class="opt">El scope <code>session</code> no es compatible con testcontainers</button>
+    <button class="opt">xdist no soporta fixtures con <code>yield</code></button>
+    <div class="exp">"Session" significa una vez por <em>corrida de pytest</em>, y con xdist cada worker es su propia corrida en su propio proceso: no hay memoria compartida entre ellos. Es la trampa más común al paralelizar. Las salidas son limitar los workers (<code>-n 4</code>), agrupar los tests de infra en un worker con <code>--dist loadgroup</code> + <code>@pytest.mark.xdist_group</code>, o levantar un solo contenedor afuera de pytest y pasarle la URL por variable de entorno.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Vas a testear el módulo que cobra con Stripe. ¿Cuál es la estrategia que da confianza real?</p>
+    <button class="opt">Mockear <code>stripe.Charge.create</code> y devolver <code>{"status": "succeeded"}</code> en todos los tests</button>
+    <button class="opt">Envolver Stripe en una clase propia, testear esa clase contra el sandbox o respuestas grabadas, y mockear solo tu interfaz en el resto de la app</button>
+    <button class="opt">No testear el cobro: depende de un servicio externo y siempre va a ser frágil</button>
+    <div class="exp">Mockear el SDK verifica tu código contra <em>tu idea</em> de la API de Stripe, congelada el día que leíste la doc. Cuando la API real agrega un campo, pagina o lanza una excepción nueva, la suite sigue verde y el cobro se rompe. El wrapper concentra en un solo lugar el conocimiento de la API externa: esa capa se testea contra algo real (<code>vcrpy</code>, el sandbox, un fake oficial) y el resto de la app mockea una interfaz que sí controlás. La tercera opción es la peor: no testear el módulo que toca plata.</div>
+  </div>
+
+  <div class="score" id="scorePS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizPS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scorePS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con PS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ps6-toolchain-moderno/lecture.html">← PS6: Toolchain moderno</a>
+  <a href="../ps8-produccion/lecture.html">PS8: Producción →</a>
+</nav>
+
+</div>
+</body>
+</html>
