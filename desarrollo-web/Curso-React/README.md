@@ -17,7 +17,7 @@
 - HTML y CSS modernos
 - JavaScript ES2022+ (arrow functions, destructuring, async/await, modules)
 - Git básico
-- Node.js 20+ instalado
+- Node.js 24+ instalado
 
 Si te falta alguno: hacer primero el [Curso de Frontend](../index.html) (módulos 02-07).
 

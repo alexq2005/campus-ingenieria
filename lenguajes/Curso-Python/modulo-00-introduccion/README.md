@@ -86,12 +86,12 @@ Imprime los 19 principios de diseño del lenguaje. Vale la pena leerlos cada cie
 ## Versiones
 
 - **Python 2.x** — discontinuado en 2020. **No usar**.
-- **Python 3.11+** — versión actual recomendada
-- **Python 3.13** — última estable a 2025
+- **Python 3.12+** — mínimo recomendado hoy
+- **Python 3.14** — última estable (verificado: septiembre 2026)
 
 ## Ejercicios
 
-1. Instalar Python 3.11+ y verificar la versión
+1. Instalar Python 3.12+ y verificar la versión
 2. Ejecutar el REPL y calcular `(15 * 23) - 47`
 3. Escribir un script `saludo.py` que imprima tu nombre y edad
 4. Leer la salida de `import this` y elegir tu principio favorito

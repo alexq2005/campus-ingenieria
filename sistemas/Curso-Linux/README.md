@@ -37,8 +37,8 @@ Curso estructurado en 14 módulos, de usuario novato a administrador competente,
 
 | Caso | Distro |
 |------|--------|
-| Principiante | Ubuntu 22.04 LTS o Linux Mint |
-| Servidor | Debian 12 o Ubuntu Server |
+| Principiante | Ubuntu 26.04 LTS o Linux Mint |
+| Servidor | Debian 13 o Ubuntu Server |
 | Aprender a fondo | Arch Linux (instalación manual) |
 | Empresa/RHEL | Fedora o Rocky Linux |
 | Windows host | WSL2 con Ubuntu |

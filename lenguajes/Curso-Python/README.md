@@ -30,7 +30,7 @@ Curso estructurado en 14 módulos, desde cero hasta nivel intermedio-avanzado, o
 
 ## Requisitos
 
-- Python 3.11 o superior — verificar con `python --version`
+- Python 3.12 o superior — verificar con `python --version`
 - Editor: VS Code, PyCharm o cualquier editor con resaltado de sintaxis
 - Terminal (bash, PowerShell o cmd)
 

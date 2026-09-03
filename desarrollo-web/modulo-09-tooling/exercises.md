@@ -2,7 +2,7 @@
 
 ## Sección A — Setup
 
-1. Instalá Node 20+ y verificá con `node -v` y `npm -v`.
+1. Instalá Node 24+ y verificá con `node -v` y `npm -v`.
 
 2. Configurá Git globalmente (`user.name`, `user.email`). Generá una SSH key (`ssh-keygen -t ed25519`) y agregala a GitHub.
 
