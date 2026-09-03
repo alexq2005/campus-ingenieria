@@ -1,8 +1,8 @@
 # 🎓 Campus de Ingeniería
 
-> Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **100 % offline**.
+> Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **offline**.
 
-**9 cursos · 171 lecciones · 52 proyectos · sin servidor · sin build · sin internet**
+**9 cursos · 127 lecciones · 49 proyectos · sin servidor · sin build · sin internet**
 
 Nueve cursos que van **de cero a empleable** — del primer `<div>` a entrenar una red neuronal y escribir Rust para un microcontrolador. Todo en **HTML estático**: se abre directo en el navegador, sin instalar nada.
 
@@ -41,7 +41,7 @@ cd campus-ingenieria
 ## 🛠️ Más allá de las lecciones
 
 - **[🗺️ Ruta de aprendizaje](ruta-aprendizaje.html)** — el camino visual de cero a empleable, conectando los 9 cursos.
-- **[🧪 Galería de proyectos](proyectos/index.html)** — 52 proyectos de dificultad creciente: del Tic-Tac-Toe a un robot con PID, fullstack, IoT, IA e impacto social.
+- **[🧪 Galería de proyectos](proyectos/index.html)** — 49 proyectos de dificultad creciente: del Tic-Tac-Toe a un robot con PID, fullstack, IoT, IA e impacto social.
 - **MVPs jugables** (corren de verdad en el navegador):
   - [⭕ Tic-Tac-Toe con IA imbatible](proyectos/demos/tic-tac-toe-app.html)
   - [📝 Notas Markdown](proyectos/demos/notas-markdown-app.html)
@@ -54,10 +54,10 @@ cd campus-ingenieria
 
 ## ✨ Qué lo hace distinto
 
-- **100 % offline** — funciona desde `file://`, sin servidor ni conexión.
-- **Cero dependencias / cero build** — es HTML, CSS y JS plano. No hay `npm install`.
+- **Offline** — el contenido, los quizzes y los simuladores funcionan desde `file://`, sin servidor ni conexión. Lo único que pide internet son el coloreado de sintaxis (si no carga, el código igual se lee) y 5 demos de React.
+- **Cero build** — es HTML, CSS y JS plano. No hay `npm install`. La única librería que hace falta para leer, `marked`, viene incluida en `assets/vendor/`.
 - **Aprender construyendo** — cada curso termina en proyectos reales.
-- **Interactivo** — quizzes autoevaluables, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
+- **Interactivo** — quiz autoevaluable en **las 127 lecciones**, checkpoints con respuesta revelable, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
 - **Puente hardware ↔ software** — Computación Física conecta la informática con la electrónica (Arduino/ESP32), y Rust llega hasta el microcontrolador.
 
 ---
@@ -81,7 +81,7 @@ desarrollo-web/             ← Frontend (modulo-00..13) · React · React Nativ
 lenguajes/                  ← Python · Go · Rust
 sistemas/                   ← Linux · Computación Física (electrónica)
 datos-ia/                   ← Datos & ML
-proyectos/                  ← galería de 52 proyectos + demos jugables
+proyectos/                  ← galería de 49 proyectos + demos jugables
 track-senior/               ← track de nivel senior
 multimedia/                 ← visualizaciones interactivas
 ```
