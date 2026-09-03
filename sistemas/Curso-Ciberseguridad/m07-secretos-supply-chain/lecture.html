@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 07 — Secretos y cadena de suministro · Curso de Ciberseguridad</title>
+  <meta name="description" content="Gestión y rotación de secretos, por qué .gitignore no alcanza, gitleaks, vaults y KMS, secretos en CI/CD, dependency confusion, lockfiles, SBOM, Sigstore y SLSA.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 07</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+  <span class="badge">🔗 Supply chain</span>
+</div>
+
+<article>
+
+<h1>Módulo 07 — Secretos y cadena de suministro</h1>
+
+<p>Podés tener criptografía impecable y un servidor endurecido, y perderlo todo por una clave que quedó en un commit o un paquete que instalaste sin mirar. Los dos problemas son el mismo: <strong>confianza otorgada sin verificación</strong>.</p>
+
+<h2>Qué cuenta como secreto</h2>
+
+<div class="concept">
+  <strong>💡 Un secreto es cualquier dato cuya posesión otorga acceso o capacidad.</strong> Si quien lo tiene puede hacer lo mismo que vos, necesita gestión de secretos.
+</div>
+
+<table>
+<thead><tr><th>Tipo</th><th>Qué habilita si se filtra</th></tr></thead>
+<tbody>
+<tr><td>Contraseñas (base, SMTP)</td><td>Leer y escribir tus datos</td></tr>
+<tr><td>API keys (Stripe, cloud)</td><td>Gastar dinero, ver clientes</td></tr>
+<tr><td>Tokens (JWT, Git)</td><td>Suplantar identidad, push a tus repos</td></tr>
+<tr><td>Claves y certificados (SSH, firma)</td><td>Firmar malware como vos</td></tr>
+<tr><td>Cadenas de conexión</td><td>Credencial <em>y</em> destino juntos</td></tr>
+</tbody>
+</table>
+
+<p>Se filtran tanto porque, mientras desarrollás, un secreto es apenas un string para que la app arranque. El costo se paga meses después, con la clave ya en 400 commits y tres forks.</p>
+
+<h2>El problema del <code>.env</code></h2>
+
+<div class="rule">
+  <strong>📌 <code>.env</code> es configuración local, no gestión de secretos:</strong> no cifra, no controla acceso, no audita, no rota ni expira.
+</div>
+
+<p>Y "lo pongo en <code>.gitignore</code>" es necesario, pero <strong>no alcanza</strong>:</p>
+
+<ul>
+  <li>Solo aplica a archivos <strong>no rastreados</strong>: si ya se commiteó, ignorarlo no hace nada.</li>
+  <li>Protege <strong>ese archivo, no el secreto</strong>: la misma clave puede estar en <code>config.js</code> o en un log.</li>
+  <li>Un <code>COPY . .</code> mete el <code>.env</code> en la imagen de contenedor que publicás.</li>
+</ul>
+
+<div class="warn">
+  Es una barrera contra el descuido, no un control: no sirve de nada una vez que el secreto salió.
+</div>
+
+<h2>Un secreto commiteado es un secreto quemado</h2>
+
+<div class="danger">
+  <strong>⚠️ Borrar el commit no revoca la clave.</strong> Git es append-only, y el objeto ya está en los forks, en los clones del equipo y en las cachés del proveedor.
+</div>
+
+<div class="analogy">
+  <strong>🔑</strong> Borrás la foto de tu llave, pero la cerradura no cambió. Lo único que sirve es cambiarla: <strong>rotar</strong>.
+</div>
+
+<div class="step"><strong>1. Rotar primero:</strong> emitís la nueva, la desplegás y revocás la vieja.</div>
+
+<div class="step"><strong>2. Investigar después:</strong> logs del proveedor desde la fecha del commit.</div>
+
+<div class="step"><strong>3. Limpiar el historial al final</strong> (<code>git filter-repo</code>), como higiene: el riesgo ya lo eliminaste al revocar.</div>
+
+<div class="info">
+  Hay bots que prueban en <strong>segundos</strong> las claves recién publicadas en repos públicos.
+</div>
+
+<h2>Detección: encontrar lo que ya se filtró</h2>
+
+<ul>
+  <li><strong>Pre-commit:</strong> <code>gitleaks protect --staged</code>, la única capa que <em>previene</em>.</li>
+  <li><strong>CI:</strong> <code>gitleaks detect</code> o <code>trufflehog</code> en cada push; falla el build.</li>
+  <li><strong>Plataforma:</strong> el secret scanning del repo barre el historial y avisa al proveedor.</li>
+</ul>
+
+<p><code>trufflehog</code> suma <strong>verificación</strong>: prueba si la clave sigue activa, y convierte 300 hallazgos ruidosos en los 4 que importan hoy.</p>
+
+<h2>Gestión real: dónde viven los secretos</h2>
+
+<p><strong>El secreto no viaja en el artefacto: se le entrega al proceso en tiempo de ejecución.</strong></p>
+
+<ul>
+  <li><strong>Variables de entorno del runtime:</strong> alcanzan en muchos casos, pero son visibles para procesos hijos y volcados de error.</li>
+  <li><strong>Vault (HashiCorp):</strong> cifrado, auditoría de cada lectura y <strong>credenciales dinámicas</strong> — un usuario de base que vive una hora y se borra solo.</li>
+  <li><strong>KMS / Secrets Manager de la nube:</strong> la app se autentica con su rol, así no existe "una clave para leer las claves".</li>
+</ul>
+
+<div class="mistake">
+  Un <code>Secret</code> de Kubernetes <strong>no está cifrado</strong> por defecto: es <strong>base64</strong>, codificación y no criptografía. Necesitás <em>encryption at rest</em> en etcd, RBAC restrictivo o un vault externo.
+</div>
+
+<h2>Rotación: la vida útil de un secreto</h2>
+
+<div class="rule">
+  <strong>📌 Un secreto de larga vida es deuda que acumula intereses.</strong> Cuanto más vive, más lugares tocó: la máquina de alguien que ya no está, un ticket, una captura, un log viejo.
+</div>
+
+<p>La dirección correcta no es "rotar más seguido" sino <strong>eliminar los secretos de larga vida</strong>:</p>
+
+<ul>
+  <li><strong>Credenciales efímeras:</strong> duran minutos, así que expiran antes de que a alguien le sirvan.</li>
+  <li><strong>OIDC en el CI</strong> en vez de claves permanentes: el runner presenta un token firmado por la plataforma, el proveedor lo valida contra una política ("repo X, rama <code>main</code>") y devuelve credenciales temporales. <strong>No queda ninguna clave guardada que robar.</strong></li>
+  <li><strong>Rotación automatizada</strong> para lo que sí debe persistir, con solapamiento para que no cause caída.</li>
+</ul>
+
+<div class="tip">
+  Ensayala antes de necesitarla: si nadie rotó nunca, el día del incidente vas a dudar entre revocar rápido (y romper el servicio) o esperar (y dejar al atacante adentro).
+</div>
+
+<h2>Secretos en CI/CD</h2>
+
+<ul>
+  <li><strong>El enmascarado en logs es parcial:</strong> tapa el valor exacto con <code>***</code>, pero no lo reconoce transformado — partido en dos líneas o en base64.</li>
+  <li><strong>No imprimas el entorno:</strong> <code>printenv</code>, <code>set -x</code> o un <code>console.log(config)</code> lo exponen todo, y el log del build lo ve más gente que el vault.</li>
+  <li><strong>PRs desde forks:</strong> correr código ajeno <em>con acceso a los secretos del repo</em> es ejecución arbitraria con tus credenciales.</li>
+  <li><strong>Mínimo privilegio por job:</strong> el de tests no necesita la clave de despliegue.</li>
+</ul>
+
+<h2>Cadena de suministro: el código que no escribiste</h2>
+
+<div class="concept">
+  <strong>💡 Tu código es una fracción mínima de lo que corre en producción.</strong> Una app moderna instala cientos de paquetes transitivos, todos con los permisos de tu aplicación y muchos con scripts que corren <em>al instalar</em>. Confiás en cada mantenedor de esa lista sin haberlo elegido.
+</div>
+
+<table>
+<thead><tr><th>Ataque</th><th>Cómo funciona</th></tr></thead>
+<tbody>
+<tr><td><strong>Typosquatting</strong></td><td>Nombre parecido al popular; te atrapa un typo (<code>reqeusts</code>)</td></tr>
+<tr><td><strong>Dependency confusion</strong></td><td>Publican en el registry público un paquete con el nombre de uno interno tuyo y versión más alta; el gestor prefiere la pública</td></tr>
+<tr><td><strong>Mantenedor comprometido</strong></td><td>Le roban la cuenta o le transfieren el proyecto, y publican con backdoor</td></tr>
+<tr><td><strong>Paquete abandonado</strong></td><td>Los CVE no se arreglan y el nombre queda libre</td></tr>
+</tbody>
+</table>
+
+<ul>
+  <li><strong><code>event-stream</code> (2018):</strong> el nuevo mantenedor agregó código que robaba billeteras de cripto.</li>
+  <li><strong><code>xz</code>/<code>liblzma</code> (2024):</strong> el atacante construyó reputación durante <em>años</em>, llegó a mantenedor y metió una backdoor contra SSH. La confianza social también es un vector.</li>
+  <li><strong>SolarWinds (2020):</strong> comprometieron el <strong>sistema de compilación</strong>: el artefacto firmado traía código que no estaba en el repositorio.</li>
+</ul>
+
+<h2>Lockfiles, SBOM y procedencia</h2>
+
+<div class="rule">
+  <strong>📌 <code>^1.2.3</code> es una decisión de seguridad, no de estilo:</strong> delega en un tercero qué código corre mañana en tu servidor.
+</div>
+
+<p>El <strong>lockfile</strong> (<code>package-lock.json</code>, <code>poetry.lock</code>, <code>Cargo.lock</code>) fija el árbol completo —transitivas incluidas— con versión exacta y <strong>hash de integridad</strong>: ese hash hace que un paquete alterado tras publicarse falle la instalación en vez de ejecutarse. En CI instalá desde el lockfile sin actualizarlo (<code>npm ci</code>).</p>
+
+<div class="concept">
+  <strong>💡 El SBOM es el inventario de lo que compone tu artefacto</strong> (CycloneDX o SPDX), y saber qué tenés instalado es prerequisito para responder ante un CVE. Log4Shell dejó la lección: el problema no fue parchear, fue <em>encontrar</em>.
+</div>
+
+<ul>
+  <li><strong>Firma:</strong> <strong>Sigstore</strong> y <code>cosign</code> firman con una identidad (OIDC), sin claves de larga vida, y dejan la evidencia en un registro público de transparencia.</li>
+  <li><strong>Procedencia:</strong> <strong>SLSA</strong> define niveles de confianza sobre tu build, hasta entornos efímeros que emiten una <em>attestation</em> firmada vinculando el artefacto con el commit y el pipeline exactos.</li>
+</ul>
+
+<div class="warn">
+  <strong>Fatiga de alertas:</strong> un equipo que recibe 300 "críticas" del escáner (SCA) las ignora todas. Priorizá por <strong>explotabilidad real</strong>: ¿la función vulnerable se llama desde tu código?, ¿hay exploit público?
+</div>
+
+<h2>🔧 En tu código</h2>
+
+<p><strong>1. Leé el secreto del entorno.</strong> Que falte debe romper el arranque, no caer en un default silencioso:</p>
+
+<pre><code class="lang-python"># ❌ Hardcodeado: viaja al repo, a los forks y a la imagen del contenedor
+STRIPE_KEY = "sk_live_…24-caracteres-de-clave-real…"
+
+# ❌ El default enmascara la falta de configuración
+STRIPE_KEY = os.environ.get("STRIPE_KEY", "sk_test_dummy")
+
+# ✅ Del entorno, con KeyError explícito al iniciar si falta
+STRIPE_KEY = os.environ["STRIPE_KEY"]
+</code></pre>
+
+<div class="info">
+  <strong>🎣 Esta lección se comió su propia trampa.</strong> El primer borrador de ese ejemplo usaba la clave de muestra de la documentación de Stripe — falsa, pública, inofensiva. Al intentar publicar el curso, <strong>GitHub rechazó el push</strong>: su <em>secret scanning push protection</em> detectó el patrón <code>sk_live_</code> seguido de 24 alfanuméricos y bloqueó el commit entero antes de que llegara al repositorio.
+  <br><br>
+  Dos cosas para llevarte. Primera: el escáner <strong>no sabe</strong> si tu clave es real, y hace bien en no arriesgarse — por eso el ejemplo de arriba ahora rompe el patrón a propósito con <code>…</code>. Segunda, la importante: <strong>ese control funciona y es gratis</strong>. Activá la protección de push en tus repositorios; es la única defensa que actúa <em>antes</em> de que el secreto exista en el historial, que es el único momento en que todavía no tenés que rotar nada.
+</div>
+
+<p><strong>2. Un <code>.gitignore</code> que cubra las variantes</strong>, más un <code>.env.example</code> versionado con las claves pero <strong>sin valores</strong>:</p>
+
+<pre><code class="lang-bash"># .gitignore
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# .env.example  (esto SÍ va al repo)
+DATABASE_URL=
+STRIPE_KEY=
+</code></pre>
+
+<p><strong>3. Commiteá el lockfile</strong> y ponelo en revisión: un diff que agrega 40 transitivas en un PR que "solo cambia un botón" es la señal que hay que mirar.</p>
+
+<p><strong>4. Pre-commit hook con gitleaks</strong>, para que el secreto nunca llegue a ser commit:</p>
+
+<pre><code class="lang-bash"># .git/hooks/pre-commit   (chmod +x)
+#!/bin/sh
+gitleaks protect --staged --redact --no-banner || {
+  echo "🚫 Posible secreto en los cambios preparados."; exit 1; }
+</code></pre>
+
+<p><strong>5. Si filtraste una clave</strong>, en este orden exacto: <strong>rotar</strong> (emitir la nueva, desplegarla y revocar la vieja; hasta ahí lo demás es cosmético), <strong>investigar</strong> los logs del proveedor, <strong>avisar</strong> al equipo, <strong>limpiar el historial</strong> con <code>git filter-repo</code> coordinando con todos porque reescribe hashes, y <strong>prevenir</strong> con hook, escaneo en CI y credenciales efímeras.</p>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. "Borro el commit y listo".</strong><br>
+  ❌ Un <code>--amend</code> o un <code>revert</code>, y seguir usando la misma credencial.<br>
+  ✅ <strong>Rotar primero:</strong> el objeto sigue en forks, clones y cachés; solo revocarlo le quita valor.
+</div>
+
+<div class="mistake">
+  <strong>2. La API key hardcodeada "por ahora".</strong><br>
+  ❌ <code>const API_KEY = "abc123"; // TODO: mover a env</code><br>
+  ✅ Sacala <strong>antes</strong> del primer commit: tras el push el arreglo ya no es editar una línea, es rotar la clave.
+</div>
+
+<div class="mistake">
+  <strong>3. No commitear el lockfile.</strong><br>
+  ❌ Ignorarlo "porque genera conflictos".<br>
+  ✅ Commitealo: sin él perdés los hashes de integridad y cada build resuelve versiones distintas.
+</div>
+
+<div class="mistake">
+  <strong>4. Loguear el objeto de configuración entero.</strong><br>
+  ❌ <code>logger.info("config: %s", config)</code>, que incluye contraseñas y tokens.<br>
+  ✅ Logueá solo las claves no sensibles, o usá un tipo que redacte su representación (<code>SecretStr</code>).
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un secreto de larga vida es más riesgoso que uno efímero, aunque ninguno se haya filtrado?</summary>
+<p>Porque el riesgo depende del tiempo y de los lugares por los que pasó: a los tres años estuvo en notebooks de gente que ya no está, en tickets, capturas y logs viejos. Uno que vive quince minutos expira antes de que sirva. Por eso la mejora no es rotar más seguido, sino credenciales efímeras y OIDC, que <em>eliminan</em> el secreto persistente en vez de administrarlo.</p></details>
+
+<details><summary>Si revisaste el fuente de una dependencia y estaba limpio, ¿por qué eso no garantiza que el paquete instalado sea seguro?</summary>
+<p>Porque el artefacto lo compiló y publicó otra persona en otro entorno: si ese build está comprometido, el paquete puede traer código que nunca estuvo en el repositorio — exactamente SolarWinds. Además los scripts de instalación corren antes de que puedas revisar nada. Cerrar la brecha exige verificar la <strong>procedencia</strong>: firma (Sigstore) y una attestation que vincule el artefacto con el commit exacto (SLSA).</p></details>
+
+<details><summary>¿Por qué un escáner que reporta 300 vulnerabilidades críticas puede dejarte menos seguro que uno que reporta 5?</summary>
+<p>Porque la seguridad la da la remediación, no la detección: ante 300 alertas indistinguibles el equipo deja de leerlas y la fatiga entierra la que importaba. La severidad nominal describe el peor escenario del componente aislado, no el tuyo: la función vulnerable puede no llamarse nunca desde tu código. Priorizar por explotabilidad real deja una lista corta que sí se arregla.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>gitleaks detect</code> sobre un repo tuyo y clasificá los hallazgos en: secreto activo, ya revocado y falso positivo.</li>
+  <li>Escribí el <strong>procedimiento de rotación</strong> de un secreto real: dónde se genera, dónde se configura y cómo se revoca el anterior sin caída.</li>
+  <li>Instalá el hook de pre-commit y probalo intentando commitear una clave de prueba.</li>
+  <li>Generá un SBOM de un proyecto tuyo y compará las dependencias <strong>transitivas</strong> con las directas.</li>
+  <li>Revisá un pipeline de CI: ¿hay claves de larga vida?, ¿se podrían reemplazar por OIDC?, ¿algún job imprime el entorno?</li>
+</ol>
+
+<section class="quiz" id="quizCS07">
+  <style>
+    #quizCS07{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS07 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS07 .q{margin-bottom:1.5rem}
+    #quizCS07 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS07 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS07 .opt:hover{border-color:var(--accent)}
+    #quizCS07 .opt:disabled{cursor:default}
+    #quizCS07 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS07 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS07 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS07 .exp.show{display:block}
+    #quizCS07 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Hace tres semanas commiteaste una API key de producción a un repo público. ¿Cuál es la primera acción?</p>
+    <button class="opt">Reescribir el historial con <code>git filter-repo</code></button>
+    <button class="opt">Agregar el archivo al <code>.gitignore</code> y commitear su remoción</button>
+    <button class="opt">Rotar: emitir una credencial nueva y revocar la expuesta</button>
+    <div class="exp">Un secreto commiteado es un secreto quemado: ya está en forks, clones y cachés y, en un repo público, casi con certeza en manos de bots. Limpiar el historial no le quita valor a la clave; lo único que lo hace es <strong>revocarla</strong>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu equipo guarda la contraseña de la base en un <code>Secret</code> de Kubernetes. ¿Qué protección da eso por defecto?</p>
+    <button class="opt">Ninguna criptográfica: base64 es codificación, no cifrado, y se revierte con un comando</button>
+    <button class="opt">Cifrado AES en etcd, así que solo lo lee el kube-apiserver</button>
+    <button class="opt">Cifrado extremo a extremo entre el pod y el almacén de secretos</button>
+    <div class="exp">El valor va en base64, reversible sin ninguna clave: cualquiera con lectura sobre el objeto o acceso a etcd lo obtiene en texto plano. Hace falta <em>encryption at rest</em> en etcd, RBAC restrictivo y, mejor, un vault externo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Alguien publica en el registry público un paquete con el nombre de una librería interna tuya y versión más alta. ¿Qué ataque es?</p>
+    <button class="opt">Typosquatting; se mitiga revisando errores de tipeo en el manifiesto</button>
+    <button class="opt">Dependency confusion; se mitiga con scopes propios y fijando el registry interno</button>
+    <button class="opt">Mantenedor comprometido; se mitiga exigiendo MFA a los mantenedores</button>
+    <div class="exp">Es <strong>dependency confusion</strong>: al resolver el nombre en varias fuentes, el gestor prefiere la versión más alta y baja la pública maliciosa. No hay typo ni cuenta robada. Se corta con un scope propio, resolviendo los internos solo contra el registry interno y commiteando el lockfile.</div>
+  </div>
+
+  <div class="score" id="scoreCS07"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS07');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS07').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M08.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m06-hardening/lecture.html">← M06: Hardening de sistemas</a>
+  <a href="../m08-secure-coding/lecture.html">M08: Secure coding y threat modeling →</a>
+</nav>
+
+</div>
+</body>
+</html>

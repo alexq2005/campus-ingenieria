@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 05 — Seguridad de redes · Curso de Ciberseguridad</title>
+  <meta name="description" content="Ataques de red explicados para defender: MITM, ARP y DNS spoofing, TLS a fondo, firewalls con y sin estado, segmentación, VPN, Zero Trust, IDS/IPS y DDoS.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 05</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+  <span class="badge">🌐 Redes</span>
+</div>
+
+<article>
+
+<h1>Módulo 05 — Seguridad de redes</h1>
+
+<p>Casi todos los protocolos que sostienen internet se diseñaron entre los 70 y los 90, en una red de universidades donde todos se conocían. Nadie previó que alguien mintiera sobre quién es. Ese pecado original —<strong>protocolos sin autenticación</strong>— es la raíz de casi todos los ataques que vas a ver acá. Lo bueno: se neutralizan con la misma receta, que ya conocés del M01. Lo malo: hay que aplicarla en serio, y "es red interna" no es excusa para saltearla.</p>
+
+<h2>La red por capas: qué se ataca en cada una</h2>
+
+<p>Cada capa de TCP/IP encapsula a la de arriba: tu JSON viaja adentro de HTTP, adentro de TCP, adentro de IP, adentro de una trama Ethernet. Quien controla una capa baja ve —y puede alterar— todo lo que va arriba, salvo que esté cifrado.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Protocolos</th><th>Qué se ataca ahí</th><th>Qué lo defiende</th></tr></thead>
+<tbody>
+<tr><td><strong>Acceso a red</strong></td><td>Ethernet, Wi-Fi, ARP</td><td>Sniffing, ARP spoofing, punto de acceso falso</td><td>VLANs, 802.1X, WPA3, cifrado extremo a extremo</td></tr>
+<tr><td><strong>Internet</strong></td><td>IP, ICMP</td><td>Suplantación de IP, escaneo, rutas manipuladas</td><td>Filtrado anti-spoofing, firewall, ACLs</td></tr>
+<tr><td><strong>Transporte</strong></td><td>TCP, UDP</td><td>SYN flood, secuestro de sesión, escaneo de puertos</td><td>Firewall con estado, SYN cookies, TLS por encima</td></tr>
+<tr><td><strong>Aplicación</strong></td><td>HTTP, DNS, SMTP</td><td>MITM sobre texto plano, DNS spoofing, DDoS de capa 7</td><td>TLS, DoH/DNSSEC, WAF, autenticación fuerte</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El cifrado protege lo que va arriba, nunca lo que va abajo.</strong> TLS oculta el contenido HTTP, pero las IPs, los puertos y el tamaño de los paquetes viajan a la vista: el atacante no lee tu mensaje, pero sabe con quién hablás, cuándo y cuánto. Eso son <strong>metadatos</strong>, y a veces dicen más que el contenido.
+</div>
+
+<h2>La muerte del castillo y el foso</h2>
+
+<p>Durante décadas el modelo fue: perímetro fuerte, adentro todo confiable. "Estás en la red corporativa, entonces sos de los nuestros". Ese modelo se murió, y no por un ataque espectacular sino por cambios de contexto:</p>
+
+<ul>
+  <li><strong>La nube.</strong> Tus servicios están en AWS, en un SaaS, en un CDN. Ya no hay un adentro.</li>
+  <li><strong>El trabajo remoto.</strong> La gente entra desde su casa o el celular: el perímetro es cada notebook.</li>
+  <li><strong>El movimiento lateral.</strong> Una credencial robada por phishing te deja adentro del castillo, donde nada más te frena.</li>
+  <li><strong>Dispositivos que no controlás.</strong> Impresoras, cámaras IP, IoT: misma red plana, ninguno parcheado.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 La ubicación en la red no es una credencial.</strong> Que un paquete venga de <code>10.0.0.0/8</code> no dice nada sobre quién lo mandó ni si tiene derecho a lo que pide. Es el mismo error que confiar en un formulario porque vino de tu propia página.
+</div>
+
+<h2>Ataques clásicos y por qué funcionan</h2>
+
+<p>Los vemos a nivel conceptual: entender el mecanismo es lo que te permite detectarlos y prevenirlos. Fijate que todos comparten la misma causa raíz.</p>
+
+<table>
+<thead><tr><th>Ataque</th><th>Mecanismo</th><th>Qué lo hace posible</th></tr></thead>
+<tbody>
+<tr><td><strong>Sniffing</strong></td><td>Leer el tráfico que pasa por un medio compartido</td><td>Protocolos en claro (HTTP, FTP, Telnet), Wi-Fi abierto</td></tr>
+<tr><td><strong>MITM</strong></td><td>Ubicarse en el medio y reenviar, leyendo y alterando</td><td>No es un ataque sino una <em>posición</em>: los de abajo la consiguen</td></tr>
+<tr><td><strong>ARP spoofing</strong></td><td>Responder "esa IP soy yo" y quedarse con el tráfico de la LAN</td><td>ARP no autentica: cualquiera contesta y le creen</td></tr>
+<tr><td><strong>DNS spoofing</strong></td><td>Contestar antes que el servidor real y mandarte a otra IP</td><td>DNS va por UDP sin firma: gana la primera respuesta</td></tr>
+<tr><td><strong>Secuestro de sesión</strong></td><td>Copiar la cookie de sesión y actuar como el usuario</td><td>Cookie en claro o accesible desde JavaScript</td></tr>
+</tbody>
+</table>
+
+<p>Contra el último, las cookies llevan <code>Secure</code>, <code>HttpOnly</code> y <code>SameSite</code>. Contra los demás, la respuesta es una sola.</p>
+
+<div class="analogy">
+  <strong>📮 Todos son el mismo truco.</strong> Es un cartero que se ofrece a llevar tu carta y nadie le pide identificación. ARP, DNS y HTTP en claro fueron diseñados <em>confiando</em> en el que responde. La solución no es preguntarle mejor al cartero: es meter la carta en un sobre lacrado que solo el destinatario pueda abrir y que denuncie si fue alterado. Eso es TLS.
+</div>
+
+<h2>DNS: el punto ciego</h2>
+
+<p>DNS es lo primero que hace cualquier conexión y lo menos protegido. Aunque después uses HTTPS, el DNS en claro filtra <strong>todos los dominios que visitás</strong> a cualquiera en el camino, y permite redirigirte.</p>
+
+<table>
+<thead><tr><th>Tecnología</th><th>Qué resuelve</th><th>Qué NO resuelve</th></tr></thead>
+<tbody>
+<tr><td><strong>DoT</strong> (DNS over TLS, 853)</td><td>Cifra la consulta hacia tu resolver</td><td>El resolver sigue viendo todo lo que consultás</td></tr>
+<tr><td><strong>DoH</strong> (DNS over HTTPS, 443)</td><td>Ídem, y se mezcla con el tráfico web</td><td>Ídem; complica el filtrado corporativo legítimo</td></tr>
+<tr><td><strong>DNSSEC</strong></td><td>Firma las respuestas: detecta manipulación</td><td>No cifra nada: las consultas siguen públicas</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  DoH/DoT y DNSSEC son <strong>complementarios, no alternativas</strong>: uno da confidencialidad del canal, el otro autenticidad del dato. Confundirlos es un clásico de entrevista.
+</div>
+
+<h2>TLS a fondo</h2>
+
+<table>
+<thead><tr><th>TLS SÍ garantiza</th><th>TLS NO garantiza</th></tr></thead>
+<tbody>
+<tr><td><strong>Confidencialidad</strong>: nadie en el camino lee el contenido</td><td>Que el sitio sea honesto o el software confiable</td></tr>
+<tr><td><strong>Integridad</strong>: si alguien altera un byte, se detecta</td><td>Que el servidor guarde bien tus datos</td></tr>
+<tr><td><strong>Autenticidad del servidor</strong>: es el dominio que dice ser</td><td>Que vos seas quien decís (eso es el M02)</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El candadito no significa "sitio seguro".</strong> Un sitio de phishing saca un certificado gratis en dos minutos y muestra el mismo candado. TLS te asegura que hablás con <code>paypa1.com</code> sin intermediarios — no que <code>paypa1.com</code> sea PayPal. Es autenticidad de <em>identidad</em>, no de <em>intenciones</em>.
+</div>
+
+<h3>El handshake, a alto nivel</h3>
+
+<pre><code class="lang-text">1. ClientHello    el cliente propone versiones de TLS y cipher suites
+2. ServerHello    el servidor elige una, y manda su certificado
+3. Verificación   el cliente valida la cadena: firma, vigencia, dominio
+4. Clave          ambos derivan una clave de sesión efímera (Diffie-Hellman)
+5. Finished       de acá en más, todo el tráfico va cifrado con esa clave
+</code></pre>
+
+<ul>
+  <li><strong>Cipher suite</strong>: el combo acordado de algoritmos (intercambio de claves + cifrado simétrico + integridad). TLS 1.3 dejó pocas opciones, todas seguras: parte de su valor es que <em>eliminó</em> lo malo en vez de dejarte elegir.</li>
+  <li><strong>Forward secrecy</strong>: la clave de sesión es efímera y no se deriva de la clave privada del servidor. Si mañana se la roban, el tráfico grabado hace un año <strong>sigue siendo indescifrable</strong>. Obligatorio en TLS 1.3.</li>
+  <li><strong>Certificate pinning</strong>: la app acepta solo un certificado o CA concretos, ignorando el almacén del sistema. Bloquea la interceptación con una CA instalada en el dispositivo.</li>
+</ul>
+
+<div class="tip">
+  <strong>Pinning: cuándo sí y cuándo no.</strong> <strong>Sí</strong> en apps móviles propias contra tu propio backend, donde controlás las dos puntas y la renovación. <strong>No</strong> en un navegador ni con terceros: el día que renueven el certificado —cada 90 días con Let's Encrypt— tu app deja de andar y solo se arregla publicando una versión nueva. Si pineás, pineá la CA intermedia y tené un pin de respaldo.
+</div>
+
+<h2>Firewalls</h2>
+
+<table>
+<thead><tr><th>Tipo</th><th>Cómo decide</th><th>Límite</th></tr></thead>
+<tbody>
+<tr><td><strong>Sin estado</strong></td><td>Mira cada paquete aislado: IP y puerto de origen y destino</td><td>No sabe si el paquete pertenece a una conexión que vos iniciaste: hay que abrir a mano el tráfico de vuelta</td></tr>
+<tr><td><strong>Con estado</strong></td><td>Mantiene una tabla de conexiones activas</td><td>Consume memoria, y esa tabla es el blanco de los floods</td></tr>
+</tbody>
+</table>
+
+<p>En Linux, <code>nftables</code> es el motor actual y <code>ufw</code> la capa amigable arriba:</p>
+
+<pre><code class="lang-bash"># Política por defecto: negar todo lo que entra, permitir lo que sale
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Y recién ahí abrir, uno por uno, los servicios que de verdad hacen falta
+sudo ufw allow 443/tcp comment 'HTTPS publico'
+sudo ufw allow from 10.0.0.0/24 to any port 22 proto tcp comment 'SSH solo admin'
+sudo ufw enable &amp;&amp; sudo ufw status verbose
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Lista blanca, siempre.</strong> Política por defecto <code>DROP</code> y después abrís lo necesario. Con la lógica inversa, cada servicio nuevo que alguien levante queda expuesto por omisión — justo el caso que nadie va a auditar.
+</div>
+
+<div class="mistake">
+  <strong>Un WAF no es un firewall de red.</strong> El firewall decide por IP y puerto (capas 3-4); el WAF inspecciona peticiones HTTP (capa 7) y frena patrones tipo inyección SQL o XSS. Son complementarios, y sobre todo: <strong>el WAF no arregla el código</strong>. Es una red de contención que te da tiempo para parchear, no un sustituto de consultas parametrizadas (M04, M08).
+</div>
+
+<h2>Segmentación</h2>
+
+<p>Segmentar es dividir la red en zonas que solo se hablan por donde vos decidís.</p>
+
+<ul>
+  <li><strong>Subredes</strong>: separación a nivel IP, controlada por ruteo y reglas de firewall.</li>
+  <li><strong>VLANs</strong>: separación lógica dentro del mismo switch. Ideal para aislar invitados, IoT y cámaras.</li>
+  <li><strong>DMZ</strong>: zona intermedia donde vive lo expuesto a internet. Si comprometen el servidor web, no llega a la base de datos porque el firewall interno solo permite ese puerto y desde ese origen.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 Segmentar no evita la intrusión: acota el desastre.</strong> El atacante casi nunca entra por donde está el premio: entra por lo más débil —una impresora, una VM de testing— y avanza hasta los datos. Eso es <strong>movimiento lateral</strong>. En una red plana, un equipo comprometido es toda la red comprometida; con segmentación, cada salto exige un ataque nuevo y deja más ruido que detectar.
+</div>
+
+<h2>VPN: para qué sirve realmente</h2>
+
+<p>Una VPN crea un túnel cifrado entre dos puntos. Sirve para dos cosas: <strong>llegar a una red privada desde afuera</strong> y <strong>proteger el tramo hasta el otro extremo del túnel</strong> en una red que no controlás.</p>
+
+<div class="warn">
+  <strong>Para qué NO sirve.</strong> No te hace anónimo: cambiás de confiar en tu ISP a confiar en el proveedor de la VPN, que ve lo mismo. No te protege del malware, ni del phishing, ni de una app que filtra datos. Y no agrega nada a un sitio que ya usa HTTPS.
+</div>
+
+<table>
+<thead><tr><th></th><th>WireGuard</th><th>IPsec</th></tr></thead>
+<tbody>
+<tr><td>Diseño</td><td>Minimalista, criptografía fija y moderna</td><td>Estándar viejo, muy configurable, mucha superficie</td></tr>
+<tr><td>Cuándo</td><td>Túneles nuevos entre servidores y usuarios</td><td>Interoperar con equipos de red y VPNs ya existentes</td></tr>
+</tbody>
+</table>
+
+<h2>Zero Trust: la identidad como perímetro</h2>
+
+<div class="step"><strong>1. Nunca confiar, siempre verificar.</strong> Cada request se autentica y autoriza por sí solo, sin importar de qué red venga. No hay zona confiable.</div>
+
+<div class="step"><strong>2. La identidad es el nuevo perímetro.</strong> El control ya no es "¿en qué red estás?" sino "¿quién sos, con qué dispositivo y qué permiso tenés para <em>este</em> recurso?" (M02 y M03).</div>
+
+<div class="step"><strong>3. Microsegmentación.</strong> Segmentar hasta el nivel de carga de trabajo: cada servicio habla solo con los que necesita. mTLS entre servicios es la forma habitual.</div>
+
+<div class="info">
+  Zero Trust <strong>no reemplaza</strong> firewalls ni segmentación: los complementa. Sigue siendo defensa en profundidad — lo que cambia es que estar adentro deja de ser una credencial.
+</div>
+
+<h2>IDS/IPS y detección en red</h2>
+
+<p>Un <strong>IDS</strong> observa el tráfico y alerta; un <strong>IPS</strong> está en línea y además bloquea. Detectan por <em>firmas</em> (patrones conocidos: preciso, ciego a lo nuevo) o por <em>anomalías</em> (desvíos del comportamiento normal: ve lo desconocido, genera falsos positivos). Con TLS extremo a extremo ya no ven contenido, así que la detección moderna se apoya en metadatos: quién habla con quién, cuánto, a qué hora, hacia qué destinos raros. Lo profundizamos en el M10.</p>
+
+<h2>DDoS</h2>
+
+<table>
+<thead><tr><th>Tipo</th><th>Cómo satura</th><th>Cómo se mitiga</th></tr></thead>
+<tbody>
+<tr><td><strong>Volumétrico</strong> (L3/L4)</td><td>Llena el ancho de banda o la tabla de conexiones</td><td>Absorción upstream: CDN, scrubbing del proveedor, anycast</td></tr>
+<tr><td><strong>De aplicación</strong> (L7)</td><td>Pide lo más caro que tengas: búsquedas, reportes, login</td><td>Rate limiting por identidad, caché, cuotas, desafíos</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>"Le ponemos más servidores" no es un plan.</strong> En un ataque volumétrico la saturación ocurre <strong>antes</strong> de llegar a tu infraestructura: el enlace ya está lleno y tus servidores extra ni se enteran. Y en uno de capa 7, escalar te hace pagar más por seguir cayéndote, porque el cuello de botella suele ser la base de datos. La mitigación real es upstream (que el tráfico no llegue) y económica (que cada petición le cueste al atacante más que a vos).
+</div>
+
+<h2>🔧 En tu código: red defensiva</h2>
+
+<div class="rule">
+  <strong>1. TLS siempre, también entre servicios internos.</strong> "Es red privada" no es cifrado. Un contenedor comprometido, una VPC mal configurada o el log de un balanceador exponen ese tráfico en claro. Con mTLS, además, cada servicio prueba quién es.
+</div>
+
+<div class="rule">
+  <strong>2. Nunca deshabilites la verificación de certificados.</strong> Aparece en todos lados porque "no andaba" y así anduvo. Lo que apaga es justo la parte de TLS que impide el MITM: seguís cifrado, pero con quien sea.
+</div>
+
+<pre><code class="lang-python">import requests
+
+# ❌ Cifra, pero acepta a cualquiera: MITM invisible y silencioso
+r = requests.get("https://api.interna/pagos", verify=False)
+
+# ✅ Si el certificado es propio, confiá en TU CA — no apagues la verificación
+r = requests.get(
+    "https://api.interna/pagos",
+    verify="/etc/ssl/certs/ca-interna.pem",
+    timeout=(3, 10),          # (conexión, lectura) — nunca sin timeout
+)
+</code></pre>
+
+<div class="rule">
+  <strong>3. Timeout en toda llamada de red.</strong> Sin timeout, un destino lento deja el worker colgado; suficientes workers colgados y tu servicio se cae solo. Un DDoS gratis, cortesía de tu propio código.
+</div>
+
+<div class="rule">
+  <strong>4. Validá el destino antes de un request saliente.</strong> Si la URL viene del usuario, tu servidor puede terminar pidiéndole datos a la red interna o al metadata service de la nube. Eso es <strong>SSRF</strong> (M04): lista blanca de dominios, y resolvé la IP para rechazar rangos privados antes de conectar.
+</div>
+
+<pre><code class="lang-python">import ipaddress, socket
+from urllib.parse import urlparse
+
+DOMINIOS_OK = {"api.proveedor.com", "cdn.proveedor.com"}
+
+def destino_permitido(url: str) -&gt; bool:
+    p = urlparse(url)
+    if p.scheme != "https" or p.hostname not in DOMINIOS_OK:
+        return False
+    ip = ipaddress.ip_address(socket.gethostbyname(p.hostname))
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local)
+</code></pre>
+
+<div class="rule">
+  <strong>5. La IP de origen no es un control de acceso.</strong> Se suplanta, cambia con NAT y detrás de un proxy es la del proxy. Sirve como señal para rate limiting o para enriquecer un log — nunca como autorización.
+</div>
+
+<pre><code class="lang-python"># ❌ El cliente controla ese header: escribe lo que quiera y "es interno"
+ip = request.headers.get("X-Forwarded-For", "").split(",")[0]
+if ip.startswith("10."):
+    return admin_panel()
+
+# ✅ Autorizá por identidad; usá la IP solo si tu proxy la firma y confiás en él
+if not usuario.tiene_rol("admin"):
+    abort(403)
+return admin_panel()
+</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Poner <code>verify=False</code> "para que ande".</strong><br>
+  ❌ El certificado interno da error, se desactiva la verificación y el ticket se cierra.<br>
+  ✅ Arreglá la causa: agregá tu CA interna al almacén de confianza o usá un certificado válido. Un error de certificado es TLS avisándote de algo real — resolvelo, no lo silencies.
+</div>
+
+<div class="mistake">
+  <strong>2. Abrir un servicio en <code>0.0.0.0</code> sin firewall.</strong><br>
+  ❌ La base de datos escucha en todas las interfaces "para probar" y queda publicada a internet. Los bots la encuentran en minutos.<br>
+  ✅ Escuchá en <code>127.0.0.1</code> si solo la usa esa máquina, y política por defecto <code>DROP</code> con excepciones explícitas.
+</div>
+
+<div class="mistake">
+  <strong>3. Asumir que la red interna es segura.</strong><br>
+  ❌ Servicios sin autenticación porque "solo son accesibles desde adentro".<br>
+  ✅ Cada servicio autentica a quien lo llama, venga de donde venga. Una credencial robada convierte "adentro" en cualquiera.
+</div>
+
+<div class="mistake">
+  <strong>4. HTTP entre microservicios "porque es red privada".</strong><br>
+  ❌ Tokens y datos personales viajando en claro por la VPC, y replicados en los logs de cada salto.<br>
+  ✅ TLS en todo tramo, idealmente mTLS. El costo hoy es marginal; la diferencia el día del incidente es total.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si tu sitio ya usa HTTPS, ¿por qué DNS en texto plano sigue siendo un problema?</summary>
+<p>Porque la consulta ocurre <strong>antes</strong> de que exista la conexión TLS, y va en claro: cualquiera en el camino ve la lista de dominios que visitás y puede responder antes que el servidor legítimo. Si te desvía, TLS lo detecta —el certificado no coincide con el dominio—, pero eso te da <em>disponibilidad rota</em>, no privacidad: la fuga de metadatos ya ocurrió. DoH/DoT tapan la fuga, DNSSEC detecta la manipulación en el origen.</p></details>
+
+<details><summary>¿Por qué forward secrecy cambia el valor de robar la clave privada de un servidor?</summary>
+<p>Sin forward secrecy, la clave de sesión se deriva de la clave privada: quien la obtenga descifra <strong>todo el tráfico pasado</strong> que haya grabado. Con forward secrecy, cada sesión negocia una clave efímera vía Diffie-Hellman que se descarta al terminar y no se puede reconstruir desde la privada. Robarla permite suplantar al servidor de ahí en adelante, pero el histórico queda inservible. Por eso el "guardar hoy, descifrar mañana" pierde sentido, y por eso TLS 1.3 lo volvió obligatorio.</p></details>
+
+<details><summary>¿Por qué Zero Trust no vuelve innecesarias las VLANs ni los firewalls?</summary>
+<p>Porque atacan capas distintas del mismo problema y ninguna es infalible. Zero Trust verifica identidad y permisos en cada request, pero depende de que ese control funcione: un bug de autorización, un token robado o un servicio que se saltea el chequeo lo dejan sin efecto. La segmentación actúa en otro plano: aunque la identidad falle, el paquete no llega porque la ruta no existe. Es defensa en profundidad. Lo que Zero Trust elimina no es la segmentación, sino la idea de que estar adentro alcance como credencial.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Dibujá el diagrama de red de un sistema que conozcas y marcá las zonas: expuesto, DMZ, interno, datos. ¿Cuántos saltos hay del punto más expuesto a los datos más valiosos?</li>
+  <li>Revisá un servidor propio: listá qué está escuchando y en qué interfaz. Para cada servicio decidí si debería estar en <code>127.0.0.1</code>, en la red interna o público, y justificá cada excepción.</li>
+  <li>Buscá en tus proyectos todo <code>verify=False</code>, <code>rejectUnauthorized: false</code>, <code>InsecureSkipVerify</code> o equivalente. Por cada uno, averiguá por qué se agregó y cómo se arreglaría bien.</li>
+  <li>Auditá los timeouts: encontrá tres llamadas de red sin timeout explícito y agregáselos. Calculá cuántas peticiones lentas simultáneas agotan tu pool de workers.</li>
+  <li>Escribí la política de firewall de tu app como lista blanca: default <code>DROP</code> y las reglas mínimas, cada una con un comentario que diga por qué existe.</li>
+  <li>Revisá dónde usás la IP de origen o <code>X-Forwarded-For</code>. ¿Alguno decide permisos? Reemplazalo por una verificación de identidad.</li>
+</ol>
+
+<section class="quiz" id="quizCS05">
+  <style>
+    #quizCS05{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS05 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS05 .q{margin-bottom:1.5rem}
+    #quizCS05 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS05 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS05 .opt:hover{border-color:var(--accent)}
+    #quizCS05 .opt:disabled{cursor:default}
+    #quizCS05 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS05 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS05 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS05 .exp.show{display:block}
+    #quizCS05 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un desarrollador agrega <code>verify=False</code> porque el certificado interno tiraba error. ¿Qué protección perdió exactamente?</p>
+    <button class="opt">Ninguna importante: el tráfico sigue cifrado con TLS</button>
+    <button class="opt">La confidencialidad: ahora los datos viajan en texto plano</button>
+    <button class="opt">La autenticidad del servidor: sigue cifrado, pero con cualquiera que se interponga</button>
+    <div class="exp">El cifrado se mantiene, y por eso el cambio se siente inofensivo. Lo que se apagó es la validación del certificado, la única parte de TLS que garantiza que del otro lado está quien decís. Sin eso, un atacante en posición de MITM presenta su propio certificado, el cliente lo acepta sin chistar y el túnel "seguro" termina en él. Cifrar con un desconocido no protege nada.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. ¿Qué tienen en común ARP spoofing, DNS spoofing y el sniffing de HTTP en claro?</p>
+    <button class="opt">Explotan protocolos que confían en el que responde, sin autenticarlo</button>
+    <button class="opt">Requieren acceso físico al cableado de la red</button>
+    <button class="opt">Solo funcionan contra sistemas sin parches de seguridad</button>
+    <div class="exp">Ninguno es un bug: los tres funcionan <strong>exactamente como fueron diseñados</strong>, en una época en que se asumía que nadie mentiría. ARP le cree a quien responde, DNS acepta la primera respuesta que llega y HTTP no verifica nada. Por eso no se arreglan con parches, sino agregando la capa de autenticación e integridad que les faltaba: TLS, DNSSEC, 802.1X.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu API cae bajo un ataque de capa 7 que golpea el endpoint de búsqueda. ¿Cuál es la respuesta más efectiva?</p>
+    <button class="opt">Triplicar la cantidad de servidores de aplicación</button>
+    <button class="opt">Rate limiting por identidad, caché de resultados y cuotas en el endpoint caro</button>
+    <button class="opt">Bloquear en el firewall todas las IPs con muchas conexiones</button>
+    <div class="exp">Un ataque L7 no llena el ancho de banda: pide lo más costoso que tenés. Escalar servidores mueve el cuello de botella a la base de datos y multiplica la factura sin resolver nada. Bloquear por IP falla porque el ataque viene distribuido y termina afectando a usuarios legítimos detrás de un NAT. Lo que funciona es encarecer el ataque: limitar por identidad, cachear lo repetido y poner cuotas donde duele.</div>
+  </div>
+
+  <div class="score" id="scoreCS05"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS05');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS05').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 A endurecer sistemas en el M06.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m04-owasp-web/lecture.html">← M04: OWASP Top 10 y seguridad web</a>
+  <a href="../m06-hardening/lecture.html">M06: Hardening de sistemas →</a>
+</nav>
+
+</div>
+</body>
+</html>

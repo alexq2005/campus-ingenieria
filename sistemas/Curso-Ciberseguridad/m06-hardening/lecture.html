@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 06 — Hardening de sistemas · Curso de Ciberseguridad</title>
+  <meta name="description" content="Reducción de superficie, gestión de parches, servicios, sudo, SSH hardening, permisos y SUID, SELinux/AppArmor, sandboxing de systemd, auditoría, benchmarks CIS y seguridad de contenedores.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 06</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Linux M04–M11</span>
+  <span class="badge">🛠️ Sistemas</span>
+</div>
+
+<article>
+
+<h1>Módulo 06 — Hardening de sistemas</h1>
+
+<p>En el M00 definimos la <strong>superficie de ataque</strong> como la suma de todos los puntos por donde alguien puede intentar entrar. <em>Hardening</em> es el trabajo de achicar esa superficie y endurecer lo poco que queda: decisiones aburridas —qué servicio apago, qué permiso saco, qué proceso encierro— que hacen que un compromiso pase de "el atacante es root" a "el atacante quedó atrapado en un servicio sin privilegios".</p>
+
+<div class="concept">
+  <strong>💡 Hardening = reducir + endurecer.</strong> Primero <strong>sacás</strong> lo que no se usa (paquetes, servicios, puertos, usuarios, permisos). Después <strong>encerrás</strong> lo que queda (mínimo privilegio, sandboxing, MAC). El orden importa: endurecer un servicio que no deberías tener corriendo es trabajo tirado.
+</div>
+
+<h2>Gestión de parches</h2>
+
+<p>Si tuvieras que elegir <strong>una sola</strong> medida, es esta. La mayoría de las intrusiones reales no usan un 0-day: usan una vulnerabilidad conocida, con exploit público, en un sistema que nadie actualizó. El escaneo automatizado del M00 no busca sistemas <em>vulnerables</em>, busca sistemas <em>viejos</em> — es más fácil.</p>
+
+<pre><code class="lang-bash"># Debian / Ubuntu: actualizaciones de seguridad desatendidas
+sudo apt install unattended-upgrades
+sudo dpkg-reconfigure --priority=low unattended-upgrades
+
+# RHEL / Fedora / Rocky
+sudo dnf install dnf-automatic
+sudo systemctl enable --now dnf-automatic-install.timer
+
+# ¿Quedó pendiente un reinicio? ¿Qué procesos usan librerías viejas?
+[ -f /var/run/reboot-required ] &amp;&amp; cat /var/run/reboot-required.pkgs
+sudo needrestart
+</code></pre>
+
+<div class="warn">
+  <strong>El problema no es instalar el parche: es reiniciar.</strong> Un <code>apt upgrade</code> actualiza <code>libssl</code> en disco, pero los procesos que ya la tenían cargada en memoria <strong>siguen usando la versión vulnerable</strong>. Así nacen los servidores con 400 días de uptime que "están parcheados" y no lo están. Si nadie se anima a reiniciar, el problema no es el parche: es que falta redundancia y un procedimiento probado.
+</div>
+
+<h2>Servicios: enumerar y apagar</h2>
+
+<p>Todo puerto abierto es una puerta. La primera pregunta ante un servicio no es "¿está bien configurado?" sino "<strong>¿tiene que existir?</strong>".</p>
+
+<pre><code class="lang-bash">ss -tulpn                      # qué escucha, en qué interfaz, qué proceso
+systemctl list-units --type=service --state=running
+sudo systemctl disable --now avahi-daemon cups rpcbind   # no alcanza con "stop"
+</code></pre>
+
+<p>Lo que sí tiene que correr pero solo consume la propia máquina no debe escuchar en <code>0.0.0.0</code>. Bindealo a <code>127.0.0.1</code> y dejá de depender de que el firewall esté bien:</p>
+
+<pre><code class="lang-bash"># /etc/postgresql/16/main/postgresql.conf
+listen_addresses = 'localhost'      # nunca '*' si solo lo usa la app local
+
+# /etc/redis/redis.conf
+bind 127.0.0.1 ::1
+protected-mode yes
+</code></pre>
+
+<div class="tip">
+  <strong>Bindear a loopback es defensa en profundidad real.</strong> Un firewall mal aplicado o una regla pisada en un despliegue dejan el puerto expuesto. Un servicio que solo escucha en <code>127.0.0.1</code> es inalcanzable desde la red aunque el firewall desaparezca por completo.
+</div>
+
+<h2>Usuarios, sudo y cuentas de servicio</h2>
+
+<p>El objetivo es que <strong>nadie trabaje como root</strong> y que cada acción privilegiada quede acotada y registrada.</p>
+
+<ul>
+  <li><strong>Nada de login directo como root.</strong> Cuentas personales + <code>sudo</code>: el log dice <em>quién</em> hizo qué, no solo "root".</li>
+  <li><strong><code>visudo</code> siempre.</strong> Valida la sintaxis antes de guardar. Un <code>sudoers</code> roto editado con <code>nano</code> deja a todos sin escalación, a veces sin forma de arreglarlo.</li>
+  <li><strong>Reglas específicas.</strong> <code>NOPASSWD: ALL</code> convierte cualquier compromiso de esa cuenta en root inmediato.</li>
+  <li><strong>Cuentas de servicio sin shell.</strong> El usuario que corre tu app no necesita iniciar sesión.</li>
+</ul>
+
+<pre><code class="lang-bash">sudo useradd --system --no-create-home --shell /usr/sbin/nologin app
+sudo visudo -f /etc/sudoers.d/deploy    # nunca editar sudoers a mano
+sudo -l -U deploy                       # qué puede hacer realmente
+</code></pre>
+
+<pre><code class="lang-bash"># ❌ Llave maestra sin contraseña: root gratis para quien tome la cuenta
+deploy ALL=(ALL) NOPASSWD: ALL
+
+# ✅ Exactamente los dos comandos que necesita, y nada más
+deploy ALL=(root) /usr/bin/systemctl restart miapp.service, \
+                  /usr/bin/systemctl status  miapp.service
+</code></pre>
+
+<div class="mistake">
+  <strong>Cuidado con los comodines.</strong> <code>deploy ALL=(root) /bin/systemctl restart *</code> parece acotado, pero permite reiniciar <em>cualquier</em> unidad, incluida una que el atacante acaba de escribir. Y dar por sudo un editor, <code>find</code> o <code>tar</code> —cualquier cosa con escape a shell— es dar root completo.
+</div>
+
+<h2>SSH hardening</h2>
+
+<p>SSH es la puerta principal del servidor y los bots la golpean todo el día. La base que resiste el 100% del ruido automatizado es corta:</p>
+
+<pre><code class="lang-bash"># /etc/ssh/sshd_config.d/99-hardening.conf
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers alex deploy
+MaxAuthTries 3
+LoginGraceTime 20
+X11Forwarding no
+</code></pre>
+
+<p>Con <code>PasswordAuthentication no</code> la fuerza bruta deja de existir como categoría: no hay contraseña que adivinar. Pero es también la forma más común de <strong>quedarse afuera del servidor</strong>. El procedimiento no se saltea:</p>
+
+<div class="step"><strong>1. Validar la sintaxis.</strong> <code>sudo sshd -t</code> — sin salida significa OK. Un typo acá y el servicio no vuelve a levantar.</div>
+<div class="step"><strong>2. Recargar sin cerrar tu sesión.</strong> <code>sudo systemctl reload ssh</code>. Tu conexión abierta sigue viva.</div>
+<div class="step"><strong>3. Probar desde OTRA terminal.</strong> <code>ssh -i ~/.ssh/id_ed25519 alex@servidor</code>.</div>
+<div class="step"><strong>4. Recién ahí cerrar la sesión original.</strong> Si el paso 3 falla, esa sesión es tu único rollback.</div>
+
+<div class="danger">
+  <strong>⚠️ Sin acceso físico ni consola out-of-band, la sesión abierta es tu único rollback.</strong> En un VPS verificá antes que tenés consola web; en un servidor propio, acceso físico o IPMI.
+</div>
+
+<h2>Permisos: octal, umask y SUID</h2>
+
+<p>Repaso: <strong>lectura = 4, escritura = 2, ejecución = 1</strong>, sumados por dueño / grupo / resto.</p>
+
+<table>
+<thead><tr><th>Octal</th><th>Símbolos</th><th>Uso típico</th></tr></thead>
+<tbody>
+<tr><td><code>600</code></td><td><code>rw-------</code></td><td>Clave privada, archivo con credenciales</td></tr>
+<tr><td><code>700</code></td><td><code>rwx------</code></td><td><code>~/.ssh</code>, directorios privados</td></tr>
+<tr><td><code>750</code></td><td><code>rwxr-x---</code></td><td>Directorio de la app: entra el grupo, nadie más</td></tr>
+<tr><td><code>755</code></td><td><code>rwxr-xr-x</code></td><td>Binarios y directorios públicos de solo lectura</td></tr>
+<tr><td><code>777</code></td><td><code>rwxrwxrwx</code></td><td><strong>Nunca.</strong> Cualquiera del sistema escribe ahí</td></tr>
+</tbody>
+</table>
+
+<p>El <strong>umask</strong> define qué permisos se <em>restan</em> a los archivos nuevos. <code>umask 027</code> crea archivos <code>640</code> y directorios <code>750</code>: el resto del mundo queda afuera por defecto, sin depender de que alguien se acuerde de hacer <code>chmod</code>.</p>
+
+<div class="warn">
+  <strong><code>chmod -R</code> sobre <code>~/.ssh</code> rompe SSH.</strong> Un <code>chmod -R 600 ~/.ssh</code> deja el <em>directorio</em> sin bit de ejecución y nadie entra; un <code>-R 700</code> deja las claves ejecutables. Y si quedan demasiado abiertos, el cliente SSH se <strong>niega</strong> a usar la clave. Archivos y directorios necesitan permisos distintos — <code>-R</code> no distingue.
+</div>
+
+<h3>SUID y SGID</h3>
+
+<p>Un binario con el bit <strong>SUID</strong> se ejecuta con los privilegios de <em>su dueño</em>, no de quien lo invoca: por eso <code>passwd</code> escribe en <code>/etc/shadow</code> siendo vos un usuario común. Es un mecanismo legítimo y también el camino clásico de escalación: si un binario SUID de root tiene un bug —o permite ejecutar comandos— cualquier usuario local se vuelve root.</p>
+
+<pre><code class="lang-bash"># Línea de base de binarios SUID/SGID: guardala y compará periódicamente
+sudo find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2&gt;/dev/null \
+  | sort &gt; /root/suid-baseline.txt
+
+# Archivos escribibles por cualquiera: casi siempre un error
+sudo find / -xdev -type f -perm -0002 -ls 2&gt;/dev/null
+</code></pre>
+
+<div class="tip">
+  No hace falta saber de memoria qué binario SUID es legítimo. Lo que importa es tener la <strong>línea de base</strong>: un SUID que aparece la semana que viene y antes no estaba es una señal de compromiso mucho más fuerte que cualquier alerta genérica. En <code>ls -l /usr/bin/passwd</code> el bit se ve como una <code>s</code> donde iría la <code>x</code> del dueño: <code>-rwsr-xr-x</code>.
+</div>
+
+<h2>MAC: SELinux y AppArmor</h2>
+
+<div class="analogy">
+  <strong>🏢 Permisos vs. política.</strong> El modelo clásico de Unix es <strong>discrecional (DAC)</strong>: el dueño de un archivo decide quién lo lee — como un empleado que presta su llave a quien quiera. El control <strong>obligatorio (MAC)</strong> es la política edilicia: aunque tengas la llave, el sistema decide que el proceso "nginx" solo toca archivos etiquetados como contenido web, y punto.
+</div>
+
+<p>SELinux (RHEL, Fedora) y AppArmor (Debian, Ubuntu) lo implementan distinto —etiquetas vs. perfiles por ruta de binario— pero existen para el mismo momento: <strong>cuando tu servicio ya fue comprometido</strong>. Sin MAC, un RCE en nginx da acceso a todo lo que nginx puede leer; con MAC, el atacante queda encerrado en lo que la política permitía.</p>
+
+<pre><code class="lang-bash">getenforce                            # SELinux: Enforcing / Permissive / Disabled
+sudo ausearch -m AVC -ts recent       # qué se denegó y por qué
+sudo semanage port -a -t http_port_t -p tcp 8080
+
+sudo aa-status                        # AppArmor
+sudo aa-complain /usr/sbin/nginx      # observar sin bloquear, para ajustar
+sudo aa-enforce  /usr/sbin/nginx
+</code></pre>
+
+<div class="mistake">
+  <strong><code>setenforce 0</code> no es una solución, es un diagnóstico.</strong> Si la app anda con SELinux en permisivo, lo que aprendiste es <em>que hay una política que ajustar</em>. La forma correcta: permisivo <strong>temporal</strong>, reproducir el problema, leer los denials con <code>ausearch</code>, corregir la etiqueta o el puerto, y volver a <code>Enforcing</code>.
+</div>
+
+<h2>systemd hardening</h2>
+
+<p>Si tu servicio corre bajo systemd —o sea, casi seguro— tenés un sandbox gratis que casi nadie activa: probablemente lo más útil y menos usado del módulo. Estas directivas usan namespaces, seccomp y capabilities del kernel sin tocar una línea de tu app:</p>
+
+<pre><code class="lang-bash"># /etc/systemd/system/miapp.service
+[Service]
+User=app
+Group=app
+ExecStart=/opt/miapp/venv/bin/gunicorn app:api --bind 127.0.0.1:8000
+
+NoNewPrivileges=yes          # no puede ganar privilegios vía SUID
+ProtectSystem=strict         # todo el FS de solo lectura para el proceso
+ProtectHome=yes              # /home y /root invisibles
+ReadWritePaths=/var/lib/miapp /var/log/miapp
+PrivateTmp=yes               # /tmp propio, aislado del resto
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>systemd-analyze security miapp.service</code> es el punto de partida.</strong> Da un puntaje de exposición de 0 a 10 y te dice qué directiva falta. Aplicalas de a poco: <code>ProtectSystem=strict</code> sin el <code>ReadWritePaths</code> correcto rompe el servicio al primer log que quiera escribir.
+</div>
+
+<h2>Auditoría e integridad</h2>
+
+<p>Endurecer sirve poco si nunca te enterás de que alguien empujó la puerta.</p>
+
+<pre><code class="lang-bash"># auditd: quién tocó qué, a nivel kernel
+sudo auditctl -w /etc/passwd          -p wa -k identidad
+sudo auditctl -w /etc/ssh/sshd_config -p wa -k ssh-config
+sudo ausearch -k ssh-config
+
+# AIDE: línea de base de integridad de archivos
+sudo aideinit          # crea el hash de referencia
+sudo aide --check      # compara y reporta cambios
+</code></pre>
+
+<table>
+<thead><tr><th>Fuente</th><th>Qué mirar</th><th>Señal de alarma</th></tr></thead>
+<tbody>
+<tr><td><code>auth.log</code> · <code>secure</code></td><td>Logins, sudo, SSH</td><td>Éxito tras muchos fallos; sudo a horas raras</td></tr>
+<tr><td><code>journalctl -u &lt;servicio&gt;</code></td><td>Arranques y crashes</td><td>Reinicios que nadie pidió</td></tr>
+<tr><td><code>ausearch -k …</code></td><td>Cambios en archivos críticos</td><td>Modificación de <code>sudoers</code> o <code>sshd_config</code></td></tr>
+<tr><td><code>aide --check</code></td><td>Integridad del sistema</td><td>Binario o SUID nuevo en <code>/usr/bin</code></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Los logs tienen que salir de la máquina: si el atacante llega a root, lo primero que hace es limpiar <code>/var/log</code>. Mandarlos a un destino central de solo escritura es lo que los convierte en evidencia. Lo profundizamos en el M10.
+</div>
+
+<h2>Benchmarks CIS</h2>
+
+<p>Alguien ya pensó todo esto por vos. Los <strong>CIS Benchmarks</strong> son guías gratuitas y detalladas por sistema (Ubuntu, RHEL, Docker, Kubernetes, nginx…), con cada control justificado, su comando de verificación y el de remediación.</p>
+
+<div class="rule">
+  <strong>📌 Partí de un estándar y documentá tus excepciones.</strong> Un benchmark te da cobertura que no se te habría ocurrido y, sobre todo, un <strong>criterio auditable</strong>: "cumplimos CIS Nivel 1 con estas cuatro excepciones justificadas" es defendible; "lo endurecimos bastante" no. <code>lynis audit system</code> da un primer diagnóstico en minutos.
+</div>
+
+<h2>Contenedores: qué aíslan y qué no</h2>
+
+<p>Un contenedor <strong>no es una máquina virtual</strong>. Es un proceso normal del host, aislado con namespaces y cgroups, que <strong>comparte el kernel</strong> con el host y con todos los demás contenedores.</p>
+
+<table>
+<thead><tr><th>Aísla</th><th>NO aísla</th></tr></thead>
+<tbody>
+<tr><td>Sistema de archivos, red y PIDs</td><td><strong>El kernel</strong>: un exploit de kernel escapa</td></tr>
+<tr><td>Límites de CPU y memoria (cgroups)</td><td>El <code>uid</code>: root adentro es root en el host</td></tr>
+<tr><td>Variables de entorno y hostname</td><td>Lo que le montes vos: <code>docker.sock</code>, volúmenes</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Root dentro del contenedor es <code>uid 0</code> del host</strong> (salvo user namespaces o modo rootless). Con un volumen mal montado, ese root escribe archivos del host. Y montar <code>/var/run/docker.sock</code> adentro equivale a entregar root del host: puede crear otro contenedor privilegiado con el disco entero.
+</div>
+
+<pre><code class="lang-bash">docker run --rm \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop=ALL --security-opt no-new-privileges \
+  --user 10001:10001 --pids-limit 200 --memory 512m \
+  miapp:1.4.2
+</code></pre>
+
+<h2>🔧 En tu código</h2>
+
+<div class="rule">
+  <strong>1. Tu app corre como usuario sin privilegios, siempre.</strong> No hay un solo caso en que tu servicio web necesite ser root. Si te pide el puerto 80, la respuesta no es root: es un reverse proxy adelante, o <code>AmbientCapabilities=CAP_NET_BIND_SERVICE</code> en la unit.
+</div>
+
+<div class="rule">
+  <strong>2. Separá el usuario que corre la app del dueño de los archivos.</strong> Si <code>app</code> ejecuta pero el código es de <code>root</code> con permisos <code>750</code>, un RCE puede leerlo pero <strong>no reescribirlo</strong>: es la diferencia entre un incidente y una puerta trasera persistente.
+</div>
+
+<div class="rule">
+  <strong>3. Nunca <code>chmod 777</code> para "arreglar" permisos.</strong> Que funcione con 777 no significa que 777 sea la solución: significa que todavía no sabés cuál es el permiso mínimo real. Casi siempre el problema es de <em>dueño</em> o de <em>grupo</em>, no de permisos.
+</div>
+
+<pre><code class="lang-bash"># ❌ "No podía escribir el log", solución de tres segundos
+chmod -R 777 /var/log/miapp    # ahora cualquier usuario local edita tus logs
+
+# ✅ Averiguar quién escribe y darle exactamente eso
+ps -o user= -p $(pgrep -f gunicorn | head -1)   # ¿con qué usuario corre?
+sudo chown app:app /var/log/miapp &amp;&amp; sudo chmod 700 /var/log/miapp
+
+# El código es de root; el grupo app lo lee y ejecuta, nadie más entra
+sudo chown -R root:app /opt/miapp &amp;&amp; sudo chmod -R 750 /opt/miapp
+</code></pre>
+
+<div class="rule">
+  <strong>4. Dockerfile: base mínima, versión fija, <code>USER</code> no-root.</strong> La imagen base es superficie de ataque pura: cada paquete que trae es un CVE que vas a tener que parchear.
+</div>
+
+<pre><code class="lang-bash"># ❌ Imagen gorda, tag móvil, root por defecto
+FROM ubuntu:latest
+RUN apt-get update &amp;&amp; apt-get install -y python3 curl vim net-tools
+COPY . /app
+CMD ["python3", "/app/main.py"]
+
+# ✅ Base mínima y fija, usuario sin privilegios, código no escribible por la app
+FROM python:3.12-slim
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin --uid 10001 app
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY --chown=root:root . .
+USER app
+CMD ["python", "main.py"]
+</code></pre>
+
+<div class="rule">
+  <strong>5. Escribí la unit de systemd endurecida desde el día uno.</strong> Copiá el bloque de sandboxing de arriba, corré <code>systemd-analyze security</code> y ajustá <code>ReadWritePaths</code> hasta que arranque limpio. Diez minutos que valen más que cualquier WAF.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. <code>chmod 777</code> como solución universal.</strong><br>
+  ❌ <code>chmod -R 777 /var/www</code> porque "no andaba".<br>
+  ✅ Identificar el usuario del proceso y ajustar dueño y grupo: <code>chown -R app:www-data /var/www</code> + <code>chmod -R 750</code>. Con 777, cualquier proceso comprometido planta una webshell en tu directorio público.
+</div>
+
+<div class="mistake">
+  <strong>2. <code>setenforce 0</code> convertido en permanente.</strong><br>
+  ❌ <code>setenforce 0</code> y después <code>SELINUX=disabled</code> "para que no moleste más".<br>
+  ✅ Permisivo temporal → <code>ausearch -m AVC -ts recent</code> → corregir la causa (<code>restorecon</code>, <code>semanage port</code>) → volver a <code>Enforcing</code>. Desactivarlo tira la única capa que contiene un servicio ya comprometido.
+</div>
+
+<div class="mistake">
+  <strong>3. <code>PasswordAuthentication no</code> sin haber probado la clave.</strong><br>
+  ❌ Editar <code>sshd_config</code>, <code>systemctl restart ssh</code> y cerrar la terminal. Si la clave no estaba en <code>authorized_keys</code> —o el archivo tenía permisos mal— el servidor queda inaccesible.<br>
+  ✅ <code>sshd -t</code> → <code>reload</code> (no <code>restart</code>) → probar en <strong>otra terminal</strong> → recién ahí cerrar la sesión original.
+</div>
+
+<div class="mistake">
+  <strong>4. Correr el contenedor como root.</strong><br>
+  ❌ Un <code>Dockerfile</code> sin <code>USER</code>: el proceso es <code>uid 0</code>, que es <code>uid 0</code> del host, y con un volumen montado escribe archivos del host como root.<br>
+  ✅ <code>USER</code> no-root en la imagen, más <code>--user</code>, <code>--cap-drop=ALL</code>, <code>--read-only</code> y <code>--security-opt no-new-privileges</code> al ejecutar. Y jamás montar <code>docker.sock</code> adentro.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si parchear es la medida con mejor relación costo/beneficio, ¿por qué es la que más se posterga?</summary>
+<p>Porque el costo no está en instalar el parche sino en el <strong>reinicio</strong>: interrumpe el servicio y nadie quiere ser quien tiró producción. El riesgo de no parchear es invisible hasta que se materializa; el de reiniciar es inmediato y tiene nombre y apellido, así que el incentivo individual empuja a posponer. La solución no es técnica sino de arquitectura: redundancia para reiniciar de a uno, ventanas pautadas y <code>needrestart</code> para saber qué procesos siguen con librerías viejas en memoria.</p></details>
+
+<details><summary>Si ya tenés los permisos bien puestos, ¿qué agrega SELinux o AppArmor?</summary>
+<p>Los permisos Unix son <strong>discrecionales</strong>: un proceso hereda toda la autoridad del usuario que lo ejecuta. Si nginx corre como <code>www-data</code>, comprometerlo da acceso a todo lo que <code>www-data</code> puede tocar, tenga o no que ver con servir web. El control <strong>obligatorio</strong> agrega una pregunta que el proceso no puede responder por sí mismo: aunque el uid tenga permiso, ¿la política permite que <em>este</em> proceso toque <em>ese</em> archivo o abra <em>ese</em> puerto? Es defensa en profundidad para cuando el servicio ya está tomado.</p></details>
+
+<details><summary>Un contenedor aísla tu proceso. ¿Qué no aísla, y por qué eso decide con qué usuario tiene que correr?</summary>
+<p>No aísla el <strong>kernel</strong>: host y contenedores comparten el mismo, así que un exploit de kernel o una capability de más permite escapar. Y no aísla el <strong>espacio de uid</strong> salvo con user namespaces: <code>root</code> adentro es literalmente <code>uid 0</code> en el host, con todo lo que eso implica sobre volúmenes y sockets montados. Por eso correr como no-root convierte un escape potencial en un escape hacia una cuenta sin privilegios: la capa de contenedor es un obstáculo, no un límite de seguridad.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>ss -tulpn</code> en tu VM y listá todo lo que escucha. Para cada uno: ¿tiene que existir? ¿tiene que escuchar fuera de <code>127.0.0.1</code>? Apagá al menos uno.</li>
+  <li>Generá tu línea de base de binarios SUID/SGID. Elegí tres y averiguá para qué existen.</li>
+  <li>Medí una unit de systemd con <code>systemd-analyze security</code>, escribí una versión endurecida y volvé a medir.</li>
+  <li>Escribí una regla de <code>sudoers</code> (validala con <code>visudo -c -f</code>) que permita reiniciar <strong>solo</strong> un servicio, sin comodines.</li>
+  <li>Aplicale a un <code>Dockerfile</code> tuyo las reglas de "En tu código" y compará el tamaño de la imagen antes y después.</li>
+  <li>Bajá el CIS Benchmark de tu distro, elegí cinco controles de Nivel 1 que no cumplas, aplicá dos y documentá por qué los otros tres quedan como excepción.</li>
+</ol>
+
+<section class="quiz" id="quizCS06">
+  <style>
+    #quizCS06{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS06 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS06 .q{margin-bottom:1.5rem}
+    #quizCS06 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS06 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS06 .opt:hover{border-color:var(--accent)}
+    #quizCS06 .opt:disabled{cursor:default}
+    #quizCS06 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS06 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS06 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS06 .exp.show{display:block}
+    #quizCS06 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu PostgreSQL escucha en <code>0.0.0.0:5432</code> pero solo lo consume la app de la misma máquina. ¿Cuál es la medida de hardening más sólida?</p>
+    <button class="opt">Ponerle una contraseña larga al usuario de la base</button>
+    <button class="opt">Agregar una regla de firewall que bloquee el 5432 desde afuera</button>
+    <button class="opt">Configurar <code>listen_addresses = 'localhost'</code> para que solo escuche en loopback</button>
+    <div class="exp">Bindear a <code>127.0.0.1</code> elimina el puerto de la red en vez de defenderlo: aunque el firewall se rompa o alguien pise las reglas en un despliegue, el servicio sigue inalcanzable. El firewall es una capa adicional válida y la contraseña fuerte es obligatoria igual, pero ambos dependen de que <em>otra cosa</em> esté bien configurada.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu app no arranca en un servidor RHEL y con <code>setenforce 0</code> funciona. ¿Qué conclusión corresponde?</p>
+    <button class="opt">Que hay una política de SELinux a ajustar: leer los denials con <code>ausearch</code>, corregir etiqueta o puerto y volver a <code>Enforcing</code></button>
+    <button class="opt">Que SELinux solo agrega sobrecarga de rendimiento y conviene dejarlo desactivado</button>
+    <button class="opt">Que el cambio es permanente y solo se revierte reinstalando el sistema</button>
+    <div class="exp"><code>setenforce 0</code> es una herramienta de <strong>diagnóstico</strong>: confirma que el bloqueo viene de SELinux y nada más. Lo correcto es reproducir el fallo en permisivo, leer los AVC denials y corregir la causa real (<code>restorecon</code>, <code>semanage fcontext</code>, <code>semanage port</code>). Dejarlo desactivado quita la capa que contiene al atacante <em>después</em> de que comprometió el servicio: justo cuando más la necesitás.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. En tu unit de systemd agregás <code>ProtectSystem=strict</code>, <code>PrivateTmp=yes</code> y <code>NoNewPrivileges=yes</code>. ¿Qué conseguiste?</p>
+    <button class="opt">Que el servicio se reinicie solo cuando falla y sus archivos queden cifrados en disco</button>
+    <button class="opt">Que el proceso vea el sistema de archivos como solo lectura, tenga un <code>/tmp</code> propio y no pueda escalar privilegios vía binarios SUID</button>
+    <button class="opt">Que el servicio corra dentro de una máquina virtual separada del host</button>
+    <div class="exp">Son tres controles distintos: <code>ProtectSystem=strict</code> monta el filesystem de solo lectura para ese proceso (por eso hay que declarar <code>ReadWritePaths</code>), <code>PrivateTmp=yes</code> le da un <code>/tmp</code> aislado y <code>NoNewPrivileges=yes</code> impide que gane privilegios vía SUID. Ninguno cifra, reinicia ni virtualiza nada: usan namespaces y capabilities del kernel, sin tocar tu código.</div>
+  </div>
+
+  <div class="score" id="scoreCS06"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS06');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS06').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M07.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m05-seguridad-redes/lecture.html">← M05: Seguridad de redes</a>
+  <a href="../m07-secretos-supply-chain/lecture.html">M07: Secretos y supply chain →</a>
+</nav>
+
+</div>
+</body>
+</html>

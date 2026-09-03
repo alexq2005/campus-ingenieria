@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 09 — DevSecOps · Curso de Ciberseguridad</title>
+  <meta name="description" content="Shift left sin bloquear la entrega: pipeline seguro etapa por etapa, gates vs feedback, seguridad del propio CI, contenedores, Kubernetes, IaC, identidad en la nube y política como código.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 09</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M07, M08</span>
+  <span class="badge">⚙️ Pipeline</span>
+</div>
+
+<article>
+
+<h1>Módulo 09 — DevSecOps</h1>
+
+<p>En el M07 viste secretos y cadena de suministro; en el M08, cómo escribir código que no se rompa solo. Este módulo hace que todo eso ocurra <strong>sin depender de que alguien se acuerde</strong>. DevSecOps no es una lista de herramientas para comprar: es decidir dónde poner cada control para que el feedback llegue cuando todavía es barato, y que el equipo no lo termine desactivando por molesto.</p>
+
+<h2>Qué significa DevSecOps en serio</h2>
+
+<div class="concept">
+  <strong>💡 Shift left = mover el control a donde el feedback es barato.</strong> El mismo bug cuesta minutos si lo detecta tu editor, horas si lo detecta el PR, días si lo detecta staging y semanas —más el incidente— si lo detecta un atacante. No es correr todo lo antes posible: es poner cada control en la etapa más temprana <em>donde todavía tiene sentido correrlo</em>.
+</div>
+
+<ul>
+  <li><strong>No es "comprar un escáner".</strong> Una herramienta que tira 400 hallazgos que nadie mira no aporta seguridad: aporta ruido y falsa cobertura.</li>
+  <li><strong>No es frenar la entrega.</strong> Si seguridad es el motivo por el que no se puede desplegar, el equipo construye desvíos: el despliegue manual, la rama que saltea el pipeline, el <code>--no-verify</code>. Un control que se saltea es peor que no tenerlo, porque encima figura como cumplido.</li>
+  <li><strong>No es un equipo aparte.</strong> Seguridad tiene que proveer <strong>caminos pavimentados</strong> —plantillas de pipeline, imágenes base endurecidas, módulos de IaC revisados— para que la opción segura sea la más fácil.</li>
+</ul>
+
+<h2>El pipeline seguro, etapa por etapa</h2>
+
+<p>Cada etapa ve cosas distintas: el SAST ve el código pero no sabe cómo se despliega; el DAST ve la app corriendo pero no sabe qué línea la rompe.</p>
+
+<table>
+<thead><tr><th>Etapa</th><th>Qué corre</th><th>Qué encuentra</th><th>¿Frena o avisa?</th></tr></thead>
+<tbody>
+<tr><td><strong>pre-commit</strong></td><td>Detección de secretos, linters</td><td>Claves pegadas, patrones inseguros obvios</td><td><strong>Frena</strong>: es local y cuesta segundos</td></tr>
+<tr><td><strong>PR</strong></td><td>SAST, SCA, revisión humana</td><td>Inyecciones, dependencias vulnerables</td><td>Frena severidad alta con exploit conocido; el resto avisa</td></tr>
+<tr><td><strong>build</strong></td><td>SBOM, escaneo de imagen, firma</td><td>Qué contiene lo que vas a publicar</td><td>Frena si hay un crítico <em>con parche</em></td></tr>
+<tr><td><strong>staging</strong></td><td>DAST, pruebas de autorización</td><td>Fallos que solo aparecen con la app corriendo</td><td>Avisa; frena solo hallazgos altos confirmados</td></tr>
+<tr><td><strong>deploy</strong></td><td>Políticas de admisión (OPA, Kyverno)</td><td>Manifiestos que violan reglas de la organización</td><td><strong>Frena</strong>: última barrera</td></tr>
+<tr><td><strong>runtime</strong></td><td>Detección, logs, alertas (M10)</td><td>Lo que se escapó de todo lo anterior</td><td>No frena: alerta y da contexto</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>SAST</strong> analiza el código sin ejecutarlo (rápido, ruidoso). <strong>SCA</strong> compara tus dependencias contra bases de vulnerabilidades. <strong>DAST</strong> ataca la app corriendo (preciso, pero solo ve lo que alcanza). El <strong>SBOM</strong> es el inventario del artefacto: cuando salga el próximo Log4Shell, es lo que te deja responder "¿nos afecta?" en minutos.
+</div>
+
+<h2>Gates vs feedback: cuándo romper el build</h2>
+
+<div class="rule">
+  <strong>📌 Un gate se justifica si cumple tres cosas:</strong> el hallazgo es <em>accionable</em> (hay parche o cambio claro), es <em>confiable</em> (pocos falsos positivos) y dejarlo pasar es <em>riesgoso</em>. Si falla alguna, informá en vez de frenar.
+</div>
+
+<p>Frenar por cualquier CVE parece lo prudente y produce lo contrario: un escáner que rompe el build con vulnerabilidades bajas, sin exploit ni parche, deja PRs bloqueados sin arreglo posible, y a la semana alguien agrega la excepción global.</p>
+
+<div class="warn">
+  <strong>El fracaso típico no es técnico, es social.</strong> El control no se rompe: se desactiva. Medí la <strong>tasa de excepciones</strong> de tus gates igual que medís sus hallazgos: si el 60% de los builds pasa con excepción, el gate ya no funciona aunque el tablero diga verde.
+</div>
+
+<p>Progresión que sí funciona: arrancá en modo <em>solo informa</em>, ajustá las reglas ruidosas y recién ahí convertí en gate lo que quedó limpio. Para lo que frena, dejá una salida documentada: excepción con dueño, motivo y vencimiento.</p>
+
+<h2>La seguridad del propio pipeline</h2>
+
+<div class="danger">
+  <strong>⚠️ Tu CI es el objetivo más valioso que tenés.</strong> Tiene credenciales de producción, escritura sobre el repositorio, acceso al registro de imágenes y ejecuta código automáticamente. Comprometerlo no da acceso a <em>un</em> servidor: da la capacidad de firmar y desplegar código malicioso en todos, con el sello de tu propio pipeline.
+</div>
+
+<div class="step"><strong>1. PRs de forks.</strong> Un PR externo trae código que un desconocido controla y que corre en tu runner. Si ese workflow accede a los secretos, cualquiera puede abrir un PR que los mande afuera.</div>
+
+<div class="step"><strong>2. Permisos del token del CI.</strong> Viene amplio por defecto. Ponelo en solo lectura a nivel de organización y subí permisos por trabajo, donde hagan falta.</div>
+
+<div class="step"><strong>3. Acciones y plugins fijados por hash.</strong> Un tag como <code>@v4</code> es una etiqueta móvil: su dueño puede reapuntarla a otro commit y tu pipeline ejecutará ese código sin que nada cambie de tu lado.</div>
+
+<div class="step"><strong>4. Runners efímeros.</strong> Uno que se destruye tras cada trabajo evita que restos de un build contaminen el siguiente. Los persistentes que ejecutan código no confiable son una vía directa a la red interna.</div>
+
+<h2>Contenedores: chico, inmutable y sin root</h2>
+
+<p>Una imagen es un sistema de archivos completo: todo lo que metas es superficie que alguien va a tener que parchear. Una base de distribución completa trae cientos de paquetes que tu app no usa, cada uno con sus CVE.</p>
+
+<ul>
+  <li><strong>Multi-stage build:</strong> compilás en una etapa con el toolchain completo y copiás solo el artefacto a una etapa final mínima. Compilador, <code>git</code>, credenciales de build y dependencias de desarrollo quedan afuera.</li>
+  <li><strong>Distroless o mínima:</strong> sin shell, sin gestor de paquetes, sin utilidades. Si el atacante logra ejecución, se encuentra sin herramientas para avanzar.</li>
+  <li><strong>Nunca root:</strong> un <code>USER</code> no privilegiado, más <code>no-new-privileges</code> y quitar todas las capacidades.</li>
+  <li><strong>Solo lectura:</strong> lo que necesite escritura va a un volumen o a un <code>tmpfs</code> explícito.</li>
+  <li><strong>Tags inmutables:</strong> desplegá <code>1.4.2</code>, o mejor el digest, nunca <code>latest</code>. Si no sabés qué corre, no podés responder si te afecta una vulnerabilidad.</li>
+</ul>
+
+<div class="mistake">
+  <strong>Los secretos no se borran de una imagen.</strong> Cada instrucción crea una capa y todas quedan en el historial. Si copiaste un archivo con una clave y lo borraste en la instrucción siguiente, la clave sigue ahí: cualquiera que baje la imagen la puede leer.
+</div>
+
+<h2>Kubernetes: lo mínimo indispensable</h2>
+
+<table>
+<thead><tr><th>Control</th><th>Por defecto viene…</th><th>Qué configurar</th></tr></thead>
+<tbody>
+<tr><td><strong>RBAC</strong></td><td>Cuentas de servicio con más permisos de los necesarios</td><td>Un rol por carga de trabajo; sin montaje del token si el pod no llama a la API</td></tr>
+<tr><td><strong>NetworkPolicies</strong></td><td><strong>Todo se habla con todo</strong>: cualquier pod alcanza a cualquier otro</td><td>Denegar por defecto en cada namespace y abrir solo los flujos que existen</td></tr>
+<tr><td><strong>Pod Security</strong></td><td>Se admiten pods privilegiados y como root</td><td>Estándar <em>restricted</em> por namespace: sin privilegios, sin escalada, sin root</td></tr>
+<tr><td><strong>Secrets</strong></td><td>Codificados en base64 — que no es cifrado</td><td>Cifrado en reposo en etcd o gestor externo; nunca en el manifiesto versionado</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  El que más rinde por esfuerzo es <strong>NetworkPolicies</strong>. La red plana por defecto es lo que convierte el compromiso de un pod cualquiera —el que sirve imágenes, el que manda mails— en acceso directo a la base de datos.
+</div>
+
+<h2>IaC: las malas configuraciones más caras</h2>
+
+<p>Con Terraform la infraestructura es código: eso trae versionado, revisión y escaneo, pero también que un error se replique en 30 entornos con un solo <code>apply</code>. Las tres configuraciones detrás de la mayoría de los incidentes públicos son siempre las mismas:</p>
+
+<ul>
+  <li><strong>Buckets de almacenamiento públicos.</strong> Nadie atacó nada: el dato estaba abierto en internet. Bloqueo de acceso público a nivel de cuenta, no solo por bucket.</li>
+  <li><strong>Grupos de seguridad abiertos a <code>0.0.0.0/0</code>,</strong> sobre todo en puertos de administración y de base de datos. El escaneo automatizado los encuentra en minutos.</li>
+  <li><strong>Cifrado apagado</strong> en volúmenes, backups y bases. Suele ser una bandera booleana que nadie activó, y es la diferencia entre un disco robado y una filtración notificable.</li>
+</ul>
+
+<p>Encima van dos prácticas: <strong>escaneo de IaC</strong> en el PR (Checkov, tfsec, Trivy), que revisa el plan antes de aplicarlo, y control de <strong>drift</strong> —la diferencia entre lo que dice el código y lo que existe—, que aparece cuando alguien toca la consola web en una urgencia y nadie lo lleva al código.</p>
+
+<h2>Identidad en la nube: efímero le gana a permanente</h2>
+
+<div class="rule">
+  <strong>📌 Una clave de larga vida es un incidente esperando su turno.</strong> No expira, no sabés dónde está copiada y su filtración puede pasar meses inadvertida. Las credenciales efímeras —un rol que se asume por unos minutos— reducen la ventana de abuso de "para siempre" a "un rato".
+</div>
+
+<p>El patrón moderno es <strong>OIDC</strong>: el CI presenta un token firmado que prueba su identidad (este repositorio, esta rama, este workflow) y la nube devuelve credenciales temporales para un rol específico. No hay clave guardada, así que no hay nada que filtrar ni que rotar.</p>
+
+<div class="warn">
+  <strong>El metadata service y el SSRF (conecta con el M04).</strong> Toda instancia en la nube expone un servicio interno de metadatos en una dirección local desde donde se leen las credenciales del rol asociado. Si tu app tiene un SSRF —un endpoint que consulta una URL que controla el usuario— el atacante puede hacer que tu propio servidor lea ese servicio y le devuelva las credenciales. Por eso <strong>un SSRF en la nube casi nunca es de severidad media</strong>.
+</div>
+
+<h2>Política como código</h2>
+
+<p>Las reglas escritas en una wiki se cumplen a veces; expresadas como código se cumplen siempre. <strong>OPA</strong> (con Rego) y <strong>Conftest</strong> permiten declarar "ninguna carga de trabajo corre como root" o "toda imagen viene de nuestro registro", y evaluarlo sobre manifiestos, planes de Terraform o Dockerfiles. La política queda versionada y revisada por PR, y se evalúa dos veces: en el PR como feedback temprano, y en la admisión del cluster como barrera final.</p>
+
+<h2>🔧 En tu código</h2>
+
+<p><strong>1. Un workflow de CI con las etapas de seguridad</strong>, con permisos explícitos:</p>
+
+<pre><code class="lang-yaml"># .github/workflows/ci.yml
+name: ci
+on: [pull_request]
+
+permissions:
+  contents: read          # el token no puede escribir NADA por defecto
+
+jobs:
+  seguridad:
+    runs-on: ubuntu-latest
+    steps:
+      # Fijado por hash: un tag como @v4 puede reapuntarse a otro commit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false      # no dejar el token en .git/config
+
+      - run: gitleaks detect --redact --exit-code 1        # secretos
+      - run: npm audit --audit-level=high                  # SCA
+      - run: semgrep --config auto --severity ERROR --error # SAST
+      - run: syft dir:. -o spdx-json=sbom.json             # SBOM
+
+      # --ignore-unfixed: sin parche disponible es ruido inaccionable
+      - run: trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 app:${{ github.sha }}
+</code></pre>
+
+<p><strong>2. Dockerfile multi-stage con usuario no root:</strong></p>
+
+<pre><code class="lang-docker"># ---- etapa 1: build (compilador, dependencias de desarrollo) ----
+FROM node:22.11.0-bookworm-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ---- etapa 2: runtime (sin shell, sin gestor de paquetes, sin root) ----
+FROM gcr.io/distroless/nodejs22-debian12:nonroot
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+USER nonroot
+CMD ["dist/server.js"]
+</code></pre>
+
+<pre><code class="lang-bash"># Y al correrlo, endurecido también desde afuera:
+docker run --read-only --tmpfs /tmp \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --user 10001:10001 app:1.4.2
+</code></pre>
+
+<div class="rule">
+  <strong>3. Permisos mínimos para el token del CI.</strong> Declará <code>permissions: contents: read</code> en todo el workflow y elevá solo en el trabajo que lo necesita: el que publica un paquete pide <code>packages: write</code>, el que corre tests no pide nada. Si un paso comprometido tiene el token en el ambiente, la diferencia entre lectura y escritura es la que hay entre un susto y un commit malicioso en tu rama principal.
+</div>
+
+
+<p><strong>4. OIDC en vez de claves guardadas en el repositorio:</strong></p>
+
+<pre><code class="lang-yaml"># ❌ Clave de larga vida guardada en los secretos del CI
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+# No expira. Si se filtra, sirve hasta que alguien la rote (spoiler: nadie la rota).
+
+# ✅ OIDC: credenciales temporales, nada guardado
+permissions:
+  id-token: write     # habilita la emisión del token OIDC
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@HASH_DE_LA_VERSION   # v4
+    with:
+      role-to-assume: arn:aws:iam::111122223333:role/deploy-staging
+      # El rol confía SOLO en este repositorio y esta rama:
+      #   "token.actions.githubusercontent.com:sub":
+      #     "repo:miorg/miapp:ref:refs/heads/main"
+</code></pre>
+
+<div class="tip">
+  Esa condición <code>sub</code> es la parte que se olvida: un rol que confía en el emisor OIDC pero no restringe repositorio ni rama puede ser asumido desde <em>cualquier</em> repositorio de la plataforma.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Secretos que terminan en el log del CI.</strong><br>
+  ❌ Hacer <code>echo</code> de una variable "para depurar". El enmascarado del CI solo tapa el valor exacto: si el script lo transforma (base64, lo parte, lo mete en un JSON), sale en texto plano.<br>
+  ✅ Nunca imprimir secretos, ni parcialmente. Depurar con la <em>longitud</em> o un hash del valor, y ante la duda, <strong>rotar</strong>: verificar sale más caro que rotar.
+</div>
+
+<div class="mistake">
+  <strong>2. Usar <code>latest</code> como tag de la imagen base.</strong><br>
+  ❌ <code>FROM node:latest</code> hace que dos builds del mismo commit produzcan imágenes distintas: el escaneo verde de ayer no dice nada del artefacto de hoy, y una actualización de la base puede romper producción sin que ningún commit lo explique.<br>
+  ✅ Fijar versión exacta, o el digest. Actualizar la base pasa a ser un cambio explícito y revertible.
+</div>
+
+<div class="mistake">
+  <strong>3. Ejecutar workflows de PRs de forks con acceso a secretos.</strong><br>
+  ❌ Un disparador que corre en el contexto del repositorio base, con los secretos disponibles, sobre código que un desconocido acaba de escribir: ejecución remota de código con credenciales incluidas, y ni hace falta que el PR se apruebe.<br>
+  ✅ Los PRs externos corren sin secretos y con token de solo lectura. Lo que requiere credenciales va en un workflow aparte, tras el merge o con aprobación manual.
+</div>
+
+<div class="mistake">
+  <strong>4. Escanear en producción y no en el PR.</strong><br>
+  ❌ El escaneo semanal del entorno productivo encuentra el problema ya desplegado, sin dueño claro y con presión por arreglarlo en caliente.<br>
+  ✅ El mismo escaneo en el PR: el autor tiene el contexto fresco y el cambio aislado. El de producción se conserva como red de contención, no como detección primaria.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué "shift left" no significa correr todas las herramientas en cada commit?</summary>
+<p>Porque cada control tiene un costo —espera, falsos positivos, mantenimiento— y una etapa donde su información sirve: un DAST necesita la app corriendo, así que en pre-commit no tiene nada que atacar. Shift left es ponerlo en la etapa <em>más temprana donde ya tiene sentido</em>: un pipeline de cuarenta minutos empuja al equipo a agrupar cambios grandes, y eso empeora la seguridad.</p></details>
+
+<details><summary>¿Qué gana un atacante que compromete tu CI, comparado con uno que compromete un servidor de producción?</summary>
+<p>Un servidor comprometido da acceso a ese servidor y a lo que alcance desde ahí; se detecta, se reconstruye y se cierra. El CI da credenciales de despliegue de <em>todos</em> los entornos, escritura sobre el código fuente y capacidad de firmar artefactos: el atacante inyecta su código en el próximo build y el pipeline lo distribuye, firmado y legítimo, a toda la flota — reconstruir los servidores no lo saca, porque vuelven a desplegar la versión comprometida.</p></details>
+
+<details><summary>¿Por qué fijar acciones y plugins del CI por hash y no por tag, si el tag ya indica una versión?</summary>
+<p>Porque un tag es una referencia móvil, no un identificador de contenido: su dueño puede reapuntar <code>v4</code> a cualquier commit y tu pipeline ejecutará ese código en el próximo build, sin que aparezca en ningún diff. Ni hace falta que sea malicioso: alcanza con que le comprometan la cuenta. El hash identifica contenido exacto, y cambiarlo exige un PR revisable.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Mapeá las etapas de un pipeline real contra la tabla del módulo: ¿qué controles faltan y dónde deberían ir?</li>
+  <li>Reescribí un workflow tuyo para que el token sea de solo lectura por defecto, subiendo permisos solo donde haga falta.</li>
+  <li>Contá cuántas acciones de terceros usa tu CI fijadas por tag y pasá a hash las que corren con acceso a secretos.</li>
+  <li>Convertí un <code>Dockerfile</code> tuyo a multi-stage con usuario no root. Compará tamaño y vulnerabilidades, antes y después.</li>
+  <li>Escribí una NetworkPolicy de denegar por defecto para un namespace de prueba y habilitá solo los flujos reales.</li>
+  <li>Corré un escáner de IaC sobre un módulo de Terraform y clasificá los hallazgos en: frena el PR, avisa, o se ignora con justificación escrita.</li>
+  <li>Diseñá el rol de nube que asumiría tu CI vía OIDC: permisos mínimos y la condición de confianza que lo limita a un repositorio y una rama.</li>
+</ol>
+
+<section class="quiz" id="quizCS09">
+  <style>
+    #quizCS09{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS09 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS09 .q{margin-bottom:1.5rem}
+    #quizCS09 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS09 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS09 .opt:hover{border-color:var(--accent)}
+    #quizCS09 .opt:disabled{cursor:default}
+    #quizCS09 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS09 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS09 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS09 .exp.show{display:block}
+    #quizCS09 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un equipo rompe el build ante cualquier CVE, incluidas las bajas, sin exploit conocido y sin parche disponible. ¿Cuál es el riesgo principal?</p>
+    <button class="opt">Que el pipeline tarde unos minutos más en cada ejecución</button>
+    <button class="opt">Que el escáner deje de detectar las vulnerabilidades nuevas</button>
+    <button class="opt">Que el equipo termine desactivando o salteando el control</button>
+    <div class="exp">Un gate que bloquea con hallazgos inaccionables deja PRs trabados sin arreglo posible, y la salida que encuentra el equipo es la excepción global: el control desaparece pero sigue figurando como cumplido, que es peor que no tenerlo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. ¿Por qué es peligroso que el workflow de CI de un PR proveniente de un fork tenga acceso a los secretos del repositorio?</p>
+    <button class="opt">Porque el autor del PR controla el código que se ejecuta y puede exfiltrar esos secretos</button>
+    <button class="opt">Porque los forks no traen el historial completo y el build puede fallar</button>
+    <button class="opt">Porque el trabajo corre en infraestructura del contribuidor</button>
+    <div class="exp">Es ejecución de código controlado por un tercero, con credenciales en el ambiente y sin que nadie apruebe nada: alcanza con abrir el PR. Ese código puede imprimir los secretos transformados para esquivar el enmascarado, o mandarlos afuera.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Copiás un archivo con una clave en una instrucción del <code>Dockerfile</code> y lo borrás en la siguiente. ¿Queda expuesta en la imagen publicada?</p>
+    <button class="opt">No: el borrado en la capa siguiente la elimina del historial</button>
+    <button class="opt">Sí: cada instrucción crea una capa y todas quedan en el historial, legibles</button>
+    <button class="opt">Solo si la imagen se publica en un registro público</button>
+    <div class="exp">Las capas son acumulativas e inmutables: borrar el archivo agrega una capa que lo oculta en el sistema de archivos final, pero la que lo contenía sigue estando y cualquiera que baje la imagen la extrae. Tampoco depende de que el registro sea público.</div>
+  </div>
+
+  <div class="score" id="scoreCS09"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS09');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS09').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M10.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m08-secure-coding/lecture.html">← M08: Secure coding y threat modeling</a>
+  <a href="../m10-deteccion-respuesta/lecture.html">M10: Detección y respuesta →</a>
+</nav>
+
+</div>
+</body>
+</html>

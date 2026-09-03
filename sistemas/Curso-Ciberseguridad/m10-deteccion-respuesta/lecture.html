@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 10 — Detección y respuesta a incidentes · Curso de Ciberseguridad</title>
+  <meta name="description" content="Telemetría, logging estructurado, centralización, SIEM, MITRE ATT&amp;CK, fatiga de alertas, el ciclo de respuesta a incidentes de NIST, contención, forense básica, post-mortem sin culpa y threat hunting.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 10</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M05, M06</span>
+  <span class="badge">🔵 Blue team</span>
+</div>
+
+<article>
+
+<h1>Módulo 10 — Detección y respuesta a incidentes</h1>
+
+<p>Hasta acá el curso construyó muros. Este módulo empieza con la pregunta incómoda: <strong>cuando alguno falle, ¿cómo te enterás?</strong> Porque va a fallar. Y la diferencia entre un susto y una catástrofe casi nunca está en el muro que se rompió, sino en cuánto tardaste en darte cuenta.</p>
+
+<h2>Asumir la brecha: MTTD y MTTR</h2>
+
+<div class="concept">
+  <strong>💡 "Assume breach" no es pesimismo, es diseño.</strong> Es invertir <em>también</em> en lo que importa <strong>después</strong> de que el atacante entró: visibilidad, detección, contención y recuperación. Un sistema que solo sabe prevenir, el día que falla, falla en silencio.
+</div>
+
+<ul>
+  <li><strong>MTTD</strong>: desde que el atacante entra hasta que alguien de tu lado se entera. También llamado <strong>dwell time</strong>.</li>
+  <li><strong>MTTR</strong>: desde que te enteraste hasta que el incidente está contenido y el servicio restablecido.</li>
+</ul>
+
+<div class="danger">
+  <strong>⚠️ El dato que duele.</strong> Los informes del sector miden el mismo patrón hace más de una década: detectar y contener una brecha lleva <strong>meses, no horas</strong> —históricamente del orden de 200 días—. Y buena parte de las intrusiones <strong>no las descubre la víctima</strong> sino un tercero: un cliente, un investigador, o el propio atacante cuando manda la nota de extorsión.
+</div>
+
+<div class="rule">
+  <strong>📌 Un atacante con 200 días adentro no es "un atacante": es un administrador más.</strong> Mapeó la red, robó credenciales y sabe dónde están tus backups. Bajar el MTTD de meses a días se logra con telemetría, no con más muros.
+</div>
+
+<h2>Telemetría: de dónde salen los datos</h2>
+
+<p>No podés detectar lo que no ves. Cada fuente ilumina una parte del ataque y es ciega al resto — por eso se combinan.</p>
+
+<table>
+<thead><tr><th>Fuente</th><th>Qué te da</th><th>Detecta bien</th><th>Punto ciego</th></tr></thead>
+<tbody>
+<tr><td><strong>Sistema</strong></td><td>Logins, <code>sudo</code>, servicios, tareas</td><td>Escalada, persistencia</td><td>Dentro de la app</td></tr>
+<tr><td><strong>Aplicación</strong></td><td>Acciones de negocio con identidad</td><td>Abuso de lógica, acceso a datos</td><td>Fuera del proceso</td></tr>
+<tr><td><strong>Red</strong></td><td>Quién habla con quién y cuánto</td><td>Exfiltración, C2, lateral</td><td>Contenido cifrado</td></tr>
+<tr><td><strong>EDR</strong></td><td>Árbol de procesos, cambios en disco</td><td>Malware, <em>living off the land</em></td><td>Equipos sin agente</td></tr>
+<tr><td><strong>Identidad</strong> (IdP)</td><td>Autenticaciones, MFA, sesiones</td><td><em>Password spraying</em>, viaje imposible</td><td>Apps fuera del IdP</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Con presupuesto cero, empezá por identidad y aplicación:</strong> casi todo incidente moderno pasa por una credencial y termina en un dato. Red y EDR son potentes pero caras de operar.
+</div>
+
+<h2>Qué loguear, y con qué calidad</h2>
+
+<p>Loguear todo es tan inútil como no loguear nada: pagás almacenamiento para no encontrar nada. Lo que siempre vale:</p>
+
+<ul>
+  <li><strong>Autenticación</strong>: logins exitosos <em>y</em> fallidos, MFA, reset de contraseña, alta y revocación de tokens.</li>
+  <li><strong>Cambios de permisos</strong>: roles, membresías, privilegios administrativos. La señal más valiosa y la que menos gente registra.</li>
+  <li><strong>Acceso a datos sensibles</strong>: quién leyó, exportó o descargó qué. Sobre todo lecturas masivas.</li>
+  <li><strong>Cambios de configuración</strong> y <strong>errores</strong>: firewall, variables de entorno, despliegues; y los 5xx, que suelen ser el eco de alguien probando límites.</li>
+</ul>
+
+<div class="warn">
+  <strong>Lo que nunca va al log:</strong> contraseñas (ni las fallidas — la gente escribe la de <em>otra</em> cuenta), tokens, cookies, claves, tarjetas y cualquier PII que no necesites. Un log con secretos es una base de credenciales <strong>sin control de acceso y guardada un año</strong>.
+</div>
+
+<p>Y el contenido no alcanza si el formato no permite reconstruir <em>qué pasó, en qué orden y quién lo hizo</em>:</p>
+
+<div class="step"><strong>1. Timestamp con zona.</strong> ISO 8601, en UTC. <code>2026-09-03T14:22:31Z</code> es procesable; <code>03/09 11:22</code> es una adivinanza sobre qué huso era.</div>
+
+<div class="step"><strong>2. Identificador de correlación.</strong> Un <code>request_id</code> generado en el borde y propagado a cada servicio y consulta. Sin él, unir 40 líneas de seis servicios con 3.000 requests por minuto entremezclados es imposible.</div>
+
+<div class="step"><strong>3. Formato estructurado.</strong> Una línea JSON por evento, con campos estables: el texto libre obliga a expresiones regulares frágiles.</div>
+
+<div class="step"><strong>4. Identidad y resultado explícitos</strong>, y <strong>5. relojes sincronizados por NTP</strong> en todas las máquinas.</div>
+
+<div class="analogy">
+  <strong>🕰️ El testigo con el reloj atrasado.</strong> Si el servidor web va cuatro minutos adelantado respecto de la base de datos, la línea de tiempo muestra la consulta maliciosa <em>antes</em> del request que la originó, y como la causalidad se lee por orden temporal la conclusión sale al revés. Sin NTP no tenés una línea de tiempo pobre: tenés una <strong>falsa</strong>.
+</div>
+
+<h2>Centralización: el log no vive en la máquina comprometida</h2>
+
+<p>Borrar rastros es un paso estándar del manual del atacante — ATT&amp;CK lo cataloga como <em>Indicator Removal</em>. Si el único registro está en el disco intruido, lo van a limpiar antes de irse.</p>
+
+<div class="rule">
+  <strong>📌 Los logs salen del host apenas se generan.</strong> Un colector central al que las máquinas <strong>solo pueden escribir, nunca leer ni borrar</strong>. Así, aunque el atacante sea root en el servidor, ya no controla la copia que importa.
+</div>
+
+<ul>
+  <li><strong>Retención.</strong> Si el dwell time se mide en meses, guardar 7 días garantiza que cuando te enteres la evidencia ya no exista. Patrón habitual: 90 días calientes y archivo frío por 12 meses.</li>
+  <li><strong>Integridad.</strong> Almacenamiento de solo anexado y hash de los lotes: un log editable sin dejar rastro no vale como evidencia.</li>
+</ul>
+
+<h2>Detección: firmas, comportamiento y anomalías</h2>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Cómo funciona</th><th>Encuentra</th><th>Se le escapa</th></tr></thead>
+<tbody>
+<tr><td><strong>Firmas</strong></td><td>Compara contra indicadores conocidos: hashes, IP, dominios</td><td>Lo ya catalogado, con pocos falsos positivos</td><td>Todo lo nuevo: cambiar un byte cambia el hash</td></tr>
+<tr><td><strong>Comportamiento</strong></td><td>Reglas sobre <em>secuencias</em>, no sobre artefactos</td><td>Técnicas, no herramientas: "Office lanzó una shell"</td><td>Lo que se disfraza de legítimo con paciencia</td></tr>
+<tr><td><strong>Anomalías</strong></td><td>Compara contra una línea base de lo normal</td><td>Horarios, volúmenes y destinos raros</td><td>Al atacante lento; y hace ruido cuando lo normal cambia</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Son complementarios: las firmas sacan el ruido barato, las reglas de comportamiento son el músculo real de la detección moderna y las anomalías son la red de seguridad para lo que nadie previó. Un programa que solo tiene firmas detecta el ataque del año pasado.
+</div>
+
+<h2>MITRE ATT&amp;CK: el lenguaje común</h2>
+
+<p>Base de conocimiento pública de cómo operan los atacantes reales, en dos niveles: las <strong>tácticas</strong> son el <em>para qué</em> (acceso inicial, ejecución, persistencia, escalada, evasión, credenciales, movimiento lateral, C2, exfiltración, impacto) y las <strong>técnicas</strong> el <em>cómo</em> concreto de cada una.</p>
+
+<div class="concept">
+  <strong>💡 Su valor no es la enciclopedia: es el mapa de cobertura.</strong> Marcás qué detecciones tenés por táctica y aparece el hueco. El resultado típico incomoda: casi todos detectan <em>acceso inicial</em> —ahí apuntan los productos comerciales— y nadie ve <em>movimiento lateral</em> ni <em>exfiltración</em>, que es donde se juegan los incidentes graves.
+</div>
+
+<pre><code class="lang-text">COBERTURA TÍPICA DE UNA PYME CON SSO + LOGS DE APP
+
+  Acceso inicial      ████████░░   logs del IdP, MFA
+  Persistencia        ██░░░░░░░░   solo alta de usuarios
+  Movimiento lateral  ░░░░░░░░░░   sin telemetría de red interna
+  Exfiltración        ██░░░░░░░░   solo descargas por la app
+</code></pre>
+
+<h2>Alertas y fatiga: mil alertas son cero alertas</h2>
+
+<div class="danger">
+  <strong>⚠️ La fatiga de alertas es una falla de seguridad, no un problema de humor.</strong> Con 400 avisos diarios y 98% de ruido, el equipo aprende —racionalmente— a ignorar el canal, y la alerta buena se cierra con el mismo clic automático que las otras 399. Hay brechas históricas enormes donde la detección <strong>funcionó perfecto</strong> y la alerta se descartó por eso.
+</div>
+
+<div class="step"><strong>1. Toda alerta tiene dueño y acción.</strong> Si nadie sabe quién responde, no responde nadie. Y si la única acción posible es "mirar y cerrar", <strong>eso no es una alerta: es un panel</strong>.</div>
+
+<div class="step"><strong>2. Agrupar antes de notificar.</strong> Mil intentos fallidos desde una IP son <em>un</em> incidente, no mil alertas.</div>
+
+<div class="step"><strong>3. Severidad honesta.</strong> Si todo es "crítico", nada lo es. Y cada alerta cerrada como falso positivo se afina o se elimina.</div>
+
+<h2>Respuesta a incidentes: el ciclo NIST</h2>
+
+<p>NIST SP 800-61 ordena la respuesta en fases. Lo importante no son los nombres, sino <strong>qué se decide en cada una</strong>:</p>
+
+<div class="step"><strong>1. Preparación.</strong> Todo lo que hacés <em>antes</em>: quién comanda, cómo se comunica el equipo si el correo corporativo está comprometido, qué accesos de emergencia hay y cuánto tardan los backups. Única fase con cabeza fría, y la que más determina el resultado.</div>
+
+<div class="step"><strong>2. Detección y análisis.</strong> Confirmar que el evento es un incidente y dimensionarlo: qué sistemas, qué datos, qué cuentas. Acá se decide si es un ticket o se activa el plan completo. El error clásico es actuar antes de dimensionar.</div>
+
+<div class="step"><strong>3. Contención.</strong> Cortar el acceso del atacante y evitar que se extienda, sin romper la evidencia.</div>
+
+<div class="step"><strong>4. Erradicación.</strong> Cerrar la vulnerabilidad y borrar la persistencia (cuentas creadas, tareas programadas, claves SSH, webshells), rotando <strong>todas</strong> las credenciales expuestas. Si no encontraste <em>cómo</em> entró, no erradicaste nada.</div>
+
+<div class="step"><strong>5. Recuperación.</strong> Volver a producción desde backups verificados <em>anteriores</em> al compromiso, observando los días siguientes: los atacantes vuelven por la misma puerta.</div>
+
+<div class="step"><strong>6. Lecciones aprendidas.</strong> Qué pasó, por qué la detección tardó lo que tardó y qué se cambia. Sin esta fase el incidente vuelve en seis meses.</div>
+
+<h2>Contención y forense: aislar sin destruir evidencia</h2>
+
+<div class="analogy">
+  <strong>🚑 La escena del accidente.</strong> El instinto es mover al herido y despejar la calle; el procedimiento es estabilizar sin mover, porque la posición de los vehículos explica qué pasó. Igual acá: "apagá todo ya" estabiliza y <strong>borra la explicación al mismo tiempo</strong>.
+</div>
+
+<p>Cada minuto conectado es más daño, pero cada acción apurada destruye lo que necesitás para saber si lo sacaste de verdad. El equilibrio práctico: <strong>aislar de la red, no apagar</strong> (una VLAN de cuarentena corta al atacante y conserva RAM, procesos y conexiones), <strong>congelar antes de tocar</strong> (snapshot o volcado de memoria), <strong>cortar también por identidad</strong> —revocar sesiones y rotar credenciales, porque el atacante ya se movió— y <strong>documentar cada acción con hora</strong>, o después no vas a distinguir lo que hizo el atacante de lo que hizo tu equipo respondiendo.</p>
+
+<p>La primera regla forense casi siempre se viola: <strong>recolectá primero lo que se pierde antes</strong>. El orden de volatilidad va de la caché y los registros de CPU a la <strong>memoria RAM</strong> (se pierde al apagar), el estado de red y procesos, los temporales, el disco, y por último los logs remotos.</p>
+
+<ul>
+  <li><strong>Imagen bit a bit</strong>, nunca "copiar los archivos importantes": una copia pierde espacio no asignado, metadatos y borrados recuperables.</li>
+  <li><strong>Nunca trabajes sobre el original.</strong> Hash de la imagen, original intacto, análisis sobre la copia; al terminar el hash tiene que dar igual.</li>
+  <li><strong>Cadena de custodia.</strong> Registro sin huecos de quién tuvo la evidencia, cuándo y qué le hizo. Un hueco la vuelve inutilizable ante un juez.</li>
+</ul>
+
+<h2>Post-mortem sin culpa y threat hunting</h2>
+
+<div class="rule">
+  <strong>📌 El objetivo del post-mortem es el sistema, no la persona.</strong> "Juan hizo clic en el phishing" no es una causa raíz: es terminar la investigación en el peor lugar posible. Las causas están más atrás — por qué el correo llegó, por qué el clic bastó para robar la sesión, por qué esa cuenta llegaba a producción, por qué nadie se enteró en once días.
+</div>
+
+<p>El argumento es pragmático: donde el error se castiga, la gente deja de reportar. Y un incidente reportado tarde es exponencialmente más caro que uno reportado en el minuto uno por alguien que sospechó que se mandó una macana.</p>
+
+<p>Cerrado el ciclo, queda lo proactivo. La detección solo encuentra lo que alguien anticipó al escribir la regla; el <strong>threat hunting</strong> invierte la lógica — formulás una hipótesis (<em>"una credencial de servicio robada se vería autenticándose desde una IP o un horario fuera de patrón"</em>), elegís los datos que la responden, buscás, y si no encontrás nada escribís la detección automática para no volver a buscar a mano.</p>
+
+<div class="tip">
+  <strong>Un hunt que no encuentra nada igual fue exitoso</strong> si terminó en una detección nueva o en un hueco de telemetría identificado. El peor resultado no es "no había nada": es descubrir que <em>no había datos para responder la pregunta</em>.
+</div>
+
+<h2>🔧 En tu código: logging que sirve para detectar</h2>
+
+<p>Todo lo anterior depende de que la aplicación emita eventos utilizables. Un SIEM carísimo alimentado con <code>print("error")</code> no detecta nada.</p>
+
+<div class="rule">
+  <strong>1. JSON estructurado con identificador de correlación</strong> generado en el borde y presente en <em>todas</em> las líneas de la operación.
+</div>
+
+<pre><code class="lang-python">import contextvars, hashlib, json, logging
+
+request_id = contextvars.ContextVar("request_id", default="-")
+
+class FormatoJSON(logging.Formatter):
+    def format(self, record):
+        evento = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),  # con zona
+            "nivel": record.levelname,
+            "request_id": request_id.get(),   # correlación entre servicios
+            "mensaje": record.getMessage(),
+        }
+        evento.update(getattr(record, "seguro", {}))
+        return json.dumps(evento, ensure_ascii=False)
+</code></pre>
+
+<div class="rule">
+  <strong>2. Enmascarar en el camino al log</strong>, no confiar en que "nadie va a loguear eso". Una lista central sobrevive a los cambios de equipo; una convención en la cabeza de la gente, no.
+</div>
+
+<pre><code class="lang-python">PROHIBIDOS   = {"password", "token", "authorization", "cookie",
+                "secret", "api_key", "tarjeta", "cvv"}
+SEUDONIMIZAR = {"email", "dni", "telefono"}
+
+def enmascarar(datos: dict) -&gt; dict:
+    limpio = {}
+    for clave, valor in datos.items():
+        k = clave.lower()
+        if k in PROHIBIDOS:
+            limpio[clave] = "[REDACTADO]"        # nunca, ni truncado
+        elif k in SEUDONIMIZAR:                  # correlacionable, no legible
+            limpio[clave] = hashlib.sha256(str(valor).encode()).hexdigest()[:16]
+        else:
+            limpio[clave] = valor
+    return limpio
+</code></pre>
+
+<div class="rule">
+  <strong>3. Emitir eventos de seguridad explícitos.</strong> No alcanza con que el dato esté "en algún log": el SIEM necesita un tipo estable y un resultado explícito para escribir reglas encima.
+</div>
+
+<pre><code class="lang-python">log = logging.getLogger("seguridad")
+
+def evento_seguridad(tipo: str, resultado: str, **contexto):
+    log.info(tipo, extra={"seguro": {
+        "evento": tipo,                      # auth.login | authz.denegado | ...
+        "resultado": resultado,              # exito | fallo
+        "actor": contexto.pop("actor", "anonimo"),
+        "ip": contexto.pop("ip", None),
+        **enmascarar(contexto),
+    }})
+
+# ✅ Los tres que no pueden faltar en ninguna app:
+evento_seguridad("auth.login",     "fallo", actor=usuario, ip=ip)
+evento_seguridad("perm.cambio",    "exito", actor=admin, objetivo=uid, rol="admin")
+evento_seguridad("authz.denegado", "fallo", actor=usuario, recurso=f"pedido/{pid}")
+</code></pre>
+
+<div class="rule">
+  <strong>4. Alertar sobre tasas, no sobre eventos sueltos.</strong> Un 401 es rutina; doscientos en cinco minutos desde una IP es fuerza bruta. Y un pico de <strong>403</strong> de alguien ya autenticado es más interesante todavía: una sesión válida tocando puertas que no le corresponden.
+</div>
+
+<pre><code class="lang-text"># Fuerza bruta: pico de 401
+evento = "auth.login" Y resultado = "fallo"
+| agrupar por ip en ventana de 5m | donde conteo &gt;= 20
+| dueño: guardia-appsec · accion: runbook RB-014 (bloquear IP)
+
+# Sondeo de autorización: pico de 403 ya autenticado
+evento = "authz.denegado" | agrupar por actor en ventana de 10m
+| donde conteo &gt;= 15 Y recursos_distintos &gt;= 10
+| accion: runbook RB-021 (cuenta tomada o IDOR)
+</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Loguear todo sin estructura, "total después lo grepeamos".</strong><br>
+  ❌ <code>log.info(f"usuario {u} hizo {accion} en {r}")</code>, un formato por módulo y campos que cambian cuando alguien reescribe el mensaje.<br>
+  ✅ Una línea JSON por evento con campos estables. El día del incidente no tenés horas para inventar expresiones regulares sobre texto libre, y las que escribas apuradas fallan justo en las líneas que importan.
+</div>
+
+<div class="mistake">
+  <strong>2. Dejar los logs solo en el servidor afectado.</strong><br>
+  ❌ Todo en <code>/var/log</code> de la máquina comprometida, con el atacante como root y capacidad de editar o borrar.<br>
+  ✅ Envío continuo a un colector donde las máquinas <strong>solo escriben</strong>, con almacenamiento de solo anexado. Borrar rastros es un paso estándar del manual, no un escenario exótico.
+</div>
+
+<div class="mistake">
+  <strong>3. Alertas sin dueño ni acción.</strong><br>
+  ❌ Un canal con 400 mensajes diarios que "todo el equipo mira", donde nadie es responsable y la mitad son informativos.<br>
+  ✅ Cada alerta con dueño nombrado, severidad honesta y un runbook; lo que no tiene acción va a un dashboard. Una alerta que se cierra sin leer da la ilusión de cobertura.
+</div>
+
+<div class="mistake">
+  <strong>4. Apagar la máquina comprometida.</strong><br>
+  ❌ "La apagamos para cortarlo" — y con eso se va la RAM: procesos vivos, conexiones, claves en memoria, malware que nunca tocó el disco y a menudo la única prueba de <em>cómo</em> entró.<br>
+  ✅ Aislar de la red, snapshot o volcado de memoria, y recién después analizar. Cortás al atacante igual, pero conservás lo más volátil.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu app loguea en JSON, con correlación, y guarda 90 días. ¿Por qué eso todavía no es detección?</summary>
+<p>Porque un log es evidencia disponible, no detección. Detectar exige que algo <strong>mire esos datos y decida</strong>: reglas corriendo de forma continua, umbrales, alguien que reciba el resultado y un procedimiento para actuar. Sin eso tenés capacidad forense <em>a posteriori</em>: el día que un tercero te avise vas a reconstruir todo con detalle, pero el MTTD lo siguió fijando ese tercero. Los logs bajan el MTTR; lo que baja el MTTD son las reglas encima de ellos.</p></details>
+
+<details><summary>¿Por qué mapear tus detecciones contra las tácticas de ATT&amp;CK suele cambiar las prioridades?</summary>
+<p>Porque expone la asimetría entre dónde se invierte y dónde está el riesgo. La cobertura típica se concentra en <em>acceso inicial</em> mientras movimiento lateral, persistencia y exfiltración quedan en cero. Pero un atacante que logró acceso inicial ya superó esa capa: todo el daño posterior ocurre justo en las tácticas que no mirás, y por eso el dwell time se estira a meses.</p></details>
+
+<details><summary>Un post-mortem concluye "el desarrollador no validó la entrada". ¿Por qué eso es una falla del post-mortem?</summary>
+<p>Porque describe el último eslabón visible y frena antes de las causas corregibles de forma sistémica. Faltan las preguntas de sistema: ¿por qué el code review no lo vio?, ¿por qué el análisis estático del pipeline no lo marcó?, ¿por qué una entrada sin validar alcanzó para comprometer el servicio en vez de fallar contenida? Cada una produce una acción reproducible que protege del <em>próximo</em> que cometa el mismo error. Culpar a una persona deja una sola acción, no escalable: "tener más cuidado".</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Inventario de telemetría de una app tuya: de las seis fuentes de la tabla, ¿cuáles tenés hoy? Marcá los puntos ciegos.</li>
+  <li>Convertí el logging de un endpoint a JSON con <code>request_id</code>, timestamp con zona e identidad del actor. Verificá que el mismo id aparezca en todas las líneas de un request.</li>
+  <li>Implementá <code>enmascarar()</code> con tu lista de prohibidos y buscá si alguno de esos campos ya está en texto plano en tus logs actuales.</li>
+  <li>Agregá los tres eventos de seguridad del módulo y escribí para cada uno su regla de alerta, con dueño y acción.</li>
+  <li>Armá tu mapa de cobertura ATT&amp;CK: por cada táctica, ¿tenés detección, tenés datos sin detección, o no tenés nada?</li>
+  <li>Escribí el runbook de contención para "una credencial de administrador fue comprometida": qué se hace primero, qué evidencia se preserva y a quién se avisa.</li>
+</ol>
+
+<section class="quiz" id="quizCS10">
+  <style>
+    #quizCS10{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS10 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS10 .q{margin-bottom:1.5rem}
+    #quizCS10 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS10 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS10 .opt:hover{border-color:var(--accent)}
+    #quizCS10 .opt:disabled{cursor:default}
+    #quizCS10 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS10 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS10 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS10 .exp.show{display:block}
+    #quizCS10 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Detectás actividad sospechosa en un servidor de producción. ¿Cuál es la primera acción de contención correcta?</p>
+    <button class="opt">Apagarlo de inmediato para cortar al atacante lo antes posible</button>
+    <button class="opt">Reinstalar el sistema desde cero para asegurarte de que quede limpio</button>
+    <button class="opt">Aislarlo de la red y capturar la memoria antes de tocar nada más</button>
+    <div class="exp">Apagar corta al atacante pero destruye la <strong>RAM</strong>: procesos vivos, conexiones, claves y malware que nunca tocó el disco. Reinstalar es peor todavía — borra también el disco y te deja sin saber cómo entró. Aislar corta la comunicación igual de rápido y conserva lo efímero.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu equipo recibe 400 alertas por día y hace meses que las cierra en lote sin leer. ¿Cómo se describe esto?</p>
+    <button class="opt">Es una falla de detección: hay cobertura nominal pero cero capacidad real de respuesta</button>
+    <button class="opt">Es aceptable si las reglas están bien escritas: el problema es de disciplina del equipo</button>
+    <button class="opt">Es un problema de capacidad: se resuelve contratando más analistas para ese volumen</button>
+    <div class="exp">La fatiga de alertas es una <strong>falla técnica del sistema de detección</strong>, no de actitud ni de plantilla. Con 98% de ruido, ignorar el canal es el comportamiento racional. Se arregla reduciendo volumen: agrupar por entidad y ventana, mandar a un dashboard lo que no tenga acción asociada, y afinar o borrar las reglas ruidosas.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Los relojes de tu servidor web y de tu base de datos difieren en cuatro minutos. ¿Cuál es el impacto real en una investigación?</p>
+    <button class="opt">Menor: cuatro minutos es despreciable frente a un incidente que duró días</button>
+    <button class="opt">Grave: la línea de tiempo puede invertir el orden causal y llevar a conclusiones falsas</button>
+    <button class="opt">Ninguno, mientras el identificador de correlación esté en ambos logs</button>
+    <div class="exp">La causalidad en forense se lee por orden temporal. Con el web adelantado, la consulta maliciosa aparece <em>antes</em> del request que la originó y la conclusión sale invertida: buscás un origen interno cuando el ataque era externo. No es una línea de tiempo imprecisa, es una <strong>falsa</strong>, y encima parece coherente. El id de correlación agrupa las líneas de una operación, pero no ordena eventos entre sistemas.</div>
+  </div>
+
+  <div class="score" id="scoreCS10"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS10');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS10').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M11.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m09-devsecops/lecture.html">← M09: DevSecOps</a>
+  <a href="../m11-ofensiva-etica/lecture.html">M11: Ofensiva ética y metodología →</a>
+</nav>
+
+</div>
+</body>
+</html>

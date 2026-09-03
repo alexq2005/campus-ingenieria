@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 01 — Criptografía aplicada · Curso de Ciberseguridad</title>
+  <meta name="description" content="Cifrado simétrico y asimétrico, AEAD, hashing, contraseñas con Argon2id, firmas y HMAC, TLS, aleatoriedad criptográfica y post-cuántica.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 01</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M00</span>
+  <span class="badge">🔐 Fundamentos</span>
+</div>
+
+<article>
+
+<h1>Módulo 01 — Criptografía aplicada</h1>
+
+<p>La criptografía es la única parte de la seguridad donde la matemática da garantías demostrables — pero son garantías <em>estrechas</em>. Casi ningún desastre criptográfico real viene de romper el algoritmo, sino de <strong>usarlo mal</strong>. Este módulo no te enseña a diseñar cifrados; te enseña a elegir la primitiva correcta y a no cometer los seis errores que se repiten desde hace treinta años.</p>
+
+<h2>Qué resuelve la criptografía y qué no</h2>
+
+<div class="concept">
+  <strong>💡 La criptografía convierte un problema de seguridad grande en un problema de gestión de claves chico.</strong> No lo hace desaparecer: lo mueve. Ya no protegés un millón de registros, protegés una clave — enorme mejora, pero solo si esa clave está realmente protegida.
+</div>
+
+<p>Te da <strong>confidencialidad</strong> (el que intercepta no entiende), <strong>integridad</strong> (si alguien modifica, se detecta), <strong>autenticidad</strong> (viene de quien tiene la clave) y <strong>no repudio</strong> (solo con firma asimétrica).</p>
+
+<div class="rule">
+  <strong>📌 Lo que NO es.</strong> No es <strong>autenticación</strong>: cifrar bien no te dice quién está del otro lado. No es <strong>autorización</strong>: poder descifrar no es tener derecho a ver. Y no arregla un <strong>mal diseño</strong>: si tu API devuelve el registro de cualquier usuario cuando le pasás su ID, cifrar la base no cambia nada — el atacante lo pide por la puerta de adelante y el servidor lo descifra amablemente.
+</div>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> "está cifrado en reposo, estamos cubiertos". Eso protege contra quien se lleva el disco, no contra SQL injection ni contra una API sin control de acceso: ahí la aplicación descifra y entrega, porque para eso está.
+</div>
+
+<h2>Cifrado simétrico: AES y los modos</h2>
+
+<p>Una sola clave cifra y descifra. Es rápido y es lo que usás para volumen: archivos, bases, el cuerpo de una conexión TLS. El estándar es <strong>AES</strong> (128 o 256 bits) y también <strong>ChaCha20</strong>. Pero AES cifra bloques de 16 bytes, y cómo los encadenás —el <strong>modo de operación</strong>— es donde se gana o se pierde la seguridad.</p>
+
+<table>
+<thead><tr><th>Modo</th><th>¿Autentica?</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td><strong>ECB</strong></td><td>No</td><td>❌ Nunca: bloques iguales dan cifrados iguales</td></tr>
+<tr><td><strong>CBC / CTR</strong></td><td>No</td><td>⚠️ Solo con un HMAC aparte y bien hecho</td></tr>
+<tr><td><strong>AES-GCM</strong></td><td>✅</td><td>✅ Elección por defecto (AEAD)</td></tr>
+<tr><td><strong>ChaCha20-Poly1305</strong></td><td>✅</td><td>✅ Ideal sin aceleración AES por hardware</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Usá AEAD y nada más.</strong> <em>Authenticated Encryption with Associated Data</em> cifra y además produce un <strong>tag</strong> que detecta cualquier modificación del criptograma. Sin autenticación el atacante puede voltear bits del cifrado y provocar cambios controlados en el texto claro sin conocer la clave (<em>bit-flipping</em>, y de ahí los <em>padding oracle</em>). Cifrar sin autenticar es un bug, no una opción de rendimiento.
+</div>
+
+<div class="analogy">
+  <strong>🎨 Por qué ECB es un chiste.</strong> Si cifrás la imagen de un logo con ECB, el resultado <em>sigue mostrando el logo</em>: cada región de píxeles iguales produce el mismo bloque. Los bytes quedan ilegibles, pero la <strong>estructura</strong> —que muchas veces es la información— se filtra entera.
+</div>
+
+<h3>El IV / nonce: el detalle que hunde barcos</h3>
+
+<p>Los modos seguros necesitan un valor extra por cifrado: el <strong>IV</strong> o <strong>nonce</strong> (<em>number used once</em>). No es secreto —viaja junto al criptograma— pero tiene una regla absoluta.</p>
+
+<div class="danger">
+  <strong>⚠️ Nunca reuses un nonce con la misma clave.</strong> En GCM, cifrar dos mensajes con el mismo par (clave, nonce) permite recuperar texto claro por XOR entre criptogramas y deducir la clave de autenticación interna, con lo cual el atacante puede <strong>falsificar mensajes válidos</strong>. Caen confidencialidad e integridad de golpe.
+</div>
+
+<div class="tip">
+  El nonce de GCM es de 96 bits. Correcto: <strong>aleatorio</strong> con un generador criptográfico, o <strong>contador</strong> persistente que nunca se reinicia. Prohibido: nonce fijo, derivado del contenido, o un contador que se resetea al reiniciar el proceso.
+</div>
+
+<h2>Cifrado asimétrico: RSA y curvas elípticas</h2>
+
+<p>Dos claves relacionadas: la <strong>pública</strong> se reparte, la <strong>privada</strong> se guarda. Resuelve lo que el simétrico no puede: <strong>acordar una clave con alguien a quien nunca viste</strong>.</p>
+
+<table>
+<thead><tr><th>Familia</th><th>Clave</th><th>Uso real</th></tr></thead>
+<tbody>
+<tr><td><strong>RSA</strong></td><td>2048–4096</td><td>Firma e intercambio. Lento; 1024 ya no se acepta</td></tr>
+<tr><td><strong>ECDSA / Ed25519</strong></td><td>256</td><td>Firma. Fuerza de RSA-3072 con mucho menos tamaño</td></tr>
+<tr><td><strong>ECDH / X25519</strong></td><td>256</td><td>Acuerdo de clave. Base del handshake TLS moderno</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El asimétrico no sirve para datos grandes.</strong> RSA solo cifra mensajes más chicos que su módulo (~190 bytes útiles con RSA-2048 y OAEP) y es órdenes de magnitud más lento que AES. La solución es el <strong>cifrado híbrido</strong>: clave simétrica aleatoria, el archivo con AES-GCM, y RSA/ECDH solo para proteger esa clave. Es lo que hacen TLS, PGP y <code>age</code>. El asimétrico sirve para dos cosas: <strong>intercambio de clave</strong> y <strong>firma</strong>.
+</div>
+
+<h2>Hashing: la huella digital del dato</h2>
+
+<p>Entrada de cualquier tamaño, salida fija. No es cifrado: <strong>no hay vuelta atrás</strong>, no hay clave, no se "descifra un hash". Es <strong>determinista</strong>, <strong>unidireccional</strong>, tiene <strong>efecto avalancha</strong> (un bit distinto cambia ~la mitad de la salida) y debe ser <strong>resistente a colisiones</strong>. Esa última propiedad es la que se rompió, y por eso hay algoritmos muertos.</p>
+
+<table>
+<thead><tr><th>Algoritmo</th><th>Estado</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><strong>MD5</strong></td><td>❌ Roto</td><td>Colisiones en segundos; se falsificaron certificados reales</td></tr>
+<tr><td><strong>SHA-1</strong></td><td>❌ Roto</td><td>Colisión práctica en 2017 (SHAttered)</td></tr>
+<tr><td><strong>SHA-256/512, SHA-3, BLAKE2/3</strong></td><td>✅ Vigentes</td><td>Sin ataques prácticos</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Una <strong>colisión</strong> son dos entradas distintas con el mismo hash. Si verificás un instalador por su MD5, alguien puede fabricar uno malicioso con el mismo MD5 que el legítimo: la comprobación dice "coincide" y el usuario instala malware.
+</div>
+
+<h2>Hashing de contraseñas: la sección crítica</h2>
+
+<div class="danger">
+  <strong>⚠️ SHA-256 NO sirve para contraseñas.</strong> Y no porque sea débil — es excelente. El problema es su virtud: es <strong>rápido</strong>. Una GPU calcula miles de millones por segundo, así que ante una filtración el atacante prueba diccionarios enteros en minutos. Para contraseñas, la velocidad <em>es</em> la vulnerabilidad.
+</div>
+
+<p>Necesitás lo contrario: una función <strong>deliberadamente lenta y cara en memoria</strong>, calibrada para que un login honesto tarde 200-500 ms y un ataque masivo sea económicamente absurdo.</p>
+
+<table>
+<thead><tr><th>Función</th><th>Resiste</th><th>Recomendación</th></tr></thead>
+<tbody>
+<tr><td><strong>Argon2id</strong></td><td>GPU y ASIC (memory-hard)</td><td>✅ Primera opción</td></tr>
+<tr><td><strong>scrypt</strong></td><td>GPU (memory-hard)</td><td>✅ Alternativa válida</td></tr>
+<tr><td><strong>bcrypt</strong></td><td>CPU; memoria baja</td><td>✅ Aceptable (trunca a 72 bytes)</td></tr>
+<tr><td><strong>PBKDF2</strong></td><td>Poco: solo itera</td><td>⚠️ Solo si lo exige una norma</td></tr>
+<tr><td><strong>SHA-256 "a mano"</strong></td><td>Nada</td><td>❌ Nunca</td></tr>
+</tbody>
+</table>
+
+<div class="step"><strong>Salt.</strong> Valor <strong>aleatorio y distinto por usuario</strong>, guardado junto al hash (no es secreto). Sin salt, dos personas con la misma contraseña tienen el mismo hash y el atacante precalcula una tabla una vez y la reusa contra todas las bases del mundo. La biblioteca lo genera sola: no lo inventes.</div>
+
+<div class="step"><strong>Factor de costo.</strong> <code>time_cost</code> y <code>memory_cost</code> en Argon2, <code>rounds</code> en bcrypt. Se calibra en <em>tu</em> hardware de producción y se sube con los años, porque el del atacante mejora. Si tu login tarda 5 ms, está mal configurado.</div>
+
+<div class="step"><strong>Pepper.</strong> Secreto <strong>global</strong> de la app, mezclado con la contraseña y guardado fuera de la base (env, KMS, HSM). Si roban solo la base, los hashes no se pueden atacar. No reemplaza al salt: se suman.</div>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> "le hago SHA-256 mil veces, es lo mismo que bcrypt". No. Iterar SHA sube el costo en CPU pero sigue siendo trivial de paralelizar en GPU, porque casi no usa memoria. Argon2 y scrypt son <em>memory-hard</em>: obligan a reservar megabytes por intento, justo lo que una GPU con miles de núcleos y poca RAM no puede escalar.
+</div>
+
+<h2>Firmas digitales y HMAC</h2>
+
+<p>Las dos dan <strong>integridad + autenticidad</strong>. La diferencia es de quién es la clave, y eso lo cambia todo.</p>
+
+<table>
+<thead><tr><th></th><th>HMAC</th><th>Firma digital</th></tr></thead>
+<tbody>
+<tr><td><strong>Clave</strong></td><td>Simétrica: secreto compartido</td><td>Firma la privada, verifica la pública</td></tr>
+<tr><td><strong>Quién verifica</strong></td><td>Solo quien tiene el secreto</td><td>Cualquiera</td></tr>
+<tr><td><strong>No repudio</strong></td><td>❌ Cualquiera de los dos pudo generarlo</td><td>✅ Solo el dueño de la privada</td></tr>
+<tr><td><strong>Uso típico</strong></td><td>Cookies firmadas, webhooks, tokens</td><td>Certificados TLS, firma de software</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Firmar no es cifrar.</strong> Un documento firmado sigue siendo <strong>legible para todos</strong>: la firma no oculta nada, solo prueba quién lo emitió y que no fue alterado. Y al revés, un documento cifrado sin autenticar pudo ser modificado en tránsito. Son propiedades ortogonales — por eso AEAD hace las dos de una sola vez.
+</div>
+
+<h2>TLS/HTTPS: qué garantiza y qué no</h2>
+
+<p>TLS es criptografía híbrida bien empaquetada. El handshake, a alto nivel:</p>
+
+<div class="step"><strong>1. Acuerdo de clave.</strong> Negocian una clave simétrica <em>efímera</em> con ECDH (X25519) y la descartan al terminar. Eso da <strong>forward secrecy</strong>: si mañana roban la clave privada del servidor, no descifran el tráfico grabado ayer.</div>
+
+<div class="step"><strong>2. Autenticación del servidor.</strong> Manda su certificado y firma parte del handshake con su privada; el cliente verifica firma y cadena.</div>
+
+<div class="step"><strong>3. Tráfico con AEAD.</strong> El resto va con AES-GCM o ChaCha20-Poly1305 y la clave efímera.</div>
+
+<p><strong>Cadena de confianza y PKI:</strong> tu navegador no conoce a <code>ejemplo.com</code>, pero confía en <strong>autoridades certificadoras</strong> (CA) raíz preinstaladas. El certificado del sitio lo firma una CA intermedia, firmada a su vez por una raíz. El navegador verifica cadena, nombre, vencimiento y <strong>revocación</strong> (OCSP, CRL — y en la práctica, certificados de vida corta que se renuevan solos, como los de Let's Encrypt cada 90 días).</p>
+
+<div class="warn">
+  <strong>Lo que HTTPS NO garantiza.</strong> Que el sitio sea legítimo: un dominio de phishing saca su certificado gratis y muestra el mismo candado. Que la app sea segura: TLS protege el <em>transporte</em>, y al llegar el dato se descifra. Y no oculta los <strong>metadatos</strong>: quién habla con quién, cuándo y cuánto sigue visible.
+</div>
+
+<h2>Aleatoriedad: CSPRNG vs PRNG</h2>
+
+<div class="concept">
+  <strong>💡 Toda la criptografía descansa sobre números impredecibles.</strong> Claves, nonces, salts, tokens de sesión, códigos de recuperación. Si el atacante predice el número no necesita romper el algoritmo: reconstruye la clave directamente.
+</div>
+
+<p>Un <strong>PRNG</strong> común (<code>random</code> en Python, <code>Math.random()</code> en JS) está hecho para simulaciones: rápido, uniforme y <strong>determinista</strong>. El Mersenne Twister de <code>random</code> es reversible: con unos cientos de salidas observadas se recupera el estado interno y se predice todo lo que viene. Un <strong>CSPRNG</strong> (<code>secrets</code>, <code>os.urandom</code>, <code>crypto.randomBytes</code>) se alimenta de entropía del sistema operativo y está diseñado para que eso sea inviable.</p>
+
+<div class="rule">
+  <strong>📌 Regla mecánica:</strong> si el valor tiene que ser secreto o imposible de adivinar, usá el CSPRNG. Sin excepciones ni "es solo un token temporal": un token de recuperación de contraseña predecible es un bypass total de autenticación.
+</div>
+
+<h2>Criptografía post-cuántica</h2>
+
+<p>Una computadora cuántica suficientemente grande rompería con el algoritmo de Shor <strong>toda</strong> la criptografía asimétrica actual: RSA, ECDH, ECDSA, Ed25519. La simétrica aguanta mejor: Grover reduce a la mitad la fuerza efectiva, así que AES-256 se comporta como AES-128 — incómodo, no fatal.</p>
+
+<div class="danger">
+  <strong>⚠️ "Harvest now, decrypt later".</strong> Esa máquina no existe todavía, pero eso no vuelve futuro el problema: un adversario con recursos puede <strong>grabar hoy</strong> tráfico cifrado y guardarlo hasta que exista el hardware para descifrarlo. Si tu dato debe seguir siendo secreto dentro de 15 o 20 años, la amenaza ya está corriendo.
+</div>
+
+<p>El NIST cerró en 2024 los primeros estándares: <strong>ML-KEM</strong> (Kyber, encapsulado de claves), <strong>ML-DSA</strong> (Dilithium, firma) y <strong>SLH-DSA</strong> (SPHINCS+, firma basada en hashes). La adopción real es <strong>híbrida</strong>: navegadores y servidores modernos ya negocian X25519 combinado con ML-KEM, así romper el handshake exige romper las dos cosas.</p>
+
+<div class="tip">
+  Lo práctico hoy: no migres nada a mano, pero diseñá con <strong>agilidad criptográfica</strong> — algoritmo configurable, etiqueta de versión en cada dato cifrado y un camino de re-cifrado. Los sistemas que sufran la transición no van a sufrir por la matemática, sino por tener el nombre del algoritmo hardcodeado en cuarenta lugares.
+</div>
+
+<h2>🔧 En tu código</h2>
+
+<div class="rule">
+  <strong>1. Usá bibliotecas estándar; nunca implementes primitivas.</strong> En Python: <code>cryptography</code>, <code>argon2-cffi</code>, <code>bcrypt</code>, <code>secrets</code>, <code>hmac</code>. Una implementación propia falla por canales laterales (tiempos, caché) mucho antes que por matemática, y eso no se ve en los tests.
+</div>
+
+<div class="rule">
+  <strong>2. Hasheá contraseñas con Argon2id (o bcrypt), nunca con SHA.</strong> La biblioteca genera el salt, elige parámetros y los guarda dentro del propio string del hash.
+</div>
+
+<pre><code class="lang-python"># ❌ Rápido, sin salt, atacable con GPU en minutos
+import hashlib
+guardado = hashlib.sha256(password.encode()).hexdigest()
+
+# ✅ Argon2id: lento, memory-hard, salt automático
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
+
+def registrar(password):
+    return ph.hash(password)     # salt y parámetros van dentro del string
+
+def verificar(guardado, password):
+    try:
+        ph.verify(guardado, password)
+    except VerifyMismatchError:
+        return False
+    if ph.check_needs_rehash(guardado):   # subiste el costo: re-hasheá
+        guardar_nuevo(ph.hash(password))
+    return True
+</code></pre>
+
+<div class="rule">
+  <strong>3. Compará secretos en tiempo constante.</strong> El operador <code>==</code> corta apenas encuentra el primer byte distinto. Esa diferencia de nanosegundos es medible: el atacante prueba byte por byte y arma el token completo en unos miles de intentos (<em>timing attack</em>).
+</div>
+
+<pre><code class="lang-python">import hmac, hashlib
+
+# ❌ Filtra información por tiempo: termina antes cuanto peor es el intento
+if token_recibido == token_esperado:
+    autorizar()
+
+# ✅ Tiempo constante: compara todo, sin importar dónde difiere
+if hmac.compare_digest(token_recibido, token_esperado):
+    autorizar()
+
+# Verificar la firma de un webhook (patrón estándar)
+firma = hmac.new(SECRETO, cuerpo_crudo, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(firma, firma_del_header):
+    rechazar("firma invalida")
+</code></pre>
+
+<div class="rule">
+  <strong>4. Generá tokens con un CSPRNG.</strong> Nunca <code>random</code>, nunca el timestamp, nunca "un uuid4 porque parece aleatorio".
+</div>
+
+<pre><code class="lang-python">import random, secrets
+
+# ❌ Mersenne Twister: predecible observando salidas previas
+token = "".join(random.choice("abcdef0123456789") for _ in range(32))
+
+# ✅ CSPRNG del sistema operativo
+token   = secrets.token_urlsafe(32)    # sesión / recuperación de contraseña
+api_key = secrets.token_hex(32)        # 256 bits en hexadecimal
+</code></pre>
+
+<div class="rule">
+  <strong>5. Cifrá con AEAD, no con modos sin autenticación.</strong> Y guardá la clave <strong>fuera</strong> del lugar donde vive el dato cifrado: variable de entorno, gestor de secretos o KMS.
+</div>
+
+<pre><code class="lang-python">import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+clave = os.environ["APP_ENC_KEY_32B"].encode()   # nunca en el repo ni en la DB
+aesgcm = AESGCM(clave)
+
+def cifrar(texto_plano: bytes, contexto: bytes) -&gt; bytes:
+    nonce = os.urandom(12)                # 96 bits, ÚNICO por mensaje
+    return nonce + aesgcm.encrypt(nonce, texto_plano, contexto)
+
+def descifrar(blob: bytes, contexto: bytes) -&gt; bytes:
+    # si el dato fue alterado, .decrypt() lanza InvalidTag: fallá cerrado
+    return aesgcm.decrypt(blob[:12], blob[12:], contexto)
+</code></pre>
+
+<div class="info">
+  El tercer parámetro (<em>associated data</em>) no se cifra pero queda <strong>autenticado</strong>. Poner ahí el ID del usuario o del registro impide que un atacante mueva un blob cifrado válido de una fila a otra — un ataque real que el cifrado por sí solo no detiene.
+</div>
+
+<h2>Errores típicos con criptografía</h2>
+
+<div class="mistake">
+  <strong>1. Inventar criptografía propia.</strong><br>
+  ❌ "Le hago XOR con una clave larga y un par de rotaciones."<br>
+  ✅ AES-GCM de una biblioteca auditada. Los algoritmos serios los atacan equipos de criptógrafos durante años antes de darlos por seguros; tu esquema lo revisaste vos una tarde.
+</div>
+
+<div class="mistake">
+  <strong>2. Usar SHA-256 o MD5 para contraseñas.</strong><br>
+  ❌ <code>hashlib.sha256(pw.encode()).hexdigest()</code> — miles de millones por segundo en una GPU.<br>
+  ✅ Argon2id calibrado a 200-500 ms. Si ya tenés SHA en producción, migrá en el próximo login exitoso: verificás con el viejo y re-hasheás con el nuevo.
+</div>
+
+<div class="mistake">
+  <strong>3. Reusar el IV/nonce (o usar uno fijo).</strong><br>
+  ❌ <code>nonce = b"000000000000"</code> "porque hay que pasar algo".<br>
+  ✅ <code>os.urandom(12)</code> por mensaje, guardado junto al criptograma. Repetir el par (clave, nonce) en GCM no degrada la seguridad: la elimina, y encima habilita falsificar mensajes.
+</div>
+
+<div class="mistake">
+  <strong>4. Comparar hashes con <code>==</code> y guardar la clave junto al dato cifrado.</strong><br>
+  ❌ <code>if firma == firma_esperada</code>, y la clave AES en la misma tabla —o el mismo repo— que el blob.<br>
+  ✅ <code>hmac.compare_digest()</code> para todo lo secreto, y la clave en un KMS o variable de entorno. Cifrar y dejar la clave al lado equivale a no cifrar.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué no se cifran archivos grandes directamente con RSA, y qué se hace en su lugar?</summary>
+<p>Por un límite y por costo: RSA solo cifra mensajes más chicos que su módulo (~190 bytes útiles con RSA-2048 y OAEP), y además es miles de veces más lento que AES. La solución es el <strong>cifrado híbrido</strong>: generás una clave simétrica aleatoria, cifrás el contenido con AES-GCM y usás RSA o ECDH solo para proteger esa clave chiquita. Combinás la velocidad del simétrico con la capacidad del asimétrico de acordar secretos sin canal previo — es lo que hacen TLS, PGP y age.</p></details>
+
+<details><summary>¿Qué diferencia hay entre una firma digital y un HMAC, si las dos dan integridad y autenticidad?</summary>
+<p>El tipo de clave, y de ahí sale todo. El HMAC usa un <strong>secreto compartido</strong>: quien puede verificar también puede generar, así que ante un tercero ninguno de los dos puede probar que lo emitió el otro — <strong>no hay no repudio</strong>. La firma usa privada para firmar y pública para verificar: cualquiera verifica sin poder falsificar, y el firmante no puede negar la autoría. Por eso el HMAC sirve entre dos partes que ya se conocen (cookies, webhooks) y la firma para certificados o actualizaciones de software, verificables por desconocidos.</p></details>
+
+<details><summary>¿Por qué "harvest now, decrypt later" hace que la criptografía post-cuántica importe hoy, si la computadora cuántica todavía no existe?</summary>
+<p>Porque el ataque tiene dos etapas separadas en el tiempo y la primera ya es posible: un adversario con capacidad de intercepción graba tráfico cifrado hoy y lo archiva; cuando exista una máquina capaz de correr Shor, lo descifra retroactivamente. La forward secrecy no ayuda — protege contra el robo futuro de la clave privada del servidor, no contra romper el intercambio de claves en sí. Por eso la pregunta correcta no es "¿cuándo llega la computadora cuántica?" sino "¿cuántos años tiene que seguir siendo secreto este dato?".</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Buscá en un proyecto tuyo cómo se guardan las contraseñas. Si no es Argon2id, scrypt o bcrypt, escribí el plan de migración sin obligar a nadie a resetear.</li>
+  <li>Calibrá Argon2id: subí <code>time_cost</code> y <code>memory_cost</code> hasta que un <code>hash()</code> tarde 200-500 ms. Anotá parámetros y hardware.</li>
+  <li>Grepeá tu código buscando <code>random</code>, <code>Math.random</code> o <code>uuid</code> usados para generar algo secreto, y pasalos a <code>secrets</code> / <code>crypto.randomBytes</code>.</li>
+  <li>Buscá comparaciones de tokens, firmas o hashes hechas con <code>==</code> y pasalas a <code>hmac.compare_digest</code>.</li>
+  <li>Cifrá y descifrá un archivo con AES-GCM con un nonce nuevo por operación. Modificá un byte del criptograma y comprobá que falla con <code>InvalidTag</code> en vez de devolver basura.</li>
+  <li>Revisá el certificado TLS de un sitio que uses (<code>openssl s_client -connect ejemplo.com:443</code>): CA, vencimiento y algoritmo. Después listá los datos de un sistema tuyo con cuántos años debe seguir siendo confidencial cada uno: ¿alguno cae dentro del horizonte post-cuántico?</li>
+</ol>
+
+<section class="quiz" id="quizCS01">
+  <style>
+    #quizCS01{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS01 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS01 .q{margin-bottom:1.5rem}
+    #quizCS01 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS01 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS01 .opt:hover{border-color:var(--accent)}
+    #quizCS01 .opt:disabled{cursor:default}
+    #quizCS01 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS01 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS01 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS01 .exp.show{display:block}
+    #quizCS01 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Una app cifra cada mensaje con AES-GCM usando siempre el mismo nonce fijo. ¿Cuál es la consecuencia?</p>
+    <button class="opt">Ninguna grave: el nonce no es secreto, viaja junto al criptograma</button>
+    <button class="opt">Solo se pierde algo de rendimiento al reutilizar el estado interno</button>
+    <button class="opt">Se rompen confidencialidad e integridad: se filtra texto claro y se pueden falsificar mensajes</button>
+    <div class="exp">Que el nonce sea público es cierto e irrelevante: la regla es que sea <strong>único</strong> por clave. Repetirlo en GCM permite recuperar texto claro por XOR entre criptogramas y deducir la clave de autenticación interna, con lo cual el atacante fabrica mensajes que el sistema acepta como válidos.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. ¿Por qué SHA-256 es una mala elección para almacenar contraseñas, si es un algoritmo criptográficamente sólido?</p>
+    <button class="opt">Porque es demasiado rápido: una GPU prueba miles de millones de candidatos por segundo</button>
+    <button class="opt">Porque tiene colisiones prácticas conocidas desde 2017</button>
+    <button class="opt">Porque su salida es demasiado corta para guardar una contraseña larga</button>
+    <div class="exp">SHA-256 no está roto: sigue siendo el estándar para integridad y firmas. Su velocidad —virtud al verificar archivos— es exactamente la vulnerabilidad al hashear contraseñas, porque quien consigue la base prueba diccionarios enteros en minutos. Las colisiones prácticas son de <strong>SHA-1</strong>. La defensa es una función lenta y memory-hard como Argon2id.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un sitio muestra el candado de HTTPS con un certificado válido. ¿Qué garantiza eso?</p>
+    <button class="opt">Que el sitio es legítimo y la organización detrás fue verificada</button>
+    <button class="opt">Que el tráfico va cifrado y autenticado hasta ese servidor, nada sobre lo que el servidor hace después</button>
+    <button class="opt">Que los datos quedan cifrados también dentro del servidor y su base de datos</button>
+    <div class="exp">TLS protege el <strong>transporte</strong>: confidencialidad, integridad y autenticación del servidor con el que hablás. No dice nada sobre la honestidad del sitio —un dominio de phishing obtiene su certificado gratis y muestra el mismo candado— ni sobre qué pasa con el dato al llegar: ahí se descifra, y protegerlo en reposo es una decisión aparte del backend.</div>
+  </div>
+
+  <div class="score" id="scoreCS01"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS01');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS01').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M02.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m00-introduccion/lecture.html">← M00: Introducción y modelo de amenazas</a>
+  <a href="../m02-autenticacion/lecture.html">M02: Autenticación e identidad →</a>
+</nav>
+
+</div>
+</body>
+</html>

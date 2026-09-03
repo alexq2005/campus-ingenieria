@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 12 — Proyectos integradores · Curso de Ciberseguridad</title>
+  <meta name="description" content="Cinco proyectos capstone que integran todo el curso: hardening con modelo de amenazas, auditoría OWASP ASVS, pipeline de CI con seguridad, playbook de incidentes con simulacro cronometrado y un CTF con write-up.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 12</span>
+  <span class="badge">⏱ ~variable</span>
+  <span class="badge">🎯 Pre-req: M00–M11</span>
+  <span class="badge">🎓 Capstone</span>
+</div>
+
+<article>
+
+<h1>Módulo 12 — Proyectos integradores</h1>
+
+<p>Este módulo no tiene teoría nueva: tiene <strong>cinco proyectos</strong> que te obligan a usar junto lo que viste separado. Cada uno termina en un <strong>entregable concreto</strong> y trae sus <strong>criterios de "listo"</strong>, que miden tu razonamiento y no la cantidad de trabajo.</p>
+
+<div class="info">
+  No hay orden obligatorio. El 1 y el 2 son los más accesibles al terminar el curso; el 4 es el que más deja por hora invertida. Hacé uno completo y bien antes que cinco a medias.
+</div>
+
+<div class="danger">
+  <strong>⚠️ Todo esto se practica en sistemas propios o en laboratorios legales.</strong> Tus VMs, tu app, tu repositorio, o plataformas hechas para practicar con permiso explícito (picoCTF, TryHackMe, Hack The Box, DVWA, Juice Shop). Probar, escanear o auditar un sistema de un tercero sin <strong>autorización escrita</strong> es delito (en Argentina, Ley 26.388), y no hay proyecto de portfolio que valga un proceso penal. Si el proyecto 2 lo querés hacer sobre la app de tu trabajo, pedí el permiso por escrito antes.
+</div>
+
+<h2>Proyecto 1 — Modelo de amenazas + hardening de un servidor Linux</h2>
+
+<p><strong>Objetivo:</strong> tomar una máquina recién instalada, decir por escrito de qué la defendés, dejarla endurecida y <strong>justificar cada cambio</strong> sin recitar una guía.</p>
+
+<p><strong>Módulos que integra:</strong> M00 (activos, actores, superficie de ataque), M02 (autenticación y claves), M05 (puertos y servicios expuestos), M06 (hardening, mínimo privilegio, systemd).</p>
+
+<div class="step"><strong>1. Levantá la VM limpia.</strong> Instalación mínima, red aislada y un snapshot <code>base-limpia</code>: todo lo que sigue tiene que repetirse desde ahí.</div>
+
+<div class="step"><strong>2. Escribí el modelo de amenazas ANTES de tocar la configuración.</strong> Qué rol cumple el servidor, 5 activos ordenados por valor, 3 actores probables y los vectores de entrada. Sin esto, el hardening es cargo cult.</div>
+
+<div class="step"><strong>3. Medí el estado inicial.</strong> Puertos escuchando, servicios al boot, usuarios con shell, paquetes instalados. Sin línea de base no podés demostrar que mejoraste nada.</div>
+
+<div class="step"><strong>4. Aplicá el hardening.</strong> SSH solo por clave (sin contraseñas ni login de root), firewall con política por defecto <strong>DROP</strong>, servicios innecesarios desinstalados, actualizaciones automáticas y una unit de systemd endurecida.</div>
+
+<div class="step"><strong>5. Escribí el script idempotente.</strong> Corrélo dos veces seguidas: la segunda no debe cambiar nada ni fallar.</div>
+
+<div class="step"><strong>6. Verificá desde cero.</strong> Restaurá el snapshot, corré el script y comprobá que llegás al mismo estado. Si no, dependés de algo que hiciste a mano y no anotaste.</div>
+
+<pre><code class="lang-text">ESQUELETO DE LA UNIT ENDURECIDA (systemd)
+
+  User / Group           usuario dedicado, nunca root
+  NoNewPrivileges        el proceso no puede escalar privilegios
+  ProtectSystem          el sistema de archivos se ve solo-lectura
+  PrivateTmp             /tmp propio, aislado del resto
+  ReadWritePaths         la lista corta de lo que SÍ puede escribir
+  CapabilityBoundingSet  vacío salvo lo estrictamente necesario
+</code></pre>
+
+<p><strong>Entregable:</strong> el modelo de amenazas, el script de hardening idempotente con un comentario por bloque explicando <em>por qué</em>, y el checklist CIS marcado ítem por ítem —incluidos los que decidiste <strong>no</strong> aplicar y el motivo.</p>
+
+<p><strong>Criterios de "listo":</strong></p>
+
+<ul>
+  <li>Podés justificar <strong>cada</strong> cambio contra tu modelo: qué activo protege y de qué actor.</li>
+  <li>Los ítems del CIS descartados tienen una razón escrita, no un casillero vacío.</li>
+  <li>El script corre dos veces seguidas sin cambiar nada la segunda vez.</li>
+  <li>Desde el snapshot llegás al mismo estado final.</li>
+  <li>El servicio sigue funcionando: un servidor endurecido que rompió la app no es seguro, está roto.</li>
+</ul>
+
+<div class="warn">
+  <strong>Trampa habitual:</strong> aplicar un benchmark entero sin leerlo. Terminás con un servidor que no arranca, o con un checklist verde y una idea falsa de tu postura de seguridad. El benchmark es una lista de candidatos a decisión, no una receta.
+</div>
+
+<p><strong>Dónde practicar:</strong> tu VM local (VirtualBox, VMware, KVM) o una instancia de nube pagada por vos. Nunca un servidor de la empresa "porque total lo mejoro".</p>
+
+<h2>Proyecto 2 — Auditoría de seguridad de una app web propia</h2>
+
+<p><strong>Objetivo:</strong> auditar una aplicación con un estándar reconocido en vez de con tu intuición, y reportar los hallazgos de forma que un no técnico entienda por qué hay que arreglarlos.</p>
+
+<p><strong>Módulos que integra:</strong> M02 (autenticación y sesiones), M03 (autorización, IDOR), M04 (OWASP Top 10 web), y de fondo M01 (almacenamiento de contraseñas).</p>
+
+<div class="step"><strong>1. Elegí la app y bajá el ASVS.</strong> Una app <strong>tuya</strong>: un proyecto del campus, un side project, tu portfolio con login. Usá <strong>OWASP ASVS nivel 1</strong>, el piso pensado para verificarse desde afuera.</div>
+
+<div class="step"><strong>2. Armá la planilla.</strong> Una fila por requisito con tres estados: <em>cumple</em>, <em>no cumple</em>, <em>no aplica</em>. Prohibido dejar celdas vacías e inventar un cuarto estado tipo "más o menos".</div>
+
+<div class="step"><strong>3. Verificá, no supongas.</strong> "Las contraseñas están hasheadas" no se marca leyendo el código: se marca mirando la base y viendo el prefijo del algoritmo. Cada <em>cumple</em> necesita evidencia.</div>
+
+<div class="step"><strong>4. Priorizá cinco hallazgos por riesgo.</strong> Riesgo ≈ probabilidad × impacto: un fallo de autorización que expone datos ajenos va antes que un header faltante, aunque el header sea más fácil de arreglar.</div>
+
+<div class="step"><strong>5. Escribí la remediación concreta.</strong> Qué archivo, qué cambio y cómo verificás que quedó arreglado. Un hallazgo sin remediación accionable es una queja.</div>
+
+<table>
+<thead><tr><th>Hallazgo</th><th>Etiqueta técnica</th><th>Impacto de negocio</th></tr></thead>
+<tbody>
+<tr><td>El endpoint de facturas no valida el dueño</td><td>Control de acceso roto (IDOR)</td><td>Cualquier usuario registrado lee las facturas de todos</td></tr>
+<tr><td>Sesión sin expiración</td><td>Gestión de sesiones deficiente</td><td>Una notebook robada da acceso indefinido a la cuenta</td></tr>
+<tr><td>Contraseñas con hash rápido</td><td>Almacenamiento criptográfico débil</td><td>Si se filtra la base, se recuperan en horas y se reusan contra el mail del usuario</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La etiqueta técnica no convence a nadie que firme presupuesto.</strong> "IDOR en <code>/api/facturas/:id</code>" te dice algo a vos; "cualquier cliente puede ver las facturas de los demás" le dice algo al que decide si se arregla esta semana o el trimestre que viene. Escribí las dos: la técnica ubica el bug, la de negocio consigue el tiempo.
+</div>
+
+<p><strong>Entregable:</strong> la planilla ASVS nivel 1 completa (con evidencia en los que cumplen) más un documento con los <strong>5 hallazgos priorizados</strong>: descripción técnica, impacto de negocio, riesgo estimado y remediación.</p>
+
+<p><strong>Criterios de "listo":</strong></p>
+
+<ul>
+  <li>Cada hallazgo tiene <strong>impacto de negocio</strong> en una oración sin jerga.</li>
+  <li>El orden se sostiene con probabilidad e impacto, no con "esto es lo que sé arreglar".</li>
+  <li>Los <em>no aplica</em> están justificados: la app no tiene esa funcionalidad, no al revés.</li>
+  <li>Al menos un hallazgo ya está corregido, con el commit enlazado.</li>
+  <li>Alguien que no conoce tu app entiende, leyendo el informe, qué está en riesgo.</li>
+</ul>
+
+<p><strong>Dónde practicar:</strong> tu propia app. Si no tenés una con login, auditá <strong>OWASP Juice Shop</strong> en tu VM: es deliberadamente vulnerable y está hecha para esto.</p>
+
+<h2>Proyecto 3 — Pipeline de CI con seguridad integrada</h2>
+
+<p><strong>Objetivo:</strong> que tu repositorio detecte problemas solo, en cada cambio, y que el pipeline sea lo bastante rápido y silencioso como para que el equipo no lo termine desactivando.</p>
+
+<p><strong>Módulos que integra:</strong> M07 (secretos y cadena de suministro), M08 (secure coding, patrones que detecta el SAST), M09 (DevSecOps, gates y SBOM).</p>
+
+<div class="step"><strong>1. Secret scanning.</strong> Que ningún token ni clave privada entre al repositorio. Sumá un hook local además del check en CI: en CI el secreto ya está en el historial y hay que rotarlo igual.</div>
+
+<div class="step"><strong>2. SCA (dependencias).</strong> Análisis contra bases de vulnerabilidades conocidas. Fijate que lea el archivo de <em>lock</em>, que es lo que realmente se instala.</div>
+
+<div class="step"><strong>3. SAST.</strong> Análisis estático del código propio: concatenación en consultas, deserialización insegura, aleatoriedad no criptográfica, validación ausente.</div>
+
+<div class="step"><strong>4. SBOM.</strong> Inventario de componentes (CycloneDX o SPDX) como artefacto de cada build. Cuando salga la próxima vulnerabilidad grave en una librería popular, respondés "¿nos afecta?" en minutos y no en días.</div>
+
+<div class="step"><strong>5. Decidí qué frena y qué avisa — y escribilo.</strong> Este paso <em>es</em> el proyecto. Un pipeline que frena por todo se desactiva en dos semanas; uno que nunca frena no protege nada.</div>
+
+<pre><code class="lang-text">POLÍTICA DE GATES (ejemplo defendible)
+
+  FRENA EL BUILD (exit != 0)
+    secreto detectado en el diff           → riesgo inmediato, rotar y limpiar
+    dependencia crítica CON parche         → hay solución, se aplica
+    SAST severidad alta en código nuevo    → todavía es barato arreglarlo
+
+  SOLO AVISA (anota el PR, no bloquea)
+    dependencia crítica SIN parche         → bloquear no la arregla
+    SAST severidad media o en código viejo → deuda, se planifica
+    licencia inesperada                    → decisión legal, no técnica
+    SBOM generado                          → es evidencia, no un veredicto
+</code></pre>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> poner todos los checks en modo bloqueante el primer día. En una semana el equipo tiene 40 builds rojos por hallazgos viejos, y en la segunda alguien le agrega <code>continue-on-error</code> a todo. Arrancá con <em>solo avisa</em> sobre lo existente y <strong>frená únicamente sobre código nuevo</strong>.
+</div>
+
+<p><strong>Entregable:</strong> el archivo de workflow funcionando en un repositorio tuyo, más un documento corto de <strong>decisión de gates</strong>: qué frena, qué avisa y por qué en cada caso.</p>
+
+<p><strong>Criterios de "listo":</strong></p>
+
+<ul>
+  <li>El pipeline corre en <strong>menos de 10 minutos</strong>. Si tarda más, nadie espera el resultado y se mergea igual.</li>
+  <li>No tiene falsos positivos crónicos: si el mismo hallazgo irrelevante vuelve build tras build, se suprime <strong>con justificación escrita y fecha de revisión</strong>, no se ignora mentalmente.</li>
+  <li>Cada regla bloqueante tiene una razón de una línea que sobreviviría a un reclamo del equipo.</li>
+  <li>Probaste que funciona: commiteaste un secreto de prueba (inventado, nunca uno real) y el pipeline lo frenó.</li>
+</ul>
+
+<p><strong>Dónde practicar:</strong> un repositorio propio. Las herramientas de este proyecto son 100% defensivas y corren sobre tu propio código.</p>
+
+<h2>Proyecto 4 — Playbook de respuesta a incidentes + simulacro</h2>
+
+<p><strong>Objetivo:</strong> tener escrito qué hacer cuando pasa lo peor y —la parte que casi nadie hace— <strong>ejecutarlo con cronómetro</strong> para convertir suposiciones en números.</p>
+
+<p><strong>Módulos que integra:</strong> M10 (ciclo NIST, logging, detección), M07 (rotación de credenciales), M00 (qué activo se protege primero).</p>
+
+<div class="step"><strong>1. Elegí un escenario concreto.</strong> Recomendado: <em>"una credencial de producción quedó publicada en un repositorio público"</em>. Es realista, frecuente y toca contención, erradicación y recuperación de verdad.</div>
+
+<div class="step"><strong>2. Escribí el playbook siguiendo el ciclo NIST.</strong> Preparación → Detección y análisis → Contención → Erradicación → Recuperación → Lecciones aprendidas, cada fase con acciones numeradas, responsable y qué se registra.</div>
+
+<div class="step"><strong>3. Definí los criterios de decisión por adelantado.</strong> ¿Cuándo se rota una credencial en vez de solo revocarla? ¿Cuándo se apaga el servicio? ¿Quién comunica y a quién? En medio del incidente nadie razona bien.</div>
+
+<div class="step"><strong>4. Hacé el simulacro con cronómetro.</strong> Ejecutá el playbook sobre tu laboratorio anotando el minuto de cada hito: detección, contención, credencial rotada, servicio restaurado.</div>
+
+<div class="step"><strong>5. Restaurá un backup de verdad.</strong> No "verificamos que existe": bajarlo, restaurarlo en una instancia limpia, arrancar la app contra esos datos y comprobar que están completos. Con el cronómetro corriendo.</div>
+
+<div class="step"><strong>6. Escribí el informe sin culpables.</strong> Qué tardó más de lo esperado, qué faltaba (el acceso que nadie tenía, el archivo que nadie encontró) y qué cambia en el playbook. Se corrigen sistemas, no personas.</div>
+
+<div class="rule">
+  <strong>📌 "Restaura en unas dos horas" no es un dato: es una esperanza.</strong> El tiempo de restauración solo se conoce restaurando, y las sorpresas aparecen todas ahí: el backup incompleto, la clave de cifrado que nadie tenía, las tres horas de descarga que nadie contó. Un número medido —"47 minutos, 31 de descarga"— es un control real y te dice dónde optimizar.
+</div>
+
+<p><strong>Entregable:</strong> el playbook del escenario y el <strong>informe del simulacro con tiempos reales</strong>: cronología minuto a minuto, obstáculos encontrados y acciones correctivas con responsable.</p>
+
+<p><strong>Criterios de "listo":</strong></p>
+
+<ul>
+  <li>El tiempo de restauración es un <strong>número medido</strong>, con la fecha en que se midió. No una estimación ni un objetivo.</li>
+  <li>El simulacro descubrió al menos un problema que no habías previsto. Si salió todo perfecto, hiciste el simulacro fácil.</li>
+  <li>El playbook lo puede ejecutar alguien que no lo escribió, a las 3 de la mañana, sin llamarte.</li>
+  <li>Las acciones correctivas tienen responsable y fecha, no son una lista de deseos.</li>
+  <li>Los pasos que dependen de una persona específica están marcados como riesgo.</li>
+</ul>
+
+<p><strong>Dónde practicar:</strong> tu laboratorio, con un repositorio de prueba y credenciales de juguete. Nunca simules un incidente sobre infraestructura de terceros ni publiques credenciales reales "para probar".</p>
+
+<h2>Proyecto 5 — CTF resuelto con write-up</h2>
+
+<p><strong>Objetivo:</strong> resolver un desafío en un laboratorio legal y, sobre todo, <strong>explicar tu razonamiento por escrito</strong> —incluyendo lo que no funcionó— cerrando con qué control lo habría prevenido del lado defensivo.</p>
+
+<p><strong>Módulos que integra:</strong> M11 (metodología ofensiva y ética), y según el desafío M01 (cripto), M04 (web) o M05 (redes).</p>
+
+<div class="step"><strong>1. Elegí plataforma y desafío.</strong> <strong>picoCTF</strong> (gratuito, con desafíos permanentes) o <strong>TryHackMe</strong> (salas guiadas). Nivel principiante o intermedio: la idea es entender, no sufrir.</div>
+
+<div class="step"><strong>2. Documentá mientras resolvés, no después.</strong> Anotá cada hipótesis con su hora. Reconstruir el razonamiento a posteriori produce write-ups falsos donde todo fue obvio desde el principio.</div>
+
+<div class="step"><strong>3. Anotá los callejones sin salida.</strong> Las tres horas perdidas en la pista equivocada valen más para quien lee que la solución final: muestran el proceso real de descarte.</div>
+
+<div class="step"><strong>4. Escribí el write-up.</strong> Reconocimiento → hipótesis → verificación → solución, explicando <em>por qué</em> cada paso llevaba al siguiente. Si es una lista de comandos, no es un write-up: es un historial de shell.</div>
+
+<div class="step"><strong>5. Cerrá con la sección defensiva.</strong> ¿Qué control habría hecho imposible este desafío? Validación de entrada, mínimo privilegio, otra configuración por defecto, un log que habría disparado la alerta.</div>
+
+<div class="analogy">
+  <strong>🔍 Un write-up es un informe de laboratorio, no un truco de magia.</strong> El mago no explica cómo lo hizo; el científico documenta el método para que otro lo reproduzca <em>y lo discuta</em>. Un write-up que salta de "vi el sitio" a "obtuve la flag" es magia: entretiene y no enseña nada.
+</div>
+
+<p><strong>Entregable:</strong> el write-up publicado en tu blog o repositorio, con sus tres partes: razonamiento completo, callejones sin salida y análisis defensivo.</p>
+
+<p><strong>Criterios de "listo":</strong></p>
+
+<ul>
+  <li>Alguien que no hizo el desafío puede <strong>seguir tu razonamiento</strong> y entender por qué cada paso llevaba al siguiente.</li>
+  <li>Están los intentos fallidos, con la razón por la que los descartaste.</li>
+  <li>La sección defensiva propone un control concreto, no "hay que tener cuidado".</li>
+  <li>No incluye nada operativo apuntado a sistemas fuera del laboratorio.</li>
+  <li>Respetás las reglas de la plataforma sobre publicar soluciones.</li>
+</ul>
+
+<p><strong>Dónde practicar:</strong> exclusivamente picoCTF, TryHackMe, Hack The Box, OverTheWire o laboratorios propios. Esas plataformas dan permiso explícito, y ese permiso no se extiende ni un milímetro fuera de ellas.</p>
+
+<h2>Cómo seguir</h2>
+
+<p>Terminaste doce módulos y tenés entregables. Lo que sigue no es "otro curso": es elegir profundidad y sostener la práctica.</p>
+
+<h3>Certificaciones y su valor real</h3>
+
+<p>Una certificación no te hace bueno en seguridad; te hace <strong>legible</strong> para filtros de RR.HH. y para clientes que no pueden evaluar tu trabajo técnico. Eso vale —a veces mucho— pero conviene saber qué comprás:</p>
+
+<table>
+<thead><tr><th>Certificación</th><th>Para quién es</th><th>Qué demuestra realmente</th></tr></thead>
+<tbody>
+<tr><td><strong>CompTIA Security+</strong></td><td>Quien entra al rubro o cumple un requisito formal de puesto</td><td>Vocabulario y fundamentos amplios. Abre puertas de primer empleo; no impresiona a nadie técnico</td></tr>
+<tr><td><strong>eJPT</strong></td><td>Quien quiere validar práctica ofensiva básica sin el costo del OSCP</td><td>Que sabés ejecutar una metodología en laboratorio. Buen escalón intermedio</td></tr>
+<tr><td><strong>OSCP</strong></td><td>Quien apunta a pentesting profesional</td><td>Examen práctico largo y exigente: método, resistencia y capacidad de documentar. Muy respetada y demandante</td></tr>
+<tr><td><strong>CISSP</strong></td><td>Gestión y arquitectura, con 5 años de experiencia comprobable</td><td>Gobierno, riesgo y cumplimiento. Es de gestión, no técnica: sacarla sin experiencia no tiene sentido</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Antes de pagar una certificación, preguntate para qué la querés.</strong> ¿Un puesto puntual la pide? Sacala. ¿Querés aprender? Un laboratorio propio y tres proyectos como estos enseñan más por dólar. Si desarrollás software, suele rendir más profundizar en seguridad de aplicaciones que sumar una credencial genérica.
+</div>
+
+<h3>Comunidades y fuentes</h3>
+
+<ul>
+  <li><strong>OWASP:</strong> capítulos locales con charlas abiertas y gratuitas, y los proyectos que ya usaste (Top 10, ASVS, Cheat Sheets).</li>
+  <li><strong>Boletines de vulnerabilidades:</strong> los avisos de tu distribución y de los frameworks que usás. Enterarte tarde es una decisión, no un accidente.</li>
+  <li><strong>Reportes públicos de divulgación responsable:</strong> leer vulnerabilidades ya resueltas enseña qué mira alguien con experiencia.</li>
+  <li><strong>Conferencias regionales:</strong> Ekoparty en Argentina y equivalentes locales, muchas con charlas grabadas y gratis.</li>
+</ul>
+
+<h3>Tu laboratorio propio</h3>
+
+<p>Es lo único de esta lista que no caduca. Dos o tres VMs, snapshots, una app vulnerable instalada y un repositorio de notas alcanzan. La regla: <strong>cuando aprendas algo nuevo, reproducilo ahí antes de creerlo</strong>. Un laboratorio activo es lo que hace que un año de experiencia sea un año de experiencia y no el mismo mes repetido doce veces.</p>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué el criterio del proyecto 1 es "podés justificar cada cambio" y no "cuántos ítems del CIS marcaste"?</summary>
+<p>Porque la cantidad de ítems aplicados no correlaciona con la seguridad obtenida. Un benchmark cubre un sistema genérico: algunos controles no aplican a tu caso, otros rompen tu aplicación y otros son irrelevantes contra tu adversario real. Justificar cada cambio demuestra que hubo una decisión de ingeniería; marcar casilleros solo demuestra que seguiste una guía.</p></details>
+
+<details><summary>¿Por qué un write-up con los callejones sin salida vale más que uno que va derecho a la solución?</summary>
+<p>Porque el valor está en el método de descarte, no en la respuesta. En un desafío real no sabés cuál es el camino correcto: probás, observás, descartás. Un write-up que solo muestra los pasos ganadores enseña a repetir una solución que no se va a volver a presentar igual, y transmite la idea falsa de que el que sabe acierta a la primera. Mostrar la hipótesis que falló y <em>por qué</em> la descartaste es lo único transferible al próximo problema.</p></details>
+
+<details><summary>¿Por qué un script de hardening tiene que ser idempotente?</summary>
+<p>Porque si correrlo dos veces produce resultados distintos no sabés si el servidor está en el estado que creés, ni podés correrlo periódicamente para corregir desvíos de configuración. Un script no idempotente duplica líneas de configuración, falla si un usuario ya existe o acumula reglas de firewall repetidas. La idempotencia lo convierte en una <strong>declaración del estado deseado</strong> —que es lo auditable— en vez de una secuencia que funcionó una vez, en una máquina, un día.</p></details>
+
+<section class="quiz" id="quizCS12">
+  <style>
+    #quizCS12{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS12 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS12 .q{margin-bottom:1.5rem}
+    #quizCS12 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS12 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS12 .opt:hover{border-color:var(--accent)}
+    #quizCS12 .opt:disabled{cursor:default}
+    #quizCS12 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS12 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS12 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS12 .exp.show{display:block}
+    #quizCS12 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. En el informe del simulacro escribís "el tiempo de restauración es de aproximadamente dos horas, según el tamaño del backup". ¿Por qué no cumple el criterio del proyecto 4?</p>
+    <button class="opt">Porque dos horas es demasiado tiempo para una restauración</button>
+    <button class="opt">Porque falta aclarar qué tipo de backup es</button>
+    <button class="opt">Porque es una estimación: solo restaurando de verdad aparecen los obstáculos que dominan el tiempo real</button>
+    <div class="exp">La estimación se calcula sobre el flujo feliz, y el tiempo real casi nunca lo determina el tamaño del archivo: lo determinan las sorpresas —la clave de cifrado que nadie tenía, el permiso faltante, el backup incompleto—. Restaurar es además la <strong>única</strong> forma de verificar que el backup sirve. Dos horas medidas son un control; dos horas estimadas son una suposición que se pone a prueba el día del incidente.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tenés cinco hallazgos ASVS y querés que se arreglen. ¿Por qué el criterio exige impacto de negocio además de la etiqueta técnica?</p>
+    <button class="opt">Porque quien prioriza el trabajo no es técnico, y sin el impacto traducido no puede comparar el hallazgo contra el resto del backlog</button>
+    <button class="opt">Porque la etiqueta técnica suele estar mal asignada y el impacto la corrige</button>
+    <button class="opt">Porque el estándar ASVS exige ese campo en cada requisito</button>
+    <div class="exp">La etiqueta técnica ubica el bug para quien lo va a arreglar, pero <em>cuándo</em> se arregla lo decide alguien que compara ese ítem contra features, deuda y soporte. "IDOR en el endpoint de facturas" no compite en esa mesa; "cualquier cliente puede ver las facturas de los demás" sí. Traducir el impacto es lo que convierte un hallazgo en trabajo priorizado.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu pipeline detecta una dependencia con vulnerabilidad crítica <strong>sin parche disponible</strong>. Según la política de gates del proyecto 3, ¿qué corresponde?</p>
+    <button class="opt">Frenar el build: una vulnerabilidad crítica nunca debe llegar a producción</button>
+    <button class="opt">Solo avisar: bloquear no la arregla y frena todo el trabajo del equipo sin reducir el riesgo</button>
+    <button class="opt">Suprimir el hallazgo para que no vuelva a aparecer en los builds siguientes</button>
+    <div class="exp">Un gate bloqueante tiene sentido cuando existe una acción que lo destraba: si hay parche, frenar obliga a aplicarlo. Sin parche, el bloqueo detiene todo el trabajo del equipo —incluidos los arreglos de seguridad— sin bajar el riesgo un punto, y termina en que alguien desactiva el check. Corresponde avisar, registrar la decisión con fecha de revisión y evaluar mitigaciones: aislar el componente o quitar la dependencia.</div>
+  </div>
+
+  <div class="score" id="scoreCS12"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS12');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS12').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Ahora hacé los proyectos.' : '  — repasá las que fallaste y arrancá con el proyecto 1.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m11-ofensiva-etica/lecture.html">← M11: Ofensiva ética y metodología</a>
+  <a href="../index.html">Volver al syllabus →</a>
+</nav>
+
+</div>
+</body>
+</html>

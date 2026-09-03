@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 08 — Secure coding y threat modeling · Curso de Ciberseguridad</title>
+  <meta name="description" content="Threat modeling con STRIDE, principios de diseño seguro, validación vs encoding, manejo de errores, logging seguro, TOCTOU, memory safety, SAST/DAST/IAST/SCA, fuzzing y code review con foco en seguridad.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 08</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M04</span>
+  <span class="badge">💻 Desarrollo</span>
+</div>
+
+<article>
+
+<h1>Módulo 08 — Secure coding y threat modeling</h1>
+
+<p>En el M04 viste <em>qué</em> ataca la gente. Este módulo es el otro lado del mostrador: cómo escribís código que no tenga esos agujeros y cómo los encontrás <strong>antes</strong> que otro.</p>
+
+<div class="concept">
+  <strong>💡 La seguridad barata se decide en el diseño; la cara, en producción.</strong> Cambiar un diagrama cuesta veinte minutos; cambiar el mismo diseño con clientes encima cuesta un trimestre. De ahí el orden: pensar el sistema, escribir el código y recién al final correr herramientas.
+</div>
+
+<h2>Threat modeling: cuatro preguntas</h2>
+
+<p>Suena a ceremonia de consultora, pero es sentarse con un diagrama y responder cuatro preguntas:</p>
+
+<div class="step"><strong>1. ¿Qué estamos construyendo?</strong> Un diagrama, no un documento. Si nadie puede dibujarlo en un pizarrón, nadie lo entiende lo suficiente como para asegurarlo.</div>
+
+<div class="step"><strong>2. ¿Qué puede salir mal?</strong> Acá entra STRIDE: una lista de pistas para no depender de la inspiración del día.</div>
+
+<div class="step"><strong>3. ¿Qué hacemos?</strong> Cada amenaza termina en una decisión: <em>mitigar</em>, <em>eliminar</em> la funcionalidad, <em>transferir</em> a un tercero o <em>aceptar</em> el riesgo — por escrito y con dueño.</div>
+
+<div class="step"><strong>4. ¿Lo hicimos bien?</strong> Cada mitigación termina en un ticket, un test o una línea de código. Sin salidas verificables es un acta de reunión.</div>
+
+<h3>STRIDE: las seis categorías</h3>
+
+<p>STRIDE mapea cada amenaza contra la propiedad que rompe, elemento por elemento del diagrama:</p>
+
+<table>
+<thead><tr><th>Amenaza</th><th>Rompe</th><th>Ejemplo</th><th>Mitigación</th></tr></thead>
+<tbody>
+<tr><td><strong>S</strong>poofing</td><td>Autenticidad</td><td>Reusar un token filtrado</td><td>MFA, tokens cortos, verificar firma</td></tr>
+<tr><td><strong>T</strong>ampering</td><td>Integridad</td><td>Cambiar <code>precio=1</code> en el request</td><td>Calcular en el servidor, firmar</td></tr>
+<tr><td><strong>R</strong>epudiation</td><td>No repudio</td><td>"Yo nunca aprobé eso" y no hay log</td><td>Auditoría append-only</td></tr>
+<tr><td><strong>I</strong>nformation disclosure</td><td>Confidencialidad</td><td>Un stack trace con la query</td><td>Errores genéricos, cifrado</td></tr>
+<tr><td><strong>D</strong>enial of service</td><td>Disponibilidad</td><td>Un regex que come CPU</td><td>Rate limiting, timeouts</td></tr>
+<tr><td><strong>E</strong>levation of privilege</td><td>Autorización</td><td>Un usuario común llega a <code>/admin</code></td><td>Permisos en cada request</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  STRIDE es la tríada CIA del M00 dada vuelta: cada letra es un pilar roto.
+</div>
+
+<h3>Diagrama de flujo de datos y límites de confianza</h3>
+
+<p>El artefacto es un <strong>DFD</strong>: procesos, almacenes, entidades externas y flechas. Lo que importa son los <strong>límites de confianza</strong>, donde el dato pasa a un contexto con distinto privilegio.</p>
+
+<pre><code class="lang-text">          LIMITE 1              LIMITE 2
+         (internet)           (red interna)
+              :                     :
+[Navegador] --:--HTTPS--> [API] ----:---> (Postgres)
+  entidad     :           proceso   :      almacen
+  externa     :             |       :
+              :             +-----------> [Pasarela de pagos]
+                                    :      tercero: LIMITE 3
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Toda amenaza interesante vive sobre un límite de confianza.</strong> El dato que se mueve dentro del mismo proceso rara vez es el problema; el que cruza de "lo que controla el usuario" a "lo que ejecuta mi servidor" lo es siempre. Cada flecha que atraviesa una línea necesita autenticación, validación y logging.
+</div>
+
+<h3>Cuándo se hace</h3>
+
+<p>Al <strong>diseñar</strong>. Una hora sobre un borrador cambia decisiones baratas: "este endpoint no debería existir", "esto va del lado del servidor". Dos semanas antes del release, lo mismo solo produce deuda que nadie va a pagar. Se hace cuando arranca una feature con superficie nueva —endpoint público, tercero, dinero o datos personales— y cuando el diagrama cambia.</p>
+
+<h2>Principios de diseño seguro</h2>
+
+<p>Saltzer y Schroeder los publicaron en 1975 y siguen siendo la mejor checklist de diseño que existe:</p>
+
+<ul>
+  <li><strong>Defaults seguros.</strong> Lo que no configuraste queda cerrado: bucket privado, usuario sin permisos, feature apagada.</li>
+  <li><strong>Mínimo privilegio.</strong> El worker que manda mails no necesita leer la tabla de usuarios entera.</li>
+  <li><strong>Separación de responsabilidades.</strong> Quien aprueba un pago no es quien lo ejecuta.</li>
+  <li><strong>Mediación completa.</strong> <em>Cada</em> acceso se verifica, cada vez: el permiso pudo cambiar desde el request anterior.</li>
+  <li><strong>Economía de mecanismo.</strong> Una lógica de permisos con nueve condiciones anidadas no la audita nadie, ni vos en seis meses.</li>
+  <li><strong>No confiar en el cliente.</strong> HTML, JavaScript, cookies y headers están bajo control del usuario: son sugerencias, no verdades.</li>
+</ul>
+
+<div class="warn">
+  <strong>El caso más caro es siempre el mismo:</strong> precio, descuento, rol o <code>es_admin</code> viajando en el request y el servidor usándolos tal cual. El cliente manda <em>intención</em>; el servidor decide <em>hechos</em>.
+</div>
+
+<h2>Validar la entrada ≠ codificar la salida</h2>
+
+<p>Son dos controles distintos, en momentos distintos, y necesitás los dos. Confundirlos es la causa raíz de la mitad de los XSS que siguen apareciendo:</p>
+
+<table>
+<thead><tr><th></th><th>Validación de entrada</th><th>Encoding de salida</th></tr></thead>
+<tbody>
+<tr><td><strong>Pregunta</strong></td><td>¿Tiene la forma que espero?</td><td>¿Cómo lo escribo sin que se interprete?</td></tr>
+<tr><td><strong>Dónde</strong></td><td>En el límite, apenas entra</td><td>En el destino, antes de escribirlo</td></tr>
+<tr><td><strong>Criterio</strong></td><td>Lista blanca: tipo, largo, rango</td><td>Depende del contexto de salida</td></tr>
+<tr><td><strong>Si falla</strong></td><td>Rechazar el request entero</td><td>El dato sale escapado, no roto</td></tr>
+</tbody>
+</table>
+
+<p>La clave del encoding es que <strong>depende del destino</strong>:</p>
+
+<table>
+<thead><tr><th>Destino</th><th>Qué se hace</th></tr></thead>
+<tbody>
+<tr><td>HTML (cuerpo)</td><td>Escapar <code>&lt; &gt; &amp; " '</code>, o auto-escape del template</td></tr>
+<tr><td>Atributo HTML</td><td>Escapar y <strong>siempre</strong> entre comillas</td></tr>
+<tr><td>JavaScript</td><td>No inyectar: <code>JSON.parse</code> o <code>dataset</code></td></tr>
+<tr><td>SQL</td><td>No escapar: <strong>consultas parametrizadas</strong></td></tr>
+<tr><td>Shell</td><td>Argumentos como lista, sin <code>shell=True</code></td></tr>
+<tr><td>URL</td><td><code>encodeURIComponent</code> / <code>urlencode</code></td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El malentendido clásico:</strong> "ya sanitizo en la entrada, en la salida no hace falta". Validar no puede saber a dónde irá el dato después: solo el punto de salida lo sabe.
+</div>
+
+<h2>Manejo de errores</h2>
+
+<p>Un stack trace en producción es un regalo: framework y versión, rutas del servidor, motor de la base, a veces la query con sus parámetros. Es reconocimiento gratis y le dice al atacante qué exploit buscar. Los mensajes distintos también filtran: si el login responde "usuario inexistente" en un caso y "contraseña incorrecta" en el otro, regalaste un enumerador de cuentas.</p>
+
+<div class="rule">
+  <strong>📌 Genérico afuera, detallado adentro.</strong> El usuario recibe un mensaje neutro más un <strong>id de correlación</strong>; el log recibe todo. Cuando alguien reporta "me dio error", pedís el id y en un grep tenés el stack completo.
+</div>
+
+<h2>Logging seguro</h2>
+
+<p>El log es la única forma de saber qué pasó, y también una base de secretos esperando a filtrarse: se copia a agregadores, lo lee soporte y suele tener retención larga con permisos flojos.</p>
+
+
+<table>
+<thead><tr><th>✅ Loguear siempre</th><th>❌ No loguear nunca</th></tr></thead>
+<tbody>
+<tr><td>Login exitoso y fallido (IP, user agent)</td><td>Contraseñas, incluso las fallidas</td></tr>
+<tr><td>Cambios de permisos y roles</td><td>Tokens, cookies, <code>Authorization</code></td></tr>
+<tr><td>Acceso y export de datos sensibles</td><td>Tarjetas, CVV, claves privadas</td></tr>
+<tr><td>Cambios de config y datos críticos</td><td>PII sin necesidad operativa</td></tr>
+<tr><td>Fallos de autorización y rate limit</td><td>El body del request sin filtrar</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Log injection.</strong> Si escribís datos del usuario crudos, el usuario escribe en tu log: un nombre con saltos de línea inventa una línea entera —<code>usuario=admin accion=borrar_todo</code>— y contamina la evidencia forense. Si el visor renderiza HTML, además es un XSS almacenado en la cara del equipo de seguridad. Solución: sacar <code>\n</code> y <code>\r</code>, limitar el largo y loguear estructurado.
+</div>
+
+<h2>Race conditions y TOCTOU</h2>
+
+<p>TOCTOU es <em>time-of-check to time-of-use</em>: chequeás una condición y después actuás sobre ella, y en el medio hay una ventana donde el mundo cambia. Bajo concurrencia esa ventana alcanza.</p>
+
+<pre><code class="lang-text">SALDO = 100. Dos retiros de $100 llegan juntos.
+
+  t1  A   SELECT saldo -> 100      (chequeo: alcanza)
+  t2  B   SELECT saldo -> 100      (chequeo: alcanza)
+  t3  A   UPDATE saldo = 100 - 100 = 0
+  t4  B   UPDATE saldo = 100 - 100 = 0
+
+  Se retiraron $200 de una cuenta con $100, y los
+  dos chequeos eran correctos cuando corrieron.
+</code></pre>
+
+<p>El patrón aparece en cupones de un solo uso, reserva de stock, rate limits y en el clásico "existe → lo abro" del sistema de archivos. La corrección nunca es "chequear mejor": es <strong>que el chequeo y la acción sean una sola operación</strong> — <code>UPDATE ... WHERE condición</code>, una restricción única o un bloqueo explícito.</p>
+
+<h2>Memory safety y elección de lenguaje</h2>
+
+<p>En lenguajes con memoria manual hay clases enteras de bugs que no dependen de tu lógica sino de la aritmética de punteros: <strong>buffer overflow</strong> (escribir más allá del final de un arreglo y pisar memoria contigua, incluida la dirección de retorno) y <strong>use-after-free</strong> (usar un puntero a memoria liberada, que el atacante reocupa con datos elegidos). Quien controla lo que se escribe fuera de rango suele controlar el flujo del programa.</p>
+
+<div class="info">
+  Microsoft y Google reportaron, por separado, que cerca del <strong>70% de sus vulnerabilidades críticas</strong> eran problemas de memory safety. No de criptografía ni de lógica: de punteros.
+</div>
+
+<p><strong>Rust</strong> elimina esa categoría en tiempo de compilación con ownership y borrow checker; <strong>Go</strong>, con garbage collector y chequeo de límites. Ninguno te salva de SQL injection ni de autorización rota, pero cierran de entrada lo más explotable.</p>
+
+<div class="tip">
+  El borrow checker está desarrollado en el <strong>Curso de Rust</strong> del campus, y es el mejor ejemplo de la idea que atraviesa este módulo: <em>hacer imposible de representar el estado inválido</em> gana a acordarse de chequearlo.
+</div>
+
+<h2>Herramientas: SAST, DAST, IAST, SCA</h2>
+
+<table>
+<thead><tr><th>Tipo</th><th>Qué mira</th><th>Cuándo corre</th><th>Fuerte en</th><th>Falsos positivos</th></tr></thead>
+<tbody>
+<tr><td><strong>SAST</strong></td><td>El fuente, sin ejecutarlo</td><td>En el PR</td><td>Inyección, secretos, patrones inseguros</td><td>Altos: no sabe qué es alcanzable</td></tr>
+<tr><td><strong>DAST</strong></td><td>La app corriendo, desde afuera</td><td>Contra staging</td><td>Config, headers, TLS, autenticación</td><td>Bajos: si lo explotó, existe</td></tr>
+<tr><td><strong>IAST</strong></td><td>Desde adentro de la app viva</td><td>En tests de integración</td><td>Une request y línea de código</td><td>Bajos, pero necesita agente</td></tr>
+<tr><td><strong>SCA</strong></td><td>Dependencias y versiones</td><td>En cada build</td><td>CVEs conocidos, licencias</td><td>Medios: puede no aplicar</td></tr>
+</tbody>
+</table>
+
+<p>No compiten: SAST ve el código pero no la configuración; DAST ve la configuración pero no llega a las ramas que no ejercita; SCA es el único que sabe qué versión de qué librería usás (el M07).</p>
+
+<h3>Fuzzing</h3>
+
+<div class="concept">
+  <strong>💡 Por qué encuentra lo que tus tests no.</strong> El fuzzer genera entradas mutadas —malformadas, gigantes, vacías, con caracteres raros— buscando que el código crashee, y se guía por cobertura: se queda con las que llegan a caminos nuevos. Tus tests prueban los casos que se te ocurrieron; el fuzzer prueba millones que no, y descubre que un JSON anidado 5.000 niveles revienta el stack.
+</div>
+
+<h2>Code review con foco en seguridad</h2>
+
+<p>Un review normal busca bugs y legibilidad. Uno de seguridad recorre otro orden, de mayor a menor impacto:</p>
+
+<div class="step"><strong>1. Entradas.</strong> ¿Se validan en el servidor, por lista blanca, en el límite?</div>
+<div class="step"><strong>2. Autorización.</strong> ¿Cada endpoint verifica que <em>este</em> usuario pueda tocar <em>este</em> recurso, o solo que esté logueado? Es el bug más común y el más caro.</div>
+<div class="step"><strong>3. Criptografía.</strong> ¿Primitiva estándar o alguien inventó algo? ¿Aleatoriedad criptográfica y no <code>random()</code>?</div>
+<div class="step"><strong>4. Secretos.</strong> ¿Algo hardcodeado, en un test, en un comentario o en fixtures?</div>
+<div class="step"><strong>5. Dependencias nuevas.</strong> ¿Quién la mantiene, cuánto trae de transitivo, hace falta?</div>
+
+<h2>🔧 En tu código</h2>
+
+<p>Todo lo anterior se convierte en cinco cosas concretas. La primera va hoy a la plantilla de PR del repo:</p>
+
+<pre><code class="lang-text">CHECKLIST DE SEGURIDAD DEL PR
+
+[ ]  1. Entradas nuevas validadas en el servidor, por lista blanca
+[ ]  2. Cada endpoint verifica AUTORIZACION sobre el recurso, no solo login
+[ ]  3. Consultas parametrizadas: cero concatenacion de SQL o comandos
+[ ]  4. Salida codificada segun destino (HTML, atributo, JS, URL)
+[ ]  5. Errores genericos afuera + id de correlacion
+[ ]  6. Ningun secreto, token ni PII en el log ni en el codigo
+[ ]  7. Chequeo-y-uso reemplazado por operacion atomica
+[ ]  8. Dependencias nuevas justificadas, con version fijada y sin CVEs
+[ ]  9. Los defaults del codigo nuevo son los mas restrictivos
+[ ] 10. Hay un test que verifica el CONTROL, no solo el flujo feliz
+</code></pre>
+
+<div class="rule">
+  <strong>1. TOCTOU: que la condición viaje adentro de la escritura.</strong> Si el chequeo y la acción son dos statements, existe una ventana.
+</div>
+
+<pre><code class="lang-python"># ❌ Chequeo y uso separados: dos requests simultáneos pasan los dos
+saldo = db.query_one("SELECT saldo FROM cuentas WHERE id = %s", cid)
+if saldo &gt;= monto:                                  # ← time of check
+    db.execute("UPDATE cuentas SET saldo = saldo - %s "
+               "WHERE id = %s", monto, cid)         # ← time of use
+
+# ✅ Atómico: la condición es parte del UPDATE
+filas = db.execute("UPDATE cuentas SET saldo = saldo - %s "
+                   "WHERE id = %s AND saldo &gt;= %s", monto, cid, monto)
+if filas == 0:
+    raise SaldoInsuficiente()                       # nunca quedó negativo
+</code></pre>
+
+<div class="rule">
+  <strong>2. Errores que no filtran.</strong> El detalle va al log; el usuario se lleva un identificador con el que soporte lo encuentra.
+</div>
+
+<pre><code class="lang-python">import uuid
+
+# ❌ str(e) expone rutas, motor de base, versiones y a veces la query
+@app.errorhandler(Exception)
+def manejar(e):
+    return {"error": str(e)}, 500
+
+# ✅ Genérico afuera, completo adentro, unidos por un id
+@app.errorhandler(Exception)
+def manejar(e):
+    incidente = uuid.uuid4().hex[:12]
+    log.exception("fallo id=%s ruta=%s", incidente, request.path)
+    return {"error": "Error interno", "id": incidente}, 500
+</code></pre>
+
+<div class="rule">
+  <strong>3. Un logger que enmascara por defecto.</strong> No confíes en acordarte campo por campo: que la función de logueo filtre y neutralice la log injection.
+</div>
+
+<pre><code class="lang-python">SENSIBLES = {"password", "contrasena", "token", "authorization",
+             "cookie", "api_key", "card_number", "cvv", "dni"}
+
+def sanitizar(d):
+    limpio = {}
+    for clave, valor in d.items():
+        if clave.lower() in SENSIBLES:
+            limpio[clave] = "***"                  # nunca al log
+        elif isinstance(valor, dict):
+            limpio[clave] = sanitizar(valor)       # recursivo
+        else:
+            texto = str(valor).replace("\n", " ").replace("\r", " ")
+            limpio[clave] = texto[:200]            # sin log injection
+    return limpio
+
+log.info("login_fallido", extra={"datos": sanitizar(payload)})
+</code></pre>
+
+<div class="rule">
+  <strong>4. Testeá el control, no el flujo feliz.</strong> Que Ana vea su factura no prueba nada de seguridad. Que Ana <em>no</em> vea la de Bruno sí — y falla el día que alguien rompe la autorización refactorizando.
+</div>
+
+<pre><code class="lang-python">def test_usuario_no_accede_a_factura_ajena(client):
+    token = login("ana@ejemplo.com")        # la factura 999 es de Bruno
+    r = client.get("/api/facturas/999",
+                   headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code in (403, 404)      # denegado, no 200
+    assert "total" not in r.text            # y sin filtrar el contenido
+
+def test_saldo_no_queda_negativo(db):
+    crear_cuenta(id=1, saldo=100)
+    correr_en_paralelo([lambda: retirar(1, 100)] * 10)
+    assert saldo_de(1) == 0                 # nueve fallaron, ninguno negativo
+</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Validar en el cliente y confiar en el servidor.</strong><br>
+  ❌ El formulario tiene <code>maxlength</code>, <code>type="number"</code> y validación en JavaScript, y el backend guarda lo que llegue. Con <code>curl</code> nada de eso existe.<br>
+  ✅ La del cliente es <strong>usabilidad</strong>; la del servidor es <strong>seguridad</strong>. Se hacen las dos, y la del servidor nunca asume que la otra corrió.
+</div>
+
+<div class="mistake">
+  <strong>2. Loguear el request completo con headers.</strong><br>
+  ❌ <code>log.debug("request: %s", request.__dict__)</code> parece inofensivo hasta que ves que ahí está el header <code>Authorization</code>, la cookie de sesión y el body con la contraseña: cualquiera con acceso al agregador puede suplantar usuarios.<br>
+  ✅ Campos elegidos y pasados por el sanitizador: método, ruta, status, latencia, id de usuario, id de correlación.
+</div>
+
+<div class="mistake">
+  <strong>3. Devolver la excepción cruda al usuario.</strong><br>
+  ❌ <code>return jsonify(error=str(e)), 500</code>, "así el usuario reporta mejor". Lo que reporta es tu esquema de base de datos.<br>
+  ✅ Mensaje genérico con id de correlación, y el detalle para debuggear detrás de una variable de entorno apagada en producción.
+</div>
+
+<div class="mistake">
+  <strong>4. "Lo revisamos en el pentest final".</strong><br>
+  ❌ Encuentra los problemas cuando ya son de arquitectura y la fecha está anunciada: la única salida es aceptar el riesgo. Además es una foto de una semana y no cubre lo que mergeás después.<br>
+  ✅ Threat model al diseñar, checklist en cada PR, SAST y SCA en CI, y el pentest como <em>verificación</em> de un sistema que ya se pensó.
+</div>
+
+<h3>Checkpoint</h3>
+
+<details><summary>¿Por qué el threat modeling pierde casi todo su valor si se hace justo antes del release?</summary>
+<p>Porque su salida principal son <strong>cambios de diseño</strong>, y el diseño ya está construido: "este dato no debería salir del servidor" se resuelve en minutos sobre un diagrama y en semanas sobre código en producción. Hecho tarde produce una lista que el equipo acepta como riesgo por falta de tiempo: pagaste el costo de identificar las amenazas sin comprar ninguna mitigación.</p></details>
+
+<details><summary>Un stack trace "es solo un mensaje de error". ¿Qué gana concretamente un atacante con él?</summary>
+<p>Reconocimiento dirigido y gratis: framework y versión exacta (o sea, qué CVEs probar), motor de base de datos, rutas absolutas y a veces la query con sus parámetros. Sobre todo le confirma <em>qué entrada rompe qué componente</em>: cada error distinto que provoca es un bit de información sobre tu implementación.</p></details>
+
+<details><summary>Si ya corrés SAST en el CI, ¿por qué seguís necesitando DAST?</summary>
+<p>Porque miran universos distintos. SAST analiza el fuente y no ve nada de lo que pasa fuera de él: TLS mal configurado, headers ausentes, un panel de administración expuesto. DAST ataca el sistema desplegado y encuentra justamente eso; a cambio, solo ejercita los caminos que alcanza desde afuera, mientras SAST recorre ramas que ningún request casual dispara. Difieren también en confianza: un hallazgo de DAST está demostrado; uno de SAST puede no ser alcanzable.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Dibujá el DFD de una feature tuya: entidades externas, procesos, almacenes y flechas. Marcá los <strong>límites de confianza</strong>.</li>
+  <li>Sobre ese diagrama, aplicá STRIDE a los dos elementos que tocan un límite y decidí mitigar, eliminar, transferir o aceptar.</li>
+  <li>Buscá un patrón <em>chequeo y después uso</em> (canjear cupón, "si no existe, crear") y reescribilo como operación atómica.</li>
+  <li>Revisá los últimos 200 mensajes de tu log: ¿aparece algún token, <code>Authorization</code>, contraseña o dato personal?</li>
+  <li>Reemplazá un endpoint que devuelva <code>str(e)</code> por mensaje genérico + id de correlación.</li>
+  <li>Escribí dos tests negativos de autorización: uno leyendo y otro modificando un recurso ajeno.</li>
+  <li>Agregá el checklist de 10 ítems a la plantilla de PR del repo.</li>
+</ol>
+
+<section class="quiz" id="quizCS08">
+  <style>
+    #quizCS08{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS08 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS08 .q{margin-bottom:1.5rem}
+    #quizCS08 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS08 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS08 .opt:hover{border-color:var(--accent)}
+    #quizCS08 .opt:disabled{cursor:default}
+    #quizCS08 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS08 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS08 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS08 .exp.show{display:block}
+    #quizCS08 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un usuario intercepta el request del carrito y cambia <code>precio=1200</code> por <code>precio=1</code>. En STRIDE, ¿qué categoría es?</p>
+    <button class="opt">Spoofing: se está haciendo pasar por otro usuario</button>
+    <button class="opt">Elevation of privilege: obtuvo permisos de administrador</button>
+    <button class="opt">Tampering: modificó datos y rompió la integridad</button>
+    <div class="exp"><strong>Tampering</strong> rompe la <strong>integridad</strong>: no hay suplantación (sigue siendo él) ni escalada (no ganó permisos). La mitigación no es "validar que el precio sea positivo": es que el precio <em>no viaje en el request</em> — el servidor lo busca por id de producto.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu app valida que "apellido" tenga solo letras, espacios y apóstrofos. Guardás <code>O'Brien</code> y al mostrarlo el HTML se rompe. ¿Qué falta?</p>
+    <button class="opt">Encoding de salida: el dato es válido, pero hay que codificarlo según el destino</button>
+    <button class="opt">Endurecer la validación de entrada para rechazar el apóstrofo</button>
+    <button class="opt">Nada: si pasó la validación, es seguro en cualquier contexto</button>
+    <div class="exp"><code>O'Brien</code> es legítimo y rechazarlo rompe la app para usuarios reales. El problema es de <strong>salida</strong>: el mismo string se escapa distinto en el cuerpo HTML, en un atributo, en JavaScript o en una URL, y solo el punto de salida sabe cuál corresponde.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Dos requests simultáneos consumen el mismo cupón de un solo uso: los dos leen "sin usar" y los dos lo marcan. ¿Cuál es la corrección?</p>
+    <button class="opt">Repetir la lectura del cupón justo antes de marcarlo, para confirmar</button>
+    <button class="opt">Chequeo y marca en una sola operación atómica (<code>UPDATE ... WHERE usado = false</code>) y actuar según las filas afectadas</button>
+    <button class="opt">Agregar un <code>sleep</code> aleatorio antes de marcarlo para desincronizar</button>
+    <div class="exp">Es un TOCTOU clásico: cualquier chequeo separado de la acción —por más veces que lo repitas— deja una ventana antes de la escritura. Si el <code>UPDATE</code> afecta 0 filas, el cupón ya estaba usado. Una restricción única o un bloqueo logran lo mismo; el <code>sleep</code> solo achica la probabilidad.</div>
+  </div>
+
+  <div class="score" id="scoreCS08"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS08');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS08').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M09.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m07-secretos-supply-chain/lecture.html">← M07: Secretos y cadena de suministro</a>
+  <a href="../m09-devsecops/lecture.html">M09: DevSecOps →</a>
+</nav>
+
+</div>
+</body>
+</html>

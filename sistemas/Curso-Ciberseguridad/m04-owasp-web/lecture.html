@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 04 — OWASP Top 10 y seguridad web · Curso de Ciberseguridad</title>
+  <meta name="description" content="Qué es (y qué no es) el OWASP Top 10, inyección y consultas parametrizadas, XSS y escapado por contexto, CSRF, SSRF, deserialización, XXE, misconfiguration y headers de seguridad.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 04</span>
+  <span class="badge">⏱ ~55 min</span>
+  <span class="badge">🎯 Pre-req: M03</span>
+  <span class="badge">🕸️ AppSec</span>
+</div>
+
+<article>
+
+<h1>Módulo 04 — OWASP Top 10 y seguridad web</h1>
+
+<p>La mayoría de los incidentes no son criptografía rota ni 0-days: son una consulta armada con concatenación, un dato del usuario dentro del HTML, o un servidor con la configuración de ejemplo. Este módulo recorre las familias de vulnerabilidades web más frecuentes desde la perspectiva que importa cuando escribís código: <strong>cuál es la causa raíz y cuál la corrección estructural</strong>.</p>
+
+<div class="danger">
+  <strong>⚠️ Recordatorio del M00.</strong> Los fragmentos vulnerables están para que entiendas <em>por qué</em> fallan; al lado va la corrección. Probalos solo en sistemas propios o laboratorios legales (Juice Shop, DVWA). Contra un tercero, sin permiso escrito, es delito.
+</div>
+
+<h2>Qué es OWASP y qué es (de verdad) el Top 10</h2>
+
+<p>La <strong>OWASP</strong> (Open Worldwide Application Security Project) es una fundación sin fines de lucro que publica material abierto sobre seguridad de aplicaciones. Su producto más famoso —y más malinterpretado— es el <strong>Top 10</strong>.</p>
+
+<div class="concept">
+  <strong>💡 Es una lista de concientización, no una checklist de certificación.</strong> Se arma cada tres o cuatro años con datos de aplicaciones reales: responde "¿qué categorías aparecen más seguido?", no "¿qué tildo para estar seguro?". Cubrirlas todas no te hace seguro; te saca las diez familias más frecuentes.
+</div>
+
+<div class="rule">
+  <strong>📌 Si querés una checklist de verdad, usá ASVS.</strong> El <strong>Application Security Verification Standard</strong> sí es verificable: cientos de requisitos comprobables en tres niveles (L1, L2 datos sensibles, L3 crítico). El Top 10 te dice <em>qué mirar</em>; ASVS, <em>qué verificar y cómo</em>.
+</div>
+
+<h2>El Top 10 2021 de un vistazo</h2>
+
+<table>
+<thead><tr><th>Categoría</th><th>En una línea</th><th>Módulo</th></tr></thead>
+<tbody>
+<tr><td><strong>A01</strong> Broken Access Control</td><td>Acceso a lo que no le corresponde</td><td>M03</td></tr>
+<tr><td><strong>A02</strong> Cryptographic Failures</td><td>Datos sensibles sin cifrar o con algoritmos muertos</td><td>M01</td></tr>
+<tr><td><strong>A03</strong> Injection</td><td>Entrada del usuario interpretada como código</td><td>acá</td></tr>
+<tr><td><strong>A04</strong> Insecure Design</td><td>La falla está en el diseño: no hay parche</td><td>M08</td></tr>
+<tr><td><strong>A05</strong> Security Misconfiguration</td><td>Defaults, DEBUG en producción, servicios de más</td><td>acá · M06</td></tr>
+<tr><td><strong>A06</strong> Vulnerable/Outdated Components</td><td>Dependencias con CVE conocido sin actualizar</td><td>M07</td></tr>
+<tr><td><strong>A07</strong> Identification/Auth Failures</td><td>Sesiones y contraseñas mal resueltas</td><td>M02</td></tr>
+<tr><td><strong>A08</strong> Software/Data Integrity Failures</td><td>Deserialización insegura, updates sin firmar</td><td>acá · M07</td></tr>
+<tr><td><strong>A09</strong> Logging/Monitoring Failures</td><td>Pasó algo y nadie se enteró</td><td>M10</td></tr>
+<tr><td><strong>A10</strong> Server-Side Request Forgery</td><td>Tu servidor pide lo que indique el atacante</td><td>acá</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Dos cambios de 2021: <strong>XSS dejó de ser categoría propia</strong> y pasó a A03 (es inyección, con el navegador como intérprete), y entró <strong>Insecure Design</strong> para las fallas que ningún parche arregla.
+</div>
+
+<h2>Inyección: mezclar datos con código</h2>
+
+<p>Toda inyección —SQL, comandos del SO, NoSQL, LDAP, plantillas, XSS— es la misma falla con distinto intérprete detrás:</p>
+
+<div class="concept">
+  <strong>💡 Armaste una cadena que mezcla tu código con datos que no controlás, y se la diste a un intérprete.</strong> El intérprete no puede saber qué escribiste vos y qué llegó de afuera. Si un dato trae sintaxis del lenguaje, esa sintaxis se ejecuta.
+</div>
+
+<pre><code class="lang-python"># ❌ Concatenado: si el dato trae sintaxis SQL, se ejecuta
+cur.execute(f"SELECT id FROM usuarios WHERE email = '{email}'")
+
+# ✅ Consulta parametrizada: estructura y datos viajan por separado
+cur.execute("SELECT id FROM usuarios WHERE email = %s", (email,))
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Por qué esto sí funciona y "escapar comillas" no.</strong> Con placeholders el motor recibe primero la sentencia, la parsea y <strong>fija su estructura</strong>; los valores llegan después y ya no pueden alterar el árbol de la consulta. Escapar es adivinar la gramática del intérprete a mano: alcanza un charset raro para que se te escape algo.
+</div>
+
+<div class="warn">
+  <strong>Los parámetros sirven para valores, no para identificadores.</strong> Nombres de tabla, de columna y la dirección de un <code>ORDER BY</code> no se parametrizan. Para eso, <strong>lista blanca</strong>: el usuario manda una clave y vos la traducís a una columna que escribiste vos.
+</div>
+
+<table>
+<thead><tr><th>Tipo</th><th>El intérprete es…</th><th>Defensa estructural</th></tr></thead>
+<tbody>
+<tr><td><strong>SQL</strong></td><td>El motor de base de datos</td><td>Consultas parametrizadas</td></tr>
+<tr><td><strong>Comandos del SO</strong></td><td>El shell</td><td>Lista de argumentos, nunca <code>shell=True</code></td></tr>
+<tr><td><strong>NoSQL</strong></td><td>El motor de consultas</td><td>Validar tipos: si esperabas string y llega un objeto, rechazar</td></tr>
+<tr><td><strong>LDAP</strong></td><td>El servidor de directorio</td><td>Filtros con parámetros, no concatenación</td></tr>
+<tr><td><strong>Plantillas (SSTI)</strong></td><td>El motor de templates</td><td>Nunca compilar plantillas con contenido del usuario</td></tr>
+</tbody>
+</table>
+
+<h2>XSS: cuando tu HTML ejecuta lo que escribió otro</h2>
+
+<p>XSS es inyección de HTML/JavaScript en la página que ve <strong>otro usuario</strong>. El código corre con el origen de tu sitio: lee el DOM, roba tokens accesibles desde JS y actúa por la víctima.</p>
+
+<table>
+<thead><tr><th>Variante</th><th>Por dónde entra</th><th>Alcance</th></tr></thead>
+<tbody>
+<tr><td><strong>Reflejado</strong></td><td>Un parámetro que el servidor devuelve</td><td>Solo quien abre ese link</td></tr>
+<tr><td><strong>Almacenado</strong></td><td>Se guarda en la base y se sirve a todos</td><td>El peor: se dispara solo, a cada visitante</td></tr>
+<tr><td><strong>Basado en DOM</strong></td><td>JS del cliente escribe en el DOM; el servidor no ve el payload</td><td>Invisible para el WAF y para los logs</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No existe "escapar" a secas: existe escapar <em>para un contexto</em>.</strong> El mismo dato necesita transformaciones distintas según dónde caiga.
+</div>
+
+<table>
+<thead><tr><th>Contexto de salida</th><th>Ejemplo</th><th>Qué corresponde</th></tr></thead>
+<tbody>
+<tr><td>Texto HTML</td><td><code>&lt;p&gt;Hola, DATO&lt;/p&gt;</code></td><td>Entidades para <code>&amp; &lt; &gt;</code></td></tr>
+<tr><td>Atributo</td><td><code>&lt;input value="DATO"&gt;</code></td><td>Entidades <strong>+ comillas siempre</strong>: sin comillas, un espacio escapa del atributo</td></tr>
+<tr><td>Dentro de <code>&lt;script&gt;</code></td><td><code>var u = "DATO";</code></td><td>Serialización JSON, no escapado HTML</td></tr>
+<tr><td>URL / <code>href</code></td><td><code>&lt;a href="DATO"&gt;</code></td><td>Validar el <strong>esquema</strong> (solo <code>http</code>/<code>https</code>)</td></tr>
+<tr><td>CSS</td><td><code>style="color: DATO"</code></td><td>No interpolar: usar clases predefinidas</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El auto-escaping de tu motor de plantillas cubre el texto HTML, y nada más.</strong> Jinja2, Django, ERB o Blade convierten <code>&lt;</code> en <code>&amp;lt;</code> pensando en texto. No te salva si el dato cae en un atributo sin comillas, en un <code>&lt;script&gt;</code>, o en un <code>href</code> con esquema <code>javascript:</code>.
+</div>
+
+<div class="concept">
+  <strong>💡 CSP es la red debajo del trapecio, no el trapecio.</strong> Una <code>Content-Security-Policy</code> estricta hace que un XSS que se te coló <em>no llegue a ejecutar</em>, pero es defensa en profundidad: el día que la política se afloja —una librería que exige <code>unsafe-eval</code>, un CDN nuevo— todos los XSS latentes se vuelven explotables. La solución primaria es no generarlos.
+</div>
+
+<h2>CSRF: el navegador que obedece a cualquiera</h2>
+
+<p>El navegador manda las cookies del sitio de destino en <strong>cualquier</strong> pedido, sin importar desde qué página se originó. Si tu app decide "quién sos" solo por la cookie, una página ajena puede actuar en tu nombre:</p>
+
+<pre><code class="lang-html">&lt;!-- Página del atacante: basta que la víctima la visite logueada --&gt;
+&lt;form action="https://banco.example/transferir" method="POST"&gt;
+  &lt;input type="hidden" name="destino" value="CUENTA_DEL_ATACANTE"&gt;
+&lt;/form&gt;
+&lt;script&gt;document.forms[0].submit();&lt;/script&gt;
+</code></pre>
+
+<div class="step"><strong>1. Token anti-CSRF.</strong> El servidor genera un valor aleatorio por sesión, lo incrusta en el formulario y lo exige en todo pedido que cambia estado. La página del atacante no puede leerlo: se lo impide el mismo origen.</div>
+
+<div class="step"><strong>2. Cookie con <code>SameSite</code>.</strong> Con <code>Lax</code> (default actual) la cookie no viaja en POST cross-site; con <code>Strict</code>, tampoco en navegaciones. No reemplaza al token: hay flujos con subdominios y redirecciones donde no alcanza.</div>
+
+<div class="step"><strong>3. Verificar el origen.</strong> Chequear <code>Origin</code> (o <code>Referer</code>) contra tu lista de orígenes válidos en los endpoints que mutan estado.</div>
+
+<div class="info">
+  <strong>Por qué una API con <code>Authorization: Bearer</code> es menos vulnerable.</strong> CSRF vive de la <em>autoridad ambiental</em>: credenciales que el navegador adjunta solo por ser tuyas. Un header <code>Authorization</code> lo pone el JavaScript de tu app, y una página ajena no puede hacerlo. Corolario: si guardás el token en una cookie que el servidor lee solo, volvés a ser vulnerable.
+</div>
+
+<h2>SSRF: tu servidor como proxy del atacante</h2>
+
+<p>Pasa cada vez que tu backend pide una URL provista por el usuario: previsualización de links, importación, webhooks, avatares.</p>
+
+<div class="danger">
+  <strong>⚠️ En la nube, SSRF escala de molestia a compromiso total.</strong> Los proveedores exponen un <strong>servicio de metadata</strong> en una dirección de enlace local, alcanzable solo desde adentro de la instancia y —en configuraciones antiguas— sin autenticación. Si tu servidor pide esa URL y devuelve el cuerpo, el atacante se queda con credenciales del rol de la instancia. Además alcanza tu red interna.
+</div>
+
+<ul>
+  <li><strong>Lista blanca de destinos.</strong> Si solo hablás con tres proveedores, aceptá esos hosts. Es la única defensa que no se elude con creatividad.</li>
+  <li><strong>Resolver el DNS y validar la IP</strong> antes de conectar: bloquear loopback, enlace local y rangos privados, sobre la IP ya resuelta (evita el <em>rebinding</em>).</li>
+  <li><strong>Solo <code>http</code> y <code>https</code></strong>, y no seguir redirecciones automáticamente (o revalidar en cada salto).</li>
+  <li><strong>Nunca devolver la respuesta cruda</strong>, y salir por una subred sin acceso al plano de administración.</li>
+</ul>
+
+<h2>Deserialización insegura y XXE</h2>
+
+<div class="concept">
+  <strong>💡 Los dos son el mismo error: darle a un parser potente un archivo que escribió otro.</strong> Un formato de serialización nativo (pickle, Java, YAML con tags) no describe datos: describe <strong>cómo reconstruir objetos</strong>, incluido qué constructores llamar. Deserializar entrada no confiable es ejecutar un programa que mandó el atacante.
+</div>
+
+<p>La regla es corta: no deserialices formatos nativos de fuentes que no controlás. Usá JSON con esquema explícito; si algo viaja por el cliente, firmalo (M01) y verificá la firma <em>antes</em> de parsear. En YAML, cargá en modo seguro.</p>
+
+<p><strong>XXE</strong> (XML External Entity) es la versión XML: el estándar permite declarar entidades que el parser resuelve, y algunas apuntan a recursos externos. Con eso habilitado, el parser puede terminar leyendo archivos locales o disparando pedidos de red —SSRF por la puerta de atrás—.</p>
+
+<div class="rule">
+  <strong>📌 Deshabilitá DTDs y entidades externas en todo parser XML que reciba entrada ajena.</strong> Las librerías modernas ya vienen así, pero el código viejo no. Si podés elegir, usá JSON.
+</div>
+
+<h2>Security misconfiguration</h2>
+
+<p>La categoría más aburrida y de las que más incidentes causa: no requiere habilidad, solo mirar.</p>
+
+<table>
+<thead><tr><th>Síntoma</th><th>Qué regala</th><th>Corrección</th></tr></thead>
+<tbody>
+<tr><td>Credenciales por defecto</td><td>Acceso administrativo directo</td><td>Cambiarlas al desplegar y verificarlo en el pipeline</td></tr>
+<tr><td>Listado de directorios activo</td><td>Backups, <code>.env</code>, dumps, código fuente</td><td>Desactivar el autoindex</td></tr>
+<tr><td>Errores con stack trace</td><td>Rutas, versiones, nombres de tablas</td><td>Error genérico + ID de correlación; el detalle al log</td></tr>
+<tr><td><code>DEBUG</code> en producción</td><td>Consola interactiva, variables de entorno, secretos</td><td>Chequeo de arranque que aborte si está activo</td></tr>
+<tr><td>CORS con <code>*</code> y credenciales</td><td>Cualquier origen leyendo respuestas autenticadas</td><td>Lista blanca; nunca reflejar el <code>Origin</code> recibido</td></tr>
+</tbody>
+</table>
+
+<h2>Headers de seguridad</h2>
+
+<table>
+<thead><tr><th>Header</th><th>Para qué sirve</th><th>Valor para empezar</th></tr></thead>
+<tbody>
+<tr><td><code>Content-Security-Policy</code></td><td>Limita de dónde se carga y ejecuta código</td><td><code>default-src 'self'; object-src 'none'; base-uri 'self'</code> + nonces</td></tr>
+<tr><td><code>Strict-Transport-Security</code></td><td>Obliga a HTTPS siempre; mata el downgrade</td><td><code>max-age=31536000; includeSubDomains</code></td></tr>
+<tr><td><code>X-Content-Type-Options</code></td><td>Impide que el navegador adivine el tipo y ejecute como script algo subido como texto</td><td><code>nosniff</code></td></tr>
+<tr><td><code>Referrer-Policy</code></td><td>Controla cuánta URL se filtra al navegar a otro sitio</td><td><code>strict-origin-when-cross-origin</code></td></tr>
+<tr><td><code>Permissions-Policy</code></td><td>Apaga APIs del navegador que no usás</td><td><code>camera=(), microphone=(), geolocation=()</code></td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Complemento en el campus.</strong> El <a href="../../../track-senior/modulo-04-seguridad-auth/lecture.html">track senior · módulo 04</a> cubre este terreno <strong>desde el frontend</strong>: CSP en detalle, integridad de subrecursos (SRI) y tokens en una SPA. Allá el navegador, acá el servidor.
+</div>
+
+<h2>🔧 En tu código</h2>
+
+<div class="rule">
+  <strong>1. Consultas parametrizadas, sin excepciones.</strong> Un <code>execute</code> con f-string, <code>+</code>, <code>%</code> o <code>.format()</code> es una vulnerabilidad hasta que se demuestre lo contrario.
+</div>
+
+<pre><code class="lang-python"># ❌ Distintas formas de la misma falla
+cur.execute("SELECT * FROM pedidos WHERE id = " + str(pid))
+cur.execute("UPDATE perfil SET bio = '%s'" % bio)
+
+# ✅ Placeholders siempre
+cur.execute("SELECT * FROM pedidos WHERE id = %s", (pid,))
+cur.execute("UPDATE perfil SET bio = %s WHERE id = %s", (bio, uid))
+</code></pre>
+
+<div class="rule">
+  <strong>2. Nunca armes un comando del SO con concatenación.</strong> Con <code>shell=True</code> el texto lo interpreta un shell, que entiende <code>;</code>, <code>|</code>, <code>&amp;&amp;</code> y sustitución de comandos. Con una <strong>lista</strong>, cada elemento es un argumento.
+</div>
+
+<pre><code class="lang-python">import subprocess, shutil
+
+# ❌ El archivo puede traer metacaracteres del shell
+subprocess.run(f"convert {archivo} /tmp/salida.png", shell=True)
+
+# ✅ 'archivo' es UN argumento, contenga lo que contenga
+subprocess.run([shutil.which("convert"), archivo, "/tmp/salida.png"],
+               shell=False, check=True, timeout=30)
+</code></pre>
+
+<div class="rule">
+  <strong>3. Escapá según el contexto de salida.</strong> El auto-escaping cubre el texto; los atributos y el JS los resolvés vos. Lo más robusto: no interpolar datos dentro de un <code>&lt;script&gt;</code>, pasalos por <code>data-*</code> y leelos desde el DOM.
+</div>
+
+<pre><code class="lang-html">&lt;!-- ❌ Sin comillas: un espacio y el dato agrega atributos nuevos --&gt;
+&lt;input value={{ nombre }}&gt;
+
+&lt;!-- ❌ En JS el escapado HTML no aplica --&gt;
+&lt;script&gt;var usuario = "{{ nombre }}";&lt;/script&gt;
+
+&lt;!-- ✅ Comillas, y datos por data-* leídos con JS --&gt;
+&lt;input value="{{ nombre }}"&gt;
+&lt;div id="app" data-usuario="{{ nombre }}"&gt;&lt;/div&gt;
+&lt;script&gt;
+  const usuario = document.getElementById("app").dataset.usuario;
+&lt;/script&gt;
+</code></pre>
+
+<div class="rule">
+  <strong>4. Toda salida de red pasa por una lista blanca.</strong> Antes del pedido: parseá la URL, exigí <code>http</code>/<code>https</code>, verificá el host y descartá los rangos internos.
+</div>
+
+<pre><code class="lang-python">from urllib.parse import urlparse
+import ipaddress, socket
+
+PERMITIDOS = {"api.proveedor.com", "cdn.proveedor.com"}
+
+def salida_valida(url: str) -&gt; bool:
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or u.hostname not in PERMITIDOS:
+        return False                          # lista blanca primero
+    ip = ipaddress.ip_address(socket.gethostbyname(u.hostname))
+    return not (ip.is_private or ip.is_loopback
+                or ip.is_link_local or ip.is_reserved)
+</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. "Escapo las comillas y listo".</strong> ❌ Escapar a mano deja afuera codificaciones alternativas, contextos sin comillas y escapes aplicados dos veces. ✅ Consultas parametrizadas; y para los identificadores, lista blanca.
+</div>
+
+<div class="mistake">
+  <strong>2. Sanitizar en el cliente y confiar en eso.</strong> ❌ La validación de JavaScript y el <code>maxlength</code> son ayudas de usabilidad: el atacante no usa tu formulario, le habla directo a tu API. ✅ Validá siempre en el servidor, con esquema y tipos.
+</div>
+
+<div class="mistake">
+  <strong>3. <code>dangerouslySetInnerHTML</code> / <code>innerHTML</code> con datos del usuario.</strong> ❌ React escapa por defecto salvo ahí; el nombre te avisa. Lo mismo con <code>document.write()</code> y <code>eval()</code>. ✅ Usá <code>textContent</code> si es texto; para HTML de usuarios, un sanitizador mantenido (DOMPurify), nunca un regex propio.
+</div>
+
+<div class="mistake">
+  <strong>4. Dejar mensajes de error verbosos en producción.</strong> ❌ Un stack trace regala versiones, rutas y nombres de tablas: un mapa gratis de tu sistema. ✅ Al usuario, mensaje genérico con ID de correlación; al log, el detalle. Y un chequeo de arranque que aborte con <code>DEBUG</code> activo.
+</div>
+
+<h3>Checkpoint</h3>
+
+<details><summary>¿Por qué una consulta parametrizada es estructuralmente segura y el escapado manual no?</summary>
+<p>Porque actúan en momentos distintos. Con placeholders el motor recibe primero la sentencia, la parsea y fija su estructura; los valores llegan después y ya no pueden alterar el árbol sintáctico. El escapado manual produce <em>una sola cadena</em> que el motor parsea entera: la seguridad depende de que tu función modele perfectamente la gramática, el charset y el contexto. Es una apuesta que se pierde con el tiempo.</p></details>
+
+<details><summary>Si ya tenés una CSP estricta, ¿por qué seguir preocupándote por el XSS?</summary>
+<p>Porque la CSP mitiga la <em>explotación</em>, no elimina la <em>vulnerabilidad</em>. El agujero sigue en el código y su protección depende de una configuración que cambia por razones ajenas: una librería que necesita <code>unsafe-eval</code>, un CDN nuevo, un proxy que deja de mandar el header. Cuando se afloja, todos los XSS latentes se vuelven explotables a la vez.</p></details>
+
+<details><summary>¿Por qué una API que autentica con <code>Authorization: Bearer</code> es menos vulnerable a CSRF que una con cookie de sesión?</summary>
+<p>CSRF depende de la <strong>autoridad ambiental</strong>: credenciales que el navegador adjunta solo por ser de ese sitio. Por eso un formulario en cualquier dominio dispara un pedido autenticado. Un header <code>Authorization</code> lo pone el JavaScript de tu app, y la política de mismo origen impide que una página ajena lo escriba. Ojo: no desaparece el XSS, y si guardás el JWT en una cookie que el servidor lee solo, volviste a la autoridad ambiental.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Buscá construcción dinámica de SQL en un proyecto tuyo (<code>execute</code> con f-string, <code>+</code>, <code>%</code>) y convertí tres casos a consultas parametrizadas.</li>
+  <li>Buscá los usos de <code>shell=True</code> u <code>os.system</code> y convertilos a lista de argumentos (o evitá salir al SO).</li>
+  <li>Clasificá cada interpolación de una plantilla tuya por contexto de salida: ¿cuántas caen donde el auto-escaping <strong>no</strong> cubre?</li>
+  <li>Levantá OWASP Juice Shop, encontrá un XSS almacenado y escribí el <em>fix</em> del lado del servidor.</li>
+  <li>Compará los headers de un sitio tuyo (<code>curl -I</code>) contra la tabla del módulo e implementá los que falten.</li>
+  <li>Listá los lugares del backend que piden una URL del usuario y escribí su lista blanca de destinos.</li>
+</ol>
+
+<section class="quiz" id="quizCS04">
+  <style>
+    #quizCS04{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS04 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS04 .q{margin-bottom:1.5rem}
+    #quizCS04 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS04 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS04 .opt:hover{border-color:var(--accent)}
+    #quizCS04 .opt:disabled{cursor:default}
+    #quizCS04 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS04 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS04 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS04 .exp.show{display:block}
+    #quizCS04 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Necesitás que el usuario elija por qué columna se ordena un listado. ¿Cuál es la solución correcta?</p>
+    <button class="opt">Parametrizar el nombre de la columna como cualquier otro valor</button>
+    <button class="opt">Escapar el nombre de la columna antes de interpolarlo en el SQL</button>
+    <button class="opt">Mapear la opción recibida contra un diccionario de columnas permitidas</button>
+    <div class="exp">Los placeholders solo funcionan para <strong>valores</strong>: un identificador no se puede parametrizar: el driver lo rechaza o lo trata como string literal. Escapar tampoco sirve, porque las reglas de <em>quoting</em> son distintas y frágiles.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu motor de plantillas escapa por defecto y aun así te reportan un XSS en <code>&lt;input value={{ nombre }}&gt;</code>. ¿Por qué?</p>
+    <button class="opt">El atributo no tiene comillas: alcanza un espacio en el dato para agregar atributos nuevos</button>
+    <button class="opt">El auto-escaping no funciona dentro de etiquetas <code>&lt;input&gt;</code></button>
+    <button class="opt">Falta una CSP, que es lo único que previene el XSS</button>
+    <div class="exp">El auto-escaping convierte <code>&amp;</code>, <code>&lt;</code> y <code>&gt;</code> en entidades, correcto para <strong>texto HTML</strong>. Pero en un atributo sin comillas, un espacio termina el valor y lo que sigue se parsea como atributos nuevos —incluido un manejador de eventos—. La corrección: poner las comillas.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un endpoint recibe una URL del usuario para previsualizar un link. ¿Cuál es la defensa más efectiva contra SSRF?</p>
+    <button class="opt">Rechazar las URLs que contengan "localhost" o "127.0.0.1"</button>
+    <button class="opt">Aceptar solo hosts de una lista blanca y validar la IP resuelta antes de conectar</button>
+    <button class="opt">Hacer el pedido con timeout corto y sin devolver el cuerpo de la respuesta</button>
+    <div class="exp">Una lista negra de nombres se elude de mil formas —representaciones alternativas de la IP, redirecciones, DNS que apunta adentro—. El timeout y no devolver el cuerpo mitigan el SSRF ciego, pero el pedido igual se hace. Lo único que corta el problema de raíz es decidir <strong>vos</strong> a qué destinos se puede salir.</div>
+  </div>
+
+  <div class="score" id="scoreCS04"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS04');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS04').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M05.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m03-autorizacion/lecture.html">← M03: Autorización y control de acceso</a>
+  <a href="../m05-seguridad-redes/lecture.html">M05: Seguridad de redes →</a>
+</nav>
+
+</div>
+</body>
+</html>

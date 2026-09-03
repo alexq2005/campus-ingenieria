@@ -2,9 +2,9 @@
 
 > Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **offline**.
 
-**9 cursos · 127 lecciones · 49 proyectos · sin servidor · sin build · sin internet**
+**10 cursos · 140 lecciones · 49 proyectos · sin servidor · sin build · sin internet**
 
-Nueve cursos que van **de cero a empleable** — del primer `<div>` a entrenar una red neuronal y escribir Rust para un microcontrolador. Todo en **HTML estático**: se abre directo en el navegador, sin instalar nada.
+Diez cursos que van **de cero a empleable** — del primer `<div>` a entrenar una red neuronal y escribir Rust para un microcontrolador. Todo en **HTML estático**: se abre directo en el navegador, sin instalar nada.
 
 ---
 
@@ -22,7 +22,7 @@ cd campus-ingenieria
 
 ---
 
-## 📚 Los 9 cursos
+## 📚 Los 10 cursos
 
 | # | Curso | Contenido | Entrar |
 |---|-------|-----------|--------|
@@ -35,12 +35,13 @@ cd campus-ingenieria
 | 7 | 📊 **Datos & ML** | NumPy → pandas → scikit-learn → PyTorch | [Abrir](datos-ia/Curso-Datos-ML/index.html) |
 | 8 | 🐹 **Go** | Sintaxis, goroutines/channels, API REST — el lenguaje de la nube | [Abrir](lenguajes/Curso-Go/index.html) |
 | 9 | 🦀 **Rust** | Ownership, borrowing, lifetimes, traits, concurrencia, embebido | [Abrir](lenguajes/Curso-Rust/index.html) |
+| 10 | 🛡️ **Ciberseguridad** | Amenazas, criptografía, OWASP, redes, hardening, DevSecOps, respuesta a incidentes | [Abrir](sistemas/Curso-Ciberseguridad/index.html) |
 
 ---
 
 ## 🛠️ Más allá de las lecciones
 
-- **[🗺️ Ruta de aprendizaje](ruta-aprendizaje.html)** — el camino visual de cero a empleable, conectando los 9 cursos.
+- **[🗺️ Ruta de aprendizaje](ruta-aprendizaje.html)** — el camino visual de cero a empleable, conectando los 10 cursos.
 - **[🧪 Galería de proyectos](proyectos/index.html)** — 49 proyectos de dificultad creciente: del Tic-Tac-Toe a un robot con PID, fullstack, IoT, IA e impacto social.
 - **MVPs jugables** (corren de verdad en el navegador):
   - [⭕ Tic-Tac-Toe con IA imbatible](proyectos/demos/tic-tac-toe-app.html)
@@ -57,7 +58,7 @@ cd campus-ingenieria
 - **Offline** — el contenido, los quizzes y los simuladores funcionan desde `file://`, sin servidor ni conexión. Lo único que pide internet son el coloreado de sintaxis (si no carga, el código igual se lee) y 5 demos de React.
 - **Cero build** — es HTML, CSS y JS plano. No hay `npm install`. La única librería que hace falta para leer, `marked`, viene incluida en `assets/vendor/`.
 - **Aprender construyendo** — cada curso termina en proyectos reales.
-- **Interactivo** — quiz autoevaluable en **las 127 lecciones**, checkpoints con respuesta revelable, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
+- **Interactivo** — quiz autoevaluable en **las 140 lecciones**, checkpoints con respuesta revelable, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
 - **Puente hardware ↔ software** — Computación Física conecta la informática con la electrónica (Arduino/ESP32), y Rust llega hasta el microcontrolador.
 
 ---
@@ -79,7 +80,7 @@ index.html                  ← portada del campus (empezá acá)
 ruta-aprendizaje.html       ← roadmap visual
 desarrollo-web/             ← Frontend (modulo-00..13) · React · React Native
 lenguajes/                  ← Python · Go · Rust
-sistemas/                   ← Linux · Computación Física (electrónica)
+sistemas/                   ← Linux · Computación Física (electrónica) · Ciberseguridad
 datos-ia/                   ← Datos & ML
 proyectos/                  ← galería de 49 proyectos + demos jugables
 track-senior/               ← track de nivel senior

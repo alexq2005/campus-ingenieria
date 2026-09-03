@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 02 — Autenticación e identidad · Curso de Ciberseguridad</title>
+  <meta name="description" content="Autenticación vs identificación, los tres factores, contraseñas según NIST 800-63B, MFA y passkeys, sesiones vs JWT, OAuth2/OIDC con PKCE, ataques al login y cómo defenderlo.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 02</span>
+  <span class="badge">⏱ ~50 min</span>
+  <span class="badge">🎯 Pre-req: M01</span>
+  <span class="badge">🔑 Identidad</span>
+</div>
+
+<article>
+
+<h1>Módulo 02 — Autenticación e identidad</h1>
+
+<p>El login es la puerta de entrada de tu sistema y, estadísticamente, por donde más incidentes reales empiezan. No porque el hashing sea débil —eso lo resolviste en el M01— sino porque la identidad es donde la criptografía se choca con las personas. Este módulo va de cómo probar que alguien es quien dice ser, y de cómo sostener esa prueba durante toda una sesión.</p>
+
+<h2>Identificación, autenticación, autorización</h2>
+
+<div class="concept">
+  <strong>💡 Tres preguntas distintas, en orden.</strong> <strong>Identificación</strong>: ¿quién decís que sos? <strong>Autenticación</strong>: ¿podés probarlo? <strong>Autorización</strong>: ¿qué te dejo hacer? Confundirlas origina una familia entera de vulnerabilidades.
+</div>
+
+<table>
+<thead><tr><th>Etapa</th><th>Pregunta</th><th>Ejemplo</th><th>Falla típica</th></tr></thead>
+<tbody>
+<tr><td><strong>Identificación</strong></td><td>¿Quién sos?</td><td><code>ana@ejemplo.com</code></td><td>Tratar el identificador como prueba</td></tr>
+<tr><td><strong>Autenticación</strong></td><td>¿Lo probás?</td><td>Contraseña + TOTP</td><td>Aceptar una prueba robable</td></tr>
+<tr><td><strong>Autorización</strong></td><td>¿Qué podés hacer?</td><td>Ana ve solo sus facturas</td><td>Asumir que estar logueado alcanza</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error más común del rubro:</strong> creer que "estoy autenticado" implica "puedo hacer esto". Un usuario logueado que cambia el <code>id</code> en la URL y ve la factura de otro no rompió la autenticación, sino la <strong>autorización</strong>: eso tiene módulo propio, el M03.
+</div>
+
+<h2>Los tres factores</h2>
+
+<p>Un <strong>factor</strong> es una categoría de prueba, y lo importante es que sean de categorías distintas:</p>
+
+<ul>
+  <li><strong>Algo que sabés</strong> — contraseña, PIN. Barato, y se roba sin que te enteres.</li>
+  <li><strong>Algo que tenés</strong> — el celular con la app de códigos, una llave USB. Robarlo exige presencia física o comprometer el dispositivo.</li>
+  <li><strong>Algo que sos</strong> — huella, cara. Cómodo, pero <strong>no revocable</strong>: una huella filtrada no se cambia.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 MFA es "dos factores de categorías distintas", no "dos pasos".</strong> Contraseña + pregunta secreta son <em>dos cosas que sabés</em>: un phishing que capture una captura la otra. Contraseña + código del celular son dos categorías: hace falta la clave <em>y</em> el dispositivo.
+</div>
+
+<div class="info">
+  La mayoría de los ataques masivos a cuentas son <strong>reutilización de credenciales filtradas</strong>: el atacante tiene tu contraseña verdadera, sacada de otro sitio. Un segundo factor convierte ese ataque barato y automatizado en uno dirigido y caro.
+</div>
+
+<h2>Contraseñas: lo que dice NIST 800-63B (y lo que ya no)</h2>
+
+<p>Las reglas que casi todos aprendimos —"una mayúscula, un símbolo, cambiala cada 90 días"— fueron <strong>retiradas</strong> por el propio NIST: medir el comportamiento real mostró que <em>empeoraban</em> la seguridad.</p>
+
+<table>
+<thead><tr><th>Regla vieja</th><th>Qué provoca</th><th>Guía moderna</th></tr></thead>
+<tbody>
+<tr><td>Complejidad de caracteres</td><td><code>Password1!</code>: cumple y es trivial</td><td><strong>Longitud</strong> (mín. 8, mejor 12+)</td></tr>
+<tr><td>Rotación cada 90 días</td><td><code>Verano2025</code> → <code>Verano2026</code></td><td>Cambiar <strong>solo ante sospecha</strong></td></tr>
+<tr><td>Preguntas secretas</td><td>La respuesta está en las redes</td><td>Eliminarlas como factor</td></tr>
+<tr><td>Máximo de 12–16 caracteres</td><td>Impide frases de paso</td><td>Aceptar al menos <strong>64</strong></td></tr>
+<tr><td>Bloquear pegar</td><td>Rompe los gestores</td><td>Permitir pegar</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Lo que sí hay que hacer.</strong> Longitud mínima razonable y máxima generosa · rechazar la contraseña si aparece en una <strong>lista de filtradas</strong> · permitir pegar y espacios · nada de rotación por calendario ni preguntas de recuperación · ofrecer MFA.
+</div>
+
+<div class="analogy">
+  <strong>🔐 Por qué la longitud gana.</strong> Pensá el espacio de búsqueda como un edificio: agregar tipos de caracteres ensancha cada piso, pero agregar longitud <em>suma pisos enteros</em>. Y los humanos resolvemos la complejidad siempre con el mismo truco predecible.
+</div>
+
+<div class="tip">
+  El chequeo contra listas de filtradas es el control de mayor impacto, y no requiere mandar la contraseña a ningún lado: hay APIs de <em>k-anonimato</em> donde enviás los primeros 5 caracteres del hash y comparás el resto localmente.
+</div>
+
+<h2>MFA en la práctica: de SMS a passkeys</h2>
+
+<table>
+<thead><tr><th>Método</th><th>Fuerza</th><th>Debilidad principal</th></tr></thead>
+<tbody>
+<tr><td><strong>SMS</strong></td><td>Baja</td><td><strong>SIM swapping</strong>: portan tu número engañando a la operadora.</td></tr>
+<tr><td><strong>TOTP</strong></td><td>Media</td><td>Phisheable: si te engañan, entregás los 6 dígitos.</td></tr>
+<tr><td><strong>Push</strong></td><td>Media</td><td><strong>MFA fatigue</strong>: 50 notificaciones hasta que aceptás una. Se mitiga con <em>number matching</em>.</td></tr>
+<tr><td><strong>Llave / passkey</strong></td><td>Alta</td><td>Costo y respaldo. Inmune al phishing en la práctica.</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Por qué WebAuthn/passkeys resisten el phishing.</strong> No hay secreto que puedas entregarle a un sitio falso: el dispositivo guarda una <strong>clave privada</strong> (M01) y firma un desafío del servidor. Esa firma incluye el <strong>origen</strong>, así que el navegador ni genera una firma utilizable en <code>banco-falso.com</code>. Con TOTP, en cambio, el usuario escribe los 6 dígitos en la página falsa y el atacante los reenvía.
+</div>
+
+<h2>Sesiones vs tokens: quién guarda el estado</h2>
+
+<p>Autenticarse es un instante; sostener esa identidad en cada request siguiente es el problema real. Dos familias:</p>
+
+<table>
+<thead><tr><th></th><th>Cookie de sesión (con estado)</th><th>JWT (sin estado)</th></tr></thead>
+<tbody>
+<tr><td>Dónde vive la verdad</td><td>En el servidor (Redis, base)</td><td>En el propio token, firmado</td></tr>
+<tr><td>Qué guarda el cliente</td><td>Un identificador opaco</td><td>Los datos del usuario, legibles</td></tr>
+<tr><td><strong>Revocación</strong></td><td>Inmediata: borrás la fila</td><td><strong>Difícil</strong>: vale hasta que expira</td></tr>
+<tr><td>Escala horizontal</td><td>Requiere almacén compartido</td><td>Cualquier nodo lo valida solo</td></tr>
+<tr><td>Bueno para</td><td>Apps web clásicas</td><td>APIs entre servicios</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>La revocación es lo que se subestima.</strong> Con JWT sin estado, "cerrar sesión en todos lados", "el usuario fue despedido" o "le robaron el token" no tienen respuesta inmediata. Y las soluciones —lista de revocación, versión de credenciales, accesos de 5 minutos con <em>refresh</em>— reintroducen estado.
+</div>
+
+<div class="tip">
+  Regla práctica: para una app web normal, <strong>usá cookies de sesión</strong>. El JWT gana donde consultar un almacén central es el cuello de botella. Elegirlo "porque es moderno" termina en un JWT de 30 días en <code>localStorage</code>: lo peor de ambos mundos.
+</div>
+
+<h2>JWT en detalle y sus trampas</h2>
+
+<p>Un JWT son tres partes en base64url separadas por puntos: <code>header.payload.signature</code>.</p>
+
+<pre><code class="lang-text">eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiIxMjMiLCJyb2xlIjoiYWRtaW4ifQ . 4pcPyMD0...
+   ↑ header               ↑ payload                        ↑ firma
+   {"alg":"HS256"}        {"sub":"123","role":"admin"}      HMAC(datos, clave)
+</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El payload NO está cifrado.</strong> Base64 no es criptografía: cualquiera lo revierte sin clave, así que todo lo que pongas ahí es <strong>público</strong>. La firma da <em>integridad</em> y <em>autenticidad</em>, nunca <em>confidencialidad</em>: nada de documentos ni datos de salud adentro.
+</div>
+
+<p>Las tres trampas históricas, todas del lado de quien <strong>valida</strong>:</p>
+
+<div class="step"><strong>1. <code>alg: none</code>.</strong> El estándar admitía un algoritmo "ninguno": el atacante edita el header a <code>{"alg":"none"}</code>, borra la firma, pone <code>"role":"admin"</code> y algunas librerías viejas lo aceptaban.</div>
+
+<div class="step"><strong>2. Confusión de algoritmo.</strong> El servidor firma con RS256 pero valida con una función genérica; el atacante pasa el header a HS256 y firma con la <strong>clave pública</strong> como secreto HMAC.</div>
+
+<div class="step"><strong>3. No validar <em>claims</em>.</strong> Firma correcta no alcanza: hay que verificar <code>exp</code>, <code>iss</code> y <code>aud</code>. Un token de otro servicio de la misma organización no debería servir en tu API.</div>
+
+<pre><code class="lang-python"># ❌ El algoritmo lo elige el atacante desde el header
+datos = jwt.decode(token, clave, algorithms=["HS256", "RS256", "none"])
+
+# ✅ Algoritmo fijo en el servidor + claims verificados
+datos = jwt.decode(
+    token, clave_publica,
+    algorithms=["RS256"],
+    audience="api.miapp.com",
+    issuer="https://auth.miapp.com",
+    options={"require": ["exp", "iat", "sub"]},
+)
+</code></pre>
+
+<h2>OAuth2 y OIDC: delegar sin entregar la contraseña</h2>
+
+<div class="concept">
+  <strong>💡 Son cosas distintas y se confunden todo el tiempo.</strong> <strong>OAuth2 es autorización delegada</strong>: le da a una app permiso para actuar en tu nombre en otro servicio (leer tu calendario) sin entregarle tu contraseña. <strong>OIDC</strong> es una capa encima que agrega <strong>autenticación</strong>: devuelve un <code>id_token</code> que dice quién sos. Para "iniciar sesión con…" va OIDC.
+</div>
+
+<p>El flujo correcto hoy es <strong>authorization code + PKCE</strong>, para todo tipo de cliente:</p>
+
+<pre><code class="lang-text">1. La app genera un secreto al azar (verifier) y manda su hash (challenge)
+2. El usuario se autentica en el proveedor (nunca en la app)
+3. El proveedor devuelve un CÓDIGO de un solo uso, por el navegador
+4. La app cambia ese código por tokens, enviando el verifier original
+5. El proveedor comprueba hash(verifier) == challenge  →  entrega tokens
+</code></pre>
+
+<div class="info">
+  <strong>Qué aporta PKCE:</strong> si alguien intercepta el código del paso 3 —una app maliciosa con el mismo esquema de URL, un log, un <code>Referer</code>— no puede canjearlo: le falta el <em>verifier</em>, que nunca salió del dispositivo.
+</div>
+
+<div class="warn">
+  <strong>El flujo implícito quedó obsoleto.</strong> Devolvía el token de acceso en el fragmento de la URL: quedaba en el historial, en logs de proxies y expuesto a cualquier script de la página. Existía porque los navegadores viejos no permitían el paso 4 entre orígenes; con CORS y PKCE ya no.
+</div>
+
+<h2>SSO y federación</h2>
+
+<p><strong>SSO</strong> es autenticarte una vez y acceder a muchas aplicaciones. <strong>Federación</strong> es que esas aplicaciones confíen en un proveedor de identidad externo (SAML en lo corporativo, OIDC en la web moderna). El balance:</p>
+
+<ul>
+  <li><strong>A favor:</strong> un solo lugar donde exigir MFA, uno donde dar de baja a quien se va, auditoría centralizada.</li>
+  <li><strong>En contra:</strong> concentrás el riesgo. Comprometer el proveedor es comprometerlo todo, y si se cae nadie entra a ningún lado.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Con SSO, el proveedor de identidad pasa a ser tu activo más crítico.</strong> Exigí el MFA más fuerte que tengas para las cuentas administrativas y guardá una cuenta local de rescate: si el IdP se cae, alguien tiene que poder entrar.
+</div>
+
+<h2>Ataques contra el login</h2>
+
+<table>
+<thead><tr><th>Ataque</th><th>Cómo funciona</th><th>Qué lo delata</th></tr></thead>
+<tbody>
+<tr><td><strong>Credential stuffing</strong></td><td>Prueba pares usuario/clave de filtraciones ajenas.</td><td>Muchos usuarios, un intento cada uno</td></tr>
+<tr><td><strong>Password spraying</strong></td><td>Una contraseña común contra miles de cuentas, lento.</td><td>Pocos fallos por cuenta, repartidos en el tiempo</td></tr>
+<tr><td><strong>Fuerza bruta</strong></td><td>Muchas claves contra una sola cuenta.</td><td>Ráfaga de fallos sobre el mismo usuario</td></tr>
+<tr><td><strong>Enumeración</strong></td><td>Averiguar qué cuentas existen antes de atacarlas.</td><td>Muchos intentos con usuarios inventados</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La enumeración se filtra por tres canales, no solo por el mensaje.</strong> (1) El <strong>texto</strong>: "usuario inexistente" vs "contraseña incorrecta". (2) El <strong>tiempo</strong>: si no existe respondés en 5 ms, y si existe tardás 300 ms hasheando. (3) Otros <strong>flujos</strong>: el registro que dice "ese email ya está en uso".
+</div>
+
+<div class="danger">
+  <strong>⚠️ Recuperar contraseña es el eslabón más débil.</strong> De nada sirve MFA y Argon2id si cualquiera resetea la clave contestando "¿cuál fue tu primera mascota?", o si el token de reseteo no expira, es predecible o se usa dos veces. Un flujo sano usa tokens aleatorios de un solo uso y vida corta, invalida las sesiones y avisa por mail.
+</div>
+
+<h3>Defensas del login</h3>
+
+<ul>
+  <li><strong>Rate limiting en varias dimensiones:</strong> por IP, por cuenta y global. Solo por IP no frena el stuffing repartido en miles de IPs.</li>
+  <li><strong>Bloqueo progresivo</strong> (backoff exponencial) en vez de bloqueo duro: molesta al atacante sin dejar afuera al usuario legítimo.</li>
+  <li><strong>CAPTCHA como último recurso</strong>, solo ante señal sospechosa: es una carga de accesibilidad y se resuelve por centavos.</li>
+  <li><strong>Mensajes genéricos</strong> y comportamiento uniforme en tiempo y código de respuesta.</li>
+  <li><strong>Detectar el patrón, no el intento:</strong> picos de fallos, o muchas cuentas fallando una sola vez.</li>
+</ul>
+
+<h2>🔧 En tu código: un login que aguanta</h2>
+
+<div class="rule">
+  <strong>1. Argon2id para contraseñas, comparación en tiempo constante para tokens.</strong> Del M01: nunca en claro ni con SHA-256 pelado. Y el <code>==</code> corta en el primer byte distinto: filtra por temporización.
+</div>
+
+<pre><code class="lang-python">import secrets
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher()                     # Argon2id por defecto (M01)
+
+def registrar(usuario, clave):
+    if len(clave) &lt; 12 or esta_en_lista_de_filtradas(clave):
+        raise ValueError("clave corta o ya filtrada")
+    usuario.hash_clave = ph.hash(clave)   # el salt va dentro del hash
+
+def token_valido(recibido, esperado):     # ✅ tiempo constante
+    return secrets.compare_digest(recibido, esperado)
+</code></pre>
+
+<div class="rule">
+  <strong>2. Mensajes genéricos y tiempo uniforme.</strong> Misma respuesta y misma latencia exista o no el usuario: si no existe, hasheá igual contra un hash falso para gastar el mismo tiempo.
+</div>
+
+<pre><code class="lang-python">HASH_FALSO = ph.hash("no-existe-este-usuario")
+
+def login(email, clave):
+    u = buscar_usuario(email)
+    try:
+        ph.verify(u.hash_clave if u else HASH_FALSO, clave)   # mismo costo
+        if not u:
+            raise VerifyMismatchError
+    except VerifyMismatchError:
+        registrar_intento_fallido(email)
+        return error(401, "Usuario o contraseña incorrectos")  # ✅ genérico
+    return crear_sesion(u)
+</code></pre>
+
+<div class="rule">
+  <strong>3. Cookies con las tres banderas.</strong> <code>HttpOnly</code> impide que JavaScript las lea (mitiga el robo de sesión por XSS), <code>Secure</code> las limita a HTTPS y <code>SameSite</code> corta el envío entre sitios (mitiga CSRF).
+</div>
+
+<pre><code class="lang-js">res.cookie('sid', tokenAleatorio(32), {   // aleatorio criptográfico
+  httpOnly: true,        // invisible para document.cookie
+  secure:   true,        // solo por HTTPS
+  sameSite: 'lax',       // no viaja cross-site
+  maxAge:   1000 * 60 * 60 * 8,
+});
+</code></pre>
+
+<div class="rule">
+  <strong>4. Invalidá TODO al cambiar la contraseña.</strong> Si alguien te robó la sesión, cambiar la clave sin cerrar las existentes no lo echa. Rotá el identificador también <em>al iniciar sesión</em>, para evitar fijación de sesión.
+</div>
+
+<pre><code class="lang-python">def cambiar_clave(usuario, nueva):
+    usuario.hash_clave = ph.hash(nueva)
+    usuario.version_credenciales += 1        # invalida JWTs viejos
+    borrar_todas_las_sesiones(usuario.id)    # ✅ echa a cualquier intruso
+    crear_sesion(usuario)                    # menos al que hizo el cambio
+    notificar_por_mail(usuario, "Tu contraseña fue cambiada")
+</code></pre>
+
+<div class="rule">
+  <strong>5. Expiración corta + refresh.</strong> Token de acceso de 5–15 minutos, <em>refresh token</em> en cookie <code>HttpOnly</code> y <strong>rotado en cada uso</strong>. Si uno ya usado reaparece, es señal de robo: revocá toda la familia de tokens.
+</div>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Decir "usuario inexistente" en vez de un mensaje genérico.</strong><br>
+  ❌ <code>if (!user) return "No existe esa cuenta"; else return "Contraseña incorrecta";</code><br>
+  ✅ Un único <code>"Usuario o contraseña incorrectos"</code>, mismo código HTTP y mismo tiempo. Distinguirlos le regala una lista de cuentas válidas.
+</div>
+
+<div class="mistake">
+  <strong>2. Guardar el JWT en <code>localStorage</code> sin pensar en XSS.</strong><br>
+  ❌ <code>localStorage.setItem('token', jwt)</code> — cualquier script inyectado, propio o de una dependencia comprometida, lo lee con una línea.<br>
+  ✅ Cookie <code>HttpOnly; Secure; SameSite</code> más protección CSRF, nunca almacenamiento persistente.
+</div>
+
+<div class="mistake">
+  <strong>3. No invalidar sesiones al cambiar la contraseña.</strong><br>
+  ❌ Actualizar el hash y devolver <code>200 OK</code>: el intruso que ya tenía sesión sigue adentro.<br>
+  ✅ Borrar todas las sesiones, subir la versión de credenciales para invalidar los JWT previos y notificar por mail.
+</div>
+
+<div class="mistake">
+  <strong>4. Confiar en la validación de login del lado del cliente.</strong><br>
+  ❌ Un <code>if (usuario.rol === 'admin') mostrarPanel()</code>, o una API que acepta <code>{"user_id": 42}</code> del body como identidad.<br>
+  ✅ El cliente decide qué <em>mostrar</em>; el servidor decide qué <em>permitir</em>, tomando la identidad de la sesión o del token verificado.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué obligar a cambiar la contraseña cada 90 días reduce la seguridad en la práctica?</summary>
+<p>Porque la gente no genera una contraseña nueva y fuerte cada tres meses: aplica una transformación predecible sobre la anterior (<code>Verano2025!</code> → <code>Otono2025!</code>), o la anota. Quien tiene la clave vieja adivina la nueva en pocos intentos. Y tampoco responde al riesgo real: si te la robaron el día 1, tenés 89 días de exposición igual.</p></details>
+
+<details><summary>Si un JWT está firmado, ¿por qué no alcanza con verificar la firma para confiar en él?</summary>
+<p>Porque la firma solo prueba que el token no fue modificado y que lo emitió quien tiene la clave. No dice si sigue vigente (<code>exp</code>), si lo emitió <em>tu</em> proveedor (<code>iss</code>) ni si era para <em>tu</em> API (<code>aud</code>). Ni siquiera dice si el usuario fue dado de baja.</p></details>
+
+<details><summary>¿Por qué una passkey resiste el phishing y un código TOTP no, si los dos son "algo que tenés"?</summary>
+<p>Porque cambia qué se transmite. El TOTP es un <strong>secreto transferible</strong>: seis dígitos que el usuario puede escribir en cualquier lado, incluida una página falsa que los reenvía al sitio real. La passkey no transmite secreto alguno: firma con una clave privada que nunca sale del dispositivo, y esa firma está <strong>atada al origen</strong>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Auditá un login por los tres canales de enumeración: mensaje, código HTTP y <strong>tiempo</strong>. Medí la latencia con un usuario que existe y con uno que no.</li>
+  <li>Escribí la política de contraseñas de tu app según NIST 800-63B: longitud mínima y máxima, y qué se rechaza.</li>
+  <li>Diseñá el flujo de "olvidé mi contraseña": token, vida, usos y qué pasa con las sesiones activas.</li>
+  <li>Decodificá un JWT de ejemplo y listá qué habrías filtrado si se robaba.</li>
+  <li>Compará las cookies de sesión de tres sitios: ¿cuántos tienen <code>HttpOnly</code>, <code>Secure</code> y <code>SameSite</code> a la vez?</li>
+  <li>Activá una passkey en una cuenta personal y registrá un respaldo. Escribí qué pasa si perdés el dispositivo principal.</li>
+</ol>
+
+<section class="quiz" id="quizCS02">
+  <style>
+    #quizCS02{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS02 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS02 .q{margin-bottom:1.5rem}
+    #quizCS02 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS02 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS02 .opt:hover{border-color:var(--accent)}
+    #quizCS02 .opt:disabled{cursor:default}
+    #quizCS02 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS02 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS02 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS02 .exp.show{display:block}
+    #quizCS02 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu formulario exige "una mayúscula, un número y un símbolo" y rota la clave cada 90 días. Según NIST 800-63B, ¿qué conviene hacer?</p>
+    <button class="opt">Mantener todo y además exigir dos símbolos</button>
+    <button class="opt">Sacar la complejidad pero conservar la rotación</button>
+    <button class="opt">Sacar ambas: exigir longitud y chequear listas de filtradas</button>
+    <div class="exp">La complejidad obligatoria produce <code>Password1!</code> y la rotación por calendario produce <code>Verano2025</code> → <code>Verano2026</code>: las dos empujan a patrones predecibles. Lo que funciona es exigir <strong>longitud</strong>, permitir pegar y rechazar contraseñas ya filtradas.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un atacante clona la página de tu banco y reenvía al sitio real lo que el usuario escribe. ¿Qué segundo factor lo frena por diseño?</p>
+    <button class="opt">Una passkey/WebAuthn, porque la firma está atada al origen</button>
+    <button class="opt">Un código TOTP, porque cambia cada 30 segundos</button>
+    <button class="opt">Un código por SMS, porque llega a otro dispositivo</button>
+    <div class="exp">TOTP y SMS son <strong>secretos transferibles</strong>: el usuario los escribe en la página falsa y el atacante los reenvía antes de que expiren — durar 30 segundos no molesta a un proxy en vivo. La passkey no transmite secreto y ata la firma al <strong>origen</strong>.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tu API usa JWT sin estado, con expiración de 7 días, y a un usuario le roban el token. ¿Cuál es el problema de fondo?</p>
+    <button class="opt">Ninguno: la firma impide que el atacante lo use</button>
+    <button class="opt">La revocación: vale hasta que expire, salvo que agregues estado en el servidor</button>
+    <button class="opt">Que el payload está cifrado y no podés inspeccionarlo</button>
+    <div class="exp">La firma prueba que el token es auténtico — por eso mismo el atacante lo puede usar tal cual. Como el servidor no guarda estado, no hay fila que borrar: hasta el día 7 ese token vale. Las salidas (revocación, refresh rotado) reintroducen estado, que era lo que el JWT prometía evitar.</div>
+  </div>
+
+  <div class="score" id="scoreCS02"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS02');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS02').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M03.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m01-criptografia/lecture.html">← M01: Criptografía aplicada</a>
+  <a href="../m03-autorizacion/lecture.html">M03: Autorización y control de acceso →</a>
+</nav>
+
+</div>
+</body>
+</html>

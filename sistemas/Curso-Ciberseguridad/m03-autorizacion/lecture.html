@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Módulo 03 — Autorización y control de acceso · Curso de Ciberseguridad</title>
+  <meta name="description" content="Autenticación vs autorización, modelos ACL/RBAC/ABAC/ReBAC, mínimo privilegio, denegar por defecto, escalada horizontal y vertical, IDOR/BOLA, confused deputy, path traversal y autorización centralizada en APIs.">
+  <link rel="stylesheet" href="../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Curso de Ciberseguridad</a>
+  <a href="../../../index.html">🏠 Campus CS-FE</a>
+  <a href="../../Curso-Linux/index.html">🐧 Curso de Linux</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">Módulo 03</span>
+  <span class="badge">⏱ ~45 min</span>
+  <span class="badge">🎯 Pre-req: M02</span>
+  <span class="badge">🚪 Control de acceso</span>
+</div>
+
+<article>
+
+<h1>Módulo 03 — Autorización y control de acceso</h1>
+
+<p>En el M02 resolviste <em>quién sos</em>. Este módulo es sobre <em>qué podés hacer</em>, y ahí es donde se rompen las aplicaciones reales: un <code>id</code> en la URL que nadie verificó, un endpoint que nació sin control, un admin que se dio "por hoy" hace dos años. El control de acceso roto lidera el OWASP Top 10 desde 2021.</p>
+
+<h2>Autenticación ≠ autorización</h2>
+
+<div class="concept">
+  <strong>💡 Dos preguntas distintas, en ese orden.</strong> <strong>Autenticación</strong> (AuthN) responde "¿quién sos?" y se resuelve una vez, al entrar. <strong>Autorización</strong> (AuthZ) responde "¿podés hacer <em>esta</em> acción sobre <em>este</em> objeto?" y va <strong>en cada request</strong>. Estar logueado no es un permiso: es el prerrequisito para evaluarlos.
+</div>
+
+<div class="analogy">
+  <strong>🏨 La analogía del hotel.</strong> El mostrador te identifica con el DNI: autenticación, una sola vez. La tarjeta abre <em>tu</em> habitación y el gimnasio, pero no el depósito: autorización, y se evalúa en cada puerta. Un hotel que pide el DNI en la entrada y deja todas las puertas sin cerradura autentica perfecto y autoriza cero.
+</div>
+
+<p>Por qué la autorización se rompe mucho más que la autenticación:</p>
+
+<ul>
+  <li><strong>No hay librería que la resuelva.</strong> El login lo hace un framework probado; "esta factura es del usuario X" es lógica de tu dominio, y la escribís vos endpoint por endpoint.</li>
+  <li><strong>No falla ruidosamente.</strong> Un login roto lo reporta el primer usuario; una autorización rota funciona perfecto: solo permite de más, en silencio.</li>
+  <li><strong>Los tests miran el camino feliz:</strong> se prueba que el dueño vea su recurso, casi nunca que <em>otro</em> no lo vea.</li>
+</ul>
+
+<h2>Modelos de control de acceso</h2>
+
+<p>Cuatro formas de responder "¿puede S hacer A sobre O?". No son excluyentes: los sistemas reales combinan dos.</p>
+
+<table>
+<thead><tr><th>Modelo</th><th>Cómo decide</th><th>Cuándo usarlo</th><th>Su límite</th></tr></thead>
+<tbody>
+<tr><td><strong>ACL</strong><br>listas</td><td>Una lista por objeto: "este archivo lo leen Ana y Beto"</td><td>Pocos objetos y permisos puntuales. Los archivos de Unix</td><td>No escala: miles de objetos × miles de usuarios</td></tr>
+<tr><td><strong>RBAC</strong><br>roles</td><td>El usuario tiene roles; el rol tiene permisos: "los <code>editores</code> publican"</td><td>El más común: puestos claros y estables</td><td>Explosión de roles: aparece <code>editor_sur_sin_borrado</code></td></tr>
+<tr><td><strong>ABAC</strong><br>atributos</td><td>Reglas sobre sujeto, objeto y contexto: "el médico ve la historia si está de guardia en ese servicio"</td><td>Cuando decide el contexto: horario, país, monto</td><td>Hay que simular para saber quién accede a qué</td></tr>
+<tr><td><strong>ReBAC</strong><br>relaciones</td><td>Un grafo: "sos <em>editor</em> de la carpeta y el documento está <em>dentro</em>"</td><td>Compartición entre usuarios, jerarquías, herencia. Drive</td><td>Necesita servicio dedicado y consultas de grafo rápidas</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  El artículo <em>Zanzibar</em> de Google (2019) describe el ReBAC que autoriza Drive, YouTube y Calendar: todo son tuplas <code>objeto#relación@sujeto</code> y "¿puede X leer Y?" se resuelve recorriendo el grafo. De ahí salieron OpenFGA y SpiceDB.
+</div>
+
+<div class="tip">
+  <strong>Empezá con RBAC y agregá lo mínimo.</strong> Una regla que no entra en un rol —"solo en horario laboral", "solo montos menores a X"— va como atributo (RBAC + ABAC), no como rol nuevo. Y "un usuario comparte el objeto con otro" pide relaciones.
+</div>
+
+<h2>Los tres principios que sostienen todo</h2>
+
+<div class="step"><strong>1. Mínimo privilegio.</strong> Cada sujeto —persona, servicio, token, contenedor— recibe los permisos que necesita y ni uno más. El usuario de base de datos que arma reportes no necesita <code>UPDATE</code>; el cron de facturación no borra usuarios.</div>
+
+<div class="step"><strong>2. Denegar por defecto.</strong> Lo que no está explícitamente permitido está prohibido: un endpoint nuevo nace cerrado y se abre a propósito. Lista blanca de rutas públicas, no lista negra de rutas protegidas.</div>
+
+<div class="step"><strong>3. Separación de deberes.</strong> Nadie completa solo un proceso sensible: quien crea un pago no lo aprueba, quien escribe el código no aprueba su deploy. No es desconfianza: es que una cuenta comprometida no alcance para el daño completo.</div>
+
+<div class="warn">
+  <strong>Privilege creep: el permiso que nadie saca.</strong> Ana entra a soporte y recibe el panel de tickets. Pasa a ventas y le suman el CRM, pero nadie le quita soporte. Cubre dos semanas en facturación y le dan admin "temporal". A los tres años puede hacer todo, sin que nadie lo decidiera. El antídoto es aburrido: <strong>permisos con vencimiento</strong> y <strong>recertificación periódica</strong>.
+</div>
+
+<h2>Escalada de privilegios: horizontal y vertical</h2>
+
+<p>Cuando la autorización falla, el atacante gana permisos que no le tocaban. Hay dos direcciones, y conviene separarlas porque se testean distinto:</p>
+
+<pre><code class="lang-text">                 ▲  VERTICAL — usuario común ──► admin
+   HORIZONTAL    │     "cambio mi rol", "entro al panel /admin"
+   ◄─────────────┼─────────────►   mismo nivel, otra identidad
+   la factura    │   el perfil     "leo los datos de otro usuario"
+   del user B    │   del user C
+</code></pre>
+
+<ul>
+  <li><strong>Horizontal:</strong> seguís siendo un usuario común pero accedés a datos de <em>otro</em> usuario común. La más frecuente y la más subestimada: en los logs no aparece ningún "admin", solo un usuario legítimo pidiendo recursos. Filtrar la base de clientes entera se hace iterando IDs.</li>
+  <li><strong>Vertical:</strong> pasás a un nivel superior. Suele venir de un endpoint administrativo sin control o de un campo <code>rol</code> que el cliente manda en un <code>PUT /perfil</code>.</li>
+</ul>
+
+<h2>IDOR / BOLA: el bug número uno</h2>
+
+<div class="danger">
+  <strong>⚠️ Broken Object Level Authorization es el puesto #1 del OWASP API Security Top 10</strong>, y su primo <em>IDOR</em> el clásico de las apps web. La receta es siempre la misma: el servidor recibe un identificador desde el cliente, lo usa para buscar el dato y <strong>nunca comprueba si el usuario autenticado tiene derecho sobre ese objeto</strong>. Cambiar <code>/facturas/1042</code> por <code>/facturas/1043</code> devuelve la factura de otro: es apretar una tecla.
+</div>
+
+<p>Es tan común porque el chequeo que falta no se ve: el código "funciona" y devuelve una factura bien formada. El QA prueba con su usuario y ve la suya; el bug solo existe desde la perspectiva de un segundo usuario.</p>
+
+<div class="mistake">
+  <strong>El malentendido más caro: "lo arreglo usando UUIDs".</strong> Un UUID evita que el ID sea adivinable, pero <strong>no es la solución</strong>: el problema nunca fue que fuera predecible sino que <em>no se verifica el dueño</em>. Los identificadores se filtran solos —URLs compartidas, logs, referers, exports— y ahí el acceso vuelve a abrirse. El UUID es defensa en profundidad; la propiedad es el control.
+</div>
+
+<h2>Nivel de función vs nivel de objeto</h2>
+
+<p>Son dos chequeos distintos y necesitás los dos: confundirlos deja media aplicación abierta.</p>
+
+<table>
+<thead><tr><th>Chequeo</th><th>Pregunta</th><th>Si falta…</th><th>Ejemplo de falla</th></tr></thead>
+<tbody>
+<tr><td><strong>Nivel de función</strong></td><td>¿Este rol puede ejecutar esta operación?</td><td>Escalada <strong>vertical</strong></td><td>Un usuario común llama <code>DELETE /api/usuarios/9</code> y funciona</td></tr>
+<tr><td><strong>Nivel de objeto</strong></td><td>¿Este usuario puede tocar <em>este</em> registro?</td><td>Escalada <strong>horizontal</strong> (IDOR/BOLA)</td><td>Un usuario legítimo lee <code>GET /api/facturas/1043</code>, que es de otro</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Esconder el botón no es autorización.</strong> Si la UI oculta "Eliminar" para los no-admin pero el endpoint <code>DELETE</code> no verifica nada, la protección dura hasta que alguien abra las devtools. El front decide <strong>qué mostrar</strong>; el back, <strong>qué permitir</strong>.
+</div>
+
+<h2>Confused deputy: cuando el permiso lo pone otro</h2>
+
+<p>El <em>diputado confundido</em> es un servicio con permisos altos que ejecuta acciones a pedido de terceros con permisos bajos: actúa de buena fe, pero usa <strong>su</strong> autoridad para hacer lo que le pidió alguien que no la tenía.</p>
+
+<pre><code class="lang-text">Usuario común  ──pide──►  Servicio de reportes  ──lee con su credencial──►  RRHH
+(sin acceso a RRHH)       (acceso total a la base)
+
+El servicio pregunta "¿el dato existe?" en vez de "¿este usuario puede verlo?"
+</code></pre>
+
+<p>Aparece en integraciones todo el tiempo: el microservicio que consulta con una credencial de servicio "porque es interno", el proxy que reenvía requests sin propagar quién los originó. La regla que lo evita es una sola: <strong>el servicio decide en nombre del solicitante, no en el suyo</strong>.</p>
+
+<h3>Path traversal: el mismo bug, sobre archivos</h3>
+
+<p>Cuando el objeto es un archivo, la referencia insegura toma la forma de una ruta: si el nombre lo elige el usuario y se concatena a un directorio base, <code>../</code> permite salir de ahí y leer lo que el <em>proceso</em> puede leer.</p>
+
+<pre><code class="lang-python"># ❌ La ruta la arma el usuario
+ruta = "/var/app/uploads/" + request.args["archivo"]
+# archivo = "../../../etc/passwd"  →  se escapa del directorio base
+
+# ✅ Resolvé la ruta real y comprobá que sigue adentro
+import os
+BASE = os.path.realpath("/var/app/uploads")
+ruta = os.path.realpath(os.path.join(BASE, request.args["archivo"]))
+if not ruta.startswith(BASE + os.sep):
+    abort(403)
+
+# ✅✅ Mejor: que mande un ID; el nombre real lo buscás en la base,
+#     y ahí mismo verificás el dueño.
+</code></pre>
+
+<h2>¿Dónde vive la decisión?</h2>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Cómo es</th><th>Ventaja</th><th>Riesgo</th></tr></thead>
+<tbody>
+<tr><td><strong>En cada endpoint</strong></td><td>Un <code>if</code> al principio de cada handler</td><td>Explícito, sin infraestructura</td><td><strong>Frágil</strong>: el endpoint nuevo se olvida y nadie lo nota</td></tr>
+<tr><td><strong>En middleware</strong></td><td>Una capa que intercepta antes del handler</td><td>Denegar por defecto real: lo nuevo nace cerrado</td><td>Cubre el nivel de <em>función</em>; el de <em>objeto</em> sigue en el handler</td></tr>
+<tr><td><strong>Política centralizada</strong></td><td>Las reglas viven aparte (OPA/Rego, Cedar, Casbin) y el código pregunta</td><td>Auditable y versionable sin tocar la app; una sola verdad para todos los servicios</td><td>Un componente más que operar; latencia si se consulta por red</td></tr>
+</tbody>
+</table>
+
+<p>Centralizar convierte el control de acceso en algo que se puede <strong>leer y revisar</strong>: con reglas dispersas en 200 handlers, "¿quién puede aprobar pagos?" se responde con un grep y un rezo; con política declarativa, leyendo un archivo que además se testea solo.</p>
+
+<h3>APIs y microservicios: propagá identidad, no permisos</h3>
+
+<div class="rule">
+  <strong>📌 Entre servicios viaja <em>quién pide</em>, no <em>qué puede</em>.</strong> Si A le manda a B un header <code>X-Es-Admin: true</code>, la decisión ya la tomó A y B obedece: cualquiera que pueda hablarle a B es admin. Propagá la identidad en un token firmado y de vida corta, y que <strong>cada servicio evalúe los permisos por su cuenta</strong>. La red interna no es un perímetro.
+</div>
+
+<h2>🔧 En tu código: la autorización que no se rompe</h2>
+
+<div class="rule">
+  <strong>1. En el servidor y en cada request.</strong> Sin excepciones para "esta pantalla ya la validamos" ni para peticiones internas.
+</div>
+
+<div class="rule">
+  <strong>2. Nunca uses un identificador del cliente sin comprobar el dueño</strong>, y comprobalo <em>dentro</em> de la consulta, no en un <code>if</code> posterior que se pierde en el próximo refactor.
+</div>
+
+<pre><code class="lang-python"># ❌ IDOR: el ID viene del cliente y no se verifica de quién es
+@app.get("/facturas/&lt;int:factura_id&gt;")
+def ver_factura(factura_id):
+    f = db.query_one("SELECT * FROM facturas WHERE id = ?", factura_id)
+    return render(f)
+
+# ✅ El dueño es parte de la consulta, y sale de la sesión
+@app.get("/facturas/&lt;int:factura_id&gt;")
+def ver_factura(factura_id):
+    f = db.query_one(
+        "SELECT * FROM facturas WHERE id = ? AND owner_id = ?",
+        factura_id, sesion.usuario_id)      # ← de la sesión, jamás del request
+    if f is None:
+        abort(404)          # 404 y no 403: no confirmes que el objeto existe
+    return render(f)
+</code></pre>
+
+<div class="rule">
+  <strong>3. <em>Deny by default</em> en el router.</strong> Lista blanca de rutas públicas, no lista negra de rutas protegidas: así el endpoint que agregás mañana nace cerrado.
+</div>
+
+<pre><code class="lang-python"># ❌ Lista negra: cada ruta nueva nace pública
+RUTAS_PROTEGIDAS = {"/admin", "/facturas"}
+def middleware(req):
+    if req.path in RUTAS_PROTEGIDAS:
+        exigir_sesion(req)
+
+# ✅ Lista blanca: todo cerrado salvo lo explícitamente abierto
+RUTAS_PUBLICAS = {"/", "/login", "/health"}
+def middleware(req):
+    if req.path not in RUTAS_PUBLICAS:
+        usuario = exigir_sesion(req)
+        exigir_permiso(usuario, req)   # ¿puede ejecutar ESTA operación?
+</code></pre>
+
+<div class="rule">
+  <strong>4. El caso "A pide el recurso de B" es un test, no una revisión manual.</strong> Uno por tipo de recurso, corriendo en CI: la única forma de que el chequeo no desaparezca en un refactor futuro.
+</div>
+
+<pre><code class="lang-python">def test_usuario_a_no_accede_a_la_factura_de_b(client):
+    factura_b = crear_factura(owner=usuario_b)
+    client.login(usuario_a)
+
+    r = client.get(f"/facturas/{factura_b.id}")
+    assert r.status_code in (403, 404)
+    assert b"total" not in r.data        # ni siquiera una fuga parcial
+
+def test_usuario_comun_no_borra_usuarios(client):
+    client.login(usuario_a)              # rol: "cliente"
+    assert client.delete("/api/usuarios/9").status_code == 403
+</code></pre>
+
+<div class="rule">
+  <strong>5. No uses el rol del token sin validarlo.</strong> Verificá firma, emisor, audiencia y expiración; en operaciones sensibles consultá el estado vivo: un token de hace 50 minutos puede decir <code>admin</code> de alguien a quien despidieron hace 20.
+</div>
+
+<pre><code class="lang-python"># ❌ El cliente elige su propio rol
+if request.headers.get("X-User-Role") == "admin":
+    borrar_todo()
+
+# ✅ Identidad verificada + permisos consultados al sistema, no al token
+claims = jwt.decode(token, CLAVE_PUBLICA, algorithms=["RS256"],
+                    audience="api-facturas", issuer="https://idp.interno")
+if not politica.permite(claims["sub"], "facturas:borrar", factura_id):
+    abort(403)
+</code></pre>
+
+<h2>Errores típicos</h2>
+
+<div class="mistake">
+  <strong>1. Confiar en que el ID es difícil de adivinar.</strong><br>
+  ❌ "Usamos UUIDs, nadie va a acertar un identificador."<br>
+  ✅ El ID puede ser público: lo que protege el recurso es verificar el dueño en cada acceso.
+</div>
+
+<div class="mistake">
+  <strong>2. Comprobar permisos solo al armar el menú.</strong><br>
+  ❌ El front oculta "Eliminar" si el rol no es admin, y el endpoint <code>DELETE</code> confía en eso.<br>
+  ✅ La UI decide qué mostrar; el servidor decide qué permitir. Solo uno es un control de seguridad.
+</div>
+
+<div class="mistake">
+  <strong>3. Usar el <code>user_id</code> que viene en el cuerpo del request.</strong><br>
+  ❌ <code>transferir(desde=body["user_id"], monto=body["monto"])</code> — el cliente elige de qué cuenta sale la plata.<br>
+  ✅ La identidad sale <strong>siempre</strong> de la sesión o del token verificado.
+</div>
+
+<div class="mistake">
+  <strong>4. Dar permisos de admin "temporalmente".</strong><br>
+  ❌ "Dale admin a Ana para que resuelva esto hoy" — y ahí queda, sin registro ni fecha.<br>
+  ✅ Accesos elevados con <strong>vencimiento automático</strong> y motivo registrado. Sin soporte de expiración, el alta se abre con la baja ya agendada.
+</div>
+
+<h3>Checkpoint</h3>
+
+<details><summary>¿Por qué conviene devolver 404 en vez de 403 cuando alguien pide un objeto que no le pertenece?</summary>
+<p>Porque un 403 confirma que el objeto <strong>existe</strong>, y esa confirmación ya es información: iterando IDs con respuestas distinguibles, un atacante mapea cuántos registros hay y en qué rango están los identificadores válidos, sin leer un dato. Un 404 uniforme hace que "no existe" y "no es tuyo" se vean idénticos desde afuera. La excepción es cuando el usuario <em>debería</em> saber que el recurso existe y solo le falta un permiso.</p></details>
+
+<details><summary>Tenés RBAC funcionando y aparece el requisito "cada usuario comparte sus documentos con quien quiera". ¿Por qué RBAC solo no alcanza?</summary>
+<p>Porque RBAC asigna permisos a <em>categorías de usuarios</em> que define la organización, y acá el permiso lo define un usuario final sobre un objeto puntual, en tiempo real. Con roles habría que crear uno por documento compartido —<code>editor_doc_8842</code>—, la explosión de roles que vuelve inauditable un sistema. Es una <strong>relación</strong> entre sujeto y objeto: pide ReBAC, con herencia por carpeta. RBAC sigue sirviendo para lo organizacional.</p></details>
+
+<details><summary>Un microservicio interno acepta un header <code>X-User-Role</code> que le manda el API gateway. ¿Qué está mal y cómo se arregla?</summary>
+<p>Está delegando la autorización en quien lo llama, lo cual solo es seguro si <em>nadie más</em> puede hablarle — suposición que se cae con una VPN mal configurada, un SSRF o un contenedor comprometido: es el <em>confused deputy</em>. El arreglo tiene dos partes: propagar la <strong>identidad</strong> del usuario original en un token firmado y de vida corta (no un permiso ya resuelto), y que el servicio <strong>verifique la firma y evalúe los permisos por sí mismo</strong>.</p></details>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un endpoint tuyo que reciba un ID en la URL y rastreá el camino hasta la base: ¿dónde se verifica el dueño? Si es "en ningún lado", arreglalo con <code>WHERE id = ? AND owner_id = ?</code>.</li>
+  <li>Escribí el test "el usuario A no puede acceder al recurso de B". Verificá que <strong>falla</strong> antes del arreglo y pasa después.</li>
+  <li>Listá las rutas de tu aplicación y marcá cuáles exigen sesión y cuáles verifican permisos de función. ¿El router deniega por defecto?</li>
+  <li>Diseñá el modelo de autorización de una app de proyectos con dueño, miembros, invitados de solo lectura y comentarios privados. Elegí entre RBAC, ABAC y ReBAC, y justificá.</li>
+  <li>Revisá los permisos de tu cuenta en algún sistema que uses: ¿cuántos usaste el último mes? Los que sobran son tu <em>privilege creep</em>.</li>
+  <li>Buscá un servicio tuyo que actúe con su propia credencial a pedido de un usuario, y escribí cómo lo convertirías para que decida en nombre del solicitante.</li>
+</ol>
+
+<section class="quiz" id="quizCS03">
+  <style>
+    #quizCS03{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS03 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS03 .q{margin-bottom:1.5rem}
+    #quizCS03 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS03 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS03 .opt:hover{border-color:var(--accent)}
+    #quizCS03 .opt:disabled{cursor:default}
+    #quizCS03 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS03 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS03 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS03 .exp.show{display:block}
+    #quizCS03 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Cambiando <code>/pedidos/501</code> por <code>/pedidos/502</code> se ve el pedido de otro cliente. ¿Cuál es el arreglo correcto?</p>
+    <button class="opt">Migrar los IDs a UUIDs aleatorios para que no se puedan adivinar</button>
+    <button class="opt">Ocultar el ID de la URL y mandarlo en el cuerpo del request</button>
+    <button class="opt">Incluir al dueño en la consulta: buscar el pedido por ID <em>y</em> por el usuario de la sesión</button>
+    <div class="exp">Es un <strong>IDOR/BOLA</strong>: el problema no es que el ID sea predecible sino que no se verifica la propiedad. UUIDs y mover el ID al body son ofuscación — en cuanto el identificador se filtra, el acceso vuelve a estar abierto. El control real es <code>WHERE id = ? AND owner_id = ?</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un microservicio interno recibe del gateway el header <code>X-Es-Admin: true</code> y actúa en consecuencia. ¿Qué antipatrón es?</p>
+    <button class="opt"><em>Confused deputy</em>: usa su propia autoridad porque otro ya resolvió el permiso por él</button>
+    <button class="opt">Privilege creep: acumuló permisos que nadie revocó</button>
+    <button class="opt">Separación de deberes: falta que un segundo servicio apruebe la operación</button>
+    <div class="exp">El servicio delega la decisión en quien lo llama y ejecuta con sus permisos altos: alcanza con que algo de la red interna pueda hablarle —un SSRF, un contenedor comprometido— para ser admin. Lo correcto es propagar la <strong>identidad</strong> en un token firmado y que cada servicio evalúe los permisos por su cuenta.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. El front oculta "Eliminar usuario" para los no-admin, y el endpoint <code>DELETE /api/usuarios/{id}</code> no verifica el rol. ¿Qué falta y qué escalada habilita?</p>
+    <button class="opt">Nada grave: sin el botón visible, un usuario común no llega al endpoint</button>
+    <button class="opt">Falta autorización a nivel de <strong>función</strong> en el servidor; habilita escalada <strong>vertical</strong></button>
+    <button class="opt">Falta autorización a nivel de <strong>objeto</strong>; habilita escalada <strong>horizontal</strong></button>
+    <div class="exp">Esconder un control en la UI no es seguridad: el endpoint se llama igual con <code>curl</code>. Lo que falta es "¿este rol puede ejecutar esta operación?" —nivel de <strong>función</strong>—, y permite que un usuario común ejecute una acción de administrador: escalada <strong>vertical</strong>. La de nivel de objeto sería tocar el registro de otro usuario del mismo nivel.</div>
+  </div>
+
+  <div class="score" id="scoreCS03"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS03');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS03').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el M04.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../m02-autenticacion/lecture.html">← M02: Autenticación e identidad</a>
+  <a href="../m04-owasp-web/lecture.html">M04: OWASP Top 10 y seguridad web →</a>
+</nav>
+
+</div>
+</body>
+</html>
