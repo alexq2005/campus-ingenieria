@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS8 — Observabilidad de ML: drift, monitoreo y el ciclo de vida · Datos/ML Senior</title>
+  <meta name="description" content="Por qué un modelo es el único software que se degrada solo: los tres drifts (data, concept, label), detección con KS/PSI/chi², monitoreo sin ground truth, el ciclo de vida y el reentrenamiento, A/B testing de negocio, loops de feedback dañinos, gobernanza y cuándo retirar un modelo. Cierre del track y del recorrido senior.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS8</span>
+  <span class="badge">⏱ 35–70 min</span>
+  <span class="badge">🎯 Pre-req: DS1–DS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>DS8 — Observabilidad de ML: drift, monitoreo y el ciclo de vida</h1>
+
+<h2>DS8.0 Por qué este módulo</h2>
+
+<p>Todo el software que escribiste hasta ahora comparte una propiedad tranquilizadora: si nadie toca el código, hace hoy lo mismo que hacía ayer. Un bug es estable. Una función correcta sigue correcta hasta que alguien la rompe. Podés irte de vacaciones y volver a un sistema idéntico al que dejaste.</p>
+
+<p>Un modelo de machine learning no cumple esa promesa. Es <strong>el único software que se degrada solo</strong>, sin que nadie toque una línea, sin un deploy, sin un cambio de config. El código es el mismo. Los pesos son los mismos. Y aun así, cada semana que pasa, acierta un poco menos.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un modelo no aprende una función: aprende una <em>foto</em> del mundo en el momento en que lo entrenaste. Su corrección depende de una apuesta silenciosa —que el mundo en el que va a predecir se parece al mundo en el que aprendió—. El mundo cambia, esa apuesta se vence, y el modelo se queda viejo. Si no lo monitoreás, no te enterás hasta que el negocio se cae: se dispara el churn, se cuela el fraude, el inventario explota. Observabilidad de ML es el aparato que convierte esa degradación invisible en una alarma antes de que sea una pérdida.
+</div>
+
+<p>Este es el último módulo del track. Cierra el arco que arrancó en DS1: aprendiste a mover datos, entrenar, evaluar, servir, operar LLMs, montar RAG y hacer fine-tuning. Ahora vas a aprender lo que mantiene todo eso <strong>vivo</strong> en producción durante meses y años. Y —no es casualidad que venga al final— es lo que más se ignora y lo que más caro sale ignorar.</p>
+
+<h2>DS8.1 Por qué ML necesita una observabilidad distinta</h2>
+
+<p>Ya sabés observar servicios: logs, métricas, trazas, alertas. Un servicio normal, cuando falla, <strong>falla ruidosamente</strong>. Tira un 500. Lanza una excepción con stack trace. La latencia se dispara y suena el pager. El error rate salta y hay un incidente. El fracaso es visible por diseño: el sistema <em>grita</em>.</p>
+
+<p>Un modelo falla de la peor manera posible: <strong>en silencio y correcto de forma</strong>. Devuelve una predicción perfectamente válida —un float en [0, 1], una clase que existe, un número plausible— que es cada vez más equivocada. No hay excepción. No hay 500. No hay stack trace para "el modelo ahora está mal". Tu dashboard de infraestructura está entero en verde mientras el modelo destruye valor calladito.</p>
+
+<div class="analogy">
+  <strong>🔍 El termómetro descalibrado.</strong> Imaginá un termómetro que con los años se corrió 5 grados. Nunca da error. Nunca se rompe. Siempre muestra un número razonable —21°, 23°, 19°—. Simplemente está mal, y parece bien. No lo vas a descubrir mirando si la pantalla prende: lo descubrís cuando comparás su lectura contra una referencia. Un modelo en producción es ese termómetro, y la observabilidad de ML es la referencia contra la que lo comparás.
+</div>
+
+<table>
+<thead><tr><th></th><th>Observabilidad de infraestructura</th><th>Observabilidad de ML</th></tr></thead>
+<tbody>
+<tr><td><strong>Pregunta que responde</strong></td><td>¿El sistema responde?</td><td>¿La respuesta sigue siendo correcta?</td></tr>
+<tr><td><strong>Cómo se manifiesta la falla</strong></td><td>Ruidosa: error, timeout, caída</td><td>Silenciosa: predicción válida pero equivocada</td></tr>
+<tr><td><strong>Señales</strong></td><td>Latencia, error rate, saturación</td><td>Drift, distribución de predicciones, performance real</td></tr>
+<tr><td><strong>Herramienta clásica</strong></td><td>Prometheus, Grafana, tracing</td><td>Tests estadísticos + comparación contra un baseline</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El dashboard de infra en verde es necesario pero no suficiente.</strong> Que el modelo responda rápido y sin errores no dice nada sobre si sigue acertando. Son dos capas de observabilidad distintas: una vigila el <em>servicio</em>, la otra vigila el <em>modelo</em>. Tener la primera y creer que cubre la segunda es el error de fondo de casi todos los sistemas de ML que fallan sin aviso.
+</div>
+
+<h2>DS8.2 Los tres drifts</h2>
+
+<p>"Drift" es el nombre genérico de que el mundo se movió respecto a los datos con los que entrenaste. Pero no es una sola cosa: hay tres tipos, con causas distintas, síntomas distintos y —esto es lo importante— <strong>detectabilidad distinta</strong>. Confundirlos lleva a monitorear lo que no es y perderse lo que sí.</p>
+
+<p>Pensalos en términos de las probabilidades que aprende un modelo, que estima la relación entre las entradas <code>X</code> y la salida <code>y</code>:</p>
+
+<table>
+<thead><tr><th>Tipo de drift</th><th>Qué cambia</th><th>Ejemplo típico</th><th>Cómo se detecta</th><th>¿Sin etiquetas?</th></tr></thead>
+<tbody>
+<tr><td><strong>Data drift</strong> <em>(covariate shift)</em></td><td>P(X): la distribución de entrada</td><td>Nueva demografía de usuarios, un sensor recalibrado, cambió la moneda de una región</td><td>Tests sobre las features (KS, PSI, chi²)</td><td>✅ Sí: solo mirás las entradas</td></tr>
+<tr><td><strong>Concept drift</strong></td><td>P(y|X): la relación entrada→salida</td><td>El fraude que mutó, el comportamiento de compra tras un evento, spam que cambió de forma</td><td>Caída de performance real, o proxies</td><td>❌ Difícil: necesitás la <code>y</code> real</td></tr>
+<tr><td><strong>Label drift</strong> <em>(prior shift)</em></td><td>P(y): la distribución del objetivo</td><td>La tasa base de fraude salta de 1% a 5%; una clase se vuelve mucho más frecuente</td><td>Distribución de predicciones y de etiquetas</td><td>⚠️ Parcial</td></tr>
+</tbody>
+</table>
+
+<p><strong>Data drift</strong> es el más benigno y el más fácil de ver. Cambió lo que entra: el modelo empieza a recibir inputs de una región del espacio que casi no vio en el entrenamiento. A veces la relación X→y sigue valiendo y el modelo aguanta; a veces no. Lo bueno: lo detectás mirando <em>solo las entradas</em>, sin esperar ninguna etiqueta.</p>
+
+<p><strong>Concept drift</strong> es el asesino. Las entradas pueden verse <em>idénticas</em> —misma distribución de features, ningún test de data drift se prende— y sin embargo la respuesta correcta cambió. El mismo cliente, con los mismos datos, hoy compra distinto que el año pasado. El mismo patrón que antes era fraude hoy es una compra legítima porque los defraudadores se adaptaron. Como P(X) no se movió, la única forma honesta de detectarlo es comparar predicción contra realidad —y la realidad, las etiquetas, suele llegar tarde—.</p>
+
+<p><strong>Label drift</strong> es el corrimiento de la frecuencia base del objetivo. Tu modelo de fraude fue entrenado con 1% de casos positivos y ahora el mundo tiene 5%. Aunque la relación X→y sea la misma, el <em>umbral</em> y la calibración que elegiste quedaron mal, y las tasas de falsos positivos/negativos se descolocan.</p>
+
+<div class="mistake">
+  <strong>El error más común: monitorear solo data drift y creer que estás cubierto.</strong> Es el que se detecta gratis (mirás entradas), así que es el que todos montan. Pero el que más plata cuesta suele ser el concept drift, que es invisible a los tests de entrada. Un sistema que solo vigila P(X) duerme tranquilo mientras P(y|X) se le mueve abajo de los pies.
+</div>
+
+<h2>DS8.3 Detección de drift en la práctica</h2>
+
+<p>Detectar drift es, en el fondo, una pregunta estadística: <em>¿esta muestra de producción viene de la misma distribución que mi muestra de referencia?</em> Tomás una ventana de referencia (los datos de entrenamiento, o un período "sano" reciente) y la comparás contra una ventana actual (lo que está entrando hoy). Tres herramientas hacen el 90% del trabajo:</p>
+
+<h3>KS — Kolmogorov-Smirnov (features continuas)</h3>
+
+<p>El test KS mide la máxima distancia entre las funciones de distribución acumulada de dos muestras. Devuelve un p-valor: si es chico, las dos muestras difieren.</p>
+
+<pre><code class="lang-python">from scipy.stats import ks_2samp
+
+# ¿la distribución de una feature en producción difiere de la del entrenamiento?
+estad, pvalor = ks_2samp(feature_train, feature_prod)
+if pvalor &lt; 0.01:
+    print("posible data drift en esta feature")</code></pre>
+
+<div class="warn">
+  <strong>El KS te miente con muchos datos.</strong> Con millones de filas, el test detecta diferencias diminutas y tira p-valores minúsculos por corrimientos que a nadie le importan. Significancia estadística no es significancia práctica. En producción, con volumen alto, el KS se prende todo el tiempo y termina siendo ruido. Sirve, pero no como alarma sola.
+</div>
+
+<h3>PSI — Population Stability Index (el caballo de batalla)</h3>
+
+<p>El PSI viene del scoring crediticio y es el estándar de facto para monitorear drift, justamente porque <strong>no explota con el tamaño de la muestra</strong>. Bincea la feature, compara la proporción esperada (referencia) contra la observada (producción) en cada bin, y devuelve un número, no un p-valor.</p>
+
+<pre><code class="lang-python">import numpy as np
+
+def psi(referencia, actual, bins=10):
+    """Population Stability Index entre una muestra de referencia
+    (entrenamiento) y una actual (producción). Bins por cuantiles."""
+    cortes = np.quantile(referencia, np.linspace(0, 1, bins + 1))
+    cortes[0], cortes[-1] = -np.inf, np.inf          # cubrir las colas
+    esperado  = np.histogram(referencia, cortes)[0] / len(referencia)
+    observado = np.histogram(actual,     cortes)[0] / len(actual)
+    # suavizado para no dividir por cero en un bin vacío
+    esperado  = np.clip(esperado,  1e-6, None)
+    observado = np.clip(observado, 1e-6, None)
+    return np.sum((observado - esperado) * np.log(observado / esperado))
+
+# Interpretación estándar:
+#   PSI &lt; 0.10          estable, no hacer nada
+#   0.10 &lt;= PSI &lt; 0.25  cambio moderado, vigilar
+#   PSI &gt;= 0.25         drift fuerte, investigar / reentrenar
+print(psi(scores_train, scores_prod))</code></pre>
+
+<h3>Chi² (features categóricas)</h3>
+
+<p>Para variables categóricas —país, tipo de dispositivo, categoría de producto— el KS no aplica. Ahí se compara la tabla de frecuencias observadas contra las esperadas con un test chi-cuadrado, o directamente se calcula el PSI sobre las categorías tratando cada una como un bin.</p>
+
+<div class="danger">
+  <strong>⚠️ El problema de las etiquetas que llegan tarde (o nunca).</strong> Todo lo anterior mide la <em>entrada</em>. ¿Por qué no medir directamente el acierto? Porque las etiquetas reales casi siempre llegan con retraso: en fraude, el chargeback aparece a los 30–90 días; en crédito, el default a los meses o años; en muchos recomendadores, nunca tenés una etiqueta limpia. No podés calcular accuracy en tiempo real de algo cuya verdad todavía no ocurrió. <strong>Por eso monitoreás la entrada y las predicciones, no solo el acierto:</strong> son las únicas señales que tenés <em>hoy</em>. El acierto real es la verdad, pero es un indicador atrasado.
+</div>
+
+<div class="warn">
+  <strong>Cuidado con las comparaciones múltiples.</strong> Si corrés un test de drift sobre 200 features todas las mañanas, por pura casualidad vas a tener falsas alarmas cada día. Ponele umbrales por feature, pesá cada una por su importancia en el modelo (una feature basura que driftea no importa; la feature top sí), y alertá sobre drift <em>sostenido</em> —varias ventanas seguidas— y no sobre un pico aislado.
+</div>
+
+<h2>DS8.4 Monitorear sin ground truth</h2>
+
+<p>Este es el arte que separa a un sistema de ML serio de uno de juguete. Como la verdad llega tarde, tenés que construir una pila de señales tempranas que te avisen <em>antes</em> de poder confirmar el daño. De más temprana a más tardía:</p>
+
+<div class="step"><strong>1. Drift de entrada (DS8.3).</strong> El indicador más adelantado. Disponible al instante, sin ninguna etiqueta. Te dice que el mundo que ve el modelo cambió, aunque todavía no sepas si eso lo lastimó.</div>
+
+<div class="step"><strong>2. Distribución de las predicciones.</strong> La señal más barata y de mayor rendimiento, y la que casi nadie monta. Si tu modelo de fraude predijo 1% de fraude durante un año y de golpe predice 8%, o el mundo cambió o el modelo se rompió —de cualquier forma, querés saberlo hoy—. Aplicás PSI sobre el <em>score</em> de salida igual que sobre una feature. No cuesta nada: las predicciones ya las tenés.</div>
+
+<div class="step"><strong>3. Confianza del modelo.</strong> Para clasificadores, la distribución de la probabilidad máxima (el max-softmax). Si la masa se corre hacia la incertidumbre —cada vez más predicciones cerca de 0.5—, el modelo te está diciendo que ve entradas que no reconoce. La confianza cayendo es humo antes del fuego.</div>
+
+<div class="step"><strong>4. Proxies de negocio.</strong> Señales correlacionadas con la calidad del modelo que llegan más rápido que la etiqueta. En un recomendador, el click-through rate. En fraude, el tamaño de la cola de revisión manual. No son la verdad, pero se mueven antes.</div>
+
+<div class="step"><strong>5. Feedback tardío.</strong> Cuando por fin llegan las etiquetas reales, no las tirés: calculá la performance retrospectiva, y —clave— correlacionala con las señales tempranas que viste semanas atrás. Así calibrás tus alarmas: aprendés qué nivel de PSI predijo de verdad una caída de acierto, y afinás los umbrales para la próxima.</div>
+
+<div class="tip">
+  Si tuvieras que montar <strong>un solo</strong> monitor de ML y ninguno más, montá el de la distribución de predicciones. Cuesta cero (ya tenés las salidas), no necesita etiquetas, y atrapa una enorme clase de fallas: bugs de feature, corrimientos de mundo, y modelos que se rompieron en un deploy. Es lo primero que enciendo en cualquier sistema.
+</div>
+
+<h2>DS8.5 Las métricas de un sistema de ML en producción</h2>
+
+<p>Juntá todo lo anterior y un sistema de ML sano se vigila en tres capas. Las dos primeras te suenan de cualquier servicio; la tercera es propia de ML.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Métricas</th><th>Alerta cuando</th><th>Cruce</th></tr></thead>
+<tbody>
+<tr><td><strong>Técnica / operacional</strong></td><td>Latencia p50/p95/p99, throughput (RPS), error rate, saturación (CPU/GPU/mem), costo</td><td>Se viola el SLO de latencia o el presupuesto</td><td>Igual que cualquier servicio → <a href="../ds4-serving/lecture.html">DS4 (serving)</a></td></tr>
+<tr><td><strong>Calidad de datos</strong></td><td>% de nulos, violaciones de schema, valores fuera de rango, features que desaparecen</td><td>Cualquier violación (es un bug, no un cambio gradual)</td><td>Integridad en el boundary de datos</td></tr>
+<tr><td><strong>Calidad de modelo</strong></td><td>PSI por feature, distribución de predicciones, confianza, y —cuando llegan— performance real (AUC, RMSE, precision@k según el problema)</td><td>Drift sostenido o performance bajo el SLO</td><td>Propio de ML, este módulo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La capa de calidad de datos es la que más rápido te salva y la más olvidada.</strong> Una feature que en silencio se vuelve toda nula porque un ETL upstream se rompió arruina las predicciones al instante, y ningún test de drift sobre la <em>salida</em> lo atrapa tan rápido como un simple check de nulos en la <em>entrada</em>. Antes de sofisticar la detección de concept drift, asegurate de que las columnas que entran son las que decís que entran, con el tipo y el rango que decís. Es el 80% de los incidentes reales, y el más barato de prevenir.
+</div>
+
+<h2>DS8.6 Monitorear LLMs y RAG</h2>
+
+<p>Los sistemas con LLMs (<a href="../ds5-llmops/lecture.html">DS5</a>) y RAG (<a href="../ds6-rag/lecture.html">DS6</a>) también driftean, pero cambian las señales. No tenés un AUC ni una etiqueta clara, y aparecen ejes nuevos que un clasificador no tiene:</p>
+
+<table>
+<thead><tr><th>Qué monitorear</th><th>Por qué importa</th></tr></thead>
+<tbody>
+<tr><td><strong>Costo por request</strong> (tokens in/out × precio)</td><td>El costo de un LLM es una variable de runtime: un cambio en los prompts de usuario o en un template puede triplicarte la factura en silencio. Es la métrica que más rápido se descontrola.</td></tr>
+<tr><td><strong>Alucinación / faithfulness</strong></td><td>¿La respuesta está anclada en el contexto recuperado, o el modelo inventó? Se mide con un juez (LLM-as-judge) o scores de faithfulness, muestreando y siguiéndolo en el tiempo.</td></tr>
+<tr><td><strong>Drift de los prompts de usuario</strong></td><td>Lo que la gente pregunta cambia: temas nuevos, idiomas nuevos, intentos de jailbreak. Es data drift, pero sobre el embedding del texto: clusterizás las consultas y vigilás cómo se mueve la distribución.</td></tr>
+<tr><td><strong>Calidad de retrieval en el tiempo</strong></td><td>A medida que el corpus crece y cambia, la precisión del recuperador se degrada. Seguí el hit rate, la relevancia del contexto y la fracción de respuestas "no sé" (DS6).</td></tr>
+<tr><td><strong>Latencia de cola (p99)</strong></td><td>La latencia de un LLM tiene una cola brutal. El p50 miente; el p99 es el que sufre el usuario.</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Para LLMs casi nunca tenés una etiqueta de verdad.</strong> No hay un "acierto/no acierto" objetivo para una respuesta generada. La observabilidad se apoya, más que nunca, en proxies, revisión humana muestreada y jueces automáticos —todos imperfectos y con su propio drift—. Presupuestá un loop de evaluación humana desde el día uno: sin él, estás volando a ciegas sobre la calidad de tu sistema generativo.
+</div>
+
+<h2>DS8.7 El ciclo de vida completo</h2>
+
+<p>Acá está el cambio de mentalidad más grande del módulo. Un sistema de ML no es una línea que va de los datos al deploy y termina. Es un <strong>loop</strong>:</p>
+
+<pre><code class="lang-bash">datos ──&gt; entrenamiento ──&gt; evaluación ──&gt; serving ──&gt; monitoreo
+  ^                                                        │
+  │                                                        v
+  └──────────────── reentrenamiento &lt;──────────────── (drift!)</code></pre>
+
+<p>El monitoreo no es el final: es lo que <strong>cierra el círculo</strong>. Detecta que el modelo envejeció y dispara el reentrenamiento, que produce un modelo nuevo que vuelve a pasar por evaluación, serving y monitoreo. El modelo nunca está "terminado". Está, como mucho, "vigente por ahora".</p>
+
+<div class="concept">
+  <strong>💡 El loop es el entregable, no el modelo.</strong> Un junior entrega un modelo con buen AUC. Un sistema senior se define por otra cosa: por <em>qué tan rápido y qué tan seguro puede dar la vuelta al loop</em> —detectar que hay que reentrenar, hacerlo, validarlo y desplegarlo sin romper nada—. La accuracy de cualquier versión concreta es efímera; la capacidad de renovarla es lo que dura.
+</div>
+
+<h3>Cuándo reentrenar</h3>
+
+<p>Tres gatillos, cada uno con su compromiso:</p>
+
+<table>
+<thead><tr><th>Gatillo</th><th>Cómo funciona</th><th>Compromiso</th></tr></thead>
+<tbody>
+<tr><td><strong>Por calendario</strong></td><td>Reentrenar cada N días/semanas, pase lo que pase</td><td>Simple y predecible. Desperdicia cómputo si nada cambió y llega tarde si el drift es rápido</td></tr>
+<tr><td><strong>Por drift</strong></td><td>Reentrenar cuando una métrica de drift cruza un umbral</td><td>Reacciona al mundo real. Necesita buena detección y guardas contra el "thrashing" (reentrenar en loop)</td></tr>
+<tr><td><strong>Por performance</strong></td><td>Reentrenar cuando el acierto real cae bajo un SLO</td><td>La señal más directa, pero la más lenta: espera a que lleguen las etiquetas</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 En la práctica se combinan.</strong> Un piso por calendario (reentrenar al menos cada X, por las dudas) + gatillos por drift y por performance para reaccionar más rápido cuando el mundo se mueve + una compuerta humana para lo consecuente. Ninguno solo alcanza: el calendario es ciego, el drift puede ser paranoico, y la performance llega tarde. Juntos se cubren.
+</div>
+
+<h2>DS8.8 Reentrenamiento automatizado</h2>
+
+<p>El paso natural es automatizar el loop: un pipeline que ingiere datos frescos, reentrena, evalúa y despliega solo. Es lo correcto, pero un pipeline de reentrenamiento sin guardas es un arma cargada apuntando a producción. Cada paso tiene que ser una <strong>compuerta (gate)</strong>, no un trámite:</p>
+
+<pre><code class="lang-yaml"># pipeline de reentrenamiento — cada paso es un gate, no un trámite
+pasos:
+  - ingesta: datos_frescos_ultimas_8_semanas
+
+  - validacion_datos:             # GATE 1 — no negociable
+      checks: [schema, nulos, rango, drift_vs_referencia]
+      si_falla: abortar_y_alertar # datos corruptos -&gt; NO entrenar
+
+  - entrenamiento: reentrenar_desde_snapshot
+
+  - evaluacion:                   # GATE 2 — champion / challenger
+      contra: modelo_en_produccion
+      set: backtest_congelado     # un holdout fijo, no movido por el drift
+      promover_si: challenger_mejora_metrica_de_negocio
+
+  - despliegue:
+      estrategia: canary_10pct    # ver DS4: shadow / canary
+      monitor: [performance, negocio, guardrails]
+
+  - aprobacion_humana: requerida  # GATE 3 — para modelos consecuentes</code></pre>
+
+<h3>Los riesgos que justifican cada gate</h3>
+
+<div class="danger">
+  <strong>⚠️ Reentrenar con datos malos.</strong> Garbage in, garbage out, pero automatizado y a horario. Si la data fresca viene corrupta —un ETL roto, una caída del sistema de etiquetado, un feed que cambió de formato— el pipeline va a entrenar fielmente un modelo peor y desplegarlo, sin un solo error visible. El fracaso no es "explotó": es "embarcó en silencio un modelo peor, puntual como un reloj". El gate de validación de datos es lo único que se interpone.
+</div>
+
+<div class="mistake">
+  <strong>Auto-promover un modelo que no le gana al actual.</strong> Nunca reemplaces el modelo en producción por uno recién entrenado que no demostró ser mejor en un set de evaluación <em>congelado</em> (no uno que el propio drift movió). Champion/challenger: el nuevo pelea contra el viejo en el mismo backtest, y solo si gana, se promueve. Y aun así, primero en canary sobre una fracción del tráfico.
+</div>
+
+<p><strong>El loop de feedback que amplifica sesgo</strong> es el riesgo más sutil, y merece su propia sección (DS8.10): si las etiquetas con las que reentrenás las generó el propio modelo, el reentrenamiento hornea y amplifica su sesgo.</p>
+
+<div class="concept">
+  <strong>💡 Por qué el humano sigue haciendo falta.</strong> El pipeline automático detecta muy bien que <em>algo cambió</em>. Lo que no puede decidir es si ese cambio es de los que hay que <strong>aprender</strong> o de los que hay que <strong>resistir</strong>. Un patrón nuevo de fraude: aprendelo. Una caída de datos que parece un patrón nuevo: rechazala. Esa distinción —y la responsabilidad por un modelo que decide sobre personas— se queda del lado humano. El humano en el loop es una compuerta, no un cuello de botella a eliminar.
+</div>
+
+<h2>DS8.9 A/B testing de modelos en producción</h2>
+
+<p>Tenés dos modelos: el que está en producción y un challenger con mejor AUC en tu holdout offline. ¿Lo desplegás? Todavía no. La métrica offline es una <strong>hipótesis</strong> sobre el negocio, no el negocio. Y un modelo puede mejorar la métrica offline y <em>empeorar</em> el negocio.</p>
+
+<p>Los ejemplos abundan:</p>
+
+<ul>
+  <li>Un recomendador con mayor precisión offline que, al recomendar siempre lo más seguro, reduce la diversidad, aburre al usuario y baja el engagement de largo plazo.</li>
+  <li>Un modelo de fraude con mejor AUC que rechaza más transacciones buenas: los falsos positivos cuestan clientes y reputación, y ese costo no aparece en el AUC.</li>
+</ul>
+
+<p>La única forma de saberlo es un experimento online: enrutás una fracción del tráfico al challenger y medís la <strong>métrica de negocio real</strong>, no la de ML.</p>
+
+<pre><code class="lang-python"># El test offline es una HIPÓTESIS. El A/B es el experimento.
+# Enrutamos 10% del tráfico al challenger y medimos NEGOCIO, no AUC.
+from scipy.stats import ttest_ind
+
+# métrica de negocio (no la de ML): margen por pedido, retención, fraude neto...
+control     = negocio[grupo == "champion"]
+tratamiento = negocio[grupo == "challenger"]
+
+estad, p = ttest_ind(tratamiento, control, equal_var=False)
+lift = tratamiento.mean() - control.mean()
+print(f"lift de negocio: {lift:+.3f}  (p={p:.3f})")
+
+# Guardrails: ninguna métrica-barrera (latencia, quejas, diversidad)
+# debe empeorar, aunque el lift principal sea positivo.</code></pre>
+
+<div class="rule">
+  <strong>📌 La métrica offline es la hipótesis; el A/B es el experimento. Se embarca por el experimento, no por la hipótesis.</strong> Definí la métrica de negocio <em>antes</em> de correr el test, elegí métricas-barrera que no pueden empeorar, y dejá correr el experimento lo suficiente para tener significancia y para capturar efectos tardíos (un modelo puede verse bien la primera semana y mal el mes siguiente). La infraestructura de reparto de tráfico es la misma del canary de <a href="../ds4-serving/lecture.html">DS4</a>.
+</div>
+
+<h2>DS8.10 El loop de feedback dañino</h2>
+
+<p>Hay una clase de problema que ningún algoritmo mejor arregla, porque no es un problema de modelado: es un problema de <strong>diseño</strong>. Ocurre cuando las predicciones del modelo <em>afectan los datos futuros</em> con los que se va a reentrenar. El modelo empieza a fabricar la evidencia de sus propias decisiones.</p>
+
+<div class="analogy">
+  <strong>🔍 La recomendación que crea su propia demanda.</strong> El recomendador muestra el ítem A. Como lo muestra, A recibe clicks. Como recibe clicks, el próximo entrenamiento concluye "A es popular". Como es popular, lo recomienda más. El modelo no descubrió que A era bueno: lo <em>volvió</em> popular y después leyó su propia huella como si fuera una verdad del mundo. Y de los ítems que nunca mostró, no aprende nada: quedan condenados a la invisibilidad. Es la burbuja de filtro vista desde adentro del pipeline de datos.
+</div>
+
+<p>El segundo caso clásico es todavía más peligroso porque decide sobre personas: <strong>el modelo de crédito que se auto-confirma</strong>. Solo observás si un préstamo se pagó para los préstamos que <em>aprobaste</em>. De los que rechazaste, no hay etiqueta —nunca sabrás si esa persona habría pagado—. Al reentrenar con datos de solo-aprobados, el modelo confirma su propia frontera: jamás aprende que se equivocó al rechazar a alguien. Es el problema de las <em>etiquetas selectivas</em>, y sesga el modelo hacia sus propios prejuicios, generación tras generación.</p>
+
+<div class="mistake">
+  <strong>Tratar un loop de feedback como un bug de modelado que se arregla con una loss mejor.</strong> No hay loss que lo arregle: el problema es que tus logs dejaron de ser una muestra imparcial del mundo y pasaron a ser una muestra de <em>lo que el modelo eligió hacer</em>. Es un problema de cómo se generan los datos, no de cómo se ajustan.
+</div>
+
+<p>Como es de diseño, las soluciones son de diseño e instrumentación, no de algoritmo:</p>
+
+<ul>
+  <li><strong>Exploración:</strong> mostrar a propósito algo de tráfico aleatorio o incierto (bandits) para seguir aprendiendo de la región que el modelo nunca elegiría.</li>
+  <li><strong>Logging contrafactual:</strong> registrar la probabilidad con la que se tomó cada decisión (propensities) para después corregir el sesgo con inverse-propensity weighting.</li>
+  <li><strong>Población de holdout:</strong> un grupo que el modelo nunca toca, para tener un espejo insesgado del mundo.</li>
+  <li><strong>Revisión humana de la región excluida:</strong> mirar muestras de lo que el modelo siempre rechaza, para detectar cuándo se equivoca sistemáticamente.</li>
+</ul>
+
+<h2>DS8.11 Gobernanza de modelos</h2>
+
+<p>Cuando un modelo decide sobre crédito, contrataciones, salud o moderación, "funciona bien" deja de alcanzar. Alguien —un auditor, un regulador, la persona afectada— va a preguntar <em>por qué</em> decidió lo que decidió, con qué datos se entrenó, y quién se hace responsable. La gobernanza es la maquinaria que te deja responder.</p>
+
+<pre><code class="lang-yaml"># model_card.yaml — la ficha que exige una auditoría (y pronto, la ley)
+modelo: scoring-credito-v12
+uso_previsto: "estimar probabilidad de default en préstamos personales"
+NO_usar_para: ["decidir sin revisión humana", "otros productos de crédito"]
+
+datos_entrenamiento:
+  fuente: solicitudes_2023-2025
+  sesgos_conocidos: "solo incluye solicitudes APROBADAS (etiquetas selectivas)"
+
+evaluacion:
+  global: { auc: 0.86 }
+  por_segmento:               # la métrica global esconde el daño
+    edad_18_25: { auc: 0.71 } # bastante peor -&gt; revisar equidad
+    edad_26_60: { auc: 0.88 }
+
+limitaciones: "se degrada con cambios macroeconómicos; revisar trimestral"
+
+linaje:
+  codigo: git@sha:9f2a1c
+  datos: snapshot://2025-08-01
+  aprobo: comite_riesgo_2025-08-15</code></pre>
+
+<p>Las piezas de la gobernanza:</p>
+
+<ul>
+  <li><strong>Model cards:</strong> la ficha estándar del modelo —uso previsto, datos, resultados de evaluación <em>por segmento</em>, limitaciones conocidas, consideraciones éticas—. Fuerza a escribir lo que el AUC global esconde.</li>
+  <li><strong>Linaje (lineage):</strong> qué datos + qué código + qué hiperparámetros produjeron exactamente este modelo desplegado. Reproducibilidad: poder rastrear una predicción hasta una versión del modelo, hasta un entrenamiento, hasta un snapshot de datos.</li>
+  <li><strong>Auditoría:</strong> quién aprobó el modelo, cuándo, con qué evidencia; y un registro de las decisiones que tomó, para poder contestarlas.</li>
+  <li><strong>Las regulaciones que llegan:</strong> el AI Act europeo clasifica sistemas por riesgo y le pone obligaciones a los de alto riesgo; hay reglas sectoriales (crédito: fair lending, notificación de decisión adversa; salud), y presiones de "derecho a explicación".</li>
+</ul>
+
+<div class="info">
+  La gobernanza no es papeleo que se pega al final. El linaje y la evaluación por segmento tienen que estar <strong>construidos dentro del pipeline</strong> (DS8.8) desde el primer día, o el día de la auditoría no vas a poder reconstruirlos. El encuadre de seguridad y cumplimiento se profundiza en el track hermano de Ciberseguridad: <a href="../../../../sistemas/Curso-Ciberseguridad/senior/cs8-gobernanza/lecture.html">CS8 — Gobernanza</a>.
+</div>
+
+<h2>DS8.12 Cuándo retirar un modelo</h2>
+
+<p>Toda la conversación asume que querés mantener el modelo vivo. Pero un modelo no es para siempre, y saber cuándo apagarlo es una habilidad senior tanto como saber entrenarlo. Un modelo en producción es un <strong>pasivo con costo de mantenimiento permanente</strong>: reentrenamiento, monitoreo, guardias, cumplimiento. Se retira cuando:</p>
+
+<ul>
+  <li><strong>El costo de mantenerlo supera el valor que produce.</strong> Si sostener el loop —cómputo, tiempo del equipo, on-call, auditorías— cuesta más de lo que el modelo genera, es un pasivo neto.</li>
+  <li><strong>Una solución más simple lo alcanzó.</strong> A veces una heurística, una regla de negocio o un modelo mucho más chico hacen casi el mismo trabajo, más barato y más explicable. Es la pregunta de DS1 revisada: ¿de verdad hace falta ML acá, todavía?</li>
+  <li><strong>El problema cambió tanto que el encuadre ya no aplica.</strong> Mejor retirar y re-plantear que parchar un modelo que responde a una pregunta que ya no es la que importa.</li>
+  <li><strong>No se lo puede hacer cumplir.</strong> Si el modelo no puede alinearse con una regulación, o sus daños superan sus beneficios, apagarlo es la decisión correcta.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Embarcar un modelo es contraer un pasivo, no ganar un activo.</strong> El reflejo es acumular modelos; la disciplina senior incluye saber cuándo el movimiento responsable es apagar uno. Retirarlo bien tiene su propio plan: definir a qué se cae el sistema (¿una regla, el modelo anterior?), archivar el modelo y su linaje para futuras auditorías, y comunicar el cambio —no simplemente borrarlo—.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el modelo de demanda que se rompió solo"</h2>
+
+<blockquote>Un retailer usa un modelo que predice la demanda semanal por SKU para decidir cuánto reponer. Funcionó 8 meses con un MAPE de ~8% (error porcentual medio). Nadie tocó el código ni la config. En unas pocas semanas el MAPE trepó a 22%: stockouts de lo que sí se vendía, depósitos llenos de lo que no. El único dashboard del equipo mostraba latencia, uptime y error rate —todo en verde—. ¿Qué pasó, y cómo lo arreglás para que no vuelva a pasar a ciegas?</blockquote>
+
+<p><strong>Paso 1 — ¿Es el modelo o el pipeline?</strong> Antes de culpar al modelo, revisá la capa de calidad de datos (DS8.5): ¿hay features que se volvieron nulas, un schema que cambió, valores fuera de rango? En este caso, la entrada está estructuralmente limpia. No es un ETL roto: es el modelo el que predice mal.</p>
+
+<p><strong>Paso 2 — ¿Data drift o concept drift?</strong> Corrés PSI sobre las features principales (precio, flags de promo, día de la semana). Sorpresa: están estables, PSI &lt; 0.1. La entrada no se movió. Y sin embargo la performance se derrumbó. Eso huele inequívocamente a <strong>concept drift</strong>: P(demanda | features) cambió aunque P(features) no. Las mismas entradas ahora mapean a una demanda distinta.</p>
+
+<p><strong>Paso 3 — ¿Qué cambió en el mundo?</strong> Un evento externo —un competidor que cerró, un producto que se volvió viral, un cambio de comportamiento post-temporada— alteró <em>cómo</em> compra la gente. Los features se ven iguales; la relación con la demanda, no. Es el caso de manual del concept drift: invisible para cualquier monitoreo que solo mire entradas.</p>
+
+<p><strong>Paso 4 — ¿Por qué se detectó tan tarde?</strong> Porque el equipo monitoreaba latencia, no la distribución de predicciones ni el error real. Las ventas —la verdad— llegan con una semana de retraso, así que <em>tenían</em> la señal disponible con solo un rezago corto, y no la estaban mirando. El modelo falló en silencio y correcto de forma durante semanas, mientras el dashboard seguía verde.</p>
+
+<p><strong>Paso 5 — Montar la detección y cerrar el loop.</strong> La solución no es solo reentrenar una vez; es instalar el aparato para que la próxima vez suene una alarma:</p>
+
+<pre><code class="lang-yaml"># monitoring.yaml — qué vigila el MODELO, no solo la infra
+modelo: demanda-semanal-v7
+ventana_referencia: entrenamiento_2025Q4
+
+monitores:
+  - señal: calidad_datos
+    checks: [no_nulos, schema, rango]
+    frecuencia: por_batch
+    alerta: cualquier_violacion
+  - señal: drift_entrada
+    metrica: psi_por_feature_top10
+    frecuencia: diaria
+    umbral: 0.25
+  - señal: distribucion_predicciones     # el monitor barato y clave
+    metrica: psi_score
+    frecuencia: diaria
+    umbral: 0.25
+  - señal: performance_real
+    metrica: mape_rolling_4w
+    frecuencia: semanal                   # cuando llegan las ventas
+    umbral: 0.12
+
+reentrenar_si:
+  - performance_real.mape_rolling_4w &gt; 0.12 durante 2 semanas
+  - distribucion_predicciones.psi_score &gt; 0.25
+  - calendario: cada 4 semanas            # piso, pase lo que pase
+aprobacion_humana: requerida              # una demanda muy errada es cara</code></pre>
+
+<p>Y el reentrenamiento cierra el círculo con los gates de DS8.8: ingesta de datos recientes → validación de datos → champion/challenger contra el modelo actual en un backtest congelado → canary sobre el 10% de los SKUs → rollout completo, con firma humana porque un error grande de demanda cuesta plata de verdad.</p>
+
+<h3>La tabla que faltaba: qué monitorear y con qué frecuencia</h3>
+
+<table>
+<thead><tr><th>Señal</th><th>Métrica</th><th>Frecuencia</th><th>Alerta</th><th>Qué drift atrapa</th></tr></thead>
+<tbody>
+<tr><td>Calidad de datos</td><td>% nulos, schema, rango</td><td>Cada batch</td><td>Cualquier violación</td><td>Falla de pipeline</td></tr>
+<tr><td>Drift de entrada</td><td>PSI por feature (top-N)</td><td>Diaria</td><td>PSI &gt; 0.25</td><td>Data drift</td></tr>
+<tr><td>Distribución de predicciones</td><td>PSI del score</td><td>Diaria</td><td>PSI &gt; 0.25</td><td>Data + concept (adelantado)</td></tr>
+<tr><td>Confianza</td><td>Percentiles del score</td><td>Diaria</td><td>Caída sostenida</td><td>Data drift</td></tr>
+<tr><td>Performance real</td><td>MAPE rolling</td><td>Semanal (con ventas)</td><td>&gt; 12% por 2 semanas</td><td>Concept drift</td></tr>
+<tr><td>Negocio</td><td>Stockout / overstock ($)</td><td>Semanal</td><td>Sobre umbral</td><td>Impacto real</td></tr>
+<tr><td>Infra</td><td>p99, error rate, costo</td><td>Continuo</td><td>SLO</td><td>Operacional</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio.</strong> Infra en verde no es modelo sano. El modelo de demanda falló en silencio y correcto de forma durante semanas porque el único número que lo habría atrapado —el error real contra un baseline, o el PSI de las predicciones— no estaba en ningún dashboard. La detección de drift no es un lujo de madurez: es la diferencia entre enterarte por una alarma o enterarte por el balance del trimestre.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cómo puede un modelo "fallar" con el dashboard de infraestructura entero en verde?</summary>
+<p>Porque un modelo falla en silencio y correcto de forma: devuelve predicciones perfectamente válidas —un número, una clase que existe— que son cada vez más equivocadas. No hay excepción, ni 500, ni pico de latencia, así que la observabilidad de infra (que responde "¿el sistema responde?") no ve nada. La observabilidad de ML responde otra pregunta —"¿la respuesta sigue siendo correcta?"— y solo la contestás comparando entradas, predicciones y, cuando llega, el acierto real contra un baseline. El dashboard verde es necesario pero no suficiente.</p></details>
+
+<details><summary>Tenés un modelo de fraude y las etiquetas reales (los chargebacks) tardan 60 días. ¿Qué monitoreás mientras tanto?</summary>
+<p>Todo lo que no necesita la etiqueta, de más temprano a más tardío: (1) drift de la distribución de entrada con PSI —el indicador más adelantado—; (2) la distribución de las predicciones, el monitor más barato y de mayor señal, que ya tenés gratis; (3) la confianza del modelo, que cae cuando ve entradas que no reconoce; (4) proxies de negocio como el tamaño de la cola de revisión manual. Y cuando por fin llegan los chargebacks, calculás la performance retrospectiva y la correlacionás con las señales tempranas para calibrar los umbrales. El acierto real es la verdad, pero es un indicador atrasado: no podés esperarlo cruzado de brazos.</p></details>
+
+<details><summary>Armás un pipeline de reentrenamiento 100% automático. ¿Qué dos guardas son no negociables?</summary>
+<p>(1) Un gate de validación de datos <em>antes</em> de entrenar: si la data fresca viene corrupta (ETL roto, caída del etiquetado), el pipeline entrena un modelo peor y lo despliega en silencio, a horario. Schema, nulos, rango y drift vs. referencia tienen que poder abortar el pipeline. (2) Un gate de evaluación champion/challenger: el modelo nuevo solo se promueve si le gana al actual en un set de evaluación congelado —nunca auto-promoción a ciegas—, y aun así primero en canary. Para modelos consecuentes se suma una firma humana, porque el pipeline detecta que "algo cambió" pero no si es un cambio para aprender o para resistir.</p></details>
+
+<h2>🎓 Cierre del track y del recorrido senior</h2>
+
+<p>Este módulo cierra dos cosas a la vez. Cierra el track de <strong>Datos/ML Senior</strong> —y lo cierra literalmente, porque el monitoreo de DS8 es la flecha que vuelve a DS1: la observabilidad te dice cuándo re-correr el pipeline, reentrenar y volver a desplegar—. El recorrido tuvo forma de loop desde el principio, solo que recién ahora se ve entero:</p>
+
+<pre><code class="lang-bash">DS1 pipelines ─&gt; DS2 entrenamiento ─&gt; DS3 evaluación ─&gt; DS4 serving
+     ^                                                        │
+     │      DS5 LLMOps · DS6 RAG · DS7 fine-tuning            v
+     └────────────────── DS8 observabilidad &lt;──────── (drift, retraining)</code></pre>
+
+<p>Y cierra el <strong>plan completo de tracks senior</strong> del campus: los ocho arcos avanzados que llevan de "sé usar la herramienta" a "sé sostener un sistema en producción". Cada uno mira el mismo oficio —construir software serio— desde un ángulo, y todos se tocan:</p>
+
+<table>
+<thead><tr><th>Track senior</th><th>Qué te deja</th><th>Cómo se conecta con Datos/ML</th></tr></thead>
+<tbody>
+<tr><td><strong>Python Senior</strong></td><td>Internals, concurrencia, performance del runtime</td><td>El intérprete donde corre tu modelo; async para servirlo bajo carga</td></tr>
+<tr><td><strong>Datos/ML Senior</strong> (este)</td><td>Del dato al modelo vivo en producción</td><td>—</td></tr>
+<tr><td><strong>React Senior</strong></td><td>Estado, patrones y performance de frontend</td><td>La UI que consume tus predicciones vía la API de DS4</td></tr>
+<tr><td><strong>React Native Senior</strong></td><td>Apps móviles de nivel producción</td><td>Inferencia en el dispositivo y experiencias que dependen del modelo</td></tr>
+<tr><td><strong>Go Senior</strong></td><td>Servicios concurrentes y de sistemas</td><td>El serving de baja latencia frente a tu modelo</td></tr>
+<tr><td><strong>Rust Senior</strong></td><td>Control fino y seguridad de memoria</td><td>Kernels de inferencia de alto rendimiento e ML embebido</td></tr>
+<tr><td><strong>Ciberseguridad Senior</strong></td><td>Threat modeling, appsec, gobernanza</td><td>Seguridad de IA (CS4) y gobernanza de modelos (CS8)</td></tr>
+<tr><td><strong>Linux Senior</strong></td><td>El sistema donde todo esto corre</td><td>Contenedores, recursos y la observabilidad de infra de DS8.5</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El hilo que atraviesa los ocho tracks.</strong> Ninguno trata de la <em>versión</em> de una herramienta: todos tratan del <em>ciclo de vida</em> de un sistema. Cómo se construye, cómo se prueba, cómo se despliega, cómo se observa, cuándo se cambia y cuándo se apaga. Ese es el salto de junior a senior, y es el mismo en ML, en frontend, en sistemas o en seguridad. DS8 lo dice con la forma más nítida porque los modelos son el software que más obviamente vive y muere: pero todo software serio tiene su loop, y el trabajo senior es operarlo.
+</div>
+
+<h3>Qué estudiar después</h3>
+
+<p>El track te dio el mapa; el territorio se recorre en producción. Cuando quieras profundizar:</p>
+
+<ul>
+  <li><strong>Entrenamiento distribuido</strong> y <strong>feature stores</strong>, cuando los datos y los modelos dejan de entrar en una máquina.</li>
+  <li><strong>Streaming ML</strong> y detección de drift online, para dominios donde el mundo cambia por hora, no por trimestre.</li>
+  <li><strong>Inferencia causal</strong>, para pasar de "qué predice el modelo" a "qué pasa si intervengo" —la pregunta que casi siempre importa de verdad—.</li>
+  <li><strong>Plataformas de MLOps</strong> (MLflow, Kubeflow, SageMaker, Vertex) para no reimplementar el loop a mano cada vez.</li>
+</ul>
+
+<p>Pero el consejo más honesto es este: <strong>andá y dale una vuelta al loop con un modelo real</strong>. Ponelo en producción, monitorealo, esperá a que driftee, reentrenalo y desplegá la versión nueva sin romper nada. Esa vuelta completa —la que este módulo describe— enseña más que cualquier lección, porque recién ahí sentís en el cuerpo por qué un modelo es el único software que se degrada solo, y por qué observarlo no era opcional.</p>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un modelo es el <strong>único software que se degrada solo</strong>: su corrección depende de que el mundo se parezca al del entrenamiento, y el mundo cambia.</li>
+  <li>Falla <strong>en silencio y correcto de forma</strong>: devuelve predicciones válidas cada vez más equivocadas. La observabilidad de infra no lo ve; hace falta observabilidad de ML.</li>
+  <li>Tres drifts: <strong>data</strong> (P(X), detectable sin etiquetas), <strong>concept</strong> (P(y|X), el asesino invisible), <strong>label</strong> (P(y)).</li>
+  <li>Se detecta con <strong>KS, PSI y chi²</strong> comparando una ventana de referencia contra una actual. El PSI es el estándar porque no explota con el volumen.</li>
+  <li>Como las etiquetas llegan tarde o nunca, monitoreás <strong>entrada y predicciones</strong>, no solo el acierto. La distribución de predicciones es el monitor más barato y de mayor señal.</li>
+  <li>Tres capas de métricas: <strong>técnicas</strong> (DS4), <strong>calidad de datos</strong> (la más olvidada) y <strong>calidad de modelo</strong>. LLMs/RAG suman costo por request, alucinación, drift de prompts y calidad de retrieval (DS5/DS6).</li>
+  <li>El ciclo de vida es un <strong>loop</strong>, no una línea; el monitoreo lo cierra disparando el reentrenamiento (por calendario, por drift, por performance —combinados—).</li>
+  <li>El reentrenamiento automático necesita <strong>gates</strong>: validación de datos, champion/challenger y firma humana. Sin ellos embarca un modelo peor, en silencio y a horario.</li>
+  <li>El <strong>A/B test</strong> mide impacto de negocio, no AUC: la métrica offline es la hipótesis; el experimento decide.</li>
+  <li>Los <strong>loops de feedback dañinos</strong> son un problema de diseño, no de algoritmo: cuando el modelo genera los datos con los que se reentrena, hornea su propio sesgo.</li>
+  <li><strong>Gobernanza</strong> (model cards, linaje, auditoría) se construye en el pipeline desde el día uno. Y todo modelo es un pasivo: saber <strong>cuándo retirarlo</strong> es habilidad senior.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Implementá la función <code>psi()</code> del módulo y probala: tomá una feature de un dataset, partila en dos mitades y calculá el PSI (debería dar cerca de 0). Después desplazá artificialmente la segunda mitad (sumale una constante, o filtrá por un rango) y observá cómo el PSI cruza 0.1 y luego 0.25.</li>
+  <li>Tomá el mismo par de muestras y corré también un <code>ks_2samp</code>. Aumentá el tamaño de las muestras de 1.000 a 1.000.000 de filas manteniendo el mismo corrimiento pequeño y mostrá cómo el p-valor del KS se vuelve minúsculo mientras el PSI casi no se mueve. Explicá por qué el PSI es mejor alarma en producción.</li>
+  <li>Escribí, en pseudocódigo o en un YAML como el del módulo, el plan de monitoreo de un modelo de <em>churn</em> cuyas etiquetas reales tardan 90 días. Listá qué señales monitoreás <strong>hoy</strong> (sin etiquetas) y cuál es tu indicador atrasado.</li>
+  <li>Diseñá los tres gates de un pipeline de reentrenamiento para ese modelo de churn: qué chequea la validación de datos, contra qué compara el champion/challenger, y en qué caso exigís firma humana. Justificá cada uno con el riesgo que previene.</li>
+  <li>Dado un recomendador de productos, describí en concreto el loop de feedback dañino que podría formarse y proponé <strong>dos</strong> mecanismos de diseño para mitigarlo (exploración, logging de propensities, holdout, revisión humana). Explicá por qué una loss mejor no lo arregla.</li>
+  <li>Escribí una model card mínima (en YAML) para un modelo que ya conozcas o hayas entrenado en el track: uso previsto, "no usar para", sesgos conocidos de los datos, evaluación global <strong>y por al menos un segmento</strong>, limitaciones y linaje. Señalá qué esconde la métrica global.</li>
+  <li>Tomá un modelo del proyecto de DS y armá el argumento de negocio para <strong>retirarlo</strong>: estimá su costo de mantenimiento (reentrenamiento, monitoreo, guardias) y qué solución más simple podría reemplazarlo. Definí a qué se caería el sistema si lo apagás.</li>
+</ol>
+
+<section class="quiz" id="quizDS8">
+  <style>
+    #quizDS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS8 .q{margin-bottom:1.5rem}
+    #quizDS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS8 .opt:hover{border-color:var(--accent)}
+    #quizDS8 .opt:disabled{cursor:default}
+    #quizDS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS8 .exp.show{display:block}
+    #quizDS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="0">
+    <p>1. Tu modelo de scoring corre hace 6 meses. El dashboard de infra está entero en verde: p99 bajo, 0 errores, uptime 99.99%. Negocio reporta que las decisiones del modelo cada vez aciertan menos. ¿Qué explica mejor la contradicción?</p>
+    <button class="opt">Un modelo falla silencioso y correcto de forma: devuelve predicciones válidas cada vez más equivocadas, y la observabilidad de infra no mide si siguen siendo correctas</button>
+    <button class="opt">Es imposible: si la infra está en verde, el modelo está sano por definición</button>
+    <button class="opt">El problema es la latencia; hay que optimizar el serving y se soluciona</button>
+    <div class="exp">La observabilidad de infra responde "¿el sistema responde?"; la de ML responde "¿la respuesta sigue siendo correcta?". Son capas distintas. Data o concept drift degradan la calidad sin ningún síntoma de infraestructura: ni excepción, ni 500, ni pico de latencia. El dashboard verde es necesario pero no suficiente, y creer que cubre la calidad del modelo es el error de fondo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Las etiquetas reales de tu modelo (¿el préstamo se pagó?) tardan meses en llegar. Mientras tanto, ¿cuál es la señal MÁS temprana de que algo cambió?</p>
+    <button class="opt">La accuracy en producción, calculada en tiempo real contra la verdad</button>
+    <button class="opt">El drift de la distribución de entrada y de las predicciones (PSI), que no necesita las etiquetas</button>
+    <button class="opt">Esperar a que lleguen las etiquetas; antes no hay nada que se pueda hacer</button>
+    <div class="exp">No podés calcular accuracy sin etiquetas, y las etiquetas son un indicador atrasado que llega meses después. El drift de entrada y de la distribución de predicciones están disponibles hoy, sin ninguna etiqueta, y son los indicadores adelantados. La performance real es la verdad, pero se usa después, para calibrar los umbrales de las alarmas tempranas cuando finalmente aterriza.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Armás un pipeline de reentrenamiento 100% automático que ingiere datos frescos, entrena y despliega. ¿Cuál es el riesgo que MÁS justifica dejar un humano (y gates) en el loop?</p>
+    <button class="opt">El humano escribe el código del pipeline más rápido que la automatización</button>
+    <button class="opt">Sin gate de validación de datos, el pipeline puede entrenar con datos corruptos (un ETL roto) y desplegar un modelo peor, en silencio y a horario</button>
+    <button class="opt">Los pipelines automáticos no pueden usar GPU sin supervisión humana</button>
+    <div class="exp">El modo de falla peligroso no es "explotó": es "embarcó en silencio un modelo peor, puntual como un reloj". Por eso el gate de validación de datos (schema, nulos, rango, drift) y el gate champion/challenger (nunca auto-promover un modelo que no le gana al actual en un set congelado) son no negociables. La firma humana suma el criterio que el pipeline no tiene: detecta que "algo cambió", pero no si es un cambio para aprender o para resistir.</div>
+  </div>
+
+  <div class="score" id="scoreDS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Cerraste el track y el recorrido senior.' : '  — repasá las que fallaste. Cerraste el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds7-finetuning/lecture.html">← DS7: Fine-tuning</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

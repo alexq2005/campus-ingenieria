@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS5 — Ingeniería de detección: reglas, hunting y detección como código · Ciberseguridad Senior</title>
+  <meta name="description" content="Detection engineering como disciplina de software: ciclo de vida de una detección, detección como código con CI, la pirámide del dolor, cobertura MITRE ATT&amp;CK, escribir reglas Sigma, puntos ciegos de la telemetría, eBPF, threat hunting estructurado, fatiga de alertas, deception, métricas y cuándo NO escribir una detección.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS5</span>
+  <span class="badge">⏱ 35–80 min</span>
+  <span class="badge">🎯 Pre-req: CS1</span>
+  <span class="badge">🔵 Blue team</span>
+</div>
+
+<article>
+
+<h1>CS5 — Ingeniería de detección: reglas, hunting y detección como código</h1>
+
+<h2>CS5.0 Por qué este módulo</h2>
+
+<p>En el curso base, el M10 te dio el ciclo de <strong>respuesta</strong>: asumir la brecha, medir MTTD y MTTR, el ciclo de NIST, contener sin destruir evidencia, el post-mortem sin culpa. Sabés qué hacer cuando suena la alarma. Este módulo trata la pregunta que viene <em>antes</em> de la alarma: <strong>¿de dónde sale?</strong></p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Detectar no es un acto de reacción, es un producto de ingeniería. Una detección es <strong>software</strong>: tiene requisitos, contrato de entrada, casos de test, control de versiones, despliegue, monitoreo en producción, deuda técnica y —lo que casi nadie hace— un momento de retiro. Un SOC que trata sus reglas como configuración estática que "alguien escribió una vez" acumula exactamente la misma clase de podredumbre que un codebase sin tests: crece, deja de entenderse, y un día nadie sabe si algo todavía funciona.
+</div>
+
+<p>La diferencia entre el M10 y CS5 es la diferencia entre <em>saber apagar un incendio</em> y <em>diseñar el sistema de detección de humo de un edificio</em>. No vamos a repasar cómo reaccionar; vamos a ver cómo se fabrica, se prueba, se mide y se mantiene la capacidad de darte cuenta. Ese es el trabajo del <strong>ingeniero de detección</strong>, y es una de las especialidades blue team peor entendidas: se la confunde con "escribir reglas", cuando escribir la regla es la parte fácil.</p>
+
+<h2>CS5.1 Detection engineering como disciplina</h2>
+
+<p>Una detección nace de una <strong>hipótesis</strong> ("un atacante que robó credenciales estáticas va a orientarse hacia la cuenta con llamadas de reconocimiento") y muere cuando esa hipótesis deja de ser relevante o la técnica cambió. En el medio hay un ciclo de vida que conviene hacer explícito:</p>
+
+<div class="step"><strong>1. Hipótesis.</strong> Una afirmación falsable sobre un comportamiento adversario, anclada en ATT&amp;CK y en tu modelo de amenazas (CS1). No "detectar hackers", sino "detectar T1078.004 en nuestra cuenta de AWS de producción".</div>
+<div class="step"><strong>2. Fuente de datos.</strong> ¿Existe la telemetría que hace visible ese comportamiento? Si no existe, el proyecto no es escribir una regla: es conseguir el log. Sin dato, no hay detección posible (CS5.5).</div>
+<div class="step"><strong>3. Regla.</strong> La lógica que traduce la hipótesis a una consulta ejecutable. Portable si se puede (Sigma), específica si hace falta.</div>
+<div class="step"><strong>4. Test.</strong> Datos de ataque que <em>deben</em> disparar (true positive) y datos normales que <em>no</em> deben (false positive). Sin esto, la regla es una opinión.</div>
+<div class="step"><strong>5. Despliegue.</strong> A producción por un pipeline, no copiando y pegando en la consola del SIEM a las 3 de la mañana.</div>
+<div class="step"><strong>6. Tuning.</strong> Medir el ruido real contra tráfico real y ajustar. Casi ninguna regla nace afinada.</div>
+<div class="step"><strong>7. Retiro.</strong> La técnica quedó obsoleta, la fuente desapareció, o el control preventivo la volvió redundante. Una regla que ya no aporta se borra; dejarla es deuda.</div>
+
+<p>Si ese ciclo se parece sospechosamente al ciclo de vida de una feature de software, es porque es el mismo. Y de ahí sale la práctica que define la disciplina moderna: <strong>detección como código</strong> (<em>detection-as-code</em>). Las reglas viven en git, se revisan por pull request, se testean en CI y se despliegan por pipeline. Proyectos como las <a href="https://github.com/SigmaHQ/sigma">reglas de Sigma</a>, los <em>detection-rules</em> de Elastic o el contenido de Splunk Security se mantienen exactamente así.</p>
+
+<pre><code class="lang-bash">detection/
+├── rules/
+│   ├── credential_access/
+│   │   └── aws_recon_llaves_estaticas.yml
+│   └── discovery/
+├── tests/                        # datos de ataque + datos normales, por regla
+│   └── aws_recon_llaves_estaticas/
+│       ├── true_positive.json    # el evento que DEBE disparar
+│       └── false_positive.json   # el evento que NO debe disparar
+├── pipelines/                    # transformaciones pySigma por plataforma destino
+└── .github/workflows/ci.yml      # lint + test en cada push</code></pre>
+
+<pre><code class="lang-yaml"># .github/workflows/ci.yml — la detección se testea como cualquier software
+name: detection-ci
+on: [push, pull_request]
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint de las reglas Sigma
+        run: sigma check rules/
+      - name: Cada regla dispara con su TP y calla con su FP
+        run: pytest tests/</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla que separa un SOC senior de uno junior:</strong> ninguna detección llega a producción sin un test que demuestre que dispara con datos de ataque y calla con datos normales. Una regla sin test no es una detección, es una expresión de deseo escrita en YAML.
+</div>
+
+<div class="analogy">
+  <strong>🔗 Analogía.</strong> Un test de detección es al SOC lo que un test de regresión es al backend. No lo escribís para hoy: lo escribís para dentro de seis meses, cuando alguien cambie el formato del log, actualice el parser o "optimice" la consulta, y necesites que algo grite si la detección dejó de detectar en silencio. La falla más cara de un SOC no es la regla que da falsos positivos: es la regla que dejó de funcionar y nadie se enteró porque nunca más disparó.
+</div>
+
+<h2>CS5.2 La pirámide del dolor</h2>
+
+<p>No todas las detecciones valen lo mismo, y el criterio para ordenarlas no es cuántas alertas generan sino <strong>cuánto le cuesta al atacante evadirlas</strong>. Ese es el aporte de David Bianco con la <strong>pirámide del dolor</strong> (<em>Pyramid of Pain</em>): a medida que subís, detectar el indicador le impone al adversario un costo cada vez mayor para seguir operando.</p>
+
+<table>
+<thead><tr><th>Nivel (trivial → doloroso)</th><th>Indicador</th><th>Costo de evasión para el atacante</th><th>Valor de tu detección</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Hash de archivo</td><td>Cambiar 1 byte y recompilar: segundos</td><td>Casi nulo</td></tr>
+<tr><td>2</td><td>Dirección IP</td><td>Rotar de IP, usar un proxy: minutos</td><td>Bajo</td></tr>
+<tr><td>3</td><td>Nombre de dominio</td><td>Registrar otro dominio: horas y unos dólares</td><td>Bajo-medio</td></tr>
+<tr><td>4</td><td>Artefactos de host / red</td><td>Reconfigurar la herramienta: molesto</td><td>Medio</td></tr>
+<tr><td>5</td><td>Herramientas</td><td>Cambiar o reescribir el tooling: caro</td><td>Alto</td></tr>
+<tr><td>6</td><td><strong>TTPs</strong> (comportamiento)</td><td>Rediseñar <em>cómo</em> opera: muy caro</td><td>Máximo</td></tr>
+</tbody>
+</table>
+
+<p>La base de la pirámide es donde vive la mayoría de las listas de bloqueo comerciales: feeds de hashes e IPs "maliciosas". Son baratos de consumir y por eso son populares, pero detectan la operación de ayer. En cuanto el atacante recompila el binario o rota la infraestructura —cosa que hace de forma rutinaria y automatizada— tu detección basada en el indicador atómico queda ciega, sin que nada te avise de que quedó ciega.</p>
+
+<p>En la cima están las <strong>TTPs</strong>: las tácticas, técnicas y procedimientos. Una detección de comportamiento —"un proceso de servidor web lanzó un intérprete de comandos", "una credencial estática hizo reconocimiento desde una IP nueva"— sigue disparando aunque el atacante cambie de malware, de IP y de dominio, porque describe <em>lo que hace</em>, no <em>con qué lo hace</em>. Para dejar de disparar, tiene que cambiar su forma de operar, y eso le cuesta tiempo, dinero y a veces capacidad.</p>
+
+<div class="tip">
+  <strong>No tires la base de la pirámide.</strong> Bloquear por hash e IP es barato y filtra el ruido de fondo (el escaneo automatizado, el commodity malware), lo que deja a tus analistas tiempo para lo que importa. El error no es usar indicadores atómicos: es <em>creer que con eso estás cubierto</em>. La estrategia correcta es apoyarte en la base para el volumen y concentrar tu esfuerzo de ingeniería en la cima, donde cada detección le duele de verdad al adversario.
+</div>
+
+<h2>CS5.3 MITRE ATT&amp;CK para cobertura</h2>
+
+<p>El M10 te presentó ATT&amp;CK como lenguaje común. En detection engineering, ATT&amp;CK cumple una segunda función crítica: es el sistema de coordenadas para responder <strong>qué no estás detectando</strong>. Esa pregunta es mucho más valiosa que la lista de lo que sí, porque el atacante va a buscar exactamente el hueco.</p>
+
+<div class="mistake">
+  <strong>"Tenemos 5.000 reglas de detección."</strong> Esa frase no dice absolutamente nada sobre tu cobertura. Cinco mil reglas pueden apilarse sobre tres técnicas de <em>Execution</em> y dejar <em>Credential Access</em>, <em>Exfiltration</em> y <em>Impact</em> sin una sola detección. El número de reglas mide tu volumen de trabajo, no tu superficie defendida. Es la misma falacia que medir la calidad de un test suite por la cantidad de <code>assert</code> en vez de por la cobertura de ramas.
+</div>
+
+<p>La herramienta para hacer esto visible es el <strong>ATT&amp;CK Navigator</strong>: la matriz completa de técnicas, coloreada según tu cobertura real. Verde donde tenés una detección <em>probada</em>, rojo donde no tenés nada, amarillo donde tenés algo dudoso o sin testear. El mapa de calor resultante es incómodo la primera vez que lo hacés bien, y esa incomodidad es el punto: te muestra las tácticas enteras que asumías cubiertas y no lo están.</p>
+
+<p>La métrica honesta no es "cuántas reglas" sino "qué fracción del universo de técnicas <em>relevante para mi modelo de amenaza</em> tiene al menos una detección con test". Se calcula cruzando los <code>tags</code> de tus reglas contra ATT&amp;CK:</p>
+
+<pre><code class="lang-python"># cobertura.py — cuánta superficie de ATT&amp;CK cubrís de verdad
+import yaml, glob, collections
+
+# 1) El universo: las técnicas de las tácticas que TE importan (recorte de tu modelo)
+universo = cargar_tecnicas_relevantes(
+    tacticas=["credential-access", "discovery", "exfiltration", "persistence"]
+)
+
+# 2) Qué técnica toca cada regla, leído del campo tags: attack.tXXXX
+cubiertas = collections.Counter()
+for archivo in glob.glob("rules/**/*.yml", recursive=True):
+    with open(archivo, encoding="utf-8") as fh:      # utf-8 explícito: los .yml lo son
+        regla = yaml.safe_load(fh)
+    for tag in regla.get("tags", []):
+        if tag.startswith("attack.t"):
+            tid = tag.split(".")[1].upper()          # attack.t1078.004 → T1078.004
+            cubiertas[tid] += 1
+
+# 3) La métrica que importa NO es len(cubiertas.values())
+faltan = [t for t in universo if t not in cubiertas]
+print(f"Técnicas cubiertas: {len(cubiertas)}/{len(universo)}")
+print(f"Reglas totales:     {sum(cubiertas.values())}  ← esto NO es cobertura")
+print(f"Puntos ciegos:      {faltan[:10]} ...")</code></pre>
+
+<div class="warn">
+  <strong>Cuidado con la cobertura de papel.</strong> Marcar una técnica como "cubierta" porque existe una regla con el <code>tag</code> correcto es autoengaño si esa regla nunca disparó en un test. Cobertura real = técnica con una detección que <em>demostradamente</em> dispara contra una emulación de esa técnica (CS5.7 y el worked example). El resto es pintar la matriz de verde para la diapositiva del comité.
+</div>
+
+<h2>CS5.4 Escribir una buena regla</h2>
+
+<p>Recién ahora, con la hipótesis clara y la fuente de datos confirmada, se escribe la regla. El formato de referencia para hacerlo <strong>portable</strong> es <strong>Sigma</strong>: un YAML que describe la detección de forma agnóstica al SIEM, y que después un compilador (<code>pySigma</code> / <code>sigma-cli</code>) traduce al dialecto de tu plataforma —Elastic ES|QL, Splunk SPL, Microsoft Sentinel KQL, lo que sea.</p>
+
+<div class="concept">
+  <strong>💡 Por qué Sigma y no el lenguaje del SIEM.</strong> Escribir la regla en SPL o KQL nativo la ata a un producto. El día que migrás de SIEM —o corrés dos en paralelo, cosa habitual— reescribís todo tu contenido de detección a mano. Sigma te da la lógica una vez y N traducciones; y como es texto plano estructurado, se versiona, se revisa y se testea como cualquier código.
+</div>
+
+<p>La anatomía de una regla Sigma responde tres preguntas: <strong>dónde</strong> mirar (<code>logsource</code>), <strong>qué</strong> buscar (<code>detection</code>: los selectores y la <code>condition</code>) y <strong>qué hacer con lo dudoso</strong> (<code>falsepositives</code>, <code>level</code>). Un ejemplo mínimo sobre logs de proceso de un endpoint:</p>
+
+<pre><code class="lang-yaml">title: Intérprete de comandos lanzado por un servicio de servidor web
+id: 5b0e2a9c-8f1d-4a77-9c3e-2b6a1f0d4e21
+status: experimental
+description: |
+  Un proceso de servidor web (nginx, apache, w3wp) creó un shell.
+  Patrón clásico de webshell o de explotación de RCE. TTP, no indicador atómico.
+references:
+  - https://attack.mitre.org/techniques/T1059/
+author: SOC / Detection Engineering
+date: 2026/09/04
+logsource:
+  category: process_creation
+  product: linux
+detection:
+  padre_web:
+    ParentImage|endswith:
+      - '/nginx'
+      - '/httpd'
+      - '/apache2'
+  hijo_shell:
+    Image|endswith:
+      - '/bash'
+      - '/sh'
+      - '/dash'
+  condition: padre_web and hijo_shell
+falsepositives:
+  - Scripts de despliegue o healthchecks que el servidor lanza a propósito (allowlist)
+level: high
+tags:
+  - attack.execution
+  - attack.t1059</code></pre>
+
+<p>La parte difícil no es la sintaxis: es el <strong>equilibrio entre falsos positivos y falsos negativos</strong>. Aflojá los selectores y detectás más ataques… y más actividad legítima. Apretalos y bajás el ruido… y se te empiezan a escapar variantes del ataque. Ese balance no se resuelve pensando: se resuelve <em>midiendo</em> contra datos reales (CS5.5 y el worked example).</p>
+
+<div class="danger">
+  <strong>⚠️ Una regla ruidosa no es "una detección con margen de mejora": es un riesgo activo.</strong> Si genera 200 alertas por día y el 99% es basura, va a pasar una de dos cosas, ambas malas. O el equipo la desactiva —y perdés la cobertura de golpe—, o peor: la deja activa y aprende a cerrar ese canal en lote sin mirar, con lo que el día que el 1% real aparezca va a morir en el mismo cierre masivo que los 199 falsos. Una regla que nadie lee no detecta nada; solo te da la <em>sensación</em> de que estás cubierto. Más vale no tener la regla que tenerla y ahogarla.
+</div>
+
+<h2>CS5.5 Fuentes de telemetría y sus puntos ciegos</h2>
+
+<p>Ninguna fuente de datos lo ve todo, y el error más caro de un programa de detección es no saber <em>qué no ve</em> cada una. Un atacante competente elige su camino justamente por los puntos ciegos: opera en la capa que tu telemetría no ilumina. Conocer los huecos es tan importante como conocer lo que sí registrás.</p>
+
+<table>
+<thead><tr><th>Fuente</th><th>Qué ve muy bien</th><th>Punto ciego</th></tr></thead>
+<tbody>
+<tr><td><strong>EDR</strong> (endpoint)</td><td>Procesos, árbol de ejecución padre-hijo, escrituras a disco, inyección, carga de módulos</td><td>Tráfico cifrado que no descifra; todo lo que pasa <em>fuera</em> del host (SaaS, API cloud)</td></tr>
+<tr><td><strong>Logs de red</strong> / NetFlow</td><td>Quién habla con quién, volúmenes, huellas TLS (JA3/JA4), beaconing</td><td>El contenido cifrado; no sabe qué <em>proceso</em> originó la conexión</td></tr>
+<tr><td><strong>Logs de aplicación</strong></td><td>Lógica de negocio, qué usuario hizo qué acción, decisiones de autorización</td><td>Solo lo que el dev decidió loguear; el atacante que evita la app y va a la base directo</td></tr>
+<tr><td><strong>Cloud audit</strong> (CloudTrail, Activity Log)</td><td>Cada llamada al plano de control: crear, borrar, asumir rol, cambiar política</td><td>El plano de <em>datos</em> (leer un objeto de S3 sin data events activados); lo que pasa dentro de la VM</td></tr>
+<tr><td><strong>Identity</strong> (IdP, AuthN)</td><td>Logins, MFA, emisión de tokens, cambios de rol y de permisos</td><td>Lo que hace el token <em>después</em> de emitido; el movimiento lateral con una credencial ya válida</td></tr>
+</tbody>
+</table>
+
+<p>El corolario operativo es que casi ninguna detección seria vive de una sola fuente. La historia de un ataque cloud (CS3) se arma cruzando <strong>identity</strong> (se emitió un token para esta credencial), <strong>cloud audit</strong> (el token hizo reconocimiento) y <strong>red</strong> (los datos salieron hacia una IP nueva). Cada fuente sola es ambigua; juntas cuentan una historia.</p>
+
+<div class="info">
+  El punto ciego más subestimado está en <strong>cloud audit</strong>: por defecto, CloudTrail registra el plano de control pero <em>no</em> las lecturas de objetos de S3 (los <em>data events</em> se activan aparte y cuestan). Es decir: por defecto ves que alguien <em>listó</em> tus buckets, pero no que <em>descargó</em> su contenido. Muchísimas exfiltraciones cloud son invisibles no porque la técnica sea sofisticada, sino porque el log que las mostraría nunca se encendió.
+</div>
+
+<h2>CS5.6 eBPF para detección</h2>
+
+<p>Cuando necesitás visibilidad a nivel de <strong>syscall</strong> —lo que un proceso realmente le pide al kernel, sin depender de que la aplicación coopere loguéandolo— la herramienta moderna es <strong>eBPF</strong>. Programás el kernel de Linux para que observe eventos (una <code>execve</code>, una conexión de red, la apertura de un archivo sensible) y emita telemetría, con un costo mínimo y sin cargar un módulo de kernel riesgoso. Es el mismo mecanismo que estudiaste en el track de Linux para observabilidad, aplicado a seguridad.</p>
+
+<div class="info">
+  🔗 Si querés el fundamento de cómo eBPF adjunta programas verificados a puntos del kernel, la mecánica está en <a href="../../../Curso-Linux/senior/ls6-ebpf-observabilidad/lecture.html">Linux Senior LS6 — eBPF y observabilidad</a>. Acá nos quedamos con la consecuencia para el blue team: eBPF te da un punto de observación que el atacante, incluso con root en el contenedor, tiene muy difícil de cegar sin tocar el kernel del host.
+</div>
+
+<p>Las dos plataformas de detección construidas sobre eBPF que vas a encontrar en producción son <strong>Falco</strong> (runtime security, muy usado en Kubernetes) y <strong>Tetragon</strong> (de Cilium). Falco define reglas en un YAML propio sobre eventos de syscall; una regla típica detecta comportamiento que ningún proceso legítimo de un contenedor de producción debería tener:</p>
+
+<pre><code class="lang-yaml"># Falco: shell interactiva dentro de un contenedor de producción (a nivel syscall)
+- rule: Shell en contenedor de produccion
+  desc: Un shell arrancó dentro de un contenedor etiquetado como prod
+  condition: &gt;
+    spawned_process and container
+    and proc.name in (bash, sh, zsh, ash, dash)
+    and k8s.ns.label.entorno = "prod"
+  output: &gt;
+    Shell en prod (usuario=%user.name comando=%proc.cmdline
+    contenedor=%container.name imagen=%container.image.repository)
+  priority: WARNING
+  tags: [container, shell, mitre_execution, T1059]</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué eBPF es tan potente para detectar comportamiento.</strong> La detección basada en logs de aplicación depende de que la app te cuente lo que hizo; un atacante que compromete la app puede simplemente no loguear. La detección a nivel de syscall observa la <em>realidad del kernel</em>: no importa qué mienta el proceso, para leer un archivo tuvo que hacer una <code>openat</code>, y para exfiltrar tuvo que hacer una <code>connect</code>. Es telemetría por debajo del nivel donde el atacante controla el relato. Eso la ubica cerca de la cima de la pirámide del dolor: cegar tu EDR de syscalls le exige atacar el kernel del host, no solo el contenedor.
+</div>
+
+<div class="tip">
+  Falco y Tetragon son ruidosos de fábrica: sus rulesets por defecto disparan con muchísima actividad de operación normal (un <code>kubectl exec</code> legítimo, un job de mantenimiento). Tratalos como cualquier otra fuente de detección: <strong>afinalos contra tu tráfico real antes de conectarlos a la paginación</strong>, o vas a inaugurar tu programa de eBPF con fatiga de alertas instantánea.
+</div>
+
+<h2>CS5.7 Threat hunting estructurado</h2>
+
+<p>No todo se detecta con una regla que ya existe. El <strong>threat hunting</strong> es la búsqueda proactiva de actividad maliciosa que <em>ninguna alerta reportó</em>. Pero "hunting" no es abrir el SIEM y mirar hasta que algo llame la atención: eso es turismo. El hunting estructurado es un método con hipótesis, y su producto más valioso no es el atacante que encontrás, sino la <strong>detección automatizada que dejás construida</strong> para no tener que volver a cazar eso a mano.</p>
+
+<div class="step"><strong>1. Hipótesis anclada en ATT&amp;CK.</strong> "Si un adversario logró ejecución (T1059) en la flota de servidores, veríamos intérpretes de comandos con padres inusuales." Falsable y acotada.</div>
+<div class="step"><strong>2. Datos y análisis.</strong> Traés la telemetría relevante y aplicás una técnica de análisis. La más productiva es el <em>stack counting</em> (análisis de frecuencia): agrupás un comportamiento y mirás la <strong>cola larga</strong>, lo que casi nunca pasa. Lo raro es lo interesante.</div>
+<div class="step"><strong>3. Investigación.</strong> Cada caso de la cola se explica o se escala. La mayoría tendrá una explicación benigna —y eso también es un hallazgo: acabás de aprender qué es "normal" en tu entorno.</div>
+<div class="step"><strong>4. Operacionalización.</strong> Si el patrón es detectable de forma repetible, se convierte en una regla con su test (CS5.4) y entra al pipeline. El hunt que no deja una detección o un dato de "normalidad" documentado, se va a repetir idéntico dentro de tres meses.</div>
+
+<pre><code class="lang-python"># Hunt por análisis de frecuencia (stack counting): lo raro es sospechoso.
+# Hipótesis (T1059): un binario del sistema lanzó un intérprete de comandos
+# en un host donde eso prácticamente nunca ocurre.
+import pandas as pd
+
+ev = pd.read_parquet("edr_process_events.parquet")   # 30 días, toda la flota
+shells = ev[ev["child"].isin(["powershell.exe", "cmd.exe", "bash", "sh"])]
+
+# Agrupá por (padre → hijo) y ordená por lo MENOS frecuente primero
+ranking = (shells.groupby(["parent", "child"])
+                 .size()
+                 .sort_values())          # la cola de arriba es tu terreno de caza
+
+print(ranking.head(20))
+# 'w3wp.exe → cmd.exe'  con  1 ocurrencia en 30 días  ← eso hay que mirarlo
+# 'explorer.exe → powershell.exe' con 40.000  ← ruido de fondo normal, ignorá</code></pre>
+
+<div class="rule">
+  <strong>📌 Un hunt no termina cuando encontrás (o no encontrás) al atacante.</strong> Termina cuando el resultado quedó operacionalizado: una regla nueva con su test, o una línea de baseline documentada ("<code>w3wp.exe → cmd.exe</code> nunca es normal acá"). El valor de un equipo de hunting se mide en detecciones producidas, no en horas de pantalla.
+</div>
+
+<h2>CS5.8 Fatiga de alertas, en serio</h2>
+
+<p>El M10 nombró la fatiga de alertas. Como ingeniero de detección tenés que tratarla como lo que es: <strong>el modo de falla dominante de los SOC</strong>, y un problema técnico con solución técnica, no un problema de actitud del analista.</p>
+
+<div class="mistake">
+  <strong>Mil alertas por día son cero alertas.</strong> Un humano no tríagea mil eventos; los cierra en lote. Con 98% de ruido, ignorar el canal es el comportamiento <em>racional</em> del analista, no una falla de disciplina. Si tu respuesta a la fatiga es "hay que capacitar al equipo para que preste más atención", diagnosticaste mal: la fatiga se arregla bajando el volumen, no subiendo la fuerza de voluntad.
+</div>
+
+<p>Las tres palancas técnicas, en orden de impacto:</p>
+
+<div class="step"><strong>Agrupación (correlación).</strong> Cincuenta eventos de la misma credencial, en la misma ventana, contra el mismo recurso, son <em>un</em> incidente, no cincuenta alertas. Agrupar por entidad (usuario, host, sesión) y por ventana temporal colapsa el volumen de golpe.</div>
+<div class="step"><strong>Enriquecimiento.</strong> Una alerta sin contexto obliga al analista a diez búsquedas manuales. Agregarle automáticamente el dueño del activo, su criticidad, la geolocalización, la reputación de la IP y si el usuario está de viaje convierte tres minutos de investigación en una decisión de tres segundos.</div>
+<div class="step"><strong>Scoring de riesgo.</strong> En vez de que cada señal débil dispare su propia alerta, se acumulan en un puntaje por entidad y solo se pagina cuando el puntaje cruza un umbral. Una señal sola es ruido; cinco señales débiles sobre el mismo usuario en una hora es una historia.</div>
+
+<pre><code class="lang-python"># Scoring de riesgo por entidad: agregar señales débiles en vez de paginar cada una
+def puntaje_riesgo(entidad, señales):
+    peso = {
+        "login_geo_imposible":     40,   # viajó 9000 km en 20 min
+        "mfa_fallido_repetido":    15,
+        "acceso_a_recurso_nuevo":  10,
+        "descarga_volumen_alto":   25,
+        "uso_de_credencial_vieja": 20,
+    }
+    total = sum(peso.get(s, 0) for s in señales)
+    # Solo lo que cruza el umbral llega a un humano; el resto va a un dashboard
+    if total &gt;= 60:
+        paginar(entidad, total, señales)      # incidente: alguien lo mira YA
+    elif total &gt;= 30:
+        encolar_para_revision(entidad, total) # sospechoso: cola de baja prioridad
+    return total</code></pre>
+
+<div class="concept">
+  <strong>💡 La métrica que importa no es el volumen de alertas: es la <em>tasa de alertas accionables</em>.</strong> El porcentaje de alertas que llevan a una acción real (contener, investigar, escalar) mide la salud del sistema de detección mejor que ninguna otra cosa. Un SOC que baja de 1.000 alertas/día al 5% accionable a 50 alertas/día al 80% accionable no detecta <em>menos</em>: detecta muchísimo <strong>mejor</strong>. Optimizar por volumen —"cubrimos más porque generamos más alertas"— es optimizar la métrica que enferma al equipo.
+</div>
+
+<h2>CS5.9 Detectar lo que CS4 introdujo</h2>
+
+<p>CS4 te mostró las amenazas nuevas de los sistemas de IA: inyección de prompt, abuso de herramientas del agente, exfiltración por el canal del LLM. Esas amenazas también hay que <em>detectarlas</em>, y el punto de observación correcto no es "dentro del modelo" —que es opaco— sino en el <strong>gateway del LLM y en el sandbox de herramientas del agente</strong>, donde el comportamiento se vuelve telemetría igual que cualquier otro proceso.</p>
+
+<p>Dos hipótesis de detección concretas, ancladas en comportamiento observable:</p>
+
+<div class="step"><strong>Abuso de herramientas tras contenido no confiable.</strong> El agente procesó una entrada externa (un email, una página, un documento subido) y <em>después</em> disparó herramientas de red o de escritura que esa tarea no requería. Es la firma de una inyección de prompt que secuestró al agente. La señal es la secuencia: contenido externo → ráfaga de tool calls anómala.</div>
+<div class="step"><strong>Exfiltración por el canal del LLM.</strong> La salida del agente hacia un destino tiene un volumen anómalo para la tarea, contiene patrones de secreto (claves, tokens, PII), o egresa hacia un dominio que ese agente nunca usó. El LLM se vuelve un túnel de exfiltración con apariencia de conversación normal.</div>
+
+<pre><code class="lang-python"># Señales de exfiltración por el canal de un agente de IA (ver CS4).
+# Se corre sobre los logs del gateway/sandbox, NO "dentro" del modelo.
+def riesgo_exfil_agente(sesion):
+    señales = 0
+    # 1) Tocó contenido no confiable y DESPUÉS hizo llamadas de red
+    if sesion.leyo_contenido_externo and sesion.llamadas_red_post &gt; 0:
+        señales += 2
+    # 2) Volumen de salida anómalo para el tipo de tarea (posible volcado)
+    if sesion.tokens_salida &gt; 5 * sesion.baseline_tokens_tarea:
+        señales += 1
+    # 3) La salida matchea patrones de secreto (regex de claves/tokens/PII)
+    if sesion.salida_contiene_secretos:
+        señales += 3
+    # 4) Egress hacia un dominio que este agente nunca había usado
+    if sesion.dominio_egress_nuevo:
+        señales += 2
+    return señales      # alimenta el mismo scoring de riesgo de CS5.8</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El punto ciego de la IA es asumir que el modelo es la superficie a monitorear.</strong> No podés instrumentar el interior del modelo de forma útil, y no hace falta. La actividad maliciosa se materializa en <em>acciones</em>: una llamada a una herramienta, una conexión de red, una lectura de un secreto. Instrumentá el <strong>perímetro de acción</strong> del agente —el gateway, el sandbox, el egress— y la exfiltración por el canal del LLM se vuelve tan detectable como cualquier otra conexión anómala. El error es buscar la amenaza en la capa opaca en vez de en la capa donde deja huellas.
+</div>
+
+<h2>CS5.10 Deception: detección de alta señal</h2>
+
+<p>Toda la dificultad de la detección hasta acá vino del mismo lado: separar la señal del ruido de la actividad legítima. La <strong>deception</strong> le da la vuelta al problema. En vez de buscar lo malo entre lo bueno, plantás algo que <em>ningún usuario legítimo tiene motivo para tocar</em>: cualquier interacción con ese cebo es, por definición, sospechosa. El resultado es una detección con la mejor relación señal/ruido que existe: casi sin falsos positivos.</p>
+
+<table>
+<thead><tr><th>Cebo</th><th>Qué es</th><th>Qué revela cuando se dispara</th></tr></thead>
+<tbody>
+<tr><td><strong>Honeypot</strong></td><td>Un sistema entero falso, sin valor real, puesto para ser atacado</td><td>Reconocimiento y movimiento lateral en la red</td></tr>
+<tr><td><strong>Honeytoken</strong></td><td>Una credencial / clave falsa que solo existe para ser robada</td><td>Que alguien accedió a donde estaba guardada y la usó</td></tr>
+<tr><td><strong>Canary token</strong></td><td>Un archivo, URL o registro DNS que avisa al ser abierto/resuelto</td><td>Que un documento "señuelo" fue abierto o exfiltrado</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Honeytoken en AWS: una clave que NO da acceso a NADA. Solo existe para ser robada.
+# La sembrás donde un atacante buscaría credenciales:
+#   - un .env de un repo interno         - un backup "olvidado"
+#   - un bucket con nombre tentador      - el historial de un shell
+
+# Cualquier uso de esta accessKeyId en CloudTrail dispara una alerta CRITICA.
+# No hay falso positivo posible: ningún proceso legítimo la usa jamás.
+#   eventName=GetCallerIdentity   userIdentity.accessKeyId=AKIA_CANARY_xxxx
+
+# Canarytokens.org genera tokens (URL, doc de Office, DNS, clave AWS) en segundos:
+curl -s "https://canarytokens.org/generate"    # o autohospedá la versión abierta</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué la deception es tan valiosa para un ingeniero de detección.</strong> Una detección basada en comportamiento siempre pelea con la ambigüedad: ese login raro, ¿es un atacante o un empleado de viaje? Un honeytoken no tiene ambigüedad. Su tasa de falsos positivos es estructuralmente cercana a cero, porque el disparo requiere que alguien haya accedido a un lugar donde no debía y usado algo que no debía existir. Además, dispara <em>temprano</em> en la cadena —en la fase de reconocimiento o de acceso a credenciales, antes del impacto— que es exactamente cuando querés enterarte. Poca ingeniería te da tanta señal por tan poco ruido.
+</div>
+
+<h2>CS5.11 Métricas de un programa de detección</h2>
+
+<p>Un programa de detección se gestiona con datos o se gestiona a ciegas. Y acá está el matiz senior: hay que medir <em>el programa</em>, no solo las reglas. Una regla puede ser perfecta y el programa un desastre si tarda seis semanas en llevar una idea a producción, o si nadie sabe qué fracción de las reglas tiene test.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué mide</th><th>La trampa que te evita</th></tr></thead>
+<tbody>
+<tr><td><strong>MTTD</strong></td><td>Tiempo desde el compromiso hasta la detección (dwell time)</td><td>Sentirte seguro sin medir cuánto tarda tu peor caso</td></tr>
+<tr><td><strong>Cobertura ATT&amp;CK</strong></td><td>Fracción de técnicas relevantes con una detección <em>probada</em></td><td>Contar reglas en lugar de superficie defendida</td></tr>
+<tr><td><strong>Tasa de alertas accionables</strong></td><td>% de alertas que llevan a una acción real</td><td>Optimizar volumen y fabricar fatiga</td></tr>
+<tr><td><strong>Ratio de falsos positivos</strong></td><td>FP sobre total de alertas, <em>por regla</em></td><td>La regla que el equipo cierra en lote sin leer</td></tr>
+<tr><td><strong>Cobertura de test</strong></td><td>% de reglas con datos TP/FP corriendo en CI</td><td>Reglas que "existen" pero nunca se probaron</td></tr>
+<tr><td><strong>Time-to-detection-live</strong></td><td>Cuánto tarda una detección de idea a producción</td><td>Un pipeline que no escala con las amenazas nuevas</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Medir el programa importa tanto como escribir las reglas.</strong> El ratio de FP por regla te dice cuáles retirar o afinar antes de que causen fatiga. La cobertura de test te dice cuántas de tus detecciones son en realidad opiniones sin verificar. El MTTD te da el número honesto para la conversación con la dirección, en lugar del reconfortante y vacío "tenemos 5.000 reglas". Sin estas métricas, tu programa mejora o empeora sin que lo sepas.
+</div>
+
+<h2>CS5.12 Cuándo NO escribir una detección</h2>
+
+<p>La madurez de un ingeniero de detección se nota menos en las reglas que escribe que en las que decide <strong>no</strong> escribir. Detectar tiene un costo permanente —mantenimiento, tuning, atención del analista— y no siempre es la respuesta correcta. Tres casos en los que la detección es la herramienta equivocada:</p>
+
+<div class="step"><strong>1. Cuando el control preventivo es mejor.</strong> Si podés <em>eliminar</em> la clase de ataque, hacelo, y no escribas una detección para algo que ya no puede pasar. ¿Detectar el uso de credenciales estáticas robadas? Mejor: eliminá las credenciales estáticas y pasá a roles de corta duración (CS3). Una detección para un riesgo que un control preventivo ya cerró es puro ruido y mantenimiento a cambio de nada.</div>
+
+<div class="step"><strong>2. Cuando la fuente de datos no existe.</strong> No podés detectar lo que no ves. Si la telemetría necesaria no está —los data events de S3 apagados, sin logs de la app, sin EDR en ese segmento— el proyecto no es "escribir una regla que no va a disparar nunca": es conseguir el dato primero. Una regla sobre una fuente inexistente es cobertura de papel que te miente en la matriz.</div>
+
+<div class="step"><strong>3. Cuando el falso positivo cuesta más que el riesgo.</strong> Si una detección para un evento improbable y de bajo impacto va a generar ruido constante, la cuenta puede dar negativa: gastás más atención humana en tríagear falsos positivos de lo que jamás te va a costar el incidente que intentás prevenir. A veces la decisión correcta es aceptar el riesgo residual de forma explícita y documentada, y no detectar.</div>
+
+<div class="warn">
+  <strong>La restricción real no es técnica, es la atención de tu equipo.</strong> Cada detección que agregás consume un presupuesto finito de atención humana. Tratala como un recurso escaso: gastala donde el comportamiento es de alto valor (cima de la pirámide), la fuente existe, y la señal justifica el ruido. Escribir "una regla para cada cosa por si acaso" no te hace más seguro; te ahoga el canal y te vuelve <em>menos</em> capaz de ver lo que importa. Menos detecciones, mejores, es casi siempre la jugada correcta.
+</div>
+
+<h2>🧑‍🎓 Worked Example — detectar robo de credenciales cloud</h2>
+
+<blockquote>Un atacante consiguió las claves de acceso estáticas de un <code>IAMUser</code> de tu cuenta de AWS (un <code>.env</code> filtrado en un repo, o SSRF contra el metadata endpoint de una instancia — la técnica que viste en CS3). Ahora las usa desde su propia infraestructura. Tarea: construir la detección de punta a punta, no solo escribir la regla.</blockquote>
+
+<p><strong>Paso 1 — La hipótesis, anclada en ATT&amp;CK.</strong> El atacante que acaba de robar credenciales estáticas no sabe qué puede hacer con ellas, así que se <em>orienta</em>: pregunta quién es y qué hay. Eso mapea a <strong>T1078.004</strong> (Valid Accounts: Cloud Accounts) seguido de <strong>T1580</strong> (Cloud Infrastructure Discovery). La firma conductual: una llamada <code>sts:GetCallerIdentity</code> ("¿quién soy?") seguida de una ráfaga de llamadas <code>List*</code>/<code>Describe*</code> ("¿qué hay?"), todo con una clave de <code>IAMUser</code> (larga vida, no un rol efímero) desde una IP que no es tuya.</p>
+
+<p><strong>Paso 2 — Confirmar la fuente.</strong> Todo esto vive en <strong>CloudTrail</strong> (plano de control), que registra cada llamada a la API con <code>userIdentity.accessKeyId</code>, <code>eventName</code> y <code>sourceIPAddress</code>. La fuente existe y tiene los campos que necesito. Puedo avanzar.</p>
+
+<p><strong>Paso 3 — La regla base (nivel evento).</strong> Primero lo obvio, sabiendo que va a ser ruidoso:</p>
+
+<pre><code class="lang-yaml">title: Reconocimiento cloud con credencial estática desde IP no corporativa
+id: 3d7f0b12-6c4a-4e59-b1a0-9f2c7e5a8b40
+status: experimental
+description: |
+  Llamadas de descubrimiento (List/Describe/Get) o GetCallerIdentity ejecutadas
+  con la clave de un IAMUser desde una IP fuera de los rangos corporativos.
+  Patrón de orientación tras el robo de credenciales estáticas (T1078.004 + T1580).
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  orientacion:
+    eventName|startswith:
+      - 'GetCallerIdentity'
+      - 'List'
+      - 'Describe'
+  llave_estatica:
+    userIdentity.type: IAMUser        # descarta roles efímeros (AssumedRole)
+  ip_corporativa:
+    sourceIPAddress|cidr:
+      - '203.0.113.0/24'
+      - '198.51.100.0/24'
+  condition: llave_estatica and orientacion and not ip_corporativa
+falsepositives:
+  - Herramientas de inventario o CSPM con un IAMUser dedicado (allowlist por accessKeyId)
+  - Administradores desde una VPN residencial o de viaje
+fields:
+  - userIdentity.accessKeyId
+  - sourceIPAddress
+  - eventName
+level: medium
+tags:
+  - attack.credential-access
+  - attack.discovery
+  - attack.t1078.004
+  - attack.t1580</code></pre>
+
+<p><strong>Paso 4 — La correlación (lo que la hace precisa).</strong> La regla base dispara con <em>cada</em> llamada de descubrimiento: un administrador legítimo la enciende sin querer todo el tiempo. Lo que caracteriza al ataque no es una llamada, es la <strong>ráfaga</strong>. Sigma expresa eso con una regla de correlación que solo dispara si la misma clave produce muchos <code>eventName</code> distintos en una ventana corta:</p>
+
+<pre><code class="lang-yaml">title: Rafaga de descubrimiento con la misma credencial estatica (correlacion)
+status: experimental
+correlation:
+  type: value_count
+  rules:
+    - 3d7f0b12-6c4a-4e59-b1a0-9f2c7e5a8b40   # la regla base de arriba
+  group-by:
+    - userIdentity.accessKeyId               # por credencial
+  timespan: 10m
+  condition:
+    gte: 8                                    # 8+ acciones distintas...
+    field: eventName                          # ...de descubrimiento, en 10 min
+level: high</code></pre>
+
+<p><strong>Paso 5 — Testear contra ataque y contra normalidad.</strong> Acá se decide el umbral. Genero datos de ataque detonando la técnica en una cuenta de laboratorio, y consigo 30 días de CloudTrail real como datos "normales":</p>
+
+<pre><code class="lang-bash"># 1) Datos de ataque: detonar la técnica en una cuenta AISLADA de laboratorio
+stratus detonate aws.discovery.ec2-enumerate-from-instance
+
+# 2) Datos normales: 30 días de CloudTrail de la cuenta real (solo lectura)
+# 3) Correr la regla contra ambos con el motor de tu SIEM o con pySigma
+sigma convert -t esql -p cloudtrail rules/aws_recon_llaves_estaticas.yml</code></pre>
+
+<p><strong>Paso 6 — Iterar el umbral con la tabla de tuning.</strong> Corro cada versión contra los dos conjuntos y mido: falsos positivos por día sobre datos normales, y si sigue detectando el ataque simulado. El objetivo es el mínimo ruido que aún atrape el ataque:</p>
+
+<table>
+<thead><tr><th>Iteración</th><th>Lógica</th><th>FP/día (datos normales)</th><th>¿Detecta el ataque?</th></tr></thead>
+<tbody>
+<tr><td>v1</td><td>Cualquier <code>List</code>/<code>Describe</code> desde IP nueva</td><td>~340</td><td>✅ (ahogado en ruido)</td></tr>
+<tr><td>v2</td><td>+ solo <code>IAMUser</code> (excluye roles efímeros)</td><td>~55</td><td>✅</td></tr>
+<tr><td>v3</td><td>+ correlación: ≥8 <code>eventName</code> distintos en 10 min</td><td>3</td><td>✅</td></tr>
+<tr><td>v4</td><td>+ allowlist de <code>accessKeyId</code> del CSPM y del inventario</td><td>0–1</td><td>✅</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La decisión del umbral no se argumenta, se mide.</strong> El salto de v2 a v3 —de 55 falsos positivos a 3— no salió de intuición sino de correr la correlación contra tráfico real y ver dónde caía el ruido sin perder el verdadero positivo. El <code>gte: 8</code> no es un número mágico: es el punto que en <em>tus</em> datos separa la orientación de un atacante del trabajo de un administrador. En otra cuenta, con otra operación, el número óptimo es otro, y por eso el test contra datos propios es innegociable.
+</div>
+
+<p><strong>Paso 7 — Cerrar el ciclo.</strong> La v4 entra al repositorio con sus dos archivos de test (el <code>true_positive.json</code> de la detonación y un <code>false_positive.json</code> del administrador legítimo), se despliega por el pipeline, y queda registrada su cobertura: T1078.004 y T1580 pasan de rojo a verde en el Navigator —verde de verdad, porque hay un test que lo demuestra. Y como bonus de alta señal: sembrás un <strong>honeytoken</strong> (CS5.10) —una clave de <code>IAMUser</code> falsa en un <code>.env</code> tentador— para que el <em>próximo</em> robo se detecte en el instante cero, sin depender de umbrales.</p>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué "tenemos 5.000 reglas" no dice nada sobre tu cobertura, y qué medirías en su lugar?</summary>
+<p>Porque el número de reglas mide volumen de trabajo, no superficie defendida: las 5.000 pueden apilarse sobre unas pocas técnicas de <em>Execution</em> y dejar tácticas enteras —<em>Credential Access</em>, <em>Exfiltration</em>, <em>Impact</em>— sin una sola detección. La métrica honesta es la <strong>cobertura de ATT&amp;CK</strong>: qué fracción de las técnicas <em>relevantes para tu modelo de amenaza</em> tiene al menos una detección <strong>probada</strong> (que demostradamente dispara contra una emulación de esa técnica). Se visualiza coloreando el ATT&amp;CK Navigator, y solo cuenta como verde lo que tiene test, no lo que tiene el <code>tag</code> correcto.</p></details>
+
+<details><summary>Escribiste una regla que cubre una TTP importante pero da 200 falsos positivos por día. ¿Qué hacés?</summary>
+<p>No la dejás activa "por las dudas": una regla ruidosa es un riesgo activo, no una cobertura con margen de mejora. O el equipo la desactiva —y perdés la cobertura de golpe— o la deja y aprende a cerrar ese canal en lote, con lo que el verdadero positivo va a morir junto con los 199 falsos. La jugada es <strong>afinarla midiendo contra datos reales</strong>: agregar correlación (agrupar por entidad y ventana), enriquecer, subir el umbral, o poner una allowlist de las fuentes legítimas conocidas. Si después de eso sigue siendo inviable, considerás si el problema se resuelve mejor con un control <em>preventivo</em>, o aceptás el riesgo de forma explícita y la retirás. Menos detecciones, mejores.</p></details>
+
+<details><summary>¿Por qué una detección basada en el comportamiento (TTP) le duele más al atacante que una basada en el hash del malware?</summary>
+<p>Por la pirámide del dolor. Cambiar el hash le cuesta al atacante segundos: recompila, cambia un byte, y tu detección atómica queda ciega sin avisarte. La IP y el dominio son casi igual de baratos de rotar. Una detección de comportamiento —"un servidor web lanzó un shell", "una credencial estática hizo reconocimiento desde una IP nueva"— sigue disparando aunque cambie el malware, la IP y el dominio, porque describe <em>lo que hace</em>, no <em>con qué</em>. Para evadirla tiene que rediseñar su forma de operar, que es caro en tiempo, dinero y a veces capacidad. Por eso el esfuerzo de ingeniería se concentra en la cima de la pirámide, aunque la base (bloqueo por hash/IP) siga siendo útil para filtrar el ruido de fondo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>La detección es <strong>software</strong>: tiene ciclo de vida (hipótesis → dato → regla → test → deploy → tuning → retiro), vive en git y se testea en CI. <em>Detection-as-code</em>. Una regla sin test es una opinión.</li>
+  <li>La <strong>pirámide del dolor</strong> ordena las detecciones por costo de evasión: hash e IP son triviales de cambiar; las <strong>TTPs</strong> (comportamiento) obligan al atacante a rediseñar su operación. Concentrá la ingeniería en la cima.</li>
+  <li>La cobertura real se mide en <strong>ATT&amp;CK</strong>: fracción de técnicas relevantes con una detección probada. "Tenemos N reglas" no es una métrica de cobertura.</li>
+  <li><strong>Sigma</strong> hace la regla portable; la parte difícil es el balance FP/FN, que se resuelve <em>midiendo</em> contra datos reales, no pensando. Una regla ruidosa se termina desactivando o ignorando.</li>
+  <li>Ninguna fuente lo ve todo: EDR, red, app, cloud audit e identity tienen puntos ciegos conocidos. <strong>eBPF</strong> (Falco/Tetragon) da visibilidad de syscall por debajo del nivel que el atacante controla.</li>
+  <li>El <strong>hunting</strong> estructurado parte de una hipótesis ATT&amp;CK y su producto es una detección automatizada, no solo el atacante encontrado.</li>
+  <li>La <strong>fatiga de alertas</strong> es una falla técnica: se arregla con agrupación, enriquecimiento y scoring de riesgo. La métrica sana es la <strong>tasa de alertas accionables</strong>, no el volumen.</li>
+  <li>La <strong>deception</strong> (honeytokens, canary tokens) da la mejor relación señal/ruido posible: casi cero falsos positivos, y dispara temprano en la cadena.</li>
+  <li>Lo más senior es saber <strong>cuándo NO detectar</strong>: cuando la prevención es mejor, cuando la fuente no existe, o cuando el falso positivo cuesta más que el riesgo. La atención del equipo es el recurso escaso.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá tres reglas de detección de tu entorno (o del repo público de SigmaHQ) y ubicá cada una en un nivel de la pirámide del dolor. Para las que estén en la base, proponé una detección equivalente de comportamiento que apunte a la misma amenaza más arriba.</li>
+  <li>Elegí cinco técnicas de ATT&amp;CK de las tácticas <em>Credential Access</em> y <em>Discovery</em>. Para cada una respondé: ¿tengo la fuente de telemetría que la haría visible? Armá una mini matriz de cobertura con verde/amarillo/rojo y justificá cada color.</li>
+  <li>Escribí una regla Sigma para una TTP de tu elección, con su bloque <code>logsource</code>, <code>detection</code> y <code>falsepositives</code>. Después escribí los dos archivos de test —un true positive que debe disparar y un false positive que no— antes de considerarla terminada.</li>
+  <li>Tomá una fuente de telemetría que uses (EDR, CloudTrail, logs de tu app) y documentá tres cosas concretas que <strong>no</strong> ve. Para cada punto ciego, indicá qué otra fuente lo cubriría.</li>
+  <li>Reproducí el análisis de frecuencia (stack counting) de CS5.7 sobre cualquier dataset de eventos de proceso que tengas. Ordená por lo menos frecuente y explicá qué mirarías de la cola larga y por qué.</li>
+  <li>Diseñá un esquema de scoring de riesgo por entidad con al menos cinco señales y sus pesos. Definí los dos umbrales (paginar / encolar) y justificá por qué una señal sola no debería paginar nunca.</li>
+  <li>Sembrá un canary token (una URL o un documento de Canarytokens.org) en un lugar de prueba, disparalo vos mismo y documentá la alerta que llega. Explicá por qué su tasa de falsos positivos es estructuralmente cercana a cero.</li>
+  <li>Elegí una detección que <em>no</em> escribirías y argumentá cuál de los tres casos de CS5.12 aplica. Proponé la alternativa (control preventivo, conseguir la fuente, o aceptar el riesgo documentado).</li>
+</ol>
+
+<section class="quiz" id="quizCS_S5">
+  <style>
+    #quizCS_S5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S5 .q{margin-bottom:1.5rem}
+    #quizCS_S5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S5 .opt:hover{border-color:var(--accent)}
+    #quizCS_S5 .opt:disabled{cursor:default}
+    #quizCS_S5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S5 .exp.show{display:block}
+    #quizCS_S5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu equipo se jacta de tener 5.000 reglas de detección. ¿Qué te dice ese número sobre tu cobertura real de ATT&amp;CK?</p>
+    <button class="opt">Que la cobertura es excelente: más reglas es directamente más superficie detectada</button>
+    <button class="opt">Prácticamente nada: 5.000 reglas pueden apilarse sobre las mismas técnicas y dejar tácticas enteras sin una sola detección</button>
+    <button class="opt">Que el equipo está sobredimensionado y habría que consolidar reglas para bajar el número</button>
+    <div class="exp">El número de reglas mide volumen de trabajo, no superficie defendida. La cobertura real es la fracción de técnicas <em>relevantes</em> con una detección <strong>probada</strong>, y se ve coloreando el ATT&amp;CK Navigator. Cinco mil reglas concentradas en <em>Execution</em> pueden dejar <em>Credential Access</em> y <em>Exfiltration</em> completamente a oscuras.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Escribiste una regla que cubre una TTP importante pero genera 200 falsos positivos por día. La dejás activa "por las dudas". ¿Qué es lo más probable que pase?</p>
+    <button class="opt">El equipo la va a terminar ignorando o desactivando, y vas a tener cobertura nominal con cero capacidad real de respuesta</button>
+    <button class="opt">Nada malo: cubre la técnica y eso ya suma en la matriz de cobertura</button>
+    <button class="opt">El SIEM la va a autoafinar con el tiempo hasta que el ruido baje solo</button>
+    <div class="exp">Una regla ruidosa es un riesgo activo, no una cobertura con margen. Con 99% de basura, el equipo cierra ese canal en lote y el verdadero positivo muere junto con los falsos. Se arregla afinando contra datos reales —correlación, enriquecimiento, umbral, allowlist— o se retira y se resuelve con prevención. Una regla que nadie lee no detecta nada.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>3. En la pirámide del dolor, ¿por qué una detección basada en el hash de un malware vale mucho menos que una basada en una TTP?</p>
+    <button class="opt">Porque calcular hashes en tiempo real es demasiado costoso para un SIEM</button>
+    <button class="opt">Porque los hashes solo funcionan en un sistema operativo y las TTPs son multiplataforma</button>
+    <button class="opt">Porque cambiar el hash le cuesta segundos (recompilar), mientras que cambiar su comportamiento lo obliga a rediseñar la operación</button>
+    <div class="exp">La pirámide ordena los indicadores por costo de evasión. Hash, IP y dominio están en la base porque el atacante los rota en segundos o minutos, dejando tu detección atómica ciega sin aviso. Una detección de comportamiento sigue disparando aunque cambie de malware, IP y dominio, porque describe lo que hace, no con qué. Por eso duele de verdad y por eso ahí va el esfuerzo de ingeniería.</div>
+  </div>
+
+  <div class="score" id="scoreCS_S5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cs4-seguridad-ia/lecture.html">← CS4: Seguridad de sistemas de IA</a>
+  <a href="../cs6-red-team/lecture.html">CS6: Red team y adversary emulation →</a>
+</nav>
+
+</div>
+</body>
+</html>

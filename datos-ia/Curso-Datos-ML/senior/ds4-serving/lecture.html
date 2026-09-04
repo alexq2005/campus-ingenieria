@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS4 — Serving de modelos: de la GPU al endpoint · Datos/ML Senior</title>
+  <meta name="description" content="Exportar (pickle, TorchScript, torch.export, ONNX, SavedModel), optimizar la inferencia (cuantización INT8/INT4, pruning, distillation, ONNX Runtime y TensorRT), dynamic batching, arquitecturas de serving, latencia p50/p95/p99, escalar con GPU, feature serving y el despliegue riesgoso de modelos.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos & ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS4</span>
+  <span class="badge">⏱ 35–80 min</span>
+  <span class="badge">🎯 Pre-req: DS2</span>
+  <span class="badge">🚀 Serving</span>
+</div>
+
+<article>
+
+<h1>DS4 — Serving de modelos: de la GPU al endpoint</h1>
+
+<h2>DS4.0 Por qué este módulo</h2>
+
+<p>En DS2 entrenaste un modelo y en DS3 lo evaluaste. Los dos módulos terminan con un artefacto —unos pesos, un <code>.pt</code>, un <em>pipeline</em> de sklearn— que en tu notebook predice de maravilla. Y ahí se queda. <strong>Un modelo que no responde a un request no le sirve a nadie.</strong> Este módulo es el puente entre "el modelo funciona" y "el modelo está en producción respondiendo a usuarios reales con una latencia que alguien tolera y un costo que alguien paga".</p>
+
+<p>La tentación es pensar que servir un modelo es como servir cualquier otro código: lo metés en un <code>FastAPI</code>, exponés un <code>/predict</code> y listo. Se puede hacer así, y para un prototipo alcanza. Pero servir ML tiene restricciones que servir código común no tiene, y esas restricciones son las que hacen que el mismo modelo cueste 5 ms en el notebook y 400 ms en producción, o que tu factura de GPU se dispare sirviendo diez requests por segundo.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Servir ML es distinto por cuatro razones que no aparecen al servir un CRUD: <strong>(1)</strong> el artefacto es pesado y su formato importa —cómo lo exportás decide dónde y qué tan rápido corre—; <strong>(2)</strong> la inferencia es cara y se optimiza con técnicas propias (cuantización, batching) que no existen en un backend normal; <strong>(3)</strong> el hardware caro (GPU) solo rinde si lo alimentás en lotes, no de a un request; y <strong>(4)</strong> un modelo no falla en compilación: puede cargar, responder y estar silenciosamente peor. Entendé esos cuatro y el resto se deduce.
+</div>
+
+<p>El resto del módulo desarma cada punto. Vamos a exportar, optimizar, batchear, elegir arquitectura, medir latencia, escalar y desplegar — y a cerrar con un caso donde un modelo pasa de 400 ms a decenas de milisegundos sin tocar una sola línea de la lógica del modelo.</p>
+
+<h2>DS4.1 El gap entrenamiento → producción</h2>
+
+<p>Entrenar y servir son dos regímenes distintos que casi no comparten requisitos. En entrenamiento te importa el <em>throughput</em> sobre datos históricos, corrés en lotes grandes, tolerás que un <em>epoch</em> tarde horas y tenés todo el dataset en disco. En inferencia te importa la <em>latencia</em> de un request que llega ahora, con datos que no viste, y alguien del otro lado esperando la respuesta.</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Entrenamiento</th><th>Inferencia (serving)</th></tr></thead>
+<tbody>
+<tr><td>Métrica que importa</td><td>Throughput, accuracy final</td><td>Latencia p99, costo por predicción</td></tr>
+<tr><td>Tamaño de lote</td><td>Grande (256, 1024…)</td><td>1 request, o lo que junte el batcher</td></tr>
+<tr><td>Datos</td><td>Todo el dataset, en disco</td><td>Un ejemplo, recién llegado</td></tr>
+<tr><td>Precisión numérica</td><td>FP32 / FP16 / BF16</td><td>INT8 / INT4 alcanzan y sobran</td></tr>
+<tr><td>Gradientes</td><td>Sí (backprop)</td><td>No: solo <em>forward</em>, sin grafo de autograd</td></tr>
+<tr><td>Tolerancia a fallar</td><td>Reintentás el job</td><td>El usuario ve el error en vivo</td></tr>
+</tbody>
+</table>
+
+<p>El primer costo escondido es que el entorno de inferencia es otro. En el notebook el modelo ya está cargado en memoria de la GPU, los datos ya están en el formato exacto, no hay red de por medio y medís una predicción <em>warm</em> sobre un tensor que preparaste a mano. En producción el request llega por HTTP, hay que deserializar el JSON, traer las <em>features</em> de algún lado, moverlas a la GPU, correr el <em>forward</em> y devolver el resultado — y recién la primera vez, cargar el modelo y compilar los kernels. El "5 ms" del notebook medía una fracción diminuta del trabajo real.</p>
+
+<div class="mistake">
+  <strong>El train/serve skew vuelve, ahora del lado del serving.</strong> En DS1 y DS2 el <em>skew</em> era que las <em>features</em> de entrenamiento no coincidían con las de inferencia. Acá reaparece por el <strong>preprocesamiento</strong>: si entrenaste normalizando con la media y el desvío del dataset, y en producción normalizás con otros valores (o te olvidás de normalizar), el modelo recibe entradas fuera de distribución y predice cualquier cosa — sin tirar ningún error. El preprocesamiento tiene que viajar <em>con</em> el modelo, no reescribirse a mano en el servicio.
+</div>
+
+<pre><code class="lang-python"># El error clásico: preprocesamiento que vive en el notebook y NO en el artefacto.
+# En entrenamiento:
+media, desvio = X_train.mean(axis=0), X_train.std(axis=0)
+X_norm = (X_train - media) / desvio          # el modelo aprende con esto
+
+# En producción, seis meses después, otra persona escribe el servicio:
+def predecir(payload):
+    x = np.array(payload["features"])         # &lt;-- SIN normalizar
+    return modelo.predict(x[None, :])          # entrada fuera de distribución
+
+# Correcto: empaquetar el preprocesamiento DENTRO del artefacto que se sirve.
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+pipe = make_pipeline(StandardScaler(), modelo)  # el scaler viaja con el modelo
+pipe.fit(X_train, y_train)                       # media/desvío quedan guardados adentro</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de oro del serving:</strong> lo que se despliega no es "el modelo", es <strong>el modelo más todo su preprocesamiento</strong>, congelado en un único artefacto. Si el servicio tiene que "acordarse" de normalizar, tokenizar o rellenar nulos por su cuenta, ya introdujiste una fuente de <em>skew</em> que va a morder en silencio.
+</div>
+
+<h2>DS4.2 Formatos de exportación: cómo sale el modelo del notebook</h2>
+
+<p>Antes de optimizar nada tenés que sacar el modelo de la sesión de Python donde lo entrenaste y meterlo en un formato que otro proceso —posiblemente en otra máquina, otro lenguaje, otro runtime— pueda cargar. La elección del formato no es cosmética: decide dónde podés servir, qué tan rápido y con qué riesgo.</p>
+
+<h3>pickle: cómodo y peligroso</h3>
+
+<p>La forma más rápida de guardar un objeto de Python es <code>pickle</code> (y su primo <code>joblib</code>, que usa sklearn por defecto). Guarda el objeto entero y lo recupera idéntico. El problema es que <code>pickle</code> no serializa <em>datos</em>: serializa <strong>instrucciones para reconstruir objetos</strong>, y cargar un pickle ejecuta esas instrucciones. Deserializar un archivo que mandó otro es ejecutar código que mandó otro.</p>
+
+<pre><code class="lang-python">import pickle
+
+# Esto es, literalmente, ejecución de código arbitrario disfrazada de "cargar un modelo".
+# Un .pkl bajado de un bucket público, un hub sin verificar, un mail:
+modelo = pickle.load(open("modelo_del_internet.pkl", "rb"))   # RCE si el archivo es malicioso
+
+# Alternativa segura para PESOS de tensores: safetensors (no ejecuta nada, solo datos).
+from safetensors.torch import save_file, load_file
+save_file(model.state_dict(), "pesos.safetensors")
+pesos = load_file("pesos.safetensors")        # solo tensores, cero código
+model.load_state_dict(pesos)</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Un modelo en pickle es un vector de ejecución remota.</strong> Nunca cargues un pickle de una fuente que no controlás de punta a punta, y tratá tus propios <code>.pkl</code> como artefactos firmados y versionados, no como archivos sueltos. Para pesos, preferí <strong>safetensors</strong>, que guarda tensores y nada más. Es el mismo error de fondo que la <a href="../../../../sistemas/Curso-Ciberseguridad/m04-owasp-web/lecture.html">deserialización insegura</a> que ves en el curso de Ciberseguridad: darle a un parser potente un archivo escrito por un tercero.
+</div>
+
+<h3>TorchScript, torch.export, ONNX y SavedModel</h3>
+
+<p>Pickle te devuelve un objeto de Python que solo corre donde hay Python y las mismas versiones de las librerías. Para servir en serio querés un formato que capture el <strong>grafo de cómputo</strong> —las operaciones, no el objeto— para poder optimizarlo y ejecutarlo en runtimes rápidos, incluso sin Python.</p>
+
+<pre><code class="lang-python">import torch
+
+# 1) TorchScript (el camino clásico de PyTorch). Trace = graba una ejecución de ejemplo.
+ejemplo = torch.randn(1, 3, 224, 224)
+ts = torch.jit.trace(model.eval(), ejemplo)
+ts.save("modelo.ts")                 # corre en libtorch (C++), sin intérprete de Python
+
+# 2) torch.export (el camino moderno, PyTorch 2.x): grafo completo y portable.
+ep = torch.export.export(model.eval(), (ejemplo,))
+torch.export.save(ep, "modelo.pt2")  # base de AOTInductor y de compilación anticipada
+
+# 3) ONNX vía el exportador basado en TorchDynamo (recomendado en 2026).
+torch.onnx.export(model.eval(), (ejemplo,), "modelo.onnx", dynamo=True)</code></pre>
+
+<table>
+<thead><tr><th>Formato</th><th>Qué guarda</th><th>Portabilidad</th><th>Optimizable</th><th>Riesgo</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><strong>pickle / joblib</strong></td><td>El objeto Python entero</td><td>Solo Python, mismas versiones</td><td>No</td><td>🔴 Alto (RCE)</td><td>Prototipo interno, sklearn de andar por casa</td></tr>
+<tr><td><strong>safetensors</strong></td><td>Solo tensores (pesos)</td><td>Alta, sin código</td><td>No (son datos)</td><td>🟢 Bajo</td><td>Compartir pesos de forma segura</td></tr>
+<tr><td><strong>TorchScript</strong></td><td>Grafo + pesos (traza/script)</td><td>PyTorch / libtorch (C++)</td><td>Parcial</td><td>🟡 Medio</td><td>Servir PyTorch sin Python; legado estable</td></tr>
+<tr><td><strong>torch.export (.pt2)</strong></td><td>Grafo FX completo</td><td>Ecosistema PyTorch 2.x</td><td>Sí (AOTInductor)</td><td>🟢 Bajo</td><td>Compilación anticipada, camino a futuro</td></tr>
+<tr><td><strong>ONNX</strong></td><td>Grafo estándar abierto</td><td>Muy alta (multi-runtime)</td><td>Sí (ORT, TensorRT)</td><td>🟢 Bajo</td><td>Servir en cualquier lado, optimizar agresivo</td></tr>
+<tr><td><strong>SavedModel</strong></td><td>Grafo + pesos de TF</td><td>TensorFlow / TF Serving</td><td>Sí</td><td>🟢 Bajo</td><td>Stack TensorFlow / Keras</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>La heurística práctica:</strong> si vas a servir dentro del mismo stack que entrenaste y no te obsesiona la latencia, TorchScript o SavedModel alcanzan. Si querés servir en un runtime optimizado, en otro lenguaje, o hacer <em>cuantización</em> y <em>fusión</em> agresivas, <strong>ONNX</strong> es la moneda común: casi todo exporta a ONNX y casi todo runtime lo carga. Y si estás en PyTorch 2.x mirando al futuro, <code>torch.export</code> + AOTInductor es la apuesta que reemplaza a TorchScript.
+</div>
+
+<h2>DS4.3 Optimización de inferencia: el mismo modelo, mucho más barato</h2>
+
+<p>Un modelo entrenado en FP32 está sobredimensionado para inferir. En entrenamiento necesitás la precisión para que los gradientes no se pierdan; en inferencia solo hacés el <em>forward</em>, y ahí la precisión se puede recortar muchísimo casi sin perder <em>accuracy</em>. Tres técnicas dominan, y se pueden combinar.</p>
+
+<h3>Cuantización: de FP32 a INT8/INT4</h3>
+
+<p>Cuantizar es representar los pesos (y a veces las activaciones) con menos bits: de 32 a 8, o hasta 4. Un modelo INT8 pesa la cuarta parte que en FP32, entra mejor en la caché, mueve menos memoria y —en hardware con soporte de enteros— corre bastante más rápido. La pérdida de <em>accuracy</em> suele ser de una fracción de punto si calibrás bien.</p>
+
+<pre><code class="lang-python"># Cuantización dinámica post-entrenamiento sobre un modelo ONNX (la vía más simple).
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic(
+    "modelo.onnx",
+    "modelo.int8.onnx",
+    weight_type=QuantType.QInt8,     # pesos a 8 bits; sin datos de calibración
+)
+# Resultado típico: archivo ~4x más chico, latencia ~2-4x menor en CPU.</code></pre>
+
+<table>
+<thead><tr><th>Precisión</th><th>Tamaño relativo</th><th>Latencia relativa*</th><th>Pérdida de accuracy típica</th><th>Uso</th></tr></thead>
+<tbody>
+<tr><td>FP32</td><td>1×</td><td>1×</td><td>—</td><td>Baseline de entrenamiento</td></tr>
+<tr><td>FP16 / BF16</td><td>0.5×</td><td>~1.5–2×</td><td>Despreciable</td><td>GPU, casi gratis</td></tr>
+<tr><td>INT8</td><td>0.25×</td><td>~2–4×</td><td>&lt; 1% con calibración</td><td>Estándar de inferencia 2026</td></tr>
+<tr><td>INT4</td><td>0.125×</td><td>~3–5×</td><td>1–3% (peor sin QAT)</td><td>LLMs (GPTQ, AWQ), memoria escasa</td></tr>
+</tbody>
+</table>
+
+<p><em>*Los múltiplos dependen por completo del hardware y del modelo. En una GPU sin unidades de enteros dedicadas, INT8 puede no acelerar nada; en una CPU moderna o una GPU con soporte, el salto es real. Medí en TU hardware.</em></p>
+
+<div class="info">
+  Hay dos familias de cuantización. <strong>PTQ</strong> (<em>post-training quantization</em>) cuantiza un modelo ya entrenado: es barata y suele alcanzar. <strong>QAT</strong> (<em>quantization-aware training</em>) simula la cuantización <em>durante</em> el entrenamiento para que el modelo aprenda a tolerarla: cuesta más pero recupera <em>accuracy</em> cuando PTQ se queda corta, sobre todo en INT4. Para LLMs, el estándar es cuantizar los pesos a 4 bits con métodos como GPTQ o AWQ, tema que retomamos en DS4.10.
+</div>
+
+<h3>Pruning y distillation</h3>
+
+<p>La cuantización achica cada número; el <strong>pruning</strong> elimina números enteros — pesos o canales que aportan poco. El detalle incómodo: el <em>pruning</em> no estructurado (poner ceros sueltos) casi nunca acelera nada en hardware común, porque la matriz sigue teniendo el mismo tamaño; solo el <em>pruning</em> estructurado (sacar canales, cabezas de atención, capas enteras) da un <em>speedup</em> real. La <strong>distillation</strong> es más ambiciosa: entrenás un modelo chico (<em>student</em>) para imitar a uno grande (<em>teacher</em>), y te quedás con un modelo que es una fracción del tamaño reteniendo buena parte de la calidad.</p>
+
+<div class="analogy">
+  <strong>Una analogía.</strong> Cuantizar es escribir el mismo libro con letra más chica: cabe en menos páginas, se lee casi igual. Pruning estructurado es sacar los capítulos que nadie lee. Distillation es contratar a alguien que leyó el libro entero y escribe un resumen de la mitad de largo que sirve para el 95% de las preguntas. Los tres reducen el costo; los tres arriesgan perder algo. Y por eso ninguno se aplica sin volver a medir <em>accuracy</em> con el rigor de DS3.
+</div>
+
+<h3>Los runtimes: ONNX Runtime y TensorRT</h3>
+
+<p>Un formato optimizable no rinde solo: lo ejecuta un <em>runtime</em> que fusiona operaciones, elige kernels y explota el hardware. <strong>ONNX Runtime</strong> (ORT) corre modelos ONNX en CPU, GPU y aceleradores mediante <em>execution providers</em> intercambiables. <strong>TensorRT</strong> (NVIDIA) va más lejos en GPU: fusiona capas, autotunea kernels para tu GPU concreta y calibra precisión, a cambio de estar atado a NVIDIA y de un paso de compilación por modelo y por hardware.</p>
+
+<pre><code class="lang-python">import onnxruntime as ort
+
+# El mismo modelo ONNX, distinto backend según dónde sirvas — cambia una lista.
+sesion = ort.InferenceSession(
+    "modelo.int8.onnx",
+    providers=[
+        "TensorrtExecutionProvider",   # 1º intenta TensorRT (GPU NVIDIA)
+        "CUDAExecutionProvider",       # si no, CUDA
+        "CPUExecutionProvider",        # y de último, CPU
+    ],
+)
+salida = sesion.run(None, {"input": x})   # x es un numpy array, no un tensor de torch</code></pre>
+
+<h2>DS4.4 Batching: por qué servir de a un request desperdicia la GPU</h2>
+
+<p>Una GPU tiene miles de núcleos pensados para hacer la misma operación sobre muchos datos a la vez. Si le mandás un request con un solo ejemplo, la mayoría de esos núcleos quedan ociosos: pagás la GPU entera para usar una esquinita. La forma de aprovecharla es el <strong>batching</strong> — juntar varios requests en un lote y correrlos juntos en un <em>forward</em>.</p>
+
+<div class="concept">
+  <strong>💡 Dynamic batching.</strong> El servidor no procesa cada request al instante: los acumula durante una ventana chiquita (unos milisegundos) y arma un lote con los que llegaron. Correr un lote de 32 tarda apenas más que correr uno de 1, pero atiende 32 requests. El resultado es un salto enorme de <em>throughput</em> (requests por segundo) a cambio de un poco de latencia por request — la espera de la ventana más el <em>forward</em> del lote más grande.
+</div>
+
+<p>Es el <em>trade-off</em> central del serving de ML. Sin batching, cada request es rápido pero la GPU rinde una fracción de lo que puede, y el costo por predicción es altísimo. Con batching, la GPU se satura de trabajo útil, el costo por predicción se desploma, y la latencia individual sube un poco. La pregunta no es "¿batcheo o no?", es "¿cuánta latencia estoy dispuesto a pagar por cuánto throughput?".</p>
+
+<pre><code class="lang-python"># La intuición en números, sin servidor de por medio.
+# Supongamos: un forward de lote 1 tarda 20 ms; uno de lote 32 tarda 35 ms.
+lote_1  = 20 / 1        # 20.0 ms POR predicción
+lote_32 = 35 / 32       #  1.09 ms POR predicción  -&gt; 18x más barato por predicción
+
+# Throughput:
+#   sin batch:  1 pred / 20 ms  =   50 preds/seg
+#   lote 32:   32 pred / 35 ms  =  914 preds/seg
+# La latencia de un request pasó de 20 ms a (ventana + 35 ms). Si tu SLA lo tolera, ganaste.</code></pre>
+
+<p>En un servidor real esto lo maneja el runtime de serving. Con <strong>Triton Inference Server</strong>, activás <em>dynamic batching</em> en la configuración del modelo, sin tocar el código:</p>
+
+<pre><code># config.pbtxt de Triton — dynamic batching declarativo, sin código
+max_batch_size: 32
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 5000     # espera hasta 5 ms para juntar lote
+}</code></pre>
+
+<div class="warn">
+  <strong>El batching tiene un límite físico: la memoria.</strong> Un lote más grande usa más memoria de GPU (activaciones intermedias). Si subís <code>max_batch_size</code> sin medir, en vez de más throughput vas a comer un <em>out of memory</em> en el pico de tráfico — el peor momento posible. El tamaño de lote se ajusta con la latencia objetivo por un lado y la memoria disponible por el otro, y se prueba bajo carga, no en teoría.
+</div>
+
+<h2>DS4.5 Arquitecturas de serving: embebido, microservicio o servidor dedicado</h2>
+
+<p>Con el modelo exportado y optimizado, falta decidir <em>dónde vive</em> respecto de la aplicación que lo usa. Hay tres arquitecturas, y la elección cambia según el modelo, el equipo y la escala.</p>
+
+<h3>1. Embebido en la app</h3>
+
+<p>El modelo se carga dentro del mismo proceso que la aplicación y se lo llama como una función. Cero red, latencia mínima, despliegue trivial. Pero la app y el modelo comparten recursos y ciclo de vida: no podés escalarlos por separado, y un modelo pesado infla cada instancia de tu app.</p>
+
+<pre><code class="lang-python"># Modelo embebido en un FastAPI. Simple y directo — para modelos livianos.
+from fastapi import FastAPI
+import onnxruntime as ort, numpy as np
+
+app = FastAPI()
+sesion = ort.InferenceSession("modelo.int8.onnx", providers=["CPUExecutionProvider"])
+
+@app.post("/predict")
+def predict(payload: dict):
+    x = np.array(payload["features"], dtype=np.float32)[None, :]
+    (salida,) = sesion.run(None, {"input": x})
+    return {"pred": float(salida[0])}</code></pre>
+
+<h3>2. Microservicio de modelo</h3>
+
+<p>El modelo vive en su propio servicio detrás de una API (REST o gRPC), y la app lo llama por red. Ahora podés escalar el modelo aparte, desplegarlo aparte, y compartirlo entre varias apps. Pagás la latencia de red y la complejidad de un servicio más. Es el punto medio más común.</p>
+
+<pre><code class="lang-dockerfile"># Un microservicio de modelo se empaqueta y escala como cualquier otro servicio.
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir onnxruntime fastapi uvicorn numpy
+COPY modelo.int8.onnx servicio.py ./
+EXPOSE 8000
+CMD ["uvicorn", "servicio:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+
+<h3>3. Servidor de inferencia dedicado</h3>
+
+<p>Servidores como <strong>Triton Inference Server</strong> o TF Serving están hechos para una cosa: servir modelos rápido. Traen <em>dynamic batching</em>, ejecución concurrente de varios modelos, soporte multi-framework (ONNX, TensorRT, PyTorch, TF a la vez), versionado, métricas y colas — todo lo que tendrías que reimplementar a mano en un microservicio casero. A cambio, hay que operar una pieza de infraestructura más.</p>
+
+<table>
+<thead><tr><th>Arquitectura</th><th>Latencia</th><th>Escala independiente</th><th>Complejidad</th><th>Cuándo elegirla</th></tr></thead>
+<tbody>
+<tr><td><strong>Embebido</strong></td><td>Mínima (sin red)</td><td>❌ No</td><td>Baja</td><td>Modelo liviano (sklearn, árboles), una sola app, tráfico bajo</td></tr>
+<tr><td><strong>Microservicio</strong></td><td>+ red</td><td>✅ Sí</td><td>Media</td><td>Varias apps consumen el modelo; querés desplegarlo aparte</td></tr>
+<tr><td><strong>Servidor dedicado (Triton)</strong></td><td>+ red, óptima bajo carga</td><td>✅ Sí, con batching</td><td>Alta</td><td>GPU cara que hay que exprimir; muchos modelos; alto tráfico</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No empieces por Triton.</strong> Un árbol de gradiente que predice en 2 ms sobre CPU no necesita un servidor de inferencia con GPU y batching: metelo embebido y seguí con tu vida. El servidor dedicado se justifica cuando tenés una GPU que estás desperdiciando, o muchos modelos que coordinar. Elegir la arquitectura pesada demasiado temprano es pagar complejidad por un throughput que no necesitás.
+</div>
+
+<h2>DS4.6 Latencia: p50, p95, p99 y el cold start</h2>
+
+<p>"El modelo tarda 30 ms" es una frase sin sentido hasta que decís <em>qué</em> 30 ms. La latencia de inferencia es una distribución, no un número, y lo que le importa a tus usuarios no es el promedio sino la cola.</p>
+
+<div class="concept">
+  <strong>💡 Percentiles.</strong> El <strong>p50</strong> (mediana) es la latencia típica: la mitad de los requests tarda menos. El <strong>p95</strong> y el <strong>p99</strong> son la cola: el 5% y el 1% peor. El p99 importa porque un usuario que hace 100 requests casi seguro toca al menos uno del 1% lento, y porque en un sistema con muchos servicios en cadena, las colas se suman. Optimizar el promedio y descuidar el p99 es optimizar para el usuario que no se queja.
+</div>
+
+<pre><code class="lang-python">import numpy as np, time
+
+def percentiles(latencias_ms):
+    a = np.array(latencias_ms)
+    return {
+        "p50": np.percentile(a, 50),
+        "p95": np.percentile(a, 95),
+        "p99": np.percentile(a, 99),
+    }
+
+# CLAVE: descartar las primeras predicciones (warm-up) antes de medir.
+lat = []
+for i in range(1000):
+    t0 = time.perf_counter()
+    sesion.run(None, {"input": x})
+    dt = (time.perf_counter() - t0) * 1000
+    if i &gt;= 50:                 # las primeras 50 son cold: no cuentan
+        lat.append(dt)
+print(percentiles(lat))</code></pre>
+
+<p>Ese <code>if i &gt;= 50</code> no es un detalle: es el <strong>cold start</strong>. La primera predicción de un modelo casi siempre es dramáticamente más lenta que las siguientes, por varias razones que se acumulan: cargar los pesos a memoria de GPU, inicializar el contexto de CUDA, compilar o autotunear los kernels la primera vez que se usan (cuDNN, TensorRT), y llenar cachés. Puede ser la diferencia entre 2 segundos y 20 milisegundos.</p>
+
+<div class="mistake">
+  <strong>El cold start te arruina el autoscaling y el p99.</strong> Si escalás agregando una instancia nueva y la mandás a atender tráfico inmediatamente, sus primeros requests van a tener latencias monstruosas — justo cuando escalaste porque había pico. La solución es el <strong>warm-up</strong>: antes de marcar la instancia como "lista", dispararle unas predicciones ficticias para que pague el cold start en privado. Un <em>health check</em> que devuelve OK sin haber corrido una inferencia real está mintiendo.
+</div>
+
+<pre><code class="lang-python"># Warm-up en el arranque del servicio: pagar el cold start ANTES de recibir tráfico.
+def calentar(sesion, forma_entrada, n=10):
+    dummy = np.zeros(forma_entrada, dtype=np.float32)
+    for _ in range(n):
+        sesion.run(None, {"input": dummy})   # compila kernels, llena cachés
+    # recién ahora el servicio se declara "ready" para el balanceador</code></pre>
+
+<h2>DS4.7 Escalar: GPU cara, CPU a veces alcanza, y el costo por predicción</h2>
+
+<p>Escalar un servicio de modelo no es escalar un servicio web. Una instancia web sin estado se levanta en segundos y la matás sin culpa. Una instancia con GPU cuesta un múltiplo, tarda mucho más en aprovisionarse (conseguir el nodo, cargar el modelo, calentar) y no la escalás con la misma agilidad reactiva. El autoscaling de GPU tiene que anticiparse al pico, no correr detrás.</p>
+
+<h3>¿De verdad necesitás GPU?</h3>
+
+<p>La pregunta que más plata ahorra. Para muchos modelos —árboles, modelos lineales, redes chicas, la mayoría del ML clásico— una CPU predice lo bastante rápido y sale una fracción del costo, sin cold start de CUDA ni escasez de nodos. La GPU se justifica cuando el modelo es grande y batcheable, y cuando el volumen amortiza su costo.</p>
+
+<table>
+<thead><tr><th>Factor</th><th>CPU</th><th>GPU</th></tr></thead>
+<tbody>
+<tr><td>Costo por hora</td><td>Bajo</td><td>Alto (a veces 10×+)</td></tr>
+<tr><td>Latencia con lote 1</td><td>Competitiva</td><td>A menudo peor (overhead)</td></tr>
+<tr><td>Throughput batcheado</td><td>Limitado</td><td>Enorme</td></tr>
+<tr><td>Disponibilidad / escalado</td><td>Inmediato, elástico</td><td>Lento, con escasez</td></tr>
+<tr><td>Modelos que le convienen</td><td>Árboles, lineales, redes chicas, INT8</td><td>Deep learning grande, LLMs, alto volumen</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La métrica que ordena todo: costo por predicción.</strong> No mires "requests por segundo" ni "utilización de GPU" en abstracto. Dividí el costo del hardware por hora entre las predicciones útiles por hora y obtené <strong>dólares por millón de predicciones</strong>. Esa cifra hace comparables una CPU barata sin batching y una GPU cara saturada, y casi siempre revela que la GPU ociosa (batch 1) es carísima por predicción, mientras que la GPU saturada (batch 32) es la más barata — o que directamente no hacía falta GPU.
+</div>
+
+<pre><code class="lang-python"># Costo por predicción: la cifra que decide CPU vs GPU vs batching.
+def costo_por_millon(usd_por_hora, preds_por_seg):
+    preds_por_hora = preds_por_seg * 3600
+    return usd_por_hora / preds_por_hora * 1_000_000
+
+cpu       = costo_por_millon(usd_por_hora=0.10,  preds_por_seg=200)   # CPU barata
+gpu_batch1= costo_por_millon(usd_por_hora=2.50,  preds_por_seg=50)    # GPU ociosa
+gpu_batch = costo_por_millon(usd_por_hora=2.50,  preds_por_seg=900)   # GPU saturada
+print(f"CPU {cpu:.2f}  ·  GPU lote1 {gpu_batch1:.2f}  ·  GPU batch {gpu_batch:.2f}  USD/millón")
+# La GPU ociosa puede costar MÁS por predicción que la CPU. El batching es lo que la salva.</code></pre>
+
+<h2>DS4.8 Versionado y despliegue: por qué un modelo es más riesgoso que el código</h2>
+
+<p>Desplegar código tiene una red de seguridad enorme: compila o no compila, los tests pasan o no pasan, y si algo se rompe suele romperse ruidosamente. Un modelo no tiene nada de eso. Un modelo nuevo puede cargar sin error, devolver números con la forma correcta, pasar el <em>health check</em>... y estar peor que el anterior. Peor por <em>skew</em> de preprocesamiento, por un <em>checkpoint</em> equivocado, por <em>drift</em> de los datos desde que se entrenó, o simplemente porque generalizó peor. <strong>La degradación es silenciosa.</strong></p>
+
+<div class="danger">
+  <strong>⚠️ "Carga y devuelve un número" no es "funciona".</strong> Este es el error mental que separa desplegar código de desplegar modelos. Un endpoint verde no dice nada sobre la <em>calidad</em> de las predicciones. Un modelo puede estar sirviendo basura con 200 OK y latencia perfecta durante semanas hasta que alguien mira una métrica de negocio y ve que cayó. Por eso el despliegue de modelos se hace con estrategias que <em>comparan</em>, no que solo verifican que responda.
+</div>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Qué hace</th><th>Qué te protege</th></tr></thead>
+<tbody>
+<tr><td><strong>Shadow</strong></td><td>El modelo nuevo recibe el tráfico real en paralelo, pero sus respuestas NO se sirven: solo se registran y comparan</td><td>Ver cómo se comporta con tráfico de producción sin ningún riesgo para el usuario</td></tr>
+<tr><td><strong>Canary</strong></td><td>El modelo nuevo sirve a un % chico del tráfico (1–5%) mientras se vigilan métricas</td><td>Limitar el daño de un modelo malo al 1–5% y poder abortar</td></tr>
+<tr><td><strong>A/B testing</strong></td><td>Dos modelos sirven a dos grupos y se compara una métrica de negocio con significancia estadística</td><td>Decidir con evidencia si el nuevo es realmente mejor, no solo "no peor"</td></tr>
+<tr><td><strong>Rollback</strong></td><td>Volver a la versión anterior al instante, sin re-desplegar</td><td>Recuperación rápida cuando cualquiera de las anteriores enciende una alarma</td></tr>
+</tbody>
+</table>
+
+<p>El <em>shadow deployment</em> es la herramienta más subestimada del serving de ML, porque ataca justo la degradación silenciosa: corrés el modelo candidato contra el tráfico verdadero y comparás sus salidas con las del modelo en producción antes de arriesgar un solo usuario.</p>
+
+<pre><code class="lang-python"># Shadow: servir el viejo, registrar el nuevo, comparar offline. Sin riesgo.
+async def predict(payload):
+    viejo = modelo_actual.predict(payload)      # esto es lo que ve el usuario
+    try:
+        nuevo = modelo_candidato.predict(payload)   # sombra: NO se devuelve
+        registrar_comparacion(payload, viejo, nuevo) # se analiza aparte
+    except Exception:
+        log.warning("candidato falló en shadow")     # y ni se enteró el usuario
+    return viejo</code></pre>
+
+<div class="rule">
+  <strong>📌 Todo modelo servido lleva versión, y toda predicción sabe qué versión la produjo.</strong> Sin versionado no hay rollback (¿a qué volvés?), no hay A/B (¿qué comparás?), ni forma de reproducir una predicción que un usuario reclama seis meses después. La versión del modelo es metadata de primera clase: viaja en los logs, en las métricas y en la respuesta.
+</div>
+
+<h2>DS4.9 Feature serving: de dónde salen las features en tiempo de inferencia</h2>
+
+<p>El modelo predice a partir de <em>features</em>, pero en producción esas features no te las pasa el usuario armadas: hay que construirlas o traerlas en el momento del request. Y ahí aparece un costo que el notebook nunca te mostró, porque en el notebook las features ya estaban en un DataFrame.</p>
+
+<p>Muchas features son precalculadas y pesadas: "cantidad de compras del usuario en los últimos 30 días", "embedding del producto", "score de riesgo histórico". No las vas a computar en línea por cada request. Viven en un <strong>feature store online</strong> —una base de baja latencia, típicamente respaldada por algo como Redis— del que hacés un <em>lookup</em> por clave (el id del usuario, del producto) en el momento de inferir.</p>
+
+<div class="concept">
+  <strong>💡 El feature store resuelve el train/serve skew de las features.</strong> La idea central: las mismas features se computan una vez y se sirven a los dos mundos. La versión <em>offline</em> (histórica, para entrenar) y la <em>online</em> (última, para inferir) salen de la misma definición, así que el modelo ve en producción exactamente el tipo de valores con los que aprendió. Sin feature store, alguien reimplementa "compras últimos 30 días" en el servicio con SQL a mano, y esa reimplementación diverge del entrenamiento. Otra vez el skew.
+</div>
+
+<pre><code class="lang-python"># Traer features online por clave, y el costo escondido: la latencia del lookup.
+import time
+
+def predecir_con_features(user_id, producto_id, features_del_request):
+    t0 = time.perf_counter()
+    online = feature_store.get_online_features(          # lookup a Redis / feature store
+        entidades={"user_id": user_id, "producto_id": producto_id},
+        features=["user:compras_30d", "producto:embedding", "user:score_riesgo"],
+    )
+    t_fetch = (time.perf_counter() - t0) * 1000          # esto SUMA a tu latencia total
+
+    x = ensamblar(features_del_request, online)          # request + store
+    pred = sesion.run(None, {"input": x})
+    return pred, t_fetch</code></pre>
+
+<div class="warn">
+  <strong>La latencia de traer features es parte de tu latencia de inferencia.</strong> Es fácil optimizar el <em>forward</em> del modelo a 5 ms y no darte cuenta de que traer las features tarda 40 ms porque hacés un <em>lookup</em> por feature en vez de uno solo por lote. Si tu presupuesto de latencia es 50 ms, el modelo es apenas una parte: medí el request de punta a punta —red, deserialización, fetch de features, forward, respuesta— y optimizá el eslabón que de verdad domina, no el que suena más glamoroso.
+</div>
+
+<h2>DS4.10 Servir LLMs: por qué es otro juego (y por qué lo diferimos)</h2>
+
+<p>Todo lo anterior aplica a un modelo que recibe una entrada y devuelve una salida de una vez. Un LLM no funciona así: genera <em>token</em> por token, de forma autorregresiva, y cada token nuevo depende de todos los anteriores. Eso rompe varias de las suposiciones de este módulo y exige un stack propio.</p>
+
+<div class="info">
+  Tres cosas hacen distinto servir un LLM. <strong>(1) KV cache:</strong> para no recalcular la atención sobre todo el contexto en cada token, se cachean las claves y valores — lo que come muchísima memoria de GPU y vuelve la gestión de memoria el problema central. <strong>(2) Streaming:</strong> no esperás la respuesta completa; se transmite token a token para que el usuario vea la salida aparecer. <strong>(3) Continuous batching:</strong> el <em>dynamic batching</em> de DS4.4 no alcanza porque cada secuencia termina en un momento distinto; hace falta batchear a nivel de token, que es lo que hace <strong>vLLM</strong> con PagedAttention. Servir LLMs eficientemente es, en buena medida, administrar la KV cache.
+</div>
+
+<p>Por eso el serving de LLMs —vLLM, cuantización INT4 con GPTQ/AWQ, streaming, gestión de contexto— tiene su propio módulo. Acá quedate con que <strong>un LLM no se sirve con un <code>/predict</code> que devuelve un JSON de una</strong>, y seguí en <a href="../ds5-llmops/lecture.html">DS5 (LLMOps)</a>, donde esto se desarrolla en serio.</p>
+
+<h2>DS4.11 Cuándo NO servir un modelo propio</h2>
+
+<p>El módulo entero asume que necesitás inferencia <em>online</em>: un modelo tuyo respondiendo a requests en vivo. Es la arquitectura más cara y más compleja de operar, y muchas veces no hace falta. Antes de montar todo esto, preguntate si tu problema de verdad exige latencia online.</p>
+
+<div class="step"><strong>Batch prediction offline.</strong> Si las predicciones no se necesitan al instante —recomendaciones que se refrescan cada noche, scoring de una cartera una vez al día, clasificar documentos que llegaron en el último lote— corré el modelo en un job programado que escribe los resultados a una tabla, y que la app lea de la tabla. Sin servidor de inferencia, sin p99, sin cold start, sin GPU encendida las 24 horas. Es más barato y más simple por varios órdenes de magnitud.</div>
+
+<div class="step"><strong>Una API de terceros.</strong> Si lo que necesitás es una capacidad genérica —transcribir audio, clasificar sentimiento, generar texto, extraer entidades— y no un modelo entrenado con tus datos, una API externa te ahorra entrenar, exportar, optimizar, servir y operar. Pagás por request y por dependencia, pero no mantenés infraestructura de ML. El modelo propio se justifica cuando tu ventaja está en tus datos o cuando el volumen hace que la API salga más cara que operar lo tuyo.</div>
+
+<div class="rule">
+  <strong>📌 La pregunta previa a todo el módulo:</strong> ¿esta predicción la necesita alguien <em>ahora</em>, en el request? Si la respuesta es no, batch offline. Si es sí pero no es tu dominio, API de terceros. Servir un modelo propio online es la opción correcta con sorprendente menos frecuencia de la que se cree — y es, lejos, la más cara de mantener.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "5 ms en el notebook, 400 ms en producción"</h2>
+
+<blockquote>Entrenaste un clasificador. En el notebook, <code>modelo.predict(x)</code> devuelve en 5 ms y estás feliz. Lo ponés en un <code>/predict</code> con FastAPI, lo desplegás, y bajo carga real cada request tarda 400 ms en el p99 y el throughput es patético: 25 requests por segundo con una GPU que te está costando una fortuna. ¿Qué pasó y cómo lo arreglás sin tocar la lógica del modelo?</blockquote>
+
+<p><strong>Paso 1 — Entender por qué el "5 ms" era mentira.</strong> El notebook medía una predicción <em>warm</em>, con el modelo ya en la GPU, sobre un tensor ya preparado, sin red, sin traer features, sin serializar nada, y de a un ejemplo. Producción paga todo lo que el notebook no medía. Antes de optimizar, hay que medir de punta a punta dónde se va el tiempo real.</p>
+
+<pre><code class="lang-python"># Instrumentar el request completo, no solo el forward. Descomponer la latencia.
+import time
+def predict_instrumentado(payload):
+    marcas = {}
+    t = time.perf_counter()
+    x = deserializar(payload);            marcas["deserializar"] = _dt(t); t = time.perf_counter()
+    feats = traer_features(payload["id"]); marcas["features"]     = _dt(t); t = time.perf_counter()
+    salida = modelo_fp32(x, feats);        marcas["forward"]      = _dt(t)
+    return salida, marcas
+# Resultado del perfil: features 40 ms · forward 90 ms · deserializar 5 ms,
+# y la latencia p99 vuela por la cola porque los requests se procesan de a UNO.</code></pre>
+
+<p><strong>Paso 2 — El diagnóstico.</strong> Tres causas se suman: <strong>(a)</strong> el modelo corre en FP32, pesado y lento; <strong>(b)</strong> se sirve de a un request, así que la GPU está casi ociosa en cada <em>forward</em>; <strong>(c)</strong> las features se traen de a una, con varios <em>round-trips</em> al store. Ninguna es un problema del modelo: son todos problemas de <em>serving</em>. Los atacamos de a uno, midiendo después de cada cambio.</p>
+
+<p><strong>Paso 3 — Exportar a ONNX + ONNX Runtime.</strong> Sacamos el modelo de PyTorch-en-Python y lo corremos en un runtime optimizado con fusión de operaciones.</p>
+
+<p><strong>Paso 4 — Cuantizar a INT8.</strong> El modelo pasa a 8 bits: cuarta parte del tamaño, <em>forward</em> más rápido, con una caída de <em>accuracy</em> que verificamos contra el set de DS3 y resulta menor a medio punto.</p>
+
+<p><strong>Paso 5 — Batchear features y activar dynamic batching.</strong> Un solo <em>lookup</em> por lote en vez de uno por feature, y dejamos que el servidor junte requests en lotes de hasta 32 con una ventana de 5 ms.</p>
+
+<table>
+<thead><tr><th>Paso</th><th>p50</th><th>p99</th><th>Throughput</th><th>Costo/millón*</th></tr></thead>
+<tbody>
+<tr><td>0. Baseline (FP32, lote 1, features 1×1)</td><td>135 ms</td><td>400 ms</td><td>25 req/s</td><td>$27.8</td></tr>
+<tr><td>1. + ONNX Runtime</td><td>70 ms</td><td>190 ms</td><td>55 req/s</td><td>$12.6</td></tr>
+<tr><td>2. + Cuantización INT8</td><td>40 ms</td><td>95 ms</td><td>110 req/s</td><td>$6.3</td></tr>
+<tr><td>3. + Features batcheadas</td><td>22 ms</td><td>60 ms</td><td>130 req/s</td><td>$5.3</td></tr>
+<tr><td>4. + Dynamic batching (lote 32)</td><td>28 ms</td><td>75 ms</td><td><strong>900 req/s</strong></td><td><strong>$0.77</strong></td></tr>
+</tbody>
+</table>
+
+<p><em>*GPU a $2.50/hora, ilustrativo. Los números son de ejemplo para mostrar la forma de la mejora, no una promesa.</em></p>
+
+<div class="tip">
+  <strong>Leé la tabla con atención, porque cuenta dos historias.</strong> Los pasos 1–3 bajan la <em>latencia</em> (el p99 pasa de 400 a 60 ms). El paso 4 la sube un poco (de 60 a 75 ms) pero multiplica el <em>throughput</em> por 7 y desploma el costo por predicción de $5.3 a $0.77. Es el <em>trade-off</em> de DS4.4 en carne y hueso: cambiaste 15 ms de latencia —que tu SLA de 100 ms tolera de sobra— por una GPU que ahora rinde 36× por dólar respecto del baseline.</p>
+</div>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá ONNX e INT8".</strong> Es el método: <em>medir de punta a punta</em> antes de tocar nada, descubrir que el cuello no era el modelo sino el serving, atacar una causa a la vez, y volver a medir latencia, throughput <em>y</em> costo después de cada paso — porque optimizan cosas distintas y a veces se contraponen. El "5 ms del notebook" es la trampa; el request completo bajo carga es la verdad.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Servís de a un request y la GPU está al 8% de utilización. ¿Qué cambiás y qué esperás que pase con la latencia?</summary>
+<p>Activás <strong>dynamic batching</strong>: el servidor junta requests en un lote y los corre juntos, así la GPU procesa muchos ejemplos por <em>forward</em> en vez de uno. Esperás que el <strong>throughput</strong> suba fuerte (varios × más requests por segundo) y que el <strong>costo por predicción</strong> se desplome, porque la GPU deja de estar ociosa. A cambio, la <strong>latencia por request sube un poco</strong>: cada request espera la ventana de acumulación (unos ms) y luego el <em>forward</em> de un lote más grande. Es un buen trade si tu SLA de latencia tiene margen; es un mal trade si ya estás pegado al límite del p99.</p></details>
+
+<details><summary>Un modelo nuevo pasó todos los health checks y responde en 30 ms. ¿Por qué eso NO alcanza para desplegarlo con confianza?</summary>
+<p>Porque un <em>health check</em> verde solo dice que el modelo <em>carga y responde</em>, no que responde <em>bien</em>. Un modelo puede devolver números con la forma correcta y estar peor que el anterior por <em>skew</em> de preprocesamiento, un <em>checkpoint</em> equivocado, <em>drift</em> de los datos, o peor generalización — todo de forma silenciosa, con 200 OK. Desplegar código falla ruidosamente (no compila, tests rojos); desplegar un modelo degrada callado. Por eso hace falta <strong>shadow</strong> (comparar sus salidas contra producción sin servirlas), <strong>canary</strong> (exponerlo a un % chico vigilando métricas) y comparar una <strong>métrica de calidad</strong>, no solo verificar que responda.</p></details>
+
+<details><summary>Optimizaste el forward del modelo de 90 ms a 8 ms y el p99 total apenas bajó. ¿Dónde mirás?</summary>
+<p>Al <strong>resto del request</strong>, que ahora domina. Si el forward es 8 ms pero traer las <em>features</em> tarda 40 ms (por hacer un <em>lookup</em> por feature en vez de uno por lote), la red suma 20 ms y la deserialización otro tanto, optimizar el modelo más no mueve la aguja. La latencia se mide y se ataca <strong>de punta a punta</strong>: deserialización, fetch de features, forward, serialización de la respuesta, red. Se optimiza el eslabón que <em>domina</em> el presupuesto, que casi nunca es el que más ganas tenés de tocar. En este caso, batchear el fetch de features rinde más que cualquier truco sobre el modelo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El modelo no le sirve a nadie hasta que responde un request. Servir ML es distinto de servir código: el artefacto pesa, la inferencia es cara, la GPU solo rinde en lotes y la degradación es silenciosa.</li>
+  <li>Lo que se despliega es <strong>el modelo más su preprocesamiento</strong> en un único artefacto. Si el servicio reimplementa el preprocesamiento a mano, volvés a introducir <strong>train/serve skew</strong>.</li>
+  <li><strong>Formato:</strong> pickle es cómodo y un riesgo de <a href="../../../../sistemas/Curso-Ciberseguridad/m04-owasp-web/lecture.html">ejecución remota</a> — usá safetensors para pesos. Para servir optimizado y portable, <strong>ONNX</strong> es la moneda común; <code>torch.export</code> es el futuro en PyTorch 2.x.</li>
+  <li><strong>Optimización:</strong> cuantización INT8 (estándar 2026, ~4× más chico, &lt; 1% de accuracy) e INT4 para LLMs; pruning estructurado y distillation cuando hacen falta; runtimes como ONNX Runtime y TensorRT.</li>
+  <li><strong>Batching:</strong> servir de a un request desperdicia la GPU. El <em>dynamic batching</em> cambia un poco de latencia por muchísimo throughput y baja drásticamente el costo por predicción.</li>
+  <li><strong>Arquitectura:</strong> embebido (liviano), microservicio (escala aparte) o servidor dedicado como Triton (GPU cara, alto tráfico). No empieces por el pesado.</li>
+  <li><strong>Latencia:</strong> se mide en <strong>p50/p95/p99</strong>, no en promedio. El <strong>cold start</strong> hace lenta la primera predicción — pagalo con <em>warm-up</em> antes de recibir tráfico.</li>
+  <li><strong>Escala y costo:</strong> la GPU escala lento y caro; a veces la CPU alcanza. La métrica que ordena todo es el <strong>costo por predicción</strong>.</li>
+  <li><strong>Despliegue:</strong> un modelo es más riesgoso que el código porque no compila-o-no-compila: degrada callado. Shadow, canary, A/B y rollback, con todo versionado.</li>
+  <li><strong>Features:</strong> vienen de un <em>feature store online</em>; su latencia es parte de la tuya. <strong>LLMs</strong> son otro juego (KV cache, streaming, vLLM) → DS5. Y muchas veces no hace falta servir nada online: batch offline o API de terceros.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un modelo entrenado en DS2 y exportalo a ONNX con <code>torch.onnx.export(..., dynamo=True)</code>. Cargalo con ONNX Runtime y verificá que sus predicciones coinciden con las de PyTorch dentro de una tolerancia numérica razonable. Documentá cualquier diferencia.</li>
+  <li>Cuantizá ese modelo ONNX a INT8 con <code>quantize_dynamic</code>. Medí el tamaño del archivo antes y después, y evaluá la <em>accuracy</em> del modelo cuantizado con el set de test de DS3. ¿Cuánto perdiste y cuánto ganaste?</li>
+  <li>Escribí un script que mida la latencia de 1000 inferencias, descarte las primeras 50 (warm-up) y reporte p50, p95 y p99. Corré el mismo modelo en FP32 y en INT8 y compará las tres cifras en una tabla.</li>
+  <li>Demostrá el <strong>cold start</strong>: medí la latencia de la <em>primera</em> predicción tras cargar el modelo, y la de la número 100. Cuantificá la diferencia y explicá qué la causa en tu setup.</li>
+  <li>Implementá el cálculo de <strong>costo por millón de predicciones</strong> para tres escenarios: CPU sin batching, GPU con lote 1 y GPU con lote 32 (inventá throughputs plausibles). ¿En qué punto la GPU le gana a la CPU en costo por predicción?</li>
+  <li>Escribí el esqueleto de un <strong>shadow deployment</strong>: una función <code>predict</code> que sirva el modelo viejo, corra el candidato en paralelo sin devolver su salida, y registre ambas para comparar. Manejá el caso en que el candidato falla sin afectar al usuario.</li>
+  <li>Para un caso real tuyo (o inventado con criterio), argumentá si conviene <strong>servir online, batch offline o una API de terceros</strong>. Justificá con latencia requerida, volumen y de quién es el dominio del problema.</li>
+</ol>
+
+<section class="quiz" id="quizDS4">
+  <style>
+    #quizDS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS4 .q{margin-bottom:1.5rem}
+    #quizDS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS4 .opt:hover{border-color:var(--accent)}
+    #quizDS4 .opt:disabled{cursor:default}
+    #quizDS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizDS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizDS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS4 .exp.show{display:block}
+    #quizDS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="0">
+    <p>1. Tu modelo predice en 5 ms en el notebook pero tarda 400 ms por request en producción. ¿Cuál es la explicación de fondo MÁS probable?</p>
+    <button class="opt">El "5 ms" medía una predicción warm, de a uno, sin red, sin traer features y sin serializar; producción paga todo eso, y encima sirve de a un request sin batching</button>
+    <button class="opt">El modelo se corrompió al exportarlo del notebook</button>
+    <button class="opt">La GPU de producción es 80 veces más lenta que la del notebook</button>
+    <div class="exp">El notebook mide una fracción diminuta del trabajo real: el modelo ya cargado en GPU, un tensor listo, sin HTTP, sin feature store, de a un ejemplo. El request de producción agrega deserialización, fetch de features, red y —lo que más pega— procesar de a un request, dejando la GPU ociosa. La cura no toca la lógica del modelo: se mide de punta a punta y se ataca el serving (ONNX, INT8, batching, features batcheadas).</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Activás dynamic batching: el throughput sube 7× pero la latencia p99 de un request individual empeora un poco. ¿Es un buen cambio?</p>
+    <button class="opt">Nunca: la latencia siempre manda sobre el throughput</button>
+    <button class="opt">Depende del SLA: si tu objetivo de p99 es 100 ms y quedaste en 75 ms, cambiaste latencia que te sobraba por throughput que abarata cada predicción</button>
+    <button class="opt">Sí siempre: en una GPU el throughput es lo único que importa</button>
+    <div class="exp">Es el trade-off central del serving de ML, y no tiene respuesta absoluta: se decide contra el SLA. Batchear sube el throughput y desploma el costo por predicción (la GPU deja de estar ociosa) a cambio de algo de latencia por la ventana de acumulación y el forward de un lote mayor. Si te queda margen contra tu objetivo de p99, es un cambio excelente; si ya estás pegado al límite, no.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>3. ¿Por qué desplegar un modelo nuevo es más riesgoso que desplegar código nuevo?</p>
+    <button class="opt">Porque los modelos pesan más y tardan más en subir al servidor</button>
+    <button class="opt">No es más riesgoso: si carga y devuelve un número con la forma correcta, está bien</button>
+    <button class="opt">Porque un modelo no falla en compilación: puede cargar, responder con 200 OK y estar silenciosamente peor (skew, drift, checkpoint equivocado); por eso shadow, canary y comparar métricas de calidad</button>
+    <div class="exp">El código falla ruidosamente: no compila, los tests se ponen rojos. Un modelo degrada callado — devuelve salidas plausibles que son peores, sin ningún error. Un health check verde no dice nada sobre la calidad de las predicciones. Por eso el despliegue de modelos usa estrategias que comparan (shadow, canary, A/B) y exige versionado para poder hacer rollback y reproducir predicciones.</div>
+  </div>
+
+  <div class="score" id="scoreDS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds3-evaluacion/lecture.html">← DS3: Evaluación y validación</a>
+  <a href="../ds5-llmops/lecture.html">DS5: LLMOps →</a>
+</nav>
+
+</div>
+</body>
+</html>

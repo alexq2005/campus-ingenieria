@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS1 — Threat modeling a escala: arquitectura y decisiones · Ciberseguridad Senior</title>
+  <meta name="description" content="Threat modeling para sistemas reales, grandes y en evolución: modelado incremental y como código, los cuatro marcos (STRIDE, PASTA, LINDDUN, attack trees), DFD con límites de confianza, superficie de ataque a escala, sistemas distribuidos, priorización por riesgo real, MITRE ATT&CK, el modelo vivo y cuándo NO modelar.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS1</span>
+  <span class="badge">⏱ 35–75 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Ciberseguridad M00–M12</span>
+  <span class="badge">🧠 Arquitectura</span>
+</div>
+
+<article>
+
+<h1>CS1 — Threat modeling a escala: arquitectura y decisiones</h1>
+
+<h2>CS1.0 Por qué este módulo</h2>
+
+<p>El curso base te dio dos cosas: el mnemónico <strong>STRIDE</strong> para enumerar amenazas y el <strong>ciclo del NIST</strong> como una lista de pasos ordenados. Con eso alcanza para modelar una feature chica en una pizarra. No alcanza para el trabajo que te van a pagar como senior: modelar la seguridad de un sistema <strong>real, grande y en evolución</strong>, donde el modelo se desactualiza más rápido de lo que lo escribís.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un threat model no es un documento: es un <strong>hábito</strong> que produce un <strong>artefacto que se pudre</strong>. En un sistema que cambia cada sprint, el diagrama que dibujaste el lunes describe un sistema que ya no existe el viernes. La habilidad senior no es saber STRIDE de memoria —eso lo hace cualquiera— sino diseñar el modelado para que sea <strong>barato de repetir</strong>, viva <strong>donde trabajan los devs</strong>, y sobreviva al choque con una organización real de cientos de personas y miles de servicios.</p>
+</div>
+
+<p>Tres realidades hacen que el modelado a escala sea un problema distinto al del curso base, y ninguna es técnica:</p>
+
+<ul>
+  <li><strong>Nadie entiende el sistema entero.</strong> El monolito lo tenías en la cabeza. Doscientos microservicios no entran en ninguna cabeza; el modelo tiene que componerse de pedazos que mantienen equipos distintos.</li>
+  <li><strong>El sistema es un blanco móvil.</strong> Modelar un sistema congelado es fácil. Modelar uno que suma un límite de confianza nuevo cada semana exige un proceso, no un evento.</li>
+  <li><strong>El artefacto compite por atención.</strong> Tu modelo de amenazas es uno más entre 300 documentos. Si es largo, aburrido y está en un wiki que nadie abre, no existe.</li>
+</ul>
+
+<div class="analogy">
+  <strong>🗺️ El mapa y el territorio.</strong> Un threat model es un mapa. Un mapa desactualizado de una ciudad que ya cambió las calles no es neutral: te manda de cabeza contra una pared con total confianza. El objetivo de este módulo no es dibujar el mapa más lindo, sino montar la <em>cartografía continua</em> que mantiene el mapa razonablemente cerca del territorio.
+</div>
+
+<h2>CS1.1 Threat modeling que escala</h2>
+
+<p>El primer instinto de una organización que "toma en serio la seguridad" es contratar a alguien para que escriba <strong>el documento</strong>: cuarenta páginas de Word, todos los flujos, todas las amenazas, un anexo con la matriz STRIDE completa. Se aprueba en un comité, se archiva, y se muere. Entender <em>por qué</em> se muere es lo que te dice cómo hacerlo bien.</p>
+
+<div class="mistake">
+  <strong>Por qué el documento de 40 páginas siempre muere.</strong> <strong>(1)</strong> Es demasiado caro de actualizar: cada cambio de arquitectura obligaría a reabrir un documento enorme, así que nadie lo hace. <strong>(2)</strong> No está donde ocurre el trabajo: los devs viven en el repo y el IDE, no en Confluence. <strong>(3)</strong> Lo revisó gente que no toca el código, así que describe el sistema que <em>imaginaron</em>, no el que se desplegó. A los tres sprints es ficción con membrete.
+</div>
+
+<p>La alternativa no es "modelar menos": es <strong>modelar en incrementos chicos, por feature, integrado al diseño</strong>. En vez de un evento de tres semanas para todo el sistema, un ejercicio de treinta minutos cada vez que una feature cruza un límite nuevo. El marco de las cuatro preguntas de Shostack es lo que hace que ese ejercicio quepa en media hora:</p>
+
+<div class="rule">
+  <strong>📌 Las cuatro preguntas, por feature y no por sistema.</strong>
+  <strong>1) ¿Qué estamos construyendo?</strong> (un diagrama, aunque sea de la feature sola).
+  <strong>2) ¿Qué puede salir mal?</strong> (STRIDE sobre lo que cambió).
+  <strong>3) ¿Qué vamos a hacer al respecto?</strong> (mitigar / aceptar / eliminar, con dueño).
+  <strong>4) ¿Lo hicimos bien?</strong> (revisar el modelo contra lo que realmente se codeó). Repetidas en cada PR relevante, mantienen el modelo vivo casi sin costo marginal.
+</div>
+
+<p><strong>Threat modeling as code.</strong> La pieza que hace escalar todo esto es sacar el modelo del wiki y meterlo en el repo, como texto versionable, al lado del código que describe. Un archivo declarativo que vive con el servicio, se diffea en los PR, y del que se generan reportes y diagramas automáticamente:</p>
+
+<pre><code class="lang-yaml"># threat-model.yml — vive en el repo, versiona junto al código
+sistema: checkout-service
+revisado_por: equipo-pagos
+ultimo_cambio_arquitectonico: 2026-08-14
+
+flujos:
+  - id: F1
+    origen: navegador
+    destino: api-gateway
+    cruza_limite: internet→borde        # ← acá se concentran las amenazas
+    datos: [pan_tarjeta, cvv]
+    clasificacion: pci
+    amenazas:
+      - stride: spoofing
+        control: oauth + mtls-cliente
+        estado: implementado
+      - stride: info-disclosure
+        control: tokenizar-antes-de-persistir
+        estado: pendiente
+        riesgo_aceptado_hasta: 2026-10-01
+        dueño: maria.g            # un riesgo aceptado SIEMPRE tiene nombre y fecha</code></pre>
+
+<div class="info">
+  Hay herramientas maduras para esto y conviene conocerlas antes de inventar la tuya: <strong>OWASP Threat Dragon</strong> (modelos en JSON, diagramas versionables), <strong>pytm</strong> (un DSL en Python: describís el sistema como objetos y te genera el DFD y el listado de amenazas), y <strong>Threagile</strong> (modelo en YAML, corre en el pipeline y falla el build ante riesgos altos). No importa cuál elijas; importa que el modelo sea <em>texto en el repo</em>, no una imagen pegada en una página que nadie versiona.
+</div>
+
+<p>La cuarta pregunta —"¿lo hicimos bien?"— es la que casi todos saltean, y es la que cierra el lazo. No se responde en la reunión de modelado: se responde <strong>después</strong>, contrastando el modelo contra la realidad. ¿El control que dijiste que ibas a poner está en el código? ¿La amenaza que marcaste como "mitigada" tiene un test que lo demuestre? ¿El pentest o el red team (CS1.7) encontró algo que el modelo debió anticipar y no anticipó? Cada "no" es retroalimentación para el próximo modelo: no solo arreglás el hallazgo, ajustás <em>cómo modelás</em> para no volver a perder esa clase de amenaza. Un modelo que nunca se contrasta con la realidad no mejora nunca.</p>
+
+<h2>CS1.2 Los cuatro marcos y cuándo cada uno</h2>
+
+<p>La pregunta de junior es "¿cuál es el mejor marco?". La respuesta senior es que <strong>no compiten: son lentes distintos sobre el mismo sistema</strong>, y elegís según qué querés ver y con quién tenés que hablar. STRIDE mira componentes técnicos; PASTA mira riesgo de negocio; LINDDUN mira privacidad; los árboles de ataque miran a un adversario persiguiendo un objetivo.</p>
+
+<table>
+<thead><tr><th>Marco</th><th>Lente</th><th>Unidad de análisis</th><th>Cuándo usarlo</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>STRIDE</strong></td><td>Técnica / defensiva</td><td>Componente y flujo</td><td>El caballito de batalla: barrido por componente en cada feature. Lo maneja el dev.</td><td>Bajo</td></tr>
+<tr><td><strong>PASTA</strong></td><td>Riesgo de negocio</td><td>Escenario de ataque con impacto $</td><td>Sistemas críticos donde necesitás <em>buy-in</em> y presupuesto: traduce amenaza técnica a plata.</td><td>Alto (7 etapas)</td></tr>
+<tr><td><strong>LINDDUN</strong></td><td>Privacidad</td><td>Dato personal y su flujo</td><td>Cuando cruzan datos personales: GDPR, salud, menores. Ve amenazas que STRIDE no mira.</td><td>Medio</td></tr>
+<tr><td><strong>Attack trees</strong></td><td>Ofensiva / adversario</td><td>Objetivo del atacante</td><td>Profundizar una <em>joya de la corona</em>: raíz = meta del atacante, ramas = formas de lograrla.</td><td>Medio-alto</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La combinación que se usa en la práctica.</strong> STRIDE por defecto para cubrir en amplitud, feature por feature. Cuando un flujo toca <strong>datos personales</strong>, le sumás la lente LINDDUN sobre ese flujo. Cuando hay un <strong>activo de altísimo valor</strong> (la bóveda de claves, el ledger), le armás un <strong>attack tree</strong> dedicado. Y cuando tenés que <strong>convencer a un directorio</strong> de financiar la mitigación, envolvés todo en el lenguaje de PASTA: probabilidad, impacto en dólares, apetito de riesgo.</p>
+</div>
+
+<div class="tip">
+  LINDDUN es el que más se olvida y el que más caro sale olvidar. STRIDE te hace preguntar "¿pueden robar este dato?"; LINDDUN te hace preguntar "¿este sistema puede <em>vincular</em> dos acciones de la misma persona que deberían ser anónimas, o <em>identificar</em> a alguien que creía estar oculto?". Son amenazas de <em>diseño</em>, no de implementación: no las tapa ningún WAF.
+</div>
+
+<p>Vale la pena entender cómo se construye un <strong>attack tree</strong>, porque es el marco que mejor se combina con la threat intelligence del CS1.7. La raíz es el objetivo del atacante; las ramas son las formas de alcanzarlo, unidas por nodos <strong>OR</strong> (cualquiera de estas alcanza) y <strong>AND</strong> (hacen falta todas a la vez). Los nodos AND son oro puro: cada <code>AND</code> es un punto donde <em>un solo</em> control bien puesto rompe toda esa rama del árbol.</p>
+
+<pre><code class="lang-bash">Objetivo del atacante: VACIAR una cuenta
+│
+├─(OR)── Robar credenciales
+│         ├─ Phishing dirigido
+│         ├─ Credential stuffing (reúso de contraseña)
+│         └─ Malware infostealer
+│
+├─(OR)── Secuestrar la sesión
+│         ├─(AND)─ Robar la cookie  +  Eludir el binding de dispositivo
+│         └─ XSS que exfiltra el token
+│
+└─(OR)── Abusar de "recuperar cuenta"
+          └─(AND)─ Tomar el email de la víctima  +  Responder la pregunta secreta
+
+   ▲ Cada nodo AND es una oportunidad de defensa: reforzá UN lado y cae la rama entera.
+     (Binding de dispositivo mata la rama de sesión; MFA por email mata la de recuperación.)</code></pre>
+
+<h2>CS1.3 Diagramas de flujo de datos con límites de confianza</h2>
+
+<p>El diagrama de flujo de datos (DFD) es la herramienta central del modelado, y casi todos los que se dibujan están mal por la misma razón: <strong>no marcan los límites de confianza</strong>. Un DFD sin límites es un diagrama de arquitectura bonito; con límites, es un mapa de dónde buscar los bugs.</p>
+
+<p>Un DFD tiene cuatro tipos de elemento, y nada más:</p>
+
+<pre><code class="lang-bash"> Entidad externa      Proceso          Almacén de datos       Flujo de datos
+   [ Usuario ]       ( Servicio )       { Base de datos }          ─────►
+
+ Y un quinto que no es un elemento sino una LÍNEA:
+ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ LÍMITE DE CONFIANZA ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ (la frontera donde cambia quién controla —o en quién confiás— los datos)</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué es de verdad un límite de confianza.</strong> Es toda línea donde <strong>cambia el nivel de confianza</strong>: de internet a tu borde, de tu borde a la red interna, de tu proceso a una base de datos, de tu código a una API de un tercero, de un tenant a otro, de userland al kernel. A un lado controlás las dos puntas; al otro, una punta es —o puede volverse— hostil. El límite es exactamente donde <em>tienen</em> que vivir la validación, la autenticación, la autorización y el <em>encoding</em>.
+</div>
+
+<p>Dibujá primero los límites, después lo que los cruza, y recién ahí aplicá STRIDE a cada cruce. Un ejemplo mínimo, el login de siempre:</p>
+
+<pre><code class="lang-bash">   INTERNET (no confiable)          │          APP (confiable)
+                                    │
+   [ Usuario ] ──credenciales─────► ( Login ) ──query──► { DB usuarios }
+        ▲                           │    │
+        │                           │    ▼
+        └──── cookie de sesión ─────┘   { cache de sesiones }
+                                    │
+             ▲ TODO lo que cruza esta línea es entrada hostil hasta probar lo contrario</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El 90% de las vulnerabilidades viven en los cruces.</strong> No es casualidad ni una estadística inventada para asustar: <em>dentro</em> de una zona de confianza controlás ambos extremos, así que rara vez validás —y rara vez hace falta—. <em>En</em> el cruce, un extremo es atacable, y es justo donde el control es más fácil de olvidar porque "total, es interno" o "total, viene del gateway". SQL injection, IDOR, SSRF, deserialización insegura, XSS: todas son, en el fondo, un dato que cruzó un límite sin que nadie lo tratara como hostil.
+</div>
+
+<p>La pregunta que separa un DFD útil de uno inútil a escala es <strong>hasta dónde descomponer</strong>. Los DFD tienen niveles: el <em>nivel 0</em> (o diagrama de contexto) muestra el sistema como una caja y sus actores externos; el <em>nivel 1</em> abre los procesos internos principales; el <em>nivel 2</em> baja al detalle de un proceso. La tentación de junior es dibujar todo al nivel 2 de una: el resultado es un diagrama ilegible que nadie mantiene y que igual queda desactualizado.</p>
+
+<div class="tip">
+  <strong>Regla de decomposición:</strong> bajá de nivel <strong>solo donde aparece un límite de confianza nuevo</strong>. Si abrir un proceso no revela ningún cruce que no vieras antes, no lo abras: ese detalle es ruido para el modelo de amenazas. El DFD no tiene que documentar la arquitectura entera —para eso están otros diagramas—; tiene que mostrar dónde cambia la confianza. Un buen DFD de nivel 1 con los límites bien marcados vale más que veinte diagramas de nivel 2 sin ellos.
+</div>
+
+<h2>CS1.4 Superficie de ataque a escala</h2>
+
+<p>La superficie de ataque es la suma de todos los puntos donde un atacante puede interactuar con el sistema. En una app chica la tenés entera en la cabeza. En una organización real el problema no es medir la superficie: es que <strong>nadie sabe cuál es</strong>, porque el inventario de activos o no existe o está desactualizado desde hace años.</p>
+
+<div class="warn">
+  <strong>Lo que engorda la superficie sin que nadie lo mire:</strong> <strong>shadow IT</strong> (equipos que levantan SaaS y recursos cloud sin avisarle a nadie), <strong>APIs zombie</strong> (la <code>v1</code> quedó prendida después de lanzar la <code>v2</code>), <strong>subdominios olvidados</strong> apuntando a servicios dados de baja (candidatos a <em>subdomain takeover</em>), buckets y bases sin dueño, y esa instancia que alguien levantó "para una prueba" en 2019 y sigue corriendo con un sistema operativo sin parches.</p>
+</div>
+
+<p>Esto se puede —y se debe— descubrir de forma continua y <strong>defensiva</strong>, sobre tus propios dominios y cuentas. No es reconocimiento ofensivo contra terceros: es inventariar lo tuyo antes de que lo haga otro.</p>
+
+<pre><code class="lang-bash"># Descubrimiento DEFENSIVO de superficie, sobre TUS propios activos.
+
+# 1) Subdominios que vos mismo publicaste, vía Certificate Transparency (fuente pública)
+curl -s "https://crt.sh/?q=%25.miempresa.com&output=json" \
+  | jq -r '.[].name_value' | sort -u
+
+# 2) Instancias expuestas a internet en la nube (ejemplo AWS)
+aws ec2 describe-instances \
+  --filters "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].[InstanceId,PublicIpAddress]' --output table
+
+# 3) Reglas que abren puertos al mundo entero (0.0.0.0/0): el clásico olvido
+aws ec2 describe-security-groups \
+  --query "SecurityGroups[?IpPermissions[?contains(IpRanges[].CidrIp, '0.0.0.0/0')]].GroupId"</code></pre>
+
+<div class="mistake">
+  <strong>El error de encuadre:</strong> tratar la superficie de ataque como un problema técnico ("compremos un escáner"). El escáner encuentra lo que ya sabés que existe. El problema de fondo es <strong>organizacional</strong>: no hay un proceso que registre cada activo nuevo, no hay un dueño del inventario, y la baja de servicios no incluye "apagar y desregistrar". Podés modelar amenazas con precisión quirúrgica sobre los diez servicios que conocés mientras el incidente entra por el undécimo que nadie anotó. <strong>No se puede modelar lo que no sabés que existe.</strong>
+</div>
+
+<p>El caso testigo de por qué esto importa es el <strong>subdomain takeover</strong>. Un equipo crea <code>promo.miempresa.com</code> apuntando (con un <code>CNAME</code>) a un servicio de un tercero —un hosting, un SaaS de landing pages—, la campaña termina, dan de baja el servicio pero <strong>se olvidan de borrar el registro DNS</strong>. Ese <code>CNAME</code> queda "colgando" (<em>dangling DNS</em>) apuntando a un recurso que ya no es tuyo. Un atacante reclama ese recurso en el tercero, y ahora sirve contenido desde <em>tu</em> dominio: phishing con tu marca, robo de cookies con tu <em>same-site</em>, lo que quiera. El bug no está en ningún código: está en que la baja del servicio no incluyó desregistrar el activo.</p>
+
+<div class="rule">
+  <strong>📌 El inventario y el <em>deprovisioning</em> son controles de seguridad, no tareas de IT.</strong> La mitad de la superficie de ataque olvidada no se crea por un ataque: se crea por una baja incompleta. Todo alta de activo tiene que registrarse con un dueño, y toda baja tiene que incluir "apagar, desregistrar del DNS y sacar del inventario". Un proceso de baja que solo apaga la máquina y deja el <code>CNAME</code> vivo está fabricando vulnerabilidades futuras de forma industrial.
+</div>
+
+<h2>CS1.5 Modelado de un sistema distribuido</h2>
+
+<p>En un monolito hay esencialmente un límite de confianza: internet contra la app; la base de datos está "adentro". Cuando ese monolito se parte en microservicios, colas y caches, esa comodidad desaparece: <strong>cada llamada entre servicios es un cruce de límite potencial</strong>, y aparecen amenazas que no existían cuando todo corría en el mismo proceso.</p>
+
+<pre><code class="lang-bash">              ║ = cada salto entre servicios es un límite de confianza
+
+ [ Cliente ] ─►( Gateway )─►( pedidos-svc )─►( pagos-svc )─►( PSP externo )
+                   ║             │    ║            │
+                   ║             ▼    ║            ▼
+                   ║        { pedidos-DB }     [ cola ]─►( envios-svc )
+                   ║             ║                          │
+                   ║        ( fraude-svc ) ◄───────────────┘  ¿quién puede
+                   ║                                           publicar acá?</code></pre>
+
+<p>Las amenazas propias del entramado distribuido —las que no ves mirando un servicio aislado— son un tema de arquitectura, no de código de una función:</p>
+
+<table>
+<thead><tr><th>Amenaza entre servicios</th><th>Cómo aparece</th><th>Mitigación de diseño</th></tr></thead>
+<tbody>
+<tr><td><strong>Confused deputy</strong></td><td>El servicio B confía en un header <code>X-User-Id</code> o <code>X-Es-Admin</code> que le pasó A, y actúa con <em>su</em> autoridad alta.</td><td>Propagar <strong>identidad firmada</strong>, no afirmaciones en texto plano; cada servicio evalúa permisos por su cuenta.</td></tr>
+<tr><td><strong>SSRF interno</strong></td><td>Un servicio que baja URLs es apuntado al endpoint de metadatos <code>169.254.169.254</code> o a otro servicio interno.</td><td><em>Allowlist</em> de egreso, bloquear rangos internos, no confiar en que "interno = seguro".</td></tr>
+<tr><td><strong>Propagación de identidad</strong></td><td>El usuario original se pierde tras 5 saltos; cada servicio se re-autentica como <em>sí mismo</em> y nadie sabe en nombre de quién actúa.</td><td>Token del usuario propagado (JWT/PASETO) + <strong>mTLS</strong> para identidad de servicio; <em>token exchange</em> por salto.</td></tr>
+<tr><td><strong>Mensaje envenenado</strong></td><td>Cualquiera que pueda publicar en la cola inyecta un mensaje que aguas abajo se procesa como confiable.</td><td>Autorización de <em>publish</em>, firma del mensaje, validar el payload en el consumidor.</td></tr>
+<tr><td><strong>Cache envenenada / cruzada</strong></td><td>Una clave de cache mal segmentada mezcla datos entre tenants o usuarios.</td><td>Namespacing por tenant en la clave; nunca cachear datos sensibles sin aislar el ámbito.</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El <em>confused deputy</em> es el rey de los sistemas distribuidos.</strong> Cuando un microservicio ejecuta con permisos altos porque "otro ya autorizó", alcanza con que <em>algo</em> de la red interna pueda hablarle —un SSRF, un contenedor comprometido, un mensaje en una cola— para heredar esos permisos. Este patrón es exactamente el que desarma el <a href="../../m03-autorizacion/lecture.html">M03 del curso base (Autorización)</a>: la identidad se propaga, la decisión de autorización <strong>no se delega</strong>.
+</div>
+
+<div class="rule">
+  <strong>📌 En un sistema distribuido, "interno" no es un límite de confianza en el que puedas apoyarte.</strong> El modelo mental de "cáscara dura, interior blando" (un perímetro fuerte y adentro todos se confían) es precisamente lo que explota el movimiento lateral. La postura correcta es <strong>zero trust</strong>: modelá cada salto como si el llamador pudiera ser hostil, porque el día que un servicio se compromete, lo es.
+</div>
+
+<p>La raíz técnica del <em>confused deputy</em> tiene nombre: <strong>autoridad ambiental</strong> (<em>ambient authority</em>). El servicio actúa con permisos que le pertenecen "por estar donde está" —su rol de IAM, su posición en la red— en lugar de con permisos atados a <em>la petición concreta que está atendiendo y en nombre de quién</em>. Modelá esto explícitamente: por cada salto, preguntá "¿este servicio actúa con <em>su</em> autoridad o con la del usuario original?". Las dos respuestas de diseño que aparecen a escala son <strong>mTLS</strong> para que cada servicio pruebe <em>quién es</em> (identidad de servicio, no de usuario) y <strong>token exchange</strong> para acotar la autoridad en cada salto: el servicio A no le pasa a B su token todopoderoso, sino que intercambia el token del usuario por uno de alcance reducido, válido solo para lo que B necesita hacer. Así, si B se compromete, el token que tiene en la mano no abre todo el sistema.</p>
+
+<h2>CS1.6 Priorización real: qué se arregla con presupuesto finito</h2>
+
+<p>Enumerar amenazas es la parte fácil. La parte que separa a un senior es <strong>decidir cuáles se arreglan</strong>, sabiendo que el presupuesto —horas de ingeniería, no plata abstracta— es finito y siempre alcanza para menos de lo que la lista pide.</p>
+
+<p>Durante años el estándar informal fue <strong>DREAD</strong> (Damage, Reproducibility, Exploitability, Affected users, Discoverability), puntuando cada eje de 1 a 10 y promediando. Se abandonó, y con razón:</p>
+
+<div class="mistake">
+  <strong>Por qué se abandonó DREAD.</strong> Es <strong>subjetivo e inconsistente</strong>: dos personas puntúan la misma amenaza con números muy distintos, y la misma persona puntúa distinto según el día. Peor, produce <strong>falsa precisión</strong>: un <code>6.4</code> contra un <code>6.8</code> parece una decisión basada en datos y no significa nada. Hasta Microsoft, que lo popularizó, lo dejó de recomendar. Un número con decimales que salió de una corazonada sigue siendo una corazonada, pero ahora <em>parece</em> ciencia.
+</div>
+
+<p>El reemplazo no es otra sigla mágica, es pensar en <strong>riesgo = probabilidad × impacto</strong>, con un tercer eje que en seguridad pesa muchísimo: la <strong>exposición</strong> (¿lo alcanza cualquiera desde internet, o hace falta ya estar adentro y autenticado?). Y usar el resultado para <em>ordenar</em>, no para <em>certificar</em>:</p>
+
+<pre><code class="lang-python">from dataclasses import dataclass
+
+@dataclass
+class Hallazgo:
+    id: str
+    probabilidad: int   # 1..5  (1 improbable, 5 casi seguro)
+    impacto: int        # 1..5  (1 molesto, 5 catastrófico)
+    exposicion: int     # 1..5  (1 interno autenticado, 5 internet anónimo)
+
+    @property
+    def riesgo(self):
+        return self.probabilidad * self.impacto * self.exposicion
+
+hallazgos = [
+    Hallazgo("H1-webhook-sin-firma", 4, 5, 5),   # 100
+    Hallazgo("H2-idor-en-recibos",   3, 4, 4),   #  48
+    Hallazgo("H3-log-con-pan",       2, 5, 2),   #  20
+]
+
+# El número NO es una nota: es una forma de ORDENAR la cola de trabajo.
+for h in sorted(hallazgos, key=lambda x: x.riesgo, reverse=True):
+    print(f"{h.riesgo:3d}  {h.id}")</code></pre>
+
+<div class="rule">
+  <strong>📌 La decisión senior: trazar la línea y aceptar lo de abajo, con nombre.</strong> Ordenás por riesgo, mirás cuánto presupuesto hay, trazás una línea, y lo que queda debajo <strong>no lo ignorás: lo aceptás explícitamente</strong> como riesgo documentado, con un dueño y una fecha de revisión. Un riesgo aceptado a propósito, con nombre y apellido pegado, es gestión de riesgo. El mismo riesgo ignorado en silencio es negligencia. La diferencia entre ambos no es el riesgo: es si alguien firmó.
+</div>
+
+<div class="tip">
+  <strong>No confundas el scoring del threat model con CVSS.</strong> CVSS puntúa <em>vulnerabilidades concretas ya conocidas</em> (un CVE, un hallazgo de pentest) y es útil para eso. Un threat model razona sobre <em>amenazas de diseño</em> que todavía no son bugs con dirección: no hay un CVSS para "este servicio confía en un header interno". Para ordenar amenazas, unos pocos buckets cualitativos —Alto / Medio / Bajo— honestos le ganan a cualquier número con dos decimales, porque comunican mejor la incertidumbre real y nadie los confunde con una medición. Guardá los decimales para cuando midas algo de verdad.
+</div>
+
+<h2>CS1.7 Threat intelligence: modelar contra adversarios reales</h2>
+
+<p>Un modelo de amenazas puede irse a la fantasía muy rápido: horas gastadas defendiéndote de ataques que ningún adversario de tu perfil usaría jamás, mientras el vector que sí van a usar quedó sin mirar. La <strong>threat intelligence</strong> es el ancla contra eso: modelás contra lo que los atacantes <em>hacen de verdad</em>, no contra lo que imaginás.</p>
+
+<p><strong>MITRE ATT&CK</strong> es una base de conocimiento de tácticas y técnicas (TTPs) observadas en el mundo real. Sirve para tres cosas concretas en el modelado: aterrizar el "¿qué puede salir mal?" en técnicas reales, <strong>mapear tus defensas a técnicas</strong> y encontrar los huecos de cobertura, y priorizar por lo que los grupos que apuntan a <em>tu sector</em> efectivamente usan.</p>
+
+<pre><code class="lang-yaml"># attack-cobertura.yml — mapea técnicas reales a defensas y detecciones
+grupo_modelado: FIN7          # apunta a pagos y retail: TTPs conocidas y documentadas
+tecnicas:
+  - id: T1566.001             # spearphishing con adjunto
+    tactica: initial-access
+    mitigacion: filtrado-de-adjuntos + entrenamiento
+    deteccion: edr-macros-office
+    cobertura: parcial
+
+  - id: T1071.001             # C2 sobre HTTPS (se mimetiza con tráfico normal)
+    tactica: command-and-control
+    mitigacion: proxy-egress-allowlist
+    deteccion: analitica-de-beaconing
+    cobertura: ninguna         # ← hueco real: esto es lo que se prioriza, no lo imaginario</code></pre>
+
+<div class="info">
+  El <strong>ATT&CK Navigator</strong> te deja pintar un mapa de calor de tu cobertura: verde donde tenés mitigación y detección, rojo donde no tenés nada. Ese mapa convierte "creo que estamos bien" en "tenemos 0% de cobertura en exfiltración", que es una frase con la que se consigue presupuesto. Es la conexión directa con la <a href="../../m11-ofensiva-etica/lecture.html">ofensiva ética del M11</a>: el red team valida en la práctica las técnicas que el modelo dice que deberías detectar.
+</div>
+
+<div class="tip">
+  Cuidado con el sesgo de ATT&CK: está pesado hacia el <em>post-compromiso</em> y hacia entornos enterprise. La ausencia de una técnica en ATT&CK <strong>no</strong> significa que sea segura —significa que todavía no está catalogada—. Usalo como piso de "esto seguro pasa en la calle", no como techo de "esto es todo lo que puede pasar".
+</div>
+
+<p>El salto de calidad se llama <strong>defensa informada por amenazas</strong> (<em>threat-informed defense</em>) y es un lazo, no un informe: partís de qué grupos apuntan a tu sector (una fintech no enfrenta a los mismos adversarios que un hospital o una empresa de energía), tomás sus TTPs conocidas, verificás en tu propio entorno cuáles detectarías —idealmente con un ejercicio de <em>purple team</em> donde el rojo emula la técnica y el azul confirma si la ve—, y realimentás el modelo con los huecos que encontraste. Sin ese lazo, ATT&CK es una lista linda; con él, es la diferencia entre "creemos que detectamos exfiltración" y "emulamos T1048 el martes y no saltó ninguna alerta". La segunda frase es la que mueve presupuesto y la que corrige el modelo.</p>
+
+<h2>CS1.8 El modelo vivo: dueño, disparadores y decadencia</h2>
+
+<p>Un threat model no está nunca "terminado", porque el sistema que describe no está nunca terminado. Cada cambio de arquitectura, cada integración nueva, cada tipo de dato nuevo puede invalidarlo. Mantenerlo vivo es un problema de proceso con tres patas:</p>
+
+<div class="step"><strong>1) Dueño que no sea una persona.</strong> Si el modelo lo "posee" quien lo escribió, muere el día que esa persona cambia de equipo. El dueño es un <strong>equipo</strong> (el que opera el servicio), y la responsabilidad viaja con el servicio, no con la persona.</div>
+
+<div class="step"><strong>2) Disparadores por evento, no por calendario.</strong> Revisar "cada seis meses" garantiza que esté desactualizado cinco meses de cada seis. Los disparadores son cambios reales: <em>feature</em> nueva que agrega un flujo, límite de confianza nuevo, dependencia mayor, o un incidente. Ahí se toca el modelo, en ese PR.</div>
+
+<div class="step"><strong>3) Integrado al PR, no a un ritual aparte.</strong> Una casilla en la plantilla de PR —"¿este cambio toca un límite de confianza, agrega un flujo de datos o una dependencia externa?"— y si la respuesta es sí, actualizar el modelo es parte de la definición de <em>done</em>. Se puede incluso automatizar como <em>gate</em>:</div>
+
+<pre><code class="lang-yaml"># .github/workflows/threat-model.yml (fragmento) — gate de "modelo vivo"
+on: pull_request
+jobs:
+  revisar-modelo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Si tocaste un límite de confianza, tenés que tocar el modelo
+        run: |
+          TOCA_LIMITE=$(git diff --name-only origin/main | grep -E 'gateway|auth|payment' || true)
+          TOCA_MODELO=$(git diff --name-only origin/main | grep 'threat-model.yml' || true)
+          if [ -n "$TOCA_LIMITE" ] && [ -z "$TOCA_MODELO" ]; then
+            echo "Cambiaste un límite de confianza sin actualizar threat-model.yml"
+            exit 1
+          fi</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Un threat model desactualizado es PEOR que ninguno.</strong> No es una exageración retórica. Un modelo viejo da <strong>falsa sensación de seguridad</strong>: la gente ve la casilla "esto ya fue modelado" y deja de pensar, mientras el modelo describe un sistema que ya no existe. La ausencia de modelo al menos genera cautela —"esto no lo miró nadie, cuidado"—. La presencia de un modelo muerto genera confianza injustificada, que es exactamente lo contrario de lo que un modelo debería producir.
+</div>
+
+<div class="rule">
+  <strong>📌 Si no lo vas a mantener, retiralo con honestidad.</strong> Un modelo que sabés que está podrido y dejás "por las dudas" es un pasivo, no un activo. O se le pone dueño y disparadores y vive, o se marca explícitamente como desactualizado para que nadie se apoye en él. Lo que no se puede es fingir que un mapa viejo sigue siendo un mapa.
+</div>
+
+<h2>CS1.9 Cuándo NO hacer threat modeling exhaustivo</h2>
+
+<p>Todo lo anterior tiene un costo: tiempo, expertise y coordinación. Aplicarlo con la misma profundidad a todo es tan malo como no aplicarlo a nada. La habilidad que casi nadie enseña es la <strong>proporcionalidad</strong>: hacer coincidir la profundidad del modelado con lo que está en juego.</p>
+
+<div class="warn">
+  <strong>Dónde el modelado exhaustivo es desperdicio:</strong> un <strong>prototipo</strong> que vas a tirar, una <strong>herramienta interna</strong> sin datos sensibles y sin exposición, un <strong>MVP</strong> corriendo a validar producto que se va a reescribir entero si funciona. Sentar a cuatro personas tres semanas a hacer STRIDE-por-componente sobre eso es teatro de seguridad: gastás el presupuesto de seguridad del trimestre protegiendo algo que quizás no exista en dos meses.
+</div>
+
+<p>Lo cual no significa "cero seguridad": significa un pase liviano y proporcional. Las cuatro preguntas en quince minutos, enfocadas solo en las <em>joyas de la corona</em> (autenticación, pagos, datos personales) y difiriendo el resto explícitamente.</p>
+
+<table>
+<thead><tr><th>Sistema</th><th>Profundidad de modelado</th></tr></thead>
+<tbody>
+<tr><td>Prototipo descartable, spike técnico</td><td>Ninguno formal. Una nota de "no tiene datos reales" y listo.</td></tr>
+<tr><td>Herramienta interna, sin datos sensibles</td><td>Pase liviano: las 4 preguntas, 15 min, foco en el acceso.</td></tr>
+<tr><td>Producto con usuarios reales</td><td>STRIDE incremental por feature + LINDDUN donde haya datos personales.</td></tr>
+<tr><td>Toca dinero, salud, o es <em>load-bearing</em></td><td>Exhaustivo: STRIDE + attack trees en las joyas + PASTA para el presupuesto.</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El anti-patrón vive en las dos puntas.</strong> Modelado pesado sobre un prototipo (parálisis por análisis, teatro) <strong>y</strong> modelado cero sobre un sistema que mueve plata o datos personales (negligencia). Los dos son fallas de calibración. Y ojo con la trampa temporal: la exención del prototipo <strong>vence sola</strong>. El día que ese "MVP interno" empieza a tocar dinero, guardar PII, o a volverse una pieza de la que dependen otras, el modelado deja de ser opcional —y casi nadie se acuerda de reevaluar esa decisión que tomó cuando el sistema era un juguete.
+</div>
+
+<p>La decisión de <em>cuánto</em> modelar es, ella misma, una decisión de riesgo, y por eso también se documenta y también tiene dueño. "Elegimos un pase liviano en este sistema porque X" es una frase que alguien firma, igual que se firma un riesgo aceptado. Y el disparador que reactiva el modelado exhaustivo no puede depender de la memoria de nadie: se ata a un evento observable —"cuando este servicio empiece a persistir datos de usuarios reales", "cuando lo consuma un segundo equipo"— y esa condición se anota en el mismo lugar donde vive la exención. La proporcionalidad mal entendida es la excusa preferida para no modelar nunca; bien entendida, es asignar el presupuesto de seguridad donde de verdad protege algo.</p>
+
+<h2>🧑‍🎓 Worked Example — modelar una plataforma de pagos nueva</h2>
+
+<blockquote>Arranca un producto nuevo, <strong>PagoYa</strong>: cobra con tarjeta, guarda un ledger de transacciones, terceriza el procesamiento a un PSP (tipo Stripe) y liquida de forma asíncrona. Te piden el threat model antes del primer despliegue. Toca dinero y datos de tarjeta: acá el modelado exhaustivo <em>sí</em> corresponde.</blockquote>
+
+<p><strong>Paso 1 — Encuadre (las 4 preguntas, foco en las joyas).</strong> Qué construimos: cobro con tarjeta + ledger + liquidación. Joyas de la corona: los datos de tarjeta (alcance PCI) y la integridad del ledger. Todo lo demás es secundario frente a esos dos.</p>
+
+<p><strong>Paso 2 — DFD con los límites de confianza primero.</strong> Cuatro límites, y todo lo que los cruza:</p>
+
+<pre><code class="lang-bash">LÍMITE 1 · Internet ↔ borde          (todo lo de afuera es hostil)
+  [ Navegador ]        ──HTTPS──►  ( API Gateway )
+  [ Webhook del PSP ]  ──HTTPS──►  ( webhook-receiver )   ⚠ un atacante puede IMITAR al PSP
+
+LÍMITE 2 · Borde ↔ red interna       (no asumir "interno = confiable")
+  ( API Gateway )      ─────────►  ( pagos-svc )
+  ( pagos-svc )        ──cola────►  ( liquidacion-worker )
+
+LÍMITE 3 · Zona PCI                   (alcance de auditoría PCI-DSS)
+  ( pagos-svc )        ──tokeniza─►  { card-vault }
+  ( pagos-svc )        ──asiento──►  { ledger-DB }
+  ( pagos-svc )        ──score────►  ( fraude-svc )
+
+LÍMITE 4 · Interno ↔ tercero (PSP)   (no controlás el otro lado)
+  ( pagos-svc )        ──API──────►  ( PSP externo: Stripe )</code></pre>
+
+<p><strong>Paso 3 — STRIDE por cruce.</strong> No STRIDE sobre "el sistema": STRIDE sobre <em>cada línea</em>. Los hallazgos más jugosos aparecen solos:</p>
+
+<table>
+<thead><tr><th>Cruce</th><th>Amenaza STRIDE</th><th>Hallazgo concreto</th><th>Control</th></tr></thead>
+<tbody>
+<tr><td>Webhook del PSP</td><td><strong>S</strong>poofing</td><td>Cualquiera postea un evento "pago aprobado" falso y liberamos el envío.</td><td>Verificar la <strong>firma HMAC</strong> del webhook; nunca confiar en el body pelado.</td></tr>
+<tr><td>Navegador → Gateway</td><td><strong>I</strong>nfo disclosure</td><td>El PAN de la tarjeta se loguea en texto en el gateway.</td><td>Tokenizar antes de persistir; scrubbing de logs; nunca loguear PAN/CVV.</td></tr>
+<tr><td>pagos-svc → ledger-DB</td><td><strong>T</strong>ampering / <strong>R</strong>epudiation</td><td>Un asiento del ledger se puede modificar sin dejar rastro.</td><td>Ledger <strong>append-only</strong>, hash encadenado, auditoría inmutable.</td></tr>
+<tr><td>Gateway → pagos-svc</td><td><strong>E</strong>levation</td><td>pagos-svc confía en <code>X-User-Id</code> del gateway (confused deputy).</td><td>Token de usuario firmado propagado; pagos-svc revalida la autorización.</td></tr>
+<tr><td>Cola → liquidacion-worker</td><td><strong>T</strong>ampering</td><td>Quien publique en la cola dispara una liquidación arbitraria.</td><td>Autorizar el <em>publish</em>; firmar el mensaje; validar en el consumidor.</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 4 — Priorizar por riesgo real</strong> (probabilidad × impacto × exposición, del CS1.6), no por gusto:</p>
+
+<pre><code class="lang-python">hallazgos = [
+    Hallazgo("H1-webhook-sin-firma",  4, 5, 5),   # 100 · internet, imita al PSP, libera plata
+    Hallazgo("H2-confused-deputy",    3, 5, 3),   #  45 · exige estar en la red interna
+    Hallazgo("H3-pan-en-logs",        3, 5, 2),   #  30 · alto impacto, exposición interna
+    Hallazgo("H4-ledger-mutable",     2, 5, 2),   #  20 · grave, pero difícil de gatillar hoy
+    Hallazgo("H5-cola-sin-authz",     2, 4, 2),   #  16
+]
+# Presupuesto del sprint: alcanza para ~2 hallazgos bien hechos.</code></pre>
+
+<p><strong>Paso 5 — La tabla de decisión.</strong> Este es el entregable de verdad. No el diagrama: <strong>la tabla que dice qué entra al sprint, qué se difiere y qué se acepta como riesgo documentado, con dueño y fecha.</strong></p>
+
+<table>
+<thead><tr><th>Hallazgo</th><th>Riesgo</th><th>Decisión</th><th>Dueño · fecha</th></tr></thead>
+<tbody>
+<tr><td>H1 · webhook sin firma</td><td>100</td><td><strong>Se arregla este sprint.</strong> Bloqueante de lanzamiento: internet-facing y mueve dinero.</td><td>maria.g · sprint actual</td></tr>
+<tr><td>H2 · confused deputy</td><td>45</td><td><strong>Se arregla este sprint.</strong> Propagación de identidad firmada.</td><td>diego.r · sprint actual</td></tr>
+<tr><td>H3 · PAN en logs</td><td>30</td><td><strong>Próximo sprint.</strong> Scrubbing de logs + revisión PCI.</td><td>maria.g · sprint +1</td></tr>
+<tr><td>H4 · ledger mutable</td><td>20</td><td><strong>Riesgo aceptado</strong> hasta el hash encadenado. Mitigación temporal: permisos de escritura restringidos + alerta.</td><td>lucia.p · revisar 2026-11</td></tr>
+<tr><td>H5 · cola sin authz</td><td>16</td><td><strong>Riesgo aceptado.</strong> La cola hoy está en VPC privada; se reevalúa si se expone.</td><td>diego.r · revisar 2026-11</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "el webhook necesita firma".</strong> Es que el producto del threat modeling <strong>no es el DFD</strong>: es la tabla de decisión con dueños y fechas. El diagrama es el medio; las decisiones firmadas son el fin. Un modelo que enumera veinte amenazas y no decide qué hacer con ninguna es una lista de preocupaciones, no gestión de riesgo. Y los dos riesgos aceptados (H4, H5) no son fracasos: son decisiones conscientes, con nombre y fecha de revisión, que es exactamente como se ve la seguridad madura cuando el presupuesto es finito.
+</div>
+
+<p><strong>Paso 6 — lo que deliberadamente NO se modeló.</strong> Un modelo maduro también anota sus propios bordes. Para PagoYa se dejó explícitamente afuera, esta vuelta: el panel de administración interno (va en su propio ejercicio, con su propio DFD), la resistencia a DoS volumétrico (se delega en el proveedor de CDN/WAF y se revisa aparte), y el modelado de amenazas del pipeline de CI/CD (crítico, pero es un sistema distinto con dueños distintos). Escribir lo que quedó fuera —y por qué— es lo que evita que alguien lea el modelo dentro de seis meses y crea que cubre cosas que nunca miró. El alcance no declarado es la forma más silenciosa de falsa sensación de seguridad.</p>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un threat model desactualizado puede ser peor que no tener ninguno?</summary>
+<p>Porque produce <strong>falsa sensación de seguridad</strong>. Un modelo presente hace que la gente marque la casilla "esto ya fue analizado" y deje de pensar, mientras el modelo describe un sistema que cambió y ya no coincide con la realidad: las amenazas nuevas —el límite de confianza que se agregó el mes pasado— quedan fuera y nadie las mira, precisamente porque "ya hay un modelo". La ausencia de modelo, en cambio, genera cautela: todos saben que nadie lo revisó. Por eso un modelo que no se va a mantener hay que retirarlo con honestidad, no dejarlo "por las dudas": un mapa viejo con pinta de mapa nuevo te estrella con más confianza que no tener mapa.</p></details>
+
+<details><summary>Estás modelando un microservicio que recibe <code>X-User-Id</code> del gateway y actúa según eso. ¿Cuál es la amenaza y cuál el arreglo de fondo?</summary>
+<p>Es un <strong>confused deputy</strong>: el servicio delega la decisión de autorización en quien lo llama y ejecuta con su propia autoridad (alta). Alcanza con que cualquier cosa de la red interna pueda hablarle —un SSRF, un contenedor comprometido, un mensaje en una cola— para hacerse pasar por cualquier usuario, admin incluido. El arreglo no es "validar mejor el header": es dejar de confiar en afirmaciones en texto plano. Se propaga la <strong>identidad</strong> en un token firmado (que el servicio verifica criptográficamente) y <strong>cada servicio evalúa los permisos por su cuenta</strong>, sin delegar la decisión. Es la postura zero trust aplicada al interior: "interno" no es un límite de confianza en el que apoyarse.</p></details>
+
+<details><summary>Te piden threat model exhaustivo de un prototipo interno que se va a tirar en dos meses. ¿Qué hacés?</summary>
+<p>Aplicás proporcionalidad: <strong>no</strong> hacés el ejercicio pesado. Un prototipo descartable sin datos reales no justifica tres semanas de STRIDE-por-componente; eso sería teatro de seguridad que gasta el presupuesto en algo que quizás no exista. Hacés un pase liviano —las cuatro preguntas en quince minutos, foco solo en si toca datos reales o credenciales— y dejás anotado explícitamente por qué el modelado es liviano. Lo crítico: dejás una condición de <strong>vencimiento</strong> de esa exención. El día que el prototipo empiece a tocar dinero, guardar PII o volverse load-bearing, el modelado exhaustivo pasa a ser obligatorio, y esa reevaluación tiene que estar disparada por evento, no depender de que alguien se acuerde.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un threat model no es un documento: es un <strong>hábito</strong> que produce un <strong>artefacto que se pudre</strong>. A escala, el trabajo es gestionar esa decadencia, no dibujar el diagrama perfecto una vez.</li>
+  <li>El documento de 40 páginas muere siempre. La alternativa es <strong>modelado incremental por feature</strong>, con las <strong>4 preguntas</strong>, y <strong>threat modeling as code</strong>: el modelo vive en el repo, se diffea en los PR, se versiona con el código.</li>
+  <li>STRIDE, PASTA, LINDDUN y attack trees <strong>no compiten: son lentes</strong>. STRIDE por defecto, LINDDUN donde hay datos personales, attack trees en las joyas, PASTA para conseguir presupuesto.</li>
+  <li>El <strong>DFD sin límites de confianza</strong> es decoración. Dibujá los límites primero: el 90% de las vulnerabilidades vive en los cruces, porque ahí es donde un extremo es hostil y donde el control se olvida.</li>
+  <li>La superficie de ataque a escala es un problema <strong>organizacional</strong>, no técnico: no podés modelar lo que no sabés que existe. Shadow IT, APIs zombie y subdominios olvidados entran por donde no mirás.</li>
+  <li>En sistemas distribuidos, <strong>"interno" no es un límite de confianza</strong>. Confused deputy, SSRF interno y propagación de identidad son amenazas de arquitectura: modelá cada salto con postura zero trust.</li>
+  <li><strong>DREAD se abandonó</strong> por subjetivo y por falsa precisión. Priorizá con probabilidad × impacto × exposición para <em>ordenar</em>, trazá la línea del presupuesto, y <strong>aceptá lo de abajo con dueño y fecha</strong> —un riesgo firmado es gestión; ignorado, es negligencia.</li>
+  <li>Anclá el modelo en adversarios reales con <strong>MITRE ATT&CK</strong>: mapeá defensas a técnicas, encontrá los huecos de cobertura, priorizá por lo que los grupos de tu sector usan.</li>
+  <li>El modelo vivo tiene <strong>dueño (un equipo), disparadores por evento y gate en el PR</strong>. Un modelo desactualizado es peor que ninguno.</li>
+  <li><strong>Proporcionalidad:</strong> hacé coincidir la profundidad con lo que está en juego, y acordate de que la exención del prototipo vence sola cuando empieza a tocar dinero o datos.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un servicio real que conozcas y dibujá su DFD marcando <strong>solo los límites de confianza</strong>. Por cada cruce, escribí en una línea qué dato lo atraviesa y si hoy se valida. Contá cuántos cruces tienen validación y cuántos no.</li>
+  <li>Escribí un <code>threat-model.yml</code> mínimo (estilo CS1.1) para una feature que hayas hecho: flujos, límite que cruzan, amenazas STRIDE y estado del control. Ponelo en el repo y abrí un PR ficticio: ¿el diff se entiende sin explicación aparte?</li>
+  <li>Elegí una feature que maneje datos personales y aplicale la lente <strong>LINDDUN</strong> (linkability, identifiability, etc.). Listá al menos dos amenazas de privacidad que STRIDE <em>no</em> te habría hecho ver.</li>
+  <li>Corré un descubrimiento defensivo de superficie sobre un dominio propio con Certificate Transparency (<code>crt.sh</code>). ¿Aparece algún subdominio que no esperabas? Documentá el proceso, no publiques resultados de terceros.</li>
+  <li>Modelá los saltos de un sistema distribuido (real o de juguete) y armá la tabla de amenazas entre servicios del CS1.5. Para cada una, decidí si tu diseño actual la mitiga o la ignora.</li>
+  <li>Tomá cinco hallazgos inventados pero plausibles y puntualos con probabilidad × impacto × exposición. Ordenálos, trazá una línea de "presupuesto para dos" y escribí la <strong>tabla de decisión</strong> con dueños y fechas para los tres que quedan afuera.</li>
+  <li>Elegí una técnica de <strong>MITRE ATT&CK</strong> relevante para tu tipo de sistema y respondé con honestidad: ¿tenés mitigación? ¿tenés detección? Si la respuesta a alguna es "no", ya tenés tu primer hueco de cobertura priorizado.</li>
+</ol>
+
+<section class="quiz" id="quizCS_S1">
+  <style>
+    #quizCS_S1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S1 .q{margin-bottom:1.5rem}
+    #quizCS_S1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S1 .opt:hover{border-color:var(--accent)}
+    #quizCS_S1 .opt:disabled{cursor:default}
+    #quizCS_S1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S1 .exp.show{display:block}
+    #quizCS_S1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu organización tiene un threat model de 40 páginas, aprobado hace un año, que nadie actualizó desde entonces. ¿Cuál es la lectura correcta?</p>
+    <button class="opt">Es un buen punto de partida: mejor eso que nada</button>
+    <button class="opt">Es un pasivo: da falsa sensación de seguridad porque describe un sistema que ya cambió, y hay que ponerle dueño y disparadores o retirarlo con honestidad</button>
+    <button class="opt">Alcanza con releerlo una vez por año en un comité</button>
+    <div class="exp">Un modelo desactualizado es peor que ninguno: la gente marca "esto ya fue analizado" y deja de pensar mientras las amenazas nuevas quedan sin mirar. La salida no es archivarlo ni releerlo por calendario, sino volverlo <strong>vivo</strong> —dueño que sea un equipo, disparadores por evento, gate en el PR— o, si no se va a mantener, marcarlo explícitamente como desactualizado para que nadie se apoye en él.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Estás dibujando el DFD de un sistema y querés maximizar el valor del ejercicio. ¿Qué hacés primero?</p>
+    <button class="opt">Enumerar todos los componentes con el máximo detalle posible</button>
+    <button class="opt">Correr un escáner de vulnerabilidades y volcar los resultados al diagrama</button>
+    <button class="opt">Marcar los límites de confianza, porque el 90% de las vulnerabilidades vive en los cruces y ahí es donde hay que enfocar STRIDE</button>
+    <div class="exp">Un DFD sin límites de confianza es un diagrama de arquitectura decorativo. El valor aparece cuando marcás dónde <em>cambia</em> la confianza —internet/borde, borde/interno, tu proceso/un tercero—: esos cruces son donde un extremo es hostil y donde el control se olvida, y por eso concentran la enorme mayoría de los bugs. Los límites primero, después qué los cruza, después STRIDE sobre cada cruce.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tenés 5 hallazgos priorizados y presupuesto para arreglar 2 este sprint. ¿Qué hacés con los otros 3?</p>
+    <button class="opt">Los aceptás explícitamente como riesgo documentado, cada uno con dueño y fecha de revisión</button>
+    <button class="opt">Los dejás sin registrar: si no se arreglan, mejor no generar ruido</button>
+    <button class="opt">Recalculás los puntajes con más decimales hasta que entren en el presupuesto</button>
+    <div class="exp">Con presupuesto finito no se arregla todo, y eso está bien: la seguridad madura <em>acepta</em> riesgos a propósito. La diferencia entre gestión y negligencia no es el riesgo que queda abierto, sino si alguien lo firmó: un riesgo aceptado con dueño y fecha de revisión es una decisión; el mismo riesgo ignorado en silencio es una omisión. Y agregarle decimales al puntaje es justo la falsa precisión por la que se abandonó DREAD.</div>
+  </div>
+
+  <div class="score" id="scoreCS_S1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../cs2-appsec-avanzado/lecture.html">CS2: AppSec avanzado →</a>
+</nav>
+
+</div>
+</body>
+</html>

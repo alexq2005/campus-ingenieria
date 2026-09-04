@@ -2,7 +2,7 @@
 
 > Un campus de programación completo, estilo **Harvard CS50** — pero en español, gratis y **offline**.
 
-**10 cursos · 188 lecciones · 49 proyectos · sin servidor · sin build · sin internet**
+**10 cursos · 204 lecciones · 49 proyectos · sin servidor · sin build · sin internet**
 
 Diez cursos que van **de cero a empleable** — del primer `<div>` a entrenar una red neuronal y escribir Rust para un microcontrolador. Todo en **HTML estático**: se abre directo en el navegador, sin instalar nada.
 
@@ -58,7 +58,7 @@ cd campus-ingenieria
 - **Offline** — el contenido, los quizzes y los simuladores funcionan desde `file://`, sin servidor ni conexión. Lo único que pide internet son el coloreado de sintaxis (si no carga, el código igual se lee) y 5 demos de React.
 - **Cero build** — es HTML, CSS y JS plano. No hay `npm install`. La única librería que hace falta para leer, `marked`, viene incluida en `assets/vendor/`.
 - **Aprender construyendo** — cada curso termina en proyectos reales.
-- **Interactivo** — quiz autoevaluable en **las 188 lecciones**, checkpoints con respuesta revelable, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
+- **Interactivo** — quiz autoevaluable en **las 204 lecciones**, checkpoints con respuesta revelable, simuladores (Ley de Ohm, PID, FFT, gradient descent…) y MVPs que corren de verdad.
 - **Puente hardware ↔ software** — Computación Física conecta la informática con la electrónica (Arduino/ESP32), y Rust llega hasta el microcontrolador.
 
 ---

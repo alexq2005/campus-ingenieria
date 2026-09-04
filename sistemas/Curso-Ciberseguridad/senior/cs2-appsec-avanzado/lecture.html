@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS2 — AppSec avanzado: la clase de bug, no el bug · Ciberseguridad Senior</title>
+  <meta name="description" content="AppSec a nivel experto: casi todo bug web nace de dos confusiones —datos vs código, y canales de confianza. SSTI, inyección NoSQL/GraphQL, deserialización con gadget chains, mXSS y DOM clobbering, request smuggling, lógica de negocio, autorización a escala, secure by design y cuándo una defensa es teatro.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS2</span>
+  <span class="badge">⏱ 35–100 min</span>
+  <span class="badge">🎯 Pre-req: CS1</span>
+  <span class="badge">🕸️ AppSec</span>
+</div>
+
+<article>
+
+<h1>CS2 — AppSec avanzado: la clase de bug, no el bug</h1>
+
+<h2>CS2.0 Por qué este módulo: de bugs a clases de bug</h2>
+
+<p>El curso base te enseñó el OWASP Top 10 de a uno: acá la inyección SQL, allá el XSS reflejado, más adelante el CSRF y el SSRF. Es la forma correcta de <em>empezar</em>, porque le pone nombre y cara a cada bug. Pero tiene un techo: cada vez que sale una técnica nueva —una <em>"X injection"</em> que ayer no existía— quedás un paso atrás, esperando que alguien la bautice, escriba la regla del scanner y la agregue al checklist.</p>
+
+<p>Este módulo apunta más abajo. No a los diez bugs con nombre, sino a la <strong>clase de bug</strong>: el mecanismo común que los genera a todos. Si entendés la raíz, no necesitás haber visto el bug antes para reconocerlo. Podés razonar sobre uno que todavía no tiene nombre.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo bug de aplicación web es una instancia de <strong>una de dos confusiones</strong>: <strong>(1)</strong> confundir <em>datos</em> con <em>código</em> —dejar que la entrada del usuario cruce a un intérprete y se ejecute como estructura—, o <strong>(2)</strong> confundir <em>canales de confianza</em> —creerle a un canal (el navegador, la red interna, el otro proxy, el cliente) una autoridad que ese canal no tiene—. Inyección, XSS, deserialización, SSTI son la primera. CSRF, SSRF, smuggling, IDOR, secretos en el cliente son la segunda. Aprendé las dos confusiones y el Top 10 deja de ser una lista para memorizar: se vuelve deducible.
+</div>
+
+<p>Damos por sabido lo del M04 (inyección, XSS, CSRF, SSRF a nivel introductorio), el M03 (autorización) y el M08 (secure coding). Desde acá subimos: variantes que el scanner no ve, defensas estructurales, y el criterio para distinguir una protección real de una que solo <em>parece</em> proteger.</p>
+
+<h2>CS2.1 La raíz de casi todo: datos vs código, y canales de confianza</h2>
+
+<p>Antes de las variantes, fijemos el marco, porque es lo único que vas a poder aplicar a un bug que no viste nunca.</p>
+
+<h3>Confusión 1 — datos que se vuelven código</h3>
+
+<p>Todo intérprete recibe una cadena y la parte en dos: lo que es <em>estructura</em> (comandos, operadores, delimitadores) y lo que es <em>contenido</em> (los valores). La vulnerabilidad aparece cuando el atacante logra que <strong>parte de sus datos crucen la frontera y se lean como estructura</strong>. El intérprete cambia —motor SQL, motor de plantillas, shell, deserializador, parser de XML, DSL de consultas— pero la confusión es idéntica.</p>
+
+<div class="rule">
+  <strong>📌 La corrección es siempre la misma forma.</strong> Mantené los datos como datos: parametrización (consultas preparadas), APIs estructuradas en vez de armar strings, codificación consciente del contexto en la salida. <strong>Nunca</strong> construyas código —una query, una plantilla, un comando— concatenando texto con entrada no confiable. Si escribiste <code>"..." + entrada + "..."</code> y el resultado lo interpreta <em>algo</em>, ya perdiste; la pregunta es solo cuándo.
+</div>
+
+<h3>Confusión 2 — canales que reciben confianza que no merecen</h3>
+
+<p>El otro medio bug del mundo no es meter código: es explotar que el sistema <strong>le cree a un canal</strong>. El CSRF abusa de que el servidor confía en la autoridad ambiental del navegador (manda la cookie sola). El SSRF abusa de que un backend confía en su propia posición de red. El request smuggling abusa de que dos proxies confían en que el otro parsea igual. El IDOR abusa de que el endpoint confía en que el cliente solo pide lo suyo. Los secretos en el cliente abusan de que alguien confió en que el browser podía guardar algo.</p>
+
+<div class="rule">
+  <strong>📌 La corrección también rima.</strong> Hacé la confianza <strong>explícita y verificada en cada frontera</strong>. No infieras autoridad del canal: no porque venga con cookie es el usuario correcto para <em>ese</em> recurso; no porque lo pida el backend es una URL segura; no porque el cliente lo mande el precio es real. Cada boundary revalida.
+</div>
+
+<table>
+<thead><tr><th>Confusión</th><th>Instancias (con y sin nombre)</th><th>Antídoto de la clase</th></tr></thead>
+<tbody>
+<tr><td><strong>Datos → código</strong></td><td>SQLi, NoSQLi, SSTI, inyección de comandos y de argumentos, deserialización, XXE, LDAP/log injection, y la próxima que salga</td><td>Datos como datos: parametrizar, APIs estructuradas, encoding por contexto</td></tr>
+<tr><td><strong>Canal de confianza</strong></td><td>CSRF, SSRF, request smuggling, IDOR y authz rota, lógica de negocio, secretos en el cliente</td><td>Confianza explícita y revalidada en cada frontera; default-deny</td></tr>
+</tbody>
+</table>
+
+<p>Todo lo que sigue en este módulo es una aplicación de estas dos ideas. Cuando veas una técnica nueva, la primera pregunta es <em>¿cuál de las dos confusiones explota?</em> — y de ahí sale la defensa antes de que exista el parche.</p>
+
+<h2>CS2.2 Inyección más allá de SQL</h2>
+
+<p>El M04 te mostró la inyección con el ejemplo canónico: SQL. Acá vas a ver cuatro intérpretes distintos donde <strong>se repite exactamente el mismo patrón</strong>, para que la próxima variante no te tome por sorpresa.</p>
+
+<h3>Server-Side Template Injection (SSTI)</h3>
+
+<p>Los motores de plantillas (Jinja, Twig, Freemarker, Handlebars) toman una plantilla y la evalúan. El bug aparece cuando la <strong>entrada del usuario se vuelve parte del texto de la plantilla</strong> en lugar de ser un dato que la plantilla consume:</p>
+
+<pre><code class="lang-python"># VULNERABLE: el input del usuario se vuelve PARTE de la plantilla
+from flask import render_template_string, request
+
+@app.route("/saludo")
+def saludo():
+    nombre = request.args.get("nombre", "")
+    # se concatena input en el TEXTO de la plantilla: el motor lo va a evaluar
+    return render_template_string("&lt;h1&gt;Hola " + nombre + "&lt;/h1&gt;")</code></pre>
+
+<pre><code class="lang-python"># CORRECTO: la plantilla es estatica; el nombre es SOLO un dato
+from flask import render_template, request
+
+@app.route("/saludo")
+def saludo():
+    nombre = request.args.get("nombre", "")
+    return render_template("saludo.html", nombre=nombre)
+    # en saludo.html:  {{ nombre }}  queda auto-escapado por el motor</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Por qué SSTI escala a RCE.</strong> Se confirma la vulnerabilidad con una expresión aritmética que el motor evalúa y devuelve resuelta. A partir de ahí —y esto es lo que lo hace tan grave— como el motor expone objetos del lenguaje anfitrión, el atacante <em>navega el grafo de objetos</em> desde lo que la plantilla dejó accesible hasta una primitiva que ejecuta comandos del sistema. No necesito mostrar la cadena para que quede la lección: <strong>el input jamás debe ser parte del texto de la plantilla</strong>. Si tu framework tiene <code>render_template_string</code> con concatenación, es un hallazgo, no un estilo.
+</div>
+
+<h3>Inyección en NoSQL y GraphQL</h3>
+
+<p>"Cambié Mongo por Postgres para no tener inyección" es un malentendido: la inyección no era de SQL, era de <em>concatenar</em>. En NoSQL la variante clásica es la <strong>inyección de operadores</strong>: el cuerpo JSON del cliente entra crudo como filtro, y un objeto con un operador (<code>$ne</code>, <code>$gt</code>) reemplaza al valor escalar que esperabas.</p>
+
+<pre><code class="lang-javascript">// VULNERABLE: el cuerpo JSON del cliente entra crudo como filtro
+app.post("/login", async (req, res) =&gt; {
+  const user = await db.collection("users").findOne({
+    usuario: req.body.usuario,
+    clave:   req.body.clave        // si clave = { "$ne": null }, matchea a cualquiera
+  });
+});</code></pre>
+
+<pre><code class="lang-javascript">// CORRECTO: forzar tipos; un operador no puede colarse como valor
+const usuario = String(req.body.usuario);
+const user = await db.collection("users").findOne({ usuario });
+// la clave NUNCA va en el filtro: se compara aparte contra un hash guardado
+// (ver M01/M02). Y el input se valida con un esquema antes de tocar la query.</code></pre>
+
+<p>En <strong>GraphQL</strong> conviven dos superficies. Una es la de siempre: si un resolver arma una query SQL o Mongo con un argumento, es inyección clásica y se arregla parametrizando. La otra es propia del protocolo: la <em>introspección</em> filtra todo el esquema, las <em>consultas anidadas</em> profundas son una negación de servicio (una query que pide amigos de amigos de amigos… explota el backend), y el <em>batching</em> por alias convierte un endpoint en una máquina de fuerza bruta que evade el rate-limit por request.</p>
+
+<div class="warn">
+  <strong>Defensa GraphQL (capas, no bala de plata):</strong> límites de <em>profundidad</em> y <em>complejidad</em> de query, <em>persisted queries</em> (solo se aceptan consultas conocidas de antemano), rate-limit por costo y no por request, e introspección apagada en producción —con matiz: apagarla es ofuscación, no seguridad; el esquema se puede inferir. La seguridad real está en autorizar <strong>por campo y por objeto</strong> dentro de cada resolver, nunca solo en la puerta.
+</div>
+
+<h3>Inyección por argumentos (aunque no haya shell)</h3>
+
+<p>El consejo "no uses <code>shell=True</code>" es correcto pero incompleto. Aun sin shell —pasando una lista de argumentos, sin metacaracteres— hay inyección si la entrada del usuario se convierte en un <strong>token de <code>argv</code> que el programa lee como una opción</strong>. Un nombre de archivo que empieza con guion deja de ser un dato y pasa a ser un flag que cambia lo que hace la herramienta.</p>
+
+<pre><code class="lang-python"># VULNERABLE POR ARGUMENTOS: sin shell, pero el input decide un flag
+import subprocess
+
+def exportar(nombre):
+    # si nombre empieza con "-", curl lo interpreta como opcion, no como dato
+    subprocess.run(["curl", "https://api.interna/subir", "-F", nombre])</code></pre>
+
+<pre><code class="lang-python"># CORRECTO: validar con allowlist + separador de fin-de-opciones
+import subprocess, re
+
+def exportar(nombre):
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", nombre):
+        raise ValueError("nombre invalido")
+    # "--" le dice a la herramienta: lo que sigue NO son opciones
+    subprocess.run(["curl", "https://api.interna/subir",
+                    "-F", "archivo=@" + nombre, "--"])</code></pre>
+
+<h3>Deserialización insegura, a fondo</h3>
+
+<p>El caso más elegante —y más peligroso— de "datos que se vuelven código". Formatos como <code>pickle</code> (Python), <code>ObjectInputStream</code> (Java), <code>unserialize</code> (PHP), <code>BinaryFormatter</code> (.NET) o <code>Marshal</code> (Ruby) no transportan solo valores: transportan <strong>qué tipo reconstruir y cómo</strong>. Deserializar bytes no confiables es dejar que el atacante decida qué objetos instanciás y qué callbacks se disparan al hacerlo.</p>
+
+<pre><code class="lang-python"># VULNERABLE: pickle reconstruye CUALQUIER objeto y dispara sus callbacks
+import pickle
+datos = pickle.loads(cuerpo_no_confiable)   # RCE si el atacante controla los bytes</code></pre>
+
+<pre><code class="lang-python"># CORRECTO: formato SOLO-DATOS, sin capacidad de instanciar tipos arbitrarios
+import json
+datos = json.loads(cuerpo_no_confiable)     # a lo sumo, un JSON invalido
+# si necesitas tipos, validalos con un esquema (pydantic / jsonschema),
+# nunca dejando que el payload elija la clase a construir.</code></pre>
+
+<div class="info">
+  <strong>Qué es una <em>gadget chain</em> (conceptual).</strong> El atacante casi nunca "sube código". Reutiliza clases que <em>ya están</em> en tu aplicación y sus dependencias. Un <em>gadget</em> es una clase cuyo método de deserialización (un <code>__reduce__</code>, un <code>readObject</code>, un método mágico) hace algo aprovechable. Una <em>cadena</em> encadena varios gadgets para que el efecto acumulado —lectura de archivo, llamada a un método, ejecución— sea lo que el atacante quiere, todo con piezas que vos ya trajiste al classpath. Por eso "no tengo código peligroso" es falsa tranquilidad: el peligro es la <em>suma</em> de piezas benignas. La única defensa robusta es no deserializar datos no confiables con estos formatos; si es inevitable, allowlist estricta de tipos y firma criptográfica del payload.
+</div>
+
+<div class="mistake">
+  <strong>El patrón se repite en los cuatro casos.</strong> Plantilla, filtro NoSQL, <code>argv</code>, flujo de objetos: intérpretes distintos, misma confusión. Una vez que ves eso, "una nueva X injection" deja de ser algo nuevo que aprender —es lo mismo en un intérprete distinto—, y la defensa la deducís antes de leer el aviso.
+</div>
+
+<h2>CS2.3 XSS avanzado: cuando el sanitizado casero no alcanza</h2>
+
+<p>El M04 cubrió el XSS reflejado y almacenado, y la defensa de siempre: escapar en la salida según el contexto. Acá van las variantes que rompen las defensas ingenuas —y por qué el approach "yo sanitizo el string" es una batalla perdida contra el parser del navegador.</p>
+
+<h3>Mutation XSS (mXSS)</h3>
+
+<p>El sanitizador ve <em>un</em> DOM; el navegador construye <em>otro</em>. Cuando asignás una cadena a <code>innerHTML</code>, el parser del browser aplica décadas de reglas de recuperación de errores, contenido "foráneo" (SVG, MathML), y re-serializaciones que <strong>mutan el markup en el momento de insertarlo</strong>. El resultado es un nodo ejecutable que el sanitizador nunca vio, porque la cadena que sanitizaste no es el árbol que el navegador termina armando.</p>
+
+<div class="danger">
+  <strong>⚠️ Consecuencia dura:</strong> sanitizar un string y <em>después</em> pasarlo por <code>innerHTML</code> puede fallar aunque el string se vea limpio. La mutación ocurre al parsear, un paso <em>posterior</em> a tu limpieza. Por eso el sanitizado tiene que operar sobre el DOM ya parseado, con conocimiento del parser —no sobre texto plano con expresiones regulares.
+</div>
+
+<h3>DOM clobbering</h3>
+
+<p>Un ataque sin una sola etiqueta <code>&lt;script&gt;</code>. El HTML puede definir elementos con <code>id</code> y <code>name</code> que <strong>sombrean variables globales y propiedades</strong> del DOM. Si tu código consulta un global que un atacante puede plantar como elemento, termina usando una referencia que él controla.</p>
+
+<pre><code class="lang-html">&lt;!-- Markup del atacante, sin script: dos anclas forman una coleccion --&gt;
+&lt;a id="config"&gt;&lt;/a&gt;
+&lt;a id="config" name="apiBase" href="https://sitio-del-atacante.example"&gt;&lt;/a&gt;</code></pre>
+
+<pre><code class="lang-javascript">// El codigo confia en un global que el HTML acaba de "clobberear"
+if (window.config) {
+  cargarDesde(window.config.apiBase);   // ahora resuelve al valor del atacante
+}</code></pre>
+
+<pre><code class="lang-javascript">// CORRECTO: no confiar en lookups que el DOM puede sombrear
+const CONFIG = Object.freeze({ apiBase: "https://api.propia" });
+if (typeof CONFIG.apiBase === "string") {
+  cargarDesde(CONFIG.apiBase);          // referencia explicita + chequeo de tipo
+}</code></pre>
+
+<h3>Por qué el sanitizado casero siempre pierde</h3>
+
+<p>El parser HTML del navegador es una de las piezas de software más complejas y llenas de casos borde que existen: estados de parsing, contenido foráneo, reglas de encoding, recuperación de errores. Una expresión regular o un allowlist a mano <strong>no puede modelar eso</strong>, y cada versión del navegador cambia algún detalle. Escribir tu propio sanitizador es firmar un contrato de mantenimiento contra un blanco móvil que siempre te va a ganar.</p>
+
+<pre><code class="lang-javascript">// FRAGIL: sanitizado casero + innerHTML = mXSS tarde o temprano
+el.innerHTML = limpiarConRegex(entradaUsuario);   // el parser del browser gana
+
+// MEJOR: libreria mantenida, consciente del parser y del contexto
+import DOMPurify from "dompurify";
+el.innerHTML = DOMPurify.sanitize(entradaUsuario);
+
+// MEJOR AUN: si no necesitas HTML, ni lo parsees
+el.textContent = entradaUsuario;                  // imposible ejecutar nada</code></pre>
+
+<h3>Trusted Types: la defensa estructural</h3>
+
+<p>El problema real del XSS de DOM no es <em>un</em> sink: son los <strong>miles de sinks</strong> (<code>innerHTML</code>, <code>outerHTML</code>, <code>document.write</code>, <code>eval</code>, <code>src</code> de scripts) repartidos por todo el código, y la esperanza de que alguien se acordó de sanitizar en cada uno. <strong>Trusted Types</strong> invierte el problema: con la directiva CSP <code>require-trusted-types-for 'script'</code>, esos sinks <strong>rechazan cadenas crudas</strong> y solo aceptan valores producidos por una política registrada. Pasás de "¿sanitizamos en los mil lugares?" a "¿este valor trae la prueba de que pasó por la única política?".</p>
+
+<pre><code class="lang-javascript">// UN unico cuello de botella auditable para todo el HTML dinamico
+const politica = trustedTypes.createPolicy("app-html", {
+  createHTML: (s) =&gt; DOMPurify.sanitize(s)
+});
+
+el.innerHTML = politica.createHTML(entradaUsuario);  // OK: valor "probado"
+el.innerHTML = entradaUsuario;                        // ERROR: string crudo, rechazado</code></pre>
+
+<div class="tip">
+  Esto es exactamente el principio de <strong>secure by design</strong> (CS2.9) aplicado al DOM: en vez de depender de que el dev se acuerde en cada sink, el sink <em>falla-cerrado</em> por construcción. Cambiás disciplina humana por una garantía del runtime, y la superficie auditable pasa de miles de líneas a una sola política.
+</div>
+
+<h3>Los límites reales de CSP</h3>
+
+<p>La <strong>Content-Security-Policy</strong> es una mitigación valiosa, pero no cura el XSS: limita el radio de la explosión. Y se la sobreestima constantemente.</p>
+
+<pre><code class="lang-html">&lt;!-- Mitiga, no cura: nonce estricto + strict-dynamic, sin unsafe-inline --&gt;
+&lt;meta http-equiv="Content-Security-Policy"
+      content="script-src 'nonce-r4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'none'"&gt;</code></pre>
+
+<div class="warn">
+  <strong>Dónde una CSP se cae:</strong> <code>unsafe-inline</code> la anula; un allowlist amplio con un endpoint JSONP o un host de scripts abierto adentro es un bypass servido; sin <code>base-uri 'none'</code>, el DOM clobbering de <code>&lt;base&gt;</code> reescribe rutas; un nonce que se refleja o se reusa deja de proteger. Una CSP estricta con nonce/hash y <code>strict-dynamic</code> sube muchísimo la vara —pero el bug de XSS sigue ahí. Tratarla como "ya estamos a salvo del XSS" es el error.
+</div>
+
+<h2>CS2.4 Request smuggling: dos servidores, un desacuerdo</h2>
+
+<p>El HTTP request smuggling (o <em>HTTP desync</em>) es la confusión de canal de confianza en su forma más pura, llevada a la capa de "¿dónde termina un request y empieza el siguiente?".</p>
+
+<p>El escenario: hay un <strong>front-end</strong> (CDN, balanceador, proxy) y un <strong>back-end</strong>, y ambos leen el mismo flujo de bytes. Si el request es <em>ambiguo</em> respecto de cuánto mide el cuerpo —porque trae dos formas de indicarlo a la vez, o una malformada que uno honra y el otro ignora— los dos servidores pueden <strong>discrepar sobre dónde corta el mensaje</strong>. Lo que el front cree que es el cuerpo, el back lo interpreta como el comienzo de <em>otro</em> request, y ese request "de contrabando" se cuela adelante del pedido del próximo usuario.</p>
+
+<pre><code class="lang-bash"># La ambiguedad (defensivo): dos formas de indicar el largo, a la vez.
+# Un servidor obedece Content-Length; el otro, Transfer-Encoding.
+# La DEFENSA es rechazar el request ambiguo en el borde, NO interpretarlo.
+Content-Length: 6
+Transfer-Encoding: chunked</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Por qué es tan potente.</strong> No requiere credenciales. Es una discrepancia entre dos componentes <em>de confianza</em>, así que puede saltear controles de acceso que vivían en el front-end, envenenar cachés compartidas (un usuario recibe la respuesta destinada a otro) y capturar requests ajenos. Es el análogo, a nivel de protocolo, de la confusión datos/código: dos parsers que no se ponen de acuerdo sobre la estructura del mensaje.
+</div>
+
+<div class="rule">
+  <strong>📌 Defensa arquitectónica (conceptual, sin payload).</strong>
+  <ul>
+    <li>Normalizar o <strong>rechazar</strong> en el borde todo request con <code>Content-Length</code> y <code>Transfer-Encoding</code> a la vez, o con framing malformado.</li>
+    <li>Front y back con el <strong>mismo parser y la misma configuración</strong> HTTP: la desincronización nace de dos criterios distintos.</li>
+    <li><strong>HTTP/2 extremo a extremo</strong>: su framing lleva la longitud explícita y no admite esta ambigüedad; el riesgo reaparece si el back "baja" a HTTP/1.1.</li>
+    <li>Evitar reutilizar la conexión con el upstream cuando no aporta, para que un request no pueda contaminar al siguiente.</li>
+  </ul>
+</div>
+
+<h2>CS2.5 Lógica de negocio: los bugs que ninguna herramienta encuentra</h2>
+
+<p>Los scanners buscan <em>firmas</em>: un payload conocido, una respuesta característica. Las vulnerabilidades de lógica de negocio no tienen firma porque el request está <strong>perfectamente bien formado</strong>: lo que se rompe no es la sintaxis, es la <em>intención</em>. La secuencia o los valores violan una invariante del negocio que ninguna herramienta conoce, porque esa invariante vive en la cabeza de quien diseñó la feature.</p>
+
+<h3>Race conditions y TOCTOU en pagos</h3>
+
+<p>El patrón <strong>TOCTOU</strong> (Time-Of-Check to Time-Of-Use): entre el momento en que verificás una condición y el momento en que actuás, hay una ventana. Si llegan varios requests concurrentes, <em>todos</em> pasan el chequeo antes de que <em>ninguno</em> haya escrito el resultado. Se confía en que el estado no cambió entre el check y el use —la confusión de canal, otra vez, ahora contra el reloj—. Es el corazón del <em>Worked Example</em> de abajo.</p>
+
+<h3>Abuso de flujos</h3>
+
+<p>Un flujo multi-paso (carrito → pago → confirmación; o los pasos de un reset de contraseña) es seguro solo si el servidor obliga el orden. Si cada endpoint <strong>confía en que el paso anterior corrió</strong>, el atacante saltea: golpea "confirmar pedido" sin pasar por "pagar", o repite el paso de un reset. La defensa es una <strong>máquina de estados del lado servidor</strong>, no un flujo que maneja el cliente con botones.</p>
+
+<h3>Manipulación de precios del lado cliente</h3>
+
+<p>El clásico eterno: confiar en un precio, una cantidad o un descuento que vino del cliente —un campo oculto, un JSON con <code>precio: 0</code>—. El cliente puede mandar cualquier cosa.</p>
+
+<pre><code class="lang-javascript">// El atacante manda directamente esto; no hay "validacion de UI" que lo pare
+POST /api/checkout
+{ "item": "notebook", "precio": 1, "cantidad": 1 }</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla sin excepciones:</strong> ningún valor con consecuencia económica se toma del cliente. El servidor <strong>recalcula</strong> precio, descuento e impuestos a partir de datos que él controla (catálogo, reglas de cupón), usando del request solo los <em>identificadores</em> (qué ítem), nunca los <em>montos</em>.
+</div>
+
+<h3>IDOR encadenados</h3>
+
+<p>Un IDOR aislado puede parecer de severidad baja: "filtra el nombre de otro usuario, y qué". Pero la severidad está en la <strong>cadena</strong>. Un IDOR que expone un <code>user_id</code> alimenta a otro endpoint que, con ese id, expone un token de recuperación, que alimenta la toma de la cuenta. Tres bugs "menores" componen un account takeover.</p>
+
+<div class="concept">
+  <strong>💡 Cómo se piensan estos bugs.</strong> No se buscan con un payload: se buscan enumerando <strong>invariantes</strong> y atacando cada una. "Un cupón se aplica a lo sumo una vez por usuario." "Un usuario solo ve sus propios pedidos." "El precio es autoridad del servidor." "Los pasos ocurren en orden." Para cada invariante, la pregunta es <em>¿qué request o qué secuencia la viola?</em> Es threat modeling (CS1) a nivel de feature, y es la parte del trabajo que no se automatiza.
+</div>
+
+<h2>CS2.6 Autorización a escala: el bug más común y peor detectado</h2>
+
+<p>La autorización (M03) es fácil de explicar en un endpoint y brutalmente difícil de sostener en doscientos. Porque authz no es <em>un</em> control: es <strong>N controles</strong> dispersos, uno por endpoint, y el problema es la <strong>consistencia</strong>. Cualquier handler que se olvidó el check, o que verificó autenticación pero no autorización, o que chequeó el recurso equivocado, es un agujero.</p>
+
+<pre><code class="lang-python"># FRAGIL: la regla vive esparcida en cada handler (y alguno se la olvida)
+@app.get("/factura/{id}")
+def ver_factura(id, user):
+    factura = repo.get(id)
+    if factura.owner_id != user.id and user.role != "admin":
+        abort(403)
+    return factura
+# multiplicalo por 200 endpoints: basta UNO sin el 'if' para tener un IDOR</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Por qué es el peor detectado.</strong> La inyección y el XSS tienen payload: mandás algo raro y pasa algo raro. Un check de authz faltante <strong>no tiene payload</strong> —el "exploit" es un request perfectamente normal, hecho por el usuario equivocado—. No hay error, no hay crash, el happy path funciona impecable. El código que <em>falta</em> se ve idéntico al código correcto. Ni un scanner ni un test genérico conocen tu política, así que el bug pasa la revisión, pasa el pipeline, y vive en producción hasta que alguien lo prueba a mano.
+</div>
+
+<p>La respuesta a escala es <strong>sacar la decisión de cada handler</strong> y centralizarla en una política testeable y auditable —un motor como <strong>OPA/Rego</strong> o <strong>AWS Cedar</strong>, o una capa interna bien estructurada—. El handler hace <em>una</em> pregunta uniforme; la regla vive en un solo lugar.</p>
+
+<pre><code class="lang-python"># MEJOR: la decision se delega a UNA politica central + enforcement que falla-cerrado
+@app.get("/factura/{id}")
+@requiere_permiso                     # middleware default-deny: sin decision explicita, 403
+def ver_factura(id, user):
+    factura = repo.get(id)
+    autz.exigir(user, accion="factura:leer", recurso=factura)  # pregunta a la politica
+    return factura</code></pre>
+
+<div class="rule">
+  <strong>📌 Dos condiciones, no una.</strong> Centralizar la política resuelve la <em>consistencia</em> de la regla, pero no sirve si un handler se olvida de <em>invocarla</em>. Combinalo con enforcement a nivel framework que <strong>falle-cerrado</strong>: default-deny (sin decisión explícita, se rechaza), y autorización <strong>por objeto</strong>, no solo por ruta —el bug clásico es autorizar el endpoint pero no verificar que <em>este</em> recurso sea del usuario—.
+</div>
+
+<h2>CS2.7 La cadena de dependencias del front</h2>
+
+<p>Tu aplicación no es solo tu código: es tu código más cientos de dependencias transitivas que corren en tu build <em>y</em> en el browser de tus usuarios. Cada una es una delegación de confianza.</p>
+
+<h3>Ataques a paquetes npm</h3>
+
+<p>El vector no es una vulnerabilidad en <em>tu</em> código, sino un paquete comprometido: una cuenta de mantenedor tomada que publica una actualización maliciosa, un <em>typosquat</em> (un nombre parecido al que quisiste instalar), o <em>dependency confusion</em> (el nombre de un paquete interno resuelve al registro público, donde el atacante subió uno homónimo). El código malicioso corre en el <code>postinstall</code> durante el build, o se envía al bundle que llega al usuario.</p>
+
+<pre><code class="lang-bash"># Reproducible y verificado por hash: no "la ultima version" en cada build
+npm ci                  # instala EXACTO lo del lockfile, con chequeo de integridad
+npm audit --production  # deuda conocida en el arbol de dependencias
+npm ci --ignore-scripts # si no necesitas postinstall, no lo ejecutes</code></pre>
+
+<div class="warn">
+  <strong>Higiene de supply chain del front:</strong> lockfile con hashes de integridad y <code>npm ci</code> (no <code>npm install</code>) en CI; minimizar dependencias (cada una es superficie); revisar los <em>diffs</em> de actualización en vez de saltar de versión a ciegas; SBOM y análisis de composición (SCA); y para paquetes internos, un registro con <em>scope</em> propio para cerrar la puerta a dependency confusion.
+</div>
+
+<h3>Integridad de subrecursos (SRI)</h3>
+
+<p>Si cargás un script de un CDN, <strong>Subresource Integrity</strong> hace que el browser <em>rechace ejecutarlo</em> si los bytes no coinciden con el hash que declaraste: defensa directa contra un CDN comprometido que sirve un JavaScript alterado.</p>
+
+<pre><code class="lang-html">&lt;!-- El browser NO ejecuta el script si los bytes no coinciden con el hash --&gt;
+&lt;script src="https://cdn.example/lib.min.js"
+        integrity="sha384-oqVuAfXR9GqQ8Kux1kPzQho1wx4JwY8wCq7fdgcCY5uykM6R9rx7HNQlGYl"
+        crossorigin="anonymous"&gt;&lt;/script&gt;</code></pre>
+
+<div class="info">
+  SRI protege <em>integridad</em>, no <em>confidencialidad</em>, y tiene un límite: sirve para recursos versionados y estables —hay que actualizar el hash en cada cambio legítimo—, y no aplica a recursos generados dinámicamente. No reemplaza a la CSP; se combinan.
+</div>
+
+<h3>El DOM como superficie</h3>
+
+<p>Todo script de tercero —analítica, tag manager, chat, A/B testing— corre con <strong>acceso total al DOM</strong> y privilegios de tu mismo origen. Puede leer formularios, cookies sin <code>HttpOnly</code>, inyectar nodos. Cada tercero que embebés es confianza que le prestás a un dominio que no controlás. Minimizá, aislá lo que puedas en iframes con <code>sandbox</code>, y usá la CSP para acotar qué pueden cargar.</p>
+
+<h2>CS2.8 Secretos en el cliente: todo lo que llega al browser es público</h2>
+
+<p>La afirmación más simple y más ignorada del AppSec de front:</p>
+
+<div class="concept">
+  <strong>💡 Todo lo que llega al navegador es público.</strong> El JavaScript minificado y ofuscado, las claves de API "escondidas", los feature flags, cualquier clave de "cifrado del lado cliente": el devtools del usuario —y el de un atacante— lo ve todo. La ofuscación no es secreto; es un cartel que dice "mirá acá" con letra chica.
+</div>
+
+<pre><code class="lang-javascript">// TEATRO: "ofuscar" no es "ocultar". Apenas llega al browser, ya es publico.
+const API_KEY = "sk_live_9f8b...";   // cualquiera lo lee en el bundle</code></pre>
+
+<pre><code class="lang-javascript">// DISENO CORRECTO: el secreto vive en el backend; el browser llama a TU API
+const r = await fetch("/api/precio", {
+  method: "POST",
+  body: JSON.stringify({ items })
+});
+// el precio lo calcula y firma el servidor, con datos que el cliente no controla</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué significa para el diseño.</strong> El cliente es un <strong>entorno de ejecución no confiable que no controlás</strong>. Todo secreto que deba seguir siendo secreto vive en el servidor. Una API key que <em>tiene</em> que estar en el cliente debe ser pública por diseño: con <em>scope</em> reducido, rate-limit, restricción por referrer/origen y revocable —o proxeada por tu backend—. La validación del lado cliente es UX, nunca seguridad. Y el corolario que ata todo el módulo: <strong>autorización, cálculo de precios y reglas de negocio no se pueden hacer cumplir en el cliente</strong>. El cliente puede esconder un botón; no puede impedir el request.
+</div>
+
+<h2>CS2.9 Secure by design: la defensa que no depende de la memoria</h2>
+
+<p>Recorrimos muchas defensas. Si tuvieras que quedarte con un solo principio para elegir cómo construir, es este: <strong>la mejor defensa es la que no depende de que el dev se acuerde</strong>. La disciplina humana no escala a mil call-sites ni a cinco años de rotación de equipo. Los tipos y los <em>defaults</em>, sí.</p>
+
+<p>Elegí herramientas cuyo camino por defecto sea seguro y cuyo camino inseguro sea <em>ruidoso y visible</em>:</p>
+
+<div class="step"><strong>ORM/query builder que parametriza por defecto.</strong> El SQL crudo es el opt-in, y salta a la vista en el code review. El default no inyecta.</div>
+
+<div class="step"><strong>Plantillas con auto-escaping prendido.</strong> El marcador <code>raw</code>/<code>safe</code> es el opt-<em>out</em> visible; olvidarse produce salida escapada de más, no un XSS.</div>
+
+<div class="step"><strong>Tipos que fuerzan validación en la frontera.</strong> <em>Parse, don't validate</em>: un tipo que solo se construye validando hace que "input sin validar" sea <strong>irrepresentable</strong> aguas abajo.</div>
+
+<pre><code class="lang-python"># El tipo hace imposible representar "input sin validar" mas adelante
+import re
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Email:
+    valor: str
+    def __post_init__(self):
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", self.valor):
+            raise ValueError("email invalido")
+
+# Si una funcion pide un Email, no puede recibir un string crudo sin validar:
+# el error se detecta al CONSTRUIR, no vaya-a-saber-donde al usarlo.</code></pre>
+
+<div class="rule">
+  <strong>📌 El principio en una frase.</strong> Mové la seguridad de "acordate de hacer X en cada uno de los 1000 lugares" a "el único lugar que puede hacer X-inseguro es visible, y todo el resto es seguro por construcción". Trusted Types (CS2.3), el default-deny de authz (CS2.6) y el tipo <code>Email</code> de arriba son la misma jugada: empujar la corrección hacia los tipos y los defaults, no hacia la memoria del que codea.
+</div>
+
+<h2>CS2.10 Cuándo una defensa es teatro</h2>
+
+<p>Cerramos con el criterio para no engañarte a vos mismo. Una defensa es <strong>teatro de seguridad</strong> cuando se puede evadir <em>sin tocar el código vulnerable</em>, o cuando depende de que el atacante use exactamente el vector que anticipaste.</p>
+
+<table>
+<thead><tr><th>Teatro</th><th>Por qué falla</th><th>Defensa real</th></tr></thead>
+<tbody>
+<tr><td>WAF como <strong>única</strong> capa</td><td>Filtra firmas en el borde: se evade con encoding o con un bug de lógica que no tiene firma; el agujero sigue ahí</td><td>WAF <em>más</em> código corregido (defensa en profundidad), nunca en lugar de</td></tr>
+<tr><td>"Sanitizamos el input" (sin contexto)</td><td>Escapar para HTML lo que va a un shell, una URL o un string JS es el encoding equivocado</td><td>Encoding por <em>contexto en la salida</em>, en el sink; la validación de entrada complementa, no sustituye</td></tr>
+<tr><td>Validación solo en el cliente</td><td>El atacante manda el request directo a la API y saltea toda la UI</td><td>Validar en el servidor; el cliente es UX</td></tr>
+<tr><td>Ofuscar secretos en el bundle</td><td>Todo lo que llega al browser es público (CS2.8)</td><td>El secreto en el backend; keys de cliente scoped y revocables</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El test decisivo:</strong> preguntate "¿esta defensa se puede evadir sin arreglar el bug de fondo?". Si la respuesta es sí, es una capa —tal vez útil para ganar tiempo—, pero no es la solución. La solución vive en el código que <em>causa</em> la vulnerabilidad, y todo lo demás es contención alrededor.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el cupón que se aplica N veces</h2>
+
+<blockquote>Una tienda tiene un endpoint "aplicar cupón". El cupón <code>WELCOME10</code> es un crédito válido <strong>una vez por usuario</strong>. En producción aparece un usuario que lo aplicó cinco veces y quedó con saldo a favor. El código se ve correcto y no tiene errores. ¿Qué pasó y cómo se blinda?</blockquote>
+
+<p><strong>Paso 1 — El código "correcto" que sangra.</strong> Valida "no usado" y después marca "usado". Impecable en el happy path.</p>
+
+<pre><code class="lang-python"># VULNERABLE: TOCTOU entre validar y consumir
+def aplicar_cupon(user_id, codigo):
+    ya_usado = db.query(
+        "SELECT 1 FROM cupones_usados WHERE user_id = ? AND codigo = ?",
+        user_id, codigo)
+    if ya_usado:                       # TIME-OF-CHECK
+        raise Error("cupon ya usado")
+    descuento = tabla_cupones[codigo]
+    aplicar_descuento(user_id, descuento)
+    db.execute(                        # TIME-OF-USE (una eternidad despues, en CPU)
+        "INSERT INTO cupones_usados (user_id, codigo) VALUES (?, ?)",
+        user_id, codigo)</code></pre>
+
+<p><strong>Paso 2 — El diagnóstico.</strong> Es <strong>TOCTOU</strong>. Entre el <code>SELECT</code> (check) y el <code>INSERT</code> (use) hay una ventana. Si el atacante dispara cinco requests casi simultáneos, los cinco corren el <code>SELECT</code> y ven "no usado" <em>antes</em> de que cualquiera llegue al <code>INSERT</code>. Los cinco pasan, los cinco aplican. El request está bien formado, el código no tiene bug de sintaxis: es un bug de concurrencia que ningún linter marca. Confiamos en que el estado no cambió entre el check y el use, y esa confianza es la vulnerabilidad.</p>
+
+<p><strong>Paso 3 — Tres capas de defensa, cada una contra un ataque distinto.</strong></p>
+
+<p><em>Capa 1 — Bloqueo optimista (escritura condicional).</em> La base decide el ganador: el <code>INSERT</code> solo ocurre si nadie se adelantó. Los perdedores afectan 0 filas y se rechazan.</p>
+
+<pre><code class="lang-python"># Capa 1 — escritura condicional: la carrera la resuelve la BD, no la app
+filas = db.execute(
+    "INSERT INTO cupones_usados (user_id, codigo) "
+    "SELECT ?, ? WHERE NOT EXISTS ("
+    "  SELECT 1 FROM cupones_usados WHERE user_id = ? AND codigo = ?)",
+    user_id, codigo, user_id, codigo)
+if filas == 0:
+    raise Error("cupon ya usado")      # otro request gano la carrera</code></pre>
+
+<p><em>Capa 2 — Idempotencia.</em> El cliente manda una clave única por intención; los reintentos y duplicados devuelven el mismo resultado sin volver a aplicar.</p>
+
+<pre><code class="lang-python"># Capa 2 — idempotencia: la misma intencion produce el mismo resultado
+def aplicar_cupon(user_id, codigo, idempotency_key):
+    previo = store.get(idempotency_key)
+    if previo is not None:
+        return previo                  # reintento/duplicado: devolvemos lo guardado
+    resultado = _aplicar_una_vez(user_id, codigo)
+    store.put(idempotency_key, resultado, ttl=86400)
+    return resultado</code></pre>
+
+<p><em>Capa 3 — Límite atómico en la base.</em> La invariante vive en el <strong>esquema</strong>, no en el código. Aunque haya varias instancias de la app, el almacén compartido es el único árbitro.</p>
+
+<pre><code class="lang-sql">-- Capa 3 — la invariante vive en el esquema: la BD la enforcea siempre
+CREATE TABLE cupones_usados (
+    user_id  BIGINT      NOT NULL,
+    codigo   TEXT        NOT NULL,
+    usado_en TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_cupon_por_usuario UNIQUE (user_id, codigo)
+);
+
+-- El segundo INSERT concurrente viola UNIQUE y la BD lo rechaza en forma atomica
+INSERT INTO cupones_usados (user_id, codigo)
+VALUES ($1, $2)
+ON CONFLICT (user_id, codigo) DO NOTHING;   -- filas afectadas = 0 : ya estaba usado</code></pre>
+
+<p><strong>Paso 4 — Qué capa para qué ataque.</strong> No son redundantes: cada una tapa un hueco que las otras dejan.</p>
+
+<table>
+<thead><tr><th>Escenario de ataque</th><th>Capa que lo detiene</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Doble click / reintento de red del mismo intento</td><td>Idempotencia</td><td>La segunda vez devuelve el resultado guardado; no re-aplica</td></tr>
+<tr><td>Dos requests en el mismo instante, mismo proceso</td><td>Bloqueo optimista</td><td>Solo uno cumple la condición; el resto afecta 0 filas</td></tr>
+<tr><td>Requests repartidos entre varias instancias detrás del balanceador</td><td>Restricción atómica en la BD</td><td>Los locks de app no cruzan procesos; la BD es el único árbitro compartido</td></tr>
+<tr><td>100 requests en paralelo scripteados</td><td>BD atómica + bloqueo optimista</td><td>La invariante la enforcea el almacén; las capas de app fallan-rápido antes</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá una restricción UNIQUE".</strong> Es que la invariante —"un cupón se aplica a lo sumo una vez por usuario"— es el artefacto de diseño, y se hace cumplir en la capa <strong>más baja y autoritativa</strong> (la base), con las capas de app como optimizaciones que fallan rápido. Un lock en memoria del proceso te habría dado una falsa sensación de seguridad: no cruza instancias. Esto es <em>secure by design</em> (CS2.9): la BD no depende de que ningún dev se acuerde de nada.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Sale una técnica de inyección nueva, con otro nombre, contra un intérprete que no conocías. ¿Cómo la encarás sin esperar el parche?</summary>
+<p>Preguntándote cuál de las dos confusiones explota. Si es "datos que se vuelven código" (casi siempre, en una inyección), la defensa de la clase ya la sabés: que los datos no crucen a estructura —parametrizar, usar una API estructurada, no concatenar entrada no confiable en aquello que el intérprete va a evaluar—. No importa si el intérprete es SQL, un motor de plantillas, <code>argv</code> o un deserializador: el antídoto es el mismo. Bloquear el payload de ejemplo con una regla es perseguir firmas; corregir la frontera datos/código mata toda la clase.</p></details>
+
+<details><summary>¿Por qué un check de autorización faltante es el bug peor detectado, más que un XSS o una inyección?</summary>
+<p>Porque no tiene payload ni firma. El XSS y la inyección se disparan con una entrada anómala que produce una respuesta anómala; una herramienta puede buscar eso. Un check de authz que falta se explota con un request <em>perfectamente normal</em> hecho por el usuario equivocado: no hay error, no hay crash, el happy path anda. El código ausente se ve idéntico al código correcto, y ningún scanner conoce tu política de permisos. Por eso pasa la revisión y el pipeline, y por eso la defensa es estructural: política central testeable más enforcement default-deny por objeto, no un <code>if</code> repetido a mano en 200 lugares.</p></details>
+
+<details><summary>Tu SPA trae una API key en el bundle, minificado y ofuscado. Un revisor dice que está protegida. ¿Tiene razón?</summary>
+<p>No. Todo lo que llega al browser es público: el devtools del usuario —y de un atacante— lee el bundle entero, ofuscado o no. La ofuscación no es confidencialidad. Una clave que debe seguir secreta vive en el backend, y el browser llama a <em>tu</em> API. Si una key sí o sí tiene que estar en el cliente, tiene que ser pública por diseño: scope reducido, rate-limit, restricción por origen y revocable. SRI no ayuda acá —protege la integridad del script, no la confidencialidad de un secreto adentro—.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Casi todo bug web es una de <strong>dos confusiones</strong>: datos que se vuelven código, o un canal que recibe confianza que no merece. Aprendé las dos y deducís los bugs que todavía no tienen nombre.</li>
+  <li><strong>Inyección</strong> es la misma confusión en distintos intérpretes: SSTI, NoSQL/GraphQL, argumentos de <code>argv</code>, deserialización con <em>gadget chains</em>. La corrección siempre es mantener los datos como datos.</li>
+  <li>El <strong>XSS de DOM</strong> no se gana con sanitizado casero: el parser del navegador muta el markup (mXSS) y el HTML puede sombrear globales (DOM clobbering). La defensa estructural es <strong>Trusted Types</strong>; la CSP mitiga, no cura.</li>
+  <li>El <strong>request smuggling</strong> nace de que front y back parsean distinto el mismo request. Se defiende rechazando la ambigüedad en el borde y con HTTP/2 extremo a extremo.</li>
+  <li>Los bugs de <strong>lógica de negocio</strong> (TOCTOU, abuso de flujos, precios del cliente, IDOR encadenados) no tienen firma: se cazan enumerando invariantes y preguntando qué las viola.</li>
+  <li>La <strong>autorización a escala</strong> es el bug más común y peor detectado —sin payload, sin firma—. Se ataca con política central (OPA/Cedar) más enforcement default-deny por objeto.</li>
+  <li>La <strong>cadena de dependencias del front</strong> y los <strong>secretos en el cliente</strong> son confianza mal puesta: todo lo que llega al browser es público, y cada dependencia corre en tu build y en tus usuarios.</li>
+  <li><strong>Secure by design</strong>: la mejor defensa no depende de que el dev se acuerde —defaults seguros, tipos que fuerzan validación, sinks que fallan-cerrado—. Y una defensa que se evade sin tocar el bug de fondo es <strong>teatro</strong>.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá tres bugs cualesquiera del OWASP Top 10 y clasificá cada uno como "datos → código" o "canal de confianza". Para los que no encajen limpio, explicá por qué y qué mezcla tienen.</li>
+  <li>Escribí un endpoint mínimo vulnerable a SSTI (concatenando input en la plantilla) y su versión corregida (input como dato). Documentá, sin payload operativo, por qué la versión mala escala de "mostrar texto" a ejecución.</li>
+  <li>Reproducí en local una inyección de operadores NoSQL: un login que acepta el cuerpo JSON crudo, y mostrá cómo el forzado de tipos (<code>String(...)</code>) más un esquema lo cierra.</li>
+  <li>Implementá el ejemplo del cupón con las tres capas de defensa y escribí un test de concurrencia (varios threads/procesos) que demuestre que la restricción <code>UNIQUE</code> aguanta lo que un lock en memoria no.</li>
+  <li>Tomá una feature real (o inventada) y escribí sus <strong>invariantes</strong> de negocio como lista. Para cada una, redactá el request o la secuencia que la violaría. Es el insumo de un pentest de lógica.</li>
+  <li>Auditá un handler de tu código: ¿la autorización es por ruta o por objeto? ¿Qué pasa si se olvida el check —falla abierto o cerrado? Reescribilo para que el default sea denegar.</li>
+  <li>Revisá el <code>package.json</code> de un proyecto: ¿usás <code>npm ci</code> con lockfile en CI? ¿Cargás scripts de un CDN con <code>integrity</code>? Agregá SRI a uno y verificá que el browser lo rechaza si cambiás un byte del hash.</li>
+  <li>Buscá en un frontend cualquier valor "sensible" que viaje al cliente (una key, un flag, un endpoint interno). Argumentá si es público-por-diseño o un secreto mal ubicado, y qué rediseño lo movería al backend.</li>
+</ol>
+
+<section class="quiz" id="quizCS_S2">
+  <style>
+    #quizCS_S2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S2 .q{margin-bottom:1.5rem}
+    #quizCS_S2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S2 .opt:hover{border-color:var(--accent)}
+    #quizCS_S2 .opt:disabled{cursor:default}
+    #quizCS_S2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S2 .exp.show{display:block}
+    #quizCS_S2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Sale esta semana una técnica de "X injection" con nombre nuevo. Desde la óptica del módulo, ¿cuál es la mejor señal de que tu corrección es sólida?</p>
+    <button class="opt">Agregar una regla al WAF que matchee el payload publicado</button>
+    <button class="opt">Que la corrección elimine la confusión datos/código en ese intérprete (parametrizar / estructurar), no que bloquee el payload de ejemplo</button>
+    <button class="opt">Actualizar la librería de sanitización a la última versión y listo</button>
+    <div class="exp">La raíz es la confusión datos/código. Bloquear un payload concreto es perseguir firmas: mañana sale otra codificación y volvés a estar expuesto. Corregir la frontera —que la entrada no confiable no cruce a estructura en ese intérprete— mata toda la clase de bug, incluida la variante que todavía no viste.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. El endpoint de cupón valida "no usado" y luego marca "usado". En producción aparece aplicado 5 veces. ¿Qué defensa garantiza la invariante aunque haya varias instancias de la app detrás del balanceador?</p>
+    <button class="opt">Un lock en memoria del proceso (por ejemplo un mutex) alrededor de validar + marcar</button>
+    <button class="opt">Validar el cupón también en el cliente antes de enviar el request</button>
+    <button class="opt">Una restricción UNIQUE(user_id, codigo) en la base: la invariante la enforcea el almacén compartido, no el código</button>
+    <div class="exp">Es un TOCTOU. Un lock en memoria no cruza procesos ni instancias, así que dos réplicas detrás del balanceador vuelven a correr la carrera. La validación en el cliente es UX: el atacante pega directo a la API. La restricción <code>UNIQUE</code> vive en el único árbitro compartido —la base— y rechaza el segundo <code>INSERT</code> en forma atómica, cierre la ventana quien la cierre.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu SPA carga una API key en el bundle de JavaScript, minificado y ofuscado. Un revisor dice que está protegida. ¿Cuál es la lectura correcta?</p>
+    <button class="opt">Está expuesta: todo lo que llega al browser es público. Una key que debe ser secreta va en el backend; si sí o sí debe estar en el cliente, tiene que ser scoped y revocable</button>
+    <button class="opt">Está protegida mientras el bundle esté minificado y ofuscado</button>
+    <button class="opt">Está protegida si además servís el bundle con SRI</button>
+    <div class="exp">La ofuscación no es confidencialidad: el devtools del usuario y de un atacante leen el bundle entero. Un secreto real vive en el backend y el browser llama a tu API. SRI protege la <em>integridad</em> del script (que no lo alteren en el CDN), no la <em>confidencialidad</em> de un secreto que viaja adentro.</div>
+  </div>
+
+  <div class="score" id="scoreCS_S2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cs1-threat-modeling/lecture.html">← CS1: Threat modeling a escala</a>
+  <a href="../cs3-cloud-nativo/lecture.html">CS3: Seguridad cloud-native →</a>
+</nav>
+
+</div>
+</body>
+</html>

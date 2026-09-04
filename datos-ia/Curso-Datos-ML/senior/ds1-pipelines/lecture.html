@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS1 — Pipelines de datos: reproducibilidad y escala · Datos/ML Senior</title>
+  <meta name="description" content="Por qué el notebook no es un pipeline, cómo versionar datos con DVC/lakeFS, pandas vs Polars vs DuckDB, formatos columnares (Arrow/Parquet), data quality como código, train/serve skew, data leakage a nivel senior, orquestación y cuándo NO complicar.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS1</span>
+  <span class="badge">⏱ 35–70 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Datos &amp; ML M00–M12</span>
+  <span class="badge">🧠 Datos</span>
+</div>
+
+<article>
+
+<h1>DS1 — Pipelines de datos: reproducibilidad y escala</h1>
+
+<h2>DS1.0 Por qué este módulo</h2>
+
+<p>En el curso base aprendiste a entrenar modelos: NumPy, pandas, scikit-learn, PyTorch. En un notebook, todo anda. Cargás un CSV, hacés unas transformaciones, entrenás, y el número de validación sale hermoso. El problema es que <strong>ese notebook no es el sistema que va a producción</strong>, y el 80% del trabajo real de ML no está en el modelo: está en los datos que le llegan, cómo se calculan, de dónde vienen y si se pueden reproducir.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un modelo en producción casi nunca falla con un stack trace. Falla en silencio: una métrica que baja de a poco, una predicción sesgada que nadie mira por dos semanas, un <code>94%</code> en validación que se convierte en <code>71%</code> con datos reales. Y la causa, nueve de cada diez veces, <strong>no es el modelo — es el dato</strong>. Este módulo es sobre construir la infraestructura de datos que hace que esos fallos silenciosos no ocurran, o que cuando ocurran, se vean.
+</div>
+
+<p>La diferencia entre un análisis que corrió una vez y un pipeline que corre todos los días es la misma que hay entre un experimento y un producto. Un experimento se justifica solo: lo mirás, entendés el resultado, lo tirás. Un producto de datos tiene que ser <strong>reproducible</strong> (mismo input, mismo output), <strong>versionado</strong> (sabés qué datos y qué código produjeron cada resultado) y <strong>observable</strong> (te enterás cuando algo cambia). Nada de eso viene gratis con un <code>.ipynb</code>.</p>
+
+<div class="info">
+  <strong>Stack 2026.</strong> Damos por sentado Python 3.11+ y PyTorch 2.5+. Para datos a escala el panorama cambió: <strong>Polars</strong> (Rust, más rápido que pandas), <strong>DuckDB</strong> para analítica local sobre archivos, <strong>Arrow</strong> como formato columnar en memoria y <strong>Parquet</strong> en disco. Para versionar datos, <strong>DVC</strong> o <strong>lakeFS</strong>; para orquestar, <strong>Dagster</strong> o <strong>Airflow</strong>. No vas a necesitar todo esto en cada proyecto — de hecho, la última sección es sobre cuándo <em>no</em> usarlo.
+</div>
+
+<h2>DS1.1 El notebook no es un pipeline</h2>
+
+<p>El notebook es la mejor herramienta que existe para explorar y la peor para producir. La razón es el <strong>estado oculto</strong>: las celdas se ejecutan en el orden que vos querés, no en el que están escritas, y el kernel guarda variables que ya no aparecen en ninguna celda. Es facilísimo tener un resultado que solo se reproduce si ejecutás las celdas 1, 5, 3, 8, 12 en ese orden exacto — y nadie, ni vos en dos meses, sabe cuál era ese orden.</p>
+
+<div class="mistake">
+  <strong>El caso clásico.</strong> La celda 5 define <code>df</code>. La celda 12 hace <code>df = df.dropna()</code> mutando la variable. Volvés a correr la celda 8, que asume el <code>df</code> original con nulos. Ahora tu resultado depende de cuántas veces corriste la celda 12. Reiniciás el kernel para "limpiar" y descubrís que la mitad del análisis ya no corre porque dependía de una variable que definiste en una celda que borraste. El notebook <em>parecía</em> reproducible; nunca lo fue.
+</div>
+
+<p>Un pipeline resuelve esto con tres propiedades que el notebook no tiene:</p>
+
+<div class="step"><strong>1. Determinismo.</strong> Mismo input y mismo código producen <em>exactamente</em> el mismo output. Eso implica fijar todas las semillas (<code>random</code>, NumPy, PyTorch, y el orden de los datos), evitar dependencias del reloj o del sistema de archivos, y no depender del orden de un <code>dict</code> o de un <code>set</code> que pueda variar entre corridas.</div>
+
+<div class="step"><strong>2. Versionado.</strong> Cada corrida está identificada por la tripleta <em>datos + código + entorno</em>. Si no podés decir "este resultado salió del commit <code>a3f9</code>, con el dataset <code>v3</code> y el lockfile <code>x</code>", el resultado no es reproducible: es una anécdota.</div>
+
+<div class="step"><strong>3. Separación de etapas.</strong> Ingesta, validación, limpieza, feature engineering, entrenamiento y evaluación son etapas <em>distintas</em>, cada una con un contrato de entrada y de salida. Así cada una se testea sola, se cachea (si el input no cambió, no la re-ejecutás) y se reemplaza sin tocar las demás.</p></div>
+
+<div class="rule">
+  <strong>📌 La regla que separa el juguete del sistema.</strong> Un análisis es un pipeline cuando lo podés correr de cero, sin un humano tocando celdas, y da el mismo resultado dos veces. Si para reproducirlo hace falta que vos estés ahí ejecutando cosas en cierto orden, todavía es un experimento — y está bien que lo sea, mientras no lo confundas con producción.
+</div>
+
+<p>Esto no significa "prohibido el notebook". Significa que el notebook es donde <em>descubrís</em> la transformación, y el pipeline es donde la <em>consolidás</em>. La transición —sacar la lógica del notebook a funciones testeadas con contratos claros— es el trabajo, y es el que más gente saltea.</p>
+
+<h2>DS1.2 Versionar datos, no solo código</h2>
+
+<p>Tu código está en git. ¿Y tus datos? Si la respuesta es "en un CSV que se llama <code>train_final_v2_DEFINITIVO.csv</code> en una carpeta", tenés un problema de reproducibilidad que ninguna cantidad de tests va a arreglar. Porque el mismo código sobre datos distintos da modelos distintos, y sin versionar el dato no podés decir con qué se entrenó cada modelo.</p>
+
+<h3>Por qué git no sirve para datasets</h3>
+
+<p>git fue diseñado para versionar texto: guarda diffs línea por línea y comprime bien lo que es legible. Un Parquet de 2 GB es binario y opaco; git no puede hacer un diff útil, así que en cada cambio guarda una copia entera. Diez versiones de un dataset de 2 GB son 20 GB en tu <code>.git</code>, y clonar el repo se vuelve inviable. <code>git-lfs</code> mitiga el tamaño (guarda punteros y sube los binarios aparte) pero no resuelve la <em>semántica</em>: seguís sin poder ramificar datos, comparar dos versiones o hacer rollback de un dataset sin arrastrar todo el repo.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> Meter datasets en git es como guardar los videos crudos de una película en el repositorio del guión. El guión (código) cambia con diffs chiquitos y legibles; los videos (datos) son enormes, binarios y no se benefician de nada de lo que git hace bien. Lo que querés es versionar un <em>puntero</em> al video —su hash y dónde vive— y dejar el archivo pesado en un almacenamiento hecho para eso.
+</div>
+
+<h3>DVC: git para los punteros, object storage para los datos</h3>
+
+<p><strong>DVC</strong> (Data Version Control) hace exactamente eso. Calcula el hash del dataset, guarda un archivo chiquito de texto (<code>.dvc</code>) en git con ese hash y el tamaño, y sube el archivo real a un <em>remote</em> (S3, GCS, Azure, un disco de red). git versiona el puntero; DVC sincroniza el contenido.</p>
+
+<pre><code class="lang-bash"># Registrar un dataset: DVC lo hashea y crea el puntero
+dvc add data/train.parquet
+# genera data/train.parquet.dvc  (un YAML con el md5 y el size)
+# y agrega data/train.parquet al .gitignore automáticamente
+
+git add data/train.parquet.dvc data/.gitignore
+git commit -m "datos: snapshot v3 del set de entrenamiento"
+
+dvc push        # sube el Parquet real al remote configurado
+# ...en otra máquina, o dentro de seis meses:
+git checkout a3f9 && dvc pull   # recuperás EXACTAMENTE ese dataset</code></pre>
+
+<p>Ahora el commit de git ancla las tres cosas: el código (los <code>.py</code>), el puntero al dato (<code>.dvc</code>) y, si versionás también el lockfile, el entorno. <code>git checkout</code> de un commit viejo + <code>dvc pull</code> te devuelve el mundo exacto que produjo un modelo.</p>
+
+<h3>lakeFS: ramas y merges sobre el data lake entero</h3>
+
+<p>DVC brilla cuando versionás archivos concretos dentro de un repo. Cuando lo que querés versionar es un <em>lake</em> completo —miles de tablas Parquet sobre object storage, compartido por varios equipos— la herramienta es <strong>lakeFS</strong>: te da operaciones tipo git (branch, commit, merge, revert) sobre el storage, sin copiar los datos. Podés abrir una rama <code>experimento-x</code> del lake, correr un pipeline que reescribe tablas, validar el resultado y hacer <code>merge</code> a <code>main</code> solo si pasó — o <code>revert</code> si rompiste algo, atómicamente, sobre petabytes.</p>
+
+<div class="rule">
+  <strong>📌 Reproducibilidad real = cuatro cosas pineadas.</strong> Código (<code>git sha</code>) + datos (<code>dvc</code> hash o <code>lakeFS</code> commit) + entorno (lockfile de dependencias) + artefacto del modelo (hash del <code>.pt</code>/<code>.pkl</code>). Si falta cualquiera de las cuatro, "reproducible" es una ilusión. El día que un modelo se comporta raro en prod, esta tripleta-más-uno es la diferencia entre "reproduzco el bug en diez minutos" y "no tengo idea con qué se entrenó esto".
+</div>
+
+<h2>DS1.3 pandas vs Polars vs DuckDB</h2>
+
+<p>pandas es la herramienta con la que aprendiste, y sigue siendo la correcta para muchísimas cosas. Pero tiene límites arquitectónicos que a escala duelen: es mayormente de <strong>un solo hilo</strong>, es <strong>eager</strong> (ejecuta cada operación en el acto, sin ver la consulta completa) y carga <strong>todo en RAM</strong>. Cuando el dataset se acerca al tamaño de tu memoria, o cuando el pipeline tarda minutos donde debería tardar segundos, aparecen dos alternativas que nacieron pensando en esto.</p>
+
+<h3>Polars: lazy, multihilo y con optimizador de consultas</h3>
+
+<p><strong>Polars</strong> está escrito en Rust, usa Arrow por debajo y es multihilo de fábrica. Su superpoder es la <strong>API lazy</strong>: cuando escribís una cadena de transformaciones con <code>scan_*</code>, Polars no ejecuta nada — construye un <em>plan de consulta</em>. Recién con <code>.collect()</code> el optimizador reordena el plan y lo ejecuta de la forma más barata.</p>
+
+<pre><code class="lang-python">import polars as pl
+
+# scan_parquet NO lee el archivo: arma un plan
+plan = (
+    pl.scan_parquet("ventas/*.parquet")
+      .filter(pl.col("pais") == "AR")        # se empuja HACIA la lectura
+      .group_by("producto")
+      .agg(pl.col("monto").sum().alias("total"))
+      .sort("total", descending=True)
+)
+
+print(plan.explain())   # mirá el plan optimizado ANTES de ejecutar
+df = plan.collect()     # recién acá se lee — y se lee lo mínimo</code></pre>
+
+<p>El optimizador aplica <strong>predicate pushdown</strong> (empuja el <code>filter</code> hasta la lectura, así solo lee las filas de <code>AR</code>), <strong>projection pushdown</strong> (lee solo las columnas <code>pais</code>, <code>producto</code>, <code>monto</code> y descarta las otras 40) y elimina subexpresiones repetidas. En un notebook eager, vos leés todo y filtrás después; en Polars lazy, el motor lee menos desde el principio. Para datasets más grandes que la RAM, el modo <em>streaming</em> procesa por bloques sin materializar todo.</p>
+
+<h3>DuckDB: SQL analítico embebido sobre tus archivos</h3>
+
+<p><strong>DuckDB</strong> es "el SQLite de la analítica": una base OLAP que corre dentro de tu proceso, sin servidor, con ejecución vectorizada. Lee Parquet y CSV <em>directo desde el disco</em> sin cargarlos a un DataFrame, y te deja escribir SQL sobre ellos.</p>
+
+<pre><code class="lang-sql">-- DuckDB consulta el Parquet directo, sin materializar nada en RAM
+SELECT producto, sum(monto) AS total
+FROM 'ventas/*.parquet'
+WHERE pais = 'AR'
+GROUP BY producto
+ORDER BY total DESC
+LIMIT 10;</code></pre>
+
+<p>Para agregaciones y joins sobre archivos columnares, DuckDB suele ser lo más rápido y lo más simple: no cargás nada, no hay servidor, y aprovecha el mismo predicate pushdown que Parquet permite. Además interopera con Arrow a costo cero, así que podés pasar de DuckDB a Polars a pandas sin copiar memoria.</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Modelo</th><th>Paralelismo</th><th>Fuerte en</th><th>Flojo en</th></tr></thead>
+<tbody>
+<tr><td><strong>pandas</strong></td><td>eager, todo en RAM</td><td>1 hilo (mayormente)</td><td>Exploración, ecosistema (sklearn, matplotlib), madurez</td><td>Datos cerca del tamaño de la RAM; velocidad</td></tr>
+<tr><td><strong>Polars</strong></td><td>lazy + eager, Arrow</td><td>Multihilo</td><td>ETL, transformaciones, streaming out-of-core</td><td>Ecosistema más joven; algún método puntual falta</td></tr>
+<tr><td><strong>DuckDB</strong></td><td>SQL, vectorizado</td><td>Multihilo</td><td>Agregaciones y joins sobre Parquet; cero setup</td><td>No es un DataFrame que le pasás directo a un <code>fit()</code></td></tr>
+</tbody>
+</table>
+
+<p>Números ilustrativos de un <code>group_by + sum</code> sobre ~100 millones de filas (~4 GB en Parquet), en una máquina de 8 núcleos y 16 GB de RAM:</p>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Tiempo aprox.</th><th>Memoria pico</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>pandas <code>read_parquet</code> + <code>groupby</code></td><td>~45 s</td><td>~12 GB (al borde del OOM)</td><td>Carga todo primero, un solo hilo</td></tr>
+<tr><td>Polars <code>scan</code> + lazy <code>collect</code></td><td>~5 s</td><td>~3 GB</td><td>Pushdown + multihilo, lee lo mínimo</td></tr>
+<tr><td>DuckDB (SQL sobre el Parquet)</td><td>~4 s</td><td>~2 GB</td><td>Vectorizado, no materializa el DataFrame</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Medí en TU hardware y TU dato antes de creer cualquier número.</strong> Estos son órdenes de magnitud, no promesas: la ventaja real depende de la forma del dato, la selectividad del filtro, el ancho de las filas y hasta la versión de la librería. La conclusión que sí es robusta: para analítica columnar a escala, Polars y DuckDB juegan en otra liga que pandas eager, y la diferencia es más de memoria que de tiempo.
+</div>
+
+<h3>Cuándo pandas todavía gana</h3>
+
+<p>No todo es escala. pandas sigue siendo la mejor opción cuando el dataset es chico (el overhead de armar un plan no se amortiza), cuando una librería del ecosistema espera un DataFrame de pandas y no querés convertir, cuando necesitás un método específico que Polars no tiene, o —lo más honesto— cuando tu equipo lo conoce y el proyecto no tiene un problema de performance real. Cambiar de herramienta por moda, sin un cuello de botella medido, es sobre-ingeniería. La regla es la de siempre: primero medí, después optimizá.</p>
+
+<h2>DS1.4 Formatos columnares: Arrow y Parquet</h2>
+
+<p>Detrás de Polars y DuckDB hay una idea que vale la pena entender por separado, porque explica <em>por qué</em> son rápidos: el almacenamiento <strong>columnar</strong>.</p>
+
+<p>Un CSV o un JSON son <strong>orientados a fila</strong>: los valores de una fila están juntos en el disco. Para leer una sola columna de un archivo de 50 columnas, igual tenés que recorrer todas las filas y descartar 49 valores de cada una. Perfecto para escribir registros de a uno (un log, una transacción); pésimo para analítica, que casi siempre toca pocas columnas de muchas filas.</p>
+
+<div class="concept">
+  <strong>💡 Columnar: los valores de una misma columna están contiguos.</strong> Una consulta que usa 3 de 50 columnas lee <em>solo esas 3</em>. Y como los valores de una columna son del mismo tipo y suelen parecerse, comprimen muchísimo mejor (encoding por diccionario para categorías, run-length para repeticiones). Menos bytes leídos del disco y menos bytes en memoria: por eso el columnar gana en analítica por un margen enorme.
+</div>
+
+<p>Hay dos formatos que conviene no confundir, porque resuelven cosas distintas:</p>
+
+<ul>
+  <li><strong>Arrow</strong> es el formato <em>en memoria</em>. Define cómo se ven los datos columnares en la RAM, de forma estándar entre lenguajes. Su gracia es el <strong>zero-copy</strong>: Polars, DuckDB, pandas 2.0 y muchos otros comparten buffers Arrow sin serializar ni copiar. Pasás una tabla de DuckDB a Polars y no se mueve un byte.</li>
+  <li><strong>Parquet</strong> es el formato <em>en disco</em>. Columnar, comprimido, y —clave— con <strong>metadata por bloque</strong>: cada <em>row group</em> guarda el mínimo y el máximo de cada columna. Es un archivo pensado para que un motor lea lo menos posible.</li>
+</ul>
+
+<h3>Particionado y predicate pushdown</h3>
+
+<p>Dos técnicas explotan la metadata de Parquet para saltear datos sin leerlos:</p>
+
+<p><strong>Particionado:</strong> organizás los archivos en carpetas según una columna, por ejemplo <code>ventas/anio=2024/mes=01/parte-0.parquet</code>. Una consulta que filtra <code>anio = 2024</code> ni siquiera abre las carpetas de los otros años. Esto es <em>partition pruning</em>: descarte a nivel de directorio, gratis.</p>
+
+<p><strong>Predicate pushdown:</strong> dentro de un archivo, el motor mira el min/max de cada row group. Si tu consulta pide <code>monto &gt; 1000</code> y un row group tiene <code>max(monto) = 800</code>, lo saltea entero sin leerlo. Combinado con projection pushdown (leer solo las columnas necesarias), una consulta bien escrita sobre Parquet particionado puede tocar el 1% del dato físico.</p>
+
+<div class="tip">
+  Elegí la columna de particionado por cómo vas a <em>consultar</em>, no por cómo se ven los datos. Particioná por lo que aparece en tus <code>WHERE</code> (fecha, región, tipo). Y cuidado con el <em>over-partitioning</em>: partir por una columna de alta cardinalidad (un <code>user_id</code>) genera millones de archivos chiquitos y el costo de abrir cada uno se come toda la ganancia. La regla práctica: apuntá a archivos de entre 128 MB y 1 GB por partición.
+</div>
+
+<h2>DS1.5 Data quality como código</h2>
+
+<p>Acá va la afirmación más importante del módulo, y la que más cuesta interiorizar: <strong>un dato malo que entra al entrenamiento es peor que un bug de código</strong>. El bug de código, casi siempre, tira una excepción: lo ves, hay un stack trace, lo arreglás. El dato malo no tira nada. Entrena un modelo que da métricas plausibles, pasa a producción, y sesga decisiones durante semanas hasta que alguien nota que algo raro pasa con cierto segmento de usuarios. No hay error. Hay un modelo que aprendió basura con total tranquilidad.</p>
+
+<div class="danger">
+  <strong>⚠️ El silencio es el peligro.</strong> Un <code>NaN</code> que tu pipeline rellena con <code>0</code> "por las dudas", una columna que cambió de unidad (de pesos a miles de pesos) en la fuente, un encoding que convierte tildes en símbolos raros, una fila duplicada que infla una categoría: nada de esto rompe el <code>fit()</code>. Todo esto envenena el modelo. Los datos que cruzan un boundary —file I/O, una API, una tabla de otro equipo— son la fuente número uno de bugs silenciosos, y por eso el boundary es exactamente donde tenés que validar.
+</div>
+
+<p>La solución es tratar la calidad de datos como se trata la calidad de código: con <strong>tests</strong>, que corren solos y fallan ruidosamente. Dos herramientas del ecosistema:</p>
+
+<ul>
+  <li><strong>Pandera</strong>: definís un schema declarativo para tu DataFrame (tipos, rangos, unicidad, nulabilidad) y lo validás como una función. Liviano, se integra en el código, ideal para poner un contrato en el borde de cada etapa.</li>
+  <li><strong>Great Expectations</strong>: más pesado y más completo. Definís "expectativas" sobre los datos, genera documentación de calidad navegable y reportes de validación. Vale la pena cuando la calidad de datos es un artefacto que varios equipos consumen.</li>
+</ul>
+
+<pre><code class="lang-python">import pandera as pa
+from pandera import Column, Check, DataFrameSchema
+
+schema = DataFrameSchema({
+    "id":     Column(int,   unique=True),
+    "edad":   Column(int,   Check.in_range(0, 120)),
+    "monto":  Column(float, Check.ge(0), nullable=False),
+    "pais":   Column(str,   Check.isin(["AR", "BR", "CL", "UY"])),
+    "email":  Column(str,   Check.str_matches(r"^[^@]+@[^@]+\.[^@]+$")),
+})
+
+# lazy=True junta TODOS los errores en vez de cortar en el primero
+datos_ok = schema.validate(df, lazy=True)
+# si algo no cumple, LEVANTA una excepción con el detalle:
+# qué columna, qué check, cuántas filas y ejemplos concretos</code></pre>
+
+<p>Un buen contrato de datos va más allá de los tipos. Los checks que de verdad atrapan problemas son los <em>semánticos</em>: rangos con sentido de negocio (una edad de 300 es un dato roto, no un tipo incorrecto), unicidad de claves, tasa de nulos por debajo de un umbral, cardinalidad esperada de una categórica, y —el más avanzado— <strong>estabilidad de distribución</strong>: la media de <code>monto</code> de hoy comparada con la histórica. Un <em>drift</em> silencioso de la distribución es la señal más temprana de que algo cambió en la fuente.</p>
+
+<div class="rule">
+  <strong>📌 Fail fast, y en el boundary.</strong> Validá al ingerir (que entre solo dato sano) y otra vez antes de entrenar (que el dato transformado siga sano). Y cuando falle, que el pipeline <em>aborte</em>, no que rellene y siga. Es infinitamente más barato frenar una corrida por datos malos que entrenar, desplegar y descubrir el problema en producción tres semanas después.
+</div>
+
+<h2>DS1.6 Feature engineering reproducible</h2>
+
+<p>Llegamos a la causa número uno de modelos que andan perfecto en el test y fracasan en producción, y casi nadie la nombra en los cursos: el <strong>train/serve skew</strong>, o sesgo entre entrenamiento y servicio.</p>
+
+<div class="concept">
+  <strong>💡 Train/serve skew.</strong> Es cuando una <em>misma</em> feature se calcula de forma <em>distinta</em> en entrenamiento y en producción. En training la computás en batch, con pandas, sobre un histórico completo. En serving la computa otro código —a veces en otro lenguaje, otro equipo, otra definición— sobre un único request en tiempo real. Aunque las dos versiones tengan la misma intención, difieren en los bordes. El modelo aprendió con una distribución y en prod ve otra. Nunca lo va a decir; simplemente rinde peor.
+</div>
+
+<p>El ejemplo canónico: la feature <em>"monto promedio de compras de los últimos 30 días"</em>. En el notebook de training la calculás con un <code>groupby</code> elegante sobre toda la tabla histórica. En producción, un microservicio en otro lenguaje la recalcula por request, y define "30 días" como 30 días calendario incluyendo el día actual todavía incompleto, mientras que tu training usaba 30 días cerrados. Dos definiciones sutilmente distintas, dos distribuciones, y un modelo que degrada sin que ningún test unitario se queje.</p>
+
+<h3>La solución estructural: computar la feature una sola vez</h3>
+
+<p>El fix táctico es obvio: <strong>una sola definición de la feature</strong>, en una función compartida que importan tanto el training como el serving. Si hay un solo código que calcula "promedio de 30 días", no puede haber dos definiciones.</p>
+
+<pre><code class="lang-python"># feature_defs.py — importado por el pipeline de train Y por el de serving
+def monto_promedio_30d(historial, momento):
+    """Promedio de 'monto' en la ventana de 30 días ANTERIOR a 'momento'.
+    'momento' es el instante de la predicción; la ventana es cerrada."""
+    desde = momento - pd.Timedelta(days=30)
+    ventana = historial[(historial["ts"] &gt;= desde) &amp; (historial["ts"] &lt; momento)]
+    return ventana["monto"].mean()</code></pre>
+
+<p>El fix estructural, cuando la organización escala, es un <strong>feature store</strong>: un sistema que computa cada feature una vez y la sirve tanto al training (modo <em>offline</em>, sobre el histórico) como al serving (modo <em>online</em>, baja latencia) desde la misma definición. Resuelve el skew por construcción, y además centraliza y reutiliza features entre modelos.</p>
+
+<div class="warn">
+  <strong>Point-in-time correctness.</strong> Al armar el set de entrenamiento, cada feature de cada fila tiene que reflejar <em>lo que se sabía en el momento de esa fila</em>, no lo que se sabe hoy. Es facilísimo, con un <code>join</code> descuidado, pegarle a una fila de enero un valor que recién existió en marzo. Eso ya no es skew: es leakage temporal, el tema de la próxima sección. Un feature store serio garantiza point-in-time correctness en el join offline; a mano, es la trampa más fácil de pisar.
+</div>
+
+<h2>DS1.7 Data leakage a nivel senior</h2>
+
+<p>El curso base te mostró el leakage obvio: escalar antes de partir en train/test. Acá vamos por las formas sutiles, las que pasan revisión de código y solo se detectan si sabés qué buscar. <strong>Leakage es cualquier información sobre el target o sobre el futuro que se filtra a las features de entrenamiento y que el modelo no va a tener disponible en producción.</strong> El síntoma es siempre el mismo: un modelo demasiado bueno para ser verdad.</p>
+
+<h3>Las cuatro formas que importan</h3>
+
+<div class="step"><strong>1. Leakage temporal.</strong> Usar información del futuro para predecir el pasado. Aparece de dos maneras: un <em>split aleatorio</em> sobre una serie temporal (mezclás enero con diciembre, el modelo "ve" el futuro en el train), o una <em>feature computada con datos posteriores</em> al momento de predicción (un promedio que incluye el propio evento que querés predecir). Es el más común y el más caro.</div>
+
+<div class="step"><strong>2. Leakage por preprocesamiento.</strong> Hacer <code>fit</code> del scaler, del imputador o del encoder sobre <em>todo</em> el dataset antes de partir. La media y la varianza que usás para normalizar el train ya "vieron" el test. Se arregla metiendo el preprocesamiento dentro de un <code>Pipeline</code> de scikit-learn, que hace <code>fit</code> solo con el train de cada fold de la validación cruzada.</div>
+
+<div class="step"><strong>3. Target leakage.</strong> Una feature que es <em>consecuencia</em> del target, no causa. El ejemplo clásico: predecir el <em>default</em> de un crédito usando la feature "tiene seguro de impago activado" — pero ese seguro se contrata <em>después</em> de que se sabe que la persona va a defaultear. La feature es casi el target disfrazado. En producción no la vas a tener a tiempo, o va a significar otra cosa.</div>
+
+<div class="step"><strong>4. Leakage de grupo.</strong> El mismo sujeto (paciente, usuario, cliente) aparece en train y en test. El modelo memoriza al individuo en vez de aprender el patrón. La métrica de test miente porque el test no es realmente "datos nuevos". Se arregla con un split por grupo (<code>GroupKFold</code>), que garantiza que cada sujeto está de un solo lado.</div>
+
+<table>
+<thead><tr><th>Tipo de leakage</th><th>Qué se filtra</th><th>Ejemplo típico</th><th>Cómo se detecta / arregla</th></tr></thead>
+<tbody>
+<tr><td><strong>Temporal</strong></td><td>Información del futuro</td><td>Split aleatorio en serie temporal; feature con <code>max(fecha)</code> del dataset</td><td>Split por tiempo; auditar el timestamp de cada feature</td></tr>
+<tr><td><strong>Preprocesamiento</strong></td><td>Media/varianza del test</td><td><code>scaler.fit()</code> antes del split</td><td><code>Pipeline</code>: <code>fit</code> solo en el train de cada fold</td></tr>
+<tr><td><strong>Target</strong></td><td>Consecuencia del target</td><td>"Seguro de impago" para predecir default</td><td>¿Existía esta feature ANTES de conocer el target?</td></tr>
+<tr><td><strong>Grupo</strong></td><td>Identidad del sujeto</td><td>Mismo usuario en train y en test</td><td><code>GroupKFold</code> por sujeto</td></tr>
+<tr><td><strong>Duplicados</strong></td><td>Filas repetidas</td><td>El mismo registro cayó en train y test</td><td>Deduplicar ANTES de partir</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Las señales de que hay leakage.</strong> Un <code>AUC</code> sospechosamente cercano a <code>1.0</code>. Una sola feature que domina toda la importancia del modelo. Una correlación de una feature con el target por encima de <code>0.95</code>. Un salto de performance enorme al agregar una feature "nueva". Cuando veas cualquiera de estas, no festejes: sospechá. En ML, un resultado demasiado bueno casi siempre es un bug de datos, no un golpe de suerte.
+</div>
+
+<h2>DS1.8 Orquestación: el pipeline es software</h2>
+
+<p>Cuando el pipeline tiene varias etapas con dependencias, necesitás algo que las corra en orden, reintente las que fallan, y las dispare en la cadencia correcta. Eso es un <strong>orquestador</strong>, y modela el pipeline como un <strong>DAG</strong> (grafo acíclico dirigido): los nodos son etapas, las aristas son dependencias. <strong>Airflow</strong> es el estándar veterano; <strong>Dagster</strong> y <strong>Prefect</strong> son la generación moderna, con mejor manejo de datos y de testing local.</p>
+
+<div class="info">
+  <strong>Tasks vs. assets.</strong> Airflow piensa en <em>tareas</em> ("corré este script"). Dagster piensa en <em>assets</em> ("producí esta tabla"), lo que se llama <em>data-aware orchestration</em>: el orquestador sabe qué dato produce cada etapa, puede materializar solo lo que quedó desactualizado y razonar sobre el linaje. Para pipelines de datos y ML, pensar en assets suele encajar mejor con cómo funciona el trabajo.
+</div>
+
+<h3>Idempotencia y backfill: las dos propiedades no negociables</h3>
+
+<p><strong>Idempotencia</strong> significa que correr la misma etapa dos veces, con el mismo input, da el mismo resultado y no rompe nada. Es lo que hace que reintentar sea seguro. El patrón: escribí a una <em>partición determinista</em> (por fecha, por ejemplo) y sobreescribila, en vez de hacer un <code>append</code> ciego que duplica datos cada vez que reintentás.</p>
+
+<pre><code class="lang-python"># Idempotente: la salida es una partición determinista por fecha.
+# Re-correr el mismo día PISA esa partición; no acumula duplicados.
+def transformar(fecha: str):
+    entrada = f"raw/fecha={fecha}/"
+    salida  = f"clean/fecha={fecha}/"
+    (pl.scan_parquet(entrada)
+       .pipe(limpiar)
+       .sink_parquet(salida))   # overwrite atómico de ESA partición</code></pre>
+
+<p><strong>Backfill</strong> es recomputar el histórico cuando cambiás la lógica. Si arreglaste un bug en una feature, necesitás re-correr los últimos seis meses. Un DAG bien diseñado está <em>parametrizado por fecha</em>: podés dispararlo para cualquier ventana del pasado y, como cada etapa es idempotente, el resultado es correcto sin importar cuántas veces la corras.</p>
+
+<div class="rule">
+  <strong>📌 Un pipeline de datos es software, con las mismas necesidades.</strong> Tests (de la lógica <em>y</em> de los datos, DS1.5), CI (correr el DAG en staging con una muestra antes de mergear), observabilidad (métricas de frescura, volumen y tasa de nulos en cada corrida) y alertas cuando algo se sale de rango. Si tu pipeline no tiene nada de esto, no es un sistema de producción: es un <code>cron</code> con suerte, y la suerte se acaba.
+</div>
+
+<h2>DS1.9 Escala: cuándo salís de una sola máquina</h2>
+
+<p>Hay una creencia instalada de que "datos a escala" significa "cluster de Spark". En 2026 esa creencia está, la mayoría de las veces, equivocada — y sale carísima.</p>
+
+<div class="concept">
+  <strong>💡 Un solo nodo moderno aguanta terabytes.</strong> Una VM en la nube con 128–512 GB de RAM y discos NVMe cuesta poco y es trivial de conseguir por horas. Con Polars en modo streaming o con DuckDB, procesás cientos de GB —y hasta algunos TB— <em>en esa única máquina</em>, sin cluster, sin shuffle de red, sin serialización distribuida, sin debuggear un job que falló en el ejecutor 47. La enorme mayoría de lo que la gente llama "big data" entra cómodo en un nodo grande.
+</div>
+
+<p><strong>Spark (y el procesamiento distribuido en general) casi nunca hace falta antes de lo que la gente cree.</strong> Un cluster tiene un costo que no se ve en el benchmark: setup y mantenimiento, el <em>shuffle</em> de datos por la red entre nodos, la serialización, y sobre todo la dificultad de debuggear algo que corre en cincuenta máquinas a la vez. Ese costo solo se justifica cuando de verdad tenés decenas de TB, o un throughput que un nodo no da. Por debajo de ese umbral —donde vive el 90% de los proyectos— un solo nodo es más rápido (no paga red), más barato y muchísimo más simple de operar.</p>
+
+<p>La herramienta de escala que sí usás casi siempre es el <strong>particionado</strong>: en vez de cargar todo, procesás partición por partición, en paralelo dentro del nodo, sin que nada entre entero en memoria. Combinado con formatos columnares y pushdown, te lleva sorprendentemente lejos.</p>
+
+<div class="tip">
+  La regla operativa: <strong>medí el tamaño real de tu dato antes de elegir arquitectura.</strong> Si entra en un nodo grande —y hoy "grande" es una tarjeta de crédito y diez minutos— quedate en un nodo. Subís a distribuido cuando el nodo más grande razonable ya no alcanza, con números en la mano, no cuando lo imaginás. El costo de operar Spark de más es real; el costo de un nodo grande de más es unos dólares la hora.
+</div>
+
+<h2>DS1.10 Cuándo NO complicar</h2>
+
+<p>Todo este módulo describe herramientas potentes, y la tentación senior es usarlas todas. No lo hagas. La sobre-ingeniería de datos es tan cara como la sub-ingeniería, y bastante más común en equipos que acaban de aprender estas cosas.</p>
+
+<div class="danger">
+  <strong>⚠️ El pipeline de 3 pasos no necesita Airflow.</strong> Si tu proceso es "extraé de una tabla, transformá, guardá un Parquet" y corre una vez por día, un script de Python con <code>cron</code>, un lockfile para no pisarse, logging y una validación de Pandera al final es <em>todo</em> lo que necesitás. Montar Airflow, un feature store y un data lake para eso no te hace más senior: te hace responsable de operar tres sistemas complejos para resolver un problema que cabía en cuarenta líneas.
+</div>
+
+<p>Los síntomas de sobre-ingeniería de datos, para que los reconozcas en tus propios proyectos:</p>
+
+<ul>
+  <li>Un <strong>feature store</strong> para cinco features que usa un solo modelo.</li>
+  <li><strong>Spark</strong> para procesar 2 GB que entran en la RAM de tu laptop.</li>
+  <li>Un <strong>data lake</strong> con catálogo y capas medallion para diez tablas.</li>
+  <li><strong>DVC</strong> sobre un CSV de referencia que no cambia nunca.</li>
+  <li>Un <strong>DAG</strong> de orquestación con reintentos y sensores para un job que no tiene dependencias.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 La complejidad se justifica con escala real, no con aspiración.</strong> Volumen de datos, tamaño del equipo, SLAs concretos: esos justifican infraestructura. "Por si algún día crecemos" no. Empezá con lo más simple que funcione y verificalo de punta a punta; agregá cada pieza de infraestructura cuando el dolor que resuelve sea real y medible. Es infinitamente más fácil agregar Airflow el día que lo necesitás que sacarlo el día que descubrís que nunca lo necesitaste.
+</div>
+
+<h2>🧑‍🎓 Worked Example — 94% en validación, 71% en producción</h2>
+
+<blockquote>Un equipo entrena un modelo de <em>churn</em> (predecir qué clientes se van a dar de baja). En validación da <strong>94%</strong> de accuracy — festejan y despliegan. La primera semana en producción, la métrica real es <strong>71%</strong>. El modelo es casi inútil. ¿Qué pasó?</blockquote>
+
+<p><strong>Paso 1 — Descartar el diagnóstico fácil.</strong> "Es overfitting" es lo primero que dicen todos, y está mal. El overfitting clásico se ve <em>dentro</em> del mismo dataset: train altísimo, test bajo. Acá el problema es distinto: validación y producción son <strong>mundos distintos</strong>. Una brecha val↔prod tan grande no es memorización — es que el dato de validación no representaba al dato de producción. Eso apunta a dos sospechosos: <strong>leakage</strong> o <strong>train/serve skew</strong>. Casi siempre, cuando la brecha es brutal, están los dos.</p>
+
+<p><strong>Paso 2 — Auditar las features por importancia.</strong> Se mira qué features pesan más en el modelo. Una domina todo: <code>dias_desde_ultima_actividad</code>. Al revisar cómo se computó en el training set, aparece el bug:</p>
+
+<pre><code class="lang-python"># CÓMO SE COMPUTÓ EN TRAINING (con leakage temporal)
+df["dias_desde_ultima_actividad"] = (
+    df["fecha_actividad"].max() - df["fecha_actividad"]   # ¡max() del dataset!
+).dt.days
+# 'max()' es la fecha en que se ARMÓ el dataset — información del futuro.
+# La feature "sabe" hasta dónde llega el histórico completo.</code></pre>
+
+<p>En training, <code>max()</code> es el borde derecho del dataset: un punto en el futuro respecto de casi todas las filas. En producción, esa feature se computa contra la fecha del request (el "ahora"). Son dos definiciones distintas de "última actividad": <strong>leakage temporal</strong>. El modelo aprendió a apoyarse en una señal que en prod significa otra cosa.</p>
+
+<p><strong>Paso 3 — Encontrar el segundo problema.</strong> La otra feature importante es <code>monto_promedio_30d</code>. En training la calculó un <code>groupby</code> de pandas sobre el histórico. En producción la calcula un microservicio que define la ventana de 30 días incluyendo el día actual todavía incompleto. Misma intención, bordes distintos: <strong>train/serve skew</strong>. Dos distribuciones sutilmente corridas para la misma columna.</p>
+
+<p><strong>Paso 4 — Arreglar de raíz, no parchar.</strong> Tres cambios:</p>
+
+<div class="step"><strong>(a) Split temporal correcto.</strong> Nunca más split aleatorio en datos con tiempo. El train usa datos hasta <code>T</code>; la validación usa datos posteriores a <code>T</code>. Así la validación simula de verdad lo que es predecir el futuro.</div>
+
+<pre><code class="lang-python"># MAL: mezcla pasado y futuro, la validación miente
+train, val = train_test_split(df, test_size=0.2, random_state=42)
+
+# BIEN: la validación es SIEMPRE posterior al train
+corte = df["fecha"].quantile(0.8)
+train = df[df["fecha"] &lt;= corte]
+val   = df[df["fecha"] &gt;  corte]</code></pre>
+
+<div class="step"><strong>(b) Feature point-in-time.</strong> <code>dias_desde_ultima_actividad</code> se recomputa para que cada fila use solo lo conocido a <em>su</em> timestamp, nunca el <code>max()</code> global. La feature de training pasa a significar exactamente lo mismo que la de serving.</div>
+
+<div class="step"><strong>(c) Una sola definición de cada feature.</strong> <code>monto_promedio_30d</code> se saca a una función compartida (o a un feature store) que importan el training y el serving. Si hay un solo código, no puede haber dos definiciones de "30 días".</div>
+
+<p><strong>El resultado.</strong> La validación <em>baja</em> a 79%, y eso es una buena noticia: el 94% era mentira, inflado por el leakage. La producción <em>sube</em> a 77%. La brecha se cerró de 23 puntos a 2. Terminaron con un modelo que en el papel parece peor y en la realidad es muchísimo mejor.</p>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio.</strong> Cuando un modelo brilla en validación y se apaga en producción, el bug casi nunca está en el modelo: está en el dato. Un split temporal honesto y una feature computada una sola vez arreglan más problemas de "el modelo no anda en prod" que cualquier arquitectura de red o cualquier búsqueda de hiperparámetros. Un número de validación demasiado bueno no es un logro: es un síntoma.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué git no sirve para versionar un dataset, y qué hace DVC distinto?</summary>
+<p>git versiona <em>contenido</em> de texto con diffs línea por línea. Un Parquet es binario y opaco: git no puede diffear, así que guarda una copia completa en cada cambio, y el repositorio se infla hasta volverse inmanejable. DVC versiona un <strong>puntero</strong>: calcula el hash del dataset, guarda un archivo <code>.dvc</code> chiquito en git con ese hash, y sube el archivo real a un remote (S3/GCS). El commit de git ancla código y puntero al dato juntos; <code>git checkout</code> + <code>dvc pull</code> reconstruye el estado exacto. La reproducibilidad completa necesita cuatro cosas pineadas: código, datos, entorno y artefacto del modelo.</p></details>
+
+<details><summary>Tu modelo da 94% en validación y 71% en producción. ¿Qué descartás primero y qué sospechás?</summary>
+<p>Descartás overfitting clásico: eso se ve dentro del mismo dataset (train alto, test bajo), no como una brecha entre validación y producción. Una brecha val↔prod tan grande significa que la validación no representaba a producción, y eso apunta a <strong>leakage</strong> (una feature que usa info del futuro o del target, que en prod no está) o a <strong>train/serve skew</strong> (la misma feature computada distinto en train y en serving). Se audita empezando por las features de mayor importancia: la que domina suele ser la culpable. El arreglo típico es split temporal correcto más una única definición point-in-time de cada feature.</p></details>
+
+<details><summary>¿Por qué Polars lazy y el Parquet particionado leen menos datos que pandas eager?</summary>
+<p>pandas es eager: ejecuta cada operación al toque, sin ver la consulta completa, así que primero carga todo el archivo y recién después filtra y selecciona columnas. Polars lazy construye un <em>plan</em> con <code>scan_*</code> y lo optimiza antes de ejecutar: aplica <strong>predicate pushdown</strong> (empuja el filtro hasta la lectura, lee solo las filas que pasan) y <strong>projection pushdown</strong> (lee solo las columnas usadas). El Parquet ayuda por su estructura columnar y su metadata: min/max por row group permite saltear bloques enteros, y el particionado por carpeta descarta directorios sin abrirlos. Resultado: una consulta bien escrita puede tocar el 1% del dato físico.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>notebook no es un pipeline</strong>: le falta determinismo, versionado y separación de etapas. Un análisis es pipeline cuando corre de cero, sin humano, y da el mismo resultado dos veces.</li>
+  <li><strong>Versioná los datos</strong>, no solo el código. git no sirve para binarios grandes; DVC versiona un hash y guarda el dato en un remote; lakeFS da git sobre el lake entero. Reproducibilidad = código + datos + entorno + artefacto, los cuatro pineados.</li>
+  <li><strong>pandas / Polars / DuckDB</strong>: pandas para explorar y para el ecosistema; Polars (lazy, multihilo, pushdown) para ETL a escala; DuckDB para agregaciones SQL sobre Parquet. La ventaja a escala es más de memoria que de tiempo — medí lo tuyo.</li>
+  <li>El <strong>columnar</strong> (Arrow en memoria, Parquet en disco) gana en analítica: lee solo las columnas necesarias, comprime mejor, y con particionado + predicate pushdown saltea el grueso del dato sin leerlo.</li>
+  <li><strong>Data quality como código</strong>: un dato malo es peor que un bug, porque falla en silencio. Validá schemas (Pandera/Great Expectations) en el boundary, con checks semánticos, y abortá al fallar.</li>
+  <li><strong>Train/serve skew</strong> y <strong>data leakage</strong> son la causa #1 de modelos que andan en test y fallan en prod. Una sola definición de cada feature, point-in-time correctness, y split temporal en vez de aleatorio.</li>
+  <li>El <strong>pipeline es software</strong>: DAGs idempotentes, backfill parametrizado por fecha, tests, CI y observabilidad. Y <strong>no compliques</strong>: un solo nodo aguanta terabytes, Spark casi nunca hace falta, y el proceso de 3 pasos no necesita Airflow.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un notebook tuyo de análisis y convertilo en un pipeline: separá ingesta, validación, transformación y salida en funciones con contratos claros; fijá todas las semillas; y verificá que corre de cero dos veces con el mismo resultado.</li>
+  <li>Inicializá <code>dvc</code> en un repo, registrá un dataset con <code>dvc add</code>, commiteá el <code>.dvc</code>, cambiá el dataset y commiteá de nuevo. Después hacé <code>git checkout</code> de la primera versión + <code>dvc pull</code> y comprobá que recuperás el dataset original exacto.</li>
+  <li>Cargá el mismo dataset de ~decenas de millones de filas con pandas (<code>read_parquet</code> + <code>groupby</code>), con Polars lazy (<code>scan_parquet</code> + <code>collect</code>) y con DuckDB (SQL sobre el archivo). Cronometrá los tres y medí la memoria pico. Armá tu propia tabla con TUS números.</li>
+  <li>Guardá un dataset en Parquet particionado por fecha. Corré una consulta que filtra un rango de fechas y una columna, mirá el plan (<code>explain()</code> en Polars) y confirmá que el pushdown está descartando particiones y columnas. Compará el tiempo contra el mismo dato en un CSV único.</li>
+  <li>Escribí un schema de Pandera para un dataset con al menos un check de rango, uno de unicidad y uno de dominio (<code>isin</code>). Corrompé una fila a propósito y comprobá que <code>validate(..., lazy=True)</code> te reporta todos los errores de golpe, no solo el primero.</li>
+  <li>Construí a mano un caso de <strong>leakage temporal</strong>: entrená con un split aleatorio sobre una serie temporal y medí el accuracy; después reentrená con un split temporal correcto y compará. Explicá con números por qué el primero mentía.</li>
+  <li>Tomá una feature que dependa de una ventana de tiempo (ej: "promedio de los últimos 30 días") y escribí una única función point-in-time para ella. Demostrá que da el mismo valor calculada en modo batch (training) y por evento (serving) para el mismo timestamp.</li>
+</ol>
+
+<section class="quiz" id="quizDS1">
+  <style>
+    #quizDS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS1 .q{margin-bottom:1.5rem}
+    #quizDS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS1 .opt:hover{border-color:var(--accent)}
+    #quizDS1 .opt:disabled{cursor:default}
+    #quizDS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS1 .exp.show{display:block}
+    #quizDS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Un modelo da 94% en validación y 71% en producción. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">Overfitting clásico: subí la regularización y listo</button>
+    <button class="opt">Leakage o train/serve skew: la validación no representaba a producción</button>
+    <button class="opt">Ruido de muestreo: recolectá más datos de producción y se empareja</button>
+    <div class="exp">El overfitting clásico se ve dentro del mismo dataset (train alto, test bajo), no como una brecha entre validación y producción. Una brecha val↔prod tan grande significa que la validación mentía: casi siempre por leakage (una feature con info del futuro o del target) o por train/serve skew (la misma feature computada distinto en train y serving). Se audita empezando por la feature de mayor importancia.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Por qué git no es la herramienta para versionar un dataset grande, y DVC sí?</p>
+    <button class="opt">Porque git no soporta archivos binarios de ningún tipo</button>
+    <button class="opt">Porque los datasets siempre cambian de schema y git no lo detecta</button>
+    <button class="opt">Porque git versiona el contenido y un Parquet grande infla el repo en cada cambio; DVC versiona un hash y deja el dato en un remote</button>
+    <div class="exp">git guarda contenido con diffs de texto; un Parquet binario no se puede diffear, así que git copia el archivo entero en cada cambio y el repo se vuelve inmanejable. DVC guarda en git solo un puntero (<code>.dvc</code> con el hash) y sube el archivo real a un remote como S3. El commit ancla código y puntero al dato; <code>git checkout</code> + <code>dvc pull</code> reconstruye el estado exacto.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tenés un Parquet particionado por fecha y consultás con Polars lazy filtrando una fecha y tres columnas de cincuenta. ¿Por qué lee muchísimo menos que pandas eager?</p>
+    <button class="opt">Por predicate y projection pushdown más partition pruning: lee solo las filas, columnas y particiones necesarias</button>
+    <button class="opt">Porque Polars siempre comprime mejor que pandas, sin importar la consulta</button>
+    <button class="opt">Porque el CSV se parsea más rápido que el Parquet en Polars</button>
+    <div class="exp">Polars lazy arma un plan y lo optimiza antes de ejecutar: empuja el filtro hasta la lectura (predicate pushdown) y lee solo las columnas usadas (projection pushdown). El Parquet particionado suma partition pruning: descarta carpetas de otras fechas sin abrirlas, y su metadata min/max por row group permite saltear bloques. pandas eager, en cambio, carga todo primero y filtra después.</div>
+  </div>
+
+  <div class="score" id="scoreDS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../ds2-entrenamiento/lecture.html">DS2: Entrenamiento a escala →</a>
+</nav>
+
+</div>
+</body>
+</html>

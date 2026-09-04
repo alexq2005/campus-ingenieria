@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS7 — Fine-tuning: cuándo, cómo y con cuánto · Datos/ML Senior</title>
+  <meta name="description" content="Fine-tuning cambia CÓMO responde el modelo, no le agrega conocimiento: la decisión frente a RAG, el espectro de adaptación, LoRA/QLoRA, el dato como el 90%, SFT con trl, alineación por preferencias con DPO, herramientas (Unsloth, Torchtune, Axolotl), evaluación, serving y costo real.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS7</span>
+  <span class="badge">⏱ 35–80 min</span>
+  <span class="badge">🎯 Pre-req: DS2, DS5</span>
+  <span class="badge">🎛️ Fine-tuning</span>
+</div>
+
+<article>
+
+<h1>DS7 — Fine-tuning: cuándo, cómo y con cuánto</h1>
+
+<h2>DS7.0 Por qué este módulo</h2>
+
+<p>El fine-tuning es la herramienta más malentendida de todo el stack de LLMs. Genera dos errores simétricos que se pagan caro. Por un lado, la mayoría de los equipos que <em>lo hacen</em> deberían haber usado <a href="../ds6-rag/lecture.html">RAG</a>: fine-tunean para meterle "conocimiento" al modelo y descubren, tres semanas después, que ese conocimiento ya está desactualizado y que reentrenar es lento, caro y frágil. Por el otro lado, la mayoría de los equipos que <em>de verdad lo necesitan</em> —los que precisan que el modelo hable en un formato rígido, con un tono propio, o que ejecute una tarea que ningún prompt logra estabilizar— le tienen miedo, lo posponen, y viven parcheando el prompt hasta que el prompt tiene tres mil tokens y sigue fallando uno de cada diez casos.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Fine-tuning cambia <strong>cómo</strong> responde el modelo —formato, estilo, tarea, tono— y <strong>no</strong> le agrega <strong>conocimiento confiable</strong>. Para conocimiento está RAG. Casi todas las decisiones de este módulo se deducen de separar esos dos verbos: <em>cómo</em> responde vs <em>qué</em> sabe. El día que sabés cuál de los dos estás intentando arreglar, ya sabés qué técnica usar.
+</div>
+
+<p>Este módulo es de nivel senior porque la parte difícil no es correr el <code>trainer.train()</code> —eso hoy son quince líneas— sino tomar tres decisiones que después no se revierten barato: <strong>si</strong> fine-tunear, <strong>con qué datos</strong>, y <strong>cómo servir</strong> el resultado. El código es la parte fácil. El criterio es lo que separa un proyecto que ahorra plata de uno que quema GPU para reinventar, peor, algo que una API ya hacía.</p>
+
+<h2>DS7.1 La decisión primero: cómo vs qué</h2>
+
+<p>Antes de tocar una sola línea de PyTorch, hay una pregunta que ordena todo: <strong>lo que querés arreglar, ¿es una cuestión de <em>forma</em> o de <em>conocimiento</em>?</strong> Fine-tuning es la herramienta de la forma. Le enseña al modelo un patrón de comportamiento: "cuando te pregunten así, respondé asá, con esta estructura y este tono". Lo que <strong>no</strong> hace de forma confiable es meterle datos frescos que pueda recitar sin equivocarse. Un modelo fine-tuneado sobre tu catálogo va a <em>sonar</em> como que sabe de tu catálogo, y va a alucinar precios con total soltura.</p>
+
+<table>
+<thead><tr><th>Lo que querés</th><th>¿CÓMO o QUÉ?</th><th>Técnica correcta</th></tr></thead>
+<tbody>
+<tr><td>Responder siempre en un JSON con un schema fijo</td><td><strong>CÓMO</strong> (formato)</td><td>Fine-tuning</td></tr>
+<tr><td>Usar el tono y el vocabulario de la marca</td><td><strong>CÓMO</strong> (estilo)</td><td>Fine-tuning</td></tr>
+<tr><td>Clasificar tickets con tus 14 etiquetas propias</td><td><strong>CÓMO</strong> (tarea)</td><td>Fine-tuning (o few-shot primero)</td></tr>
+<tr><td>Conocer tu catálogo, que cambia cada semana</td><td><strong>QUÉ</strong> (conocimiento volátil)</td><td>RAG</td></tr>
+<tr><td>Citar tus políticas internas al pie de la letra</td><td><strong>QUÉ</strong> (conocimiento verificable)</td><td>RAG</td></tr>
+<tr><td>Saber de un evento posterior a su entrenamiento</td><td><strong>QUÉ</strong> (conocimiento nuevo)</td><td>RAG</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla de oro.</strong> Si la respuesta correcta <em>cambia con el tiempo</em> o tenés que poder <em>auditar de dónde salió</em>, es conocimiento: va a RAG. Si la respuesta correcta es <em>estable</em> y lo que falla es la <em>forma</em> de decirla, es comportamiento: va a fine-tuning. La pregunta "¿esto cambia el mes que viene?" resuelve el 90% de los casos sin abrir un notebook.
+</div>
+
+<p>Y acá viene lo que casi nadie dice en los tutoriales: <strong>lo más común no es elegir uno, es combinarlos.</strong> Fine-tuneás el <em>comportamiento</em> (que el modelo responda con tu estructura, tu tono, tu manera de razonar sobre el dominio) y usás RAG para el <em>conocimiento</em> (que los datos frescos entren por contexto en cada consulta). El fine-tuning enseña a hablar como tu equipo; RAG le pasa los papeles actualizados sobre la mesa antes de que hable. Los dos resuelven problemas distintos y se potencian: un modelo que ya "piensa" en tu dominio aprovecha mucho mejor los documentos que RAG le inyecta.</p>
+
+<div class="analogy">
+  <strong>Analogía.</strong> Fine-tuning es <em>formar a un empleado</em>: le enseñás los procedimientos, el tono con el que atiende, cómo estructura un informe. RAG es <em>darle acceso al sistema</em>: la base de datos de precios, el manual vigente, el ticket del cliente. Ningún jefe sensato le pide al empleado que <em>memorice</em> la lista de precios que cambia cada lunes. Lo forma bien una vez, y le da la lista actualizada cuando la necesita.
+</div>
+
+<h2>DS7.2 El espectro de adaptación</h2>
+
+<p>Fine-tuning no es el primer recurso, es uno de los últimos. Hay un espectro de técnicas para adaptar un modelo a lo tuyo, ordenado de más barato y reversible a más caro e irreversible. La disciplina senior es <strong>no saltar un escalón sin haber agotado el anterior</strong>, porque cada escalón que subís multiplica el costo y reduce tu capacidad de dar marcha atrás.</p>
+
+<table>
+<thead><tr><th>Escalón</th><th>Qué hace</th><th>Costo / reversibilidad</th><th>Cuándo subir al siguiente</th></tr></thead>
+<tbody>
+<tr><td><strong>Prompt engineering</strong></td><td>Instrucciones claras en el system prompt</td><td>Minutos · totalmente reversible</td><td>Cuando el prompt ya es enorme y sigue fallando</td></tr>
+<tr><td><strong>Few-shot</strong></td><td>2–10 ejemplos dentro del prompt</td><td>Barato · gasta tokens por request</td><td>Cuando necesitás decenas de ejemplos para acertar</td></tr>
+<tr><td><strong>RAG</strong></td><td>Recupera contexto relevante en runtime</td><td>Medio · infra de retrieval, reversible</td><td>Cuando el problema es de <em>forma</em>, no de datos</td></tr>
+<tr><td><strong>Fine-tuning</strong></td><td>Ajusta los pesos a tu comportamiento</td><td>Alto · dataset + GPU + serving propio</td><td>Cuando ninguna instrucción estabiliza el comportamiento</td></tr>
+<tr><td><strong>Pre-training</strong></td><td>Entrena desde cero o continúa el pre-entreno</td><td>Altísimo · millones de USD, meses</td><td>Casi nunca: solo con un dominio y un presupuesto enormes</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  El error de escalón más caro es saltar de "el prompt no me sale" directo a fine-tuning, sin pasar por few-shot ni RAG. La mitad de esos casos se resolvían con tres ejemplos bien elegidos en el prompt. Fine-tunear para lo que un few-shot ya lograba es pagar meses de GPU y mantenimiento para ahorrar 200 tokens por request. Hacé la cuenta antes: casi siempre pierde.
+</div>
+
+<p>Hay una excepción legítima que sí justifica subir: cuando el comportamiento que querés <strong>no cabe en un prompt razonable</strong>. Si necesitás 40 ejemplos few-shot para estabilizar la tarea, estás gastando miles de tokens de contexto en cada llamada, y encima el modelo se distrae. Ahí fine-tuning gana claro: ese conocimiento de <em>forma</em> se "comprime" en los pesos, el prompt vuelve a ser corto, y la latencia y el costo por request bajan. Ese es el sweet spot real del fine-tuning: destilar un patrón de comportamiento estable que hoy vive, caro, en el contexto.</p>
+
+<h2>DS7.3 Full fine-tuning vs PEFT: LoRA y QLoRA</h2>
+
+<p>Supongamos que ya decidiste, bien, que hace falta fine-tuning. La segunda decisión es <em>cuántos</em> parámetros vas a mover. La respuesta ingenua —"todos, para que aprenda bien"— es la cara e innecesaria. Actualizar los 8.000 millones de parámetros de un modelo (<em>full fine-tuning</em>) no solo es carísimo en memoria: para la mayoría de las adaptaciones de comportamiento es como reformar una casa entera para cambiar el color de una pared.</p>
+
+<h3>Por qué full fine-tuning es caro (los números)</h3>
+
+<p>El problema no son los pesos: son los <strong>estados del optimizador</strong>. Con Adam y precisión mixta, por cada parámetro guardás el peso, su gradiente, y dos estadísticas del optimizador (momento y varianza). La cuenta de servilleta es <strong>~16 bytes por parámetro</strong>. Para un modelo de 8B:</p>
+
+<pre><code class="lang-python"># Memoria aproximada de un FULL fine-tuning, 8B, Adam + precisión mixta
+params        = 8_000_000_000
+bytes_x_param = 16          # pesos + gradientes + momento + varianza (+ master fp32)
+gb            = params * bytes_x_param / 1e9
+print(gb)                   # ~128 GB SOLO de estados, sin contar activaciones</code></pre>
+
+<p>128 GB de estados significa varias A100/H100 de 80 GB coordinadas con paralelismo, orquestación distribuida y una factura para acompañar. Para adaptar un comportamiento, es desproporcionado. Acá entra <strong>PEFT</strong> (<em>Parameter-Efficient Fine-Tuning</em>): en vez de mover todos los parámetros, congelás el modelo base y entrenás un puñado chiquito de parámetros nuevos.</p>
+
+<h3>LoRA: adapters de bajo rango</h3>
+
+<p><strong>LoRA</strong> (<em>Low-Rank Adaptation</em>) parte de una observación fina: el <em>cambio</em> que el fine-tuning le hace a una matriz de pesos tiene, en la práctica, <strong>rango bajo</strong>. Es decir, esa actualización se puede aproximar muy bien con el producto de dos matrices flacas. Si una capa tiene una matriz de pesos <code>W</code> de tamaño <code>d×k</code>, LoRA la deja <strong>congelada</strong> y aprende un delta factorizado <code>ΔW = B·A</code>, donde <code>B</code> es <code>d×r</code> y <code>A</code> es <code>r×k</code>, con el rango <code>r</code> muchísimo más chico que <code>d</code> o <code>k</code>.</p>
+
+<pre><code class="lang-python"># La idea de LoRA, en pseudocódigo
+# W  (d x k)   -&gt; CONGELADO, nunca se toca
+# A  (r x k)   -&gt; entrenable, r es chico (8, 16, 32...)
+# B  (d x r)   -&gt; entrenable
+#
+# forward normal:   h = W @ x
+# forward con LoRA:  h = W @ x + (alpha / r) * (B @ (A @ x))
+#
+# En vez de entrenar d*k parámetros, entrenás r*(d + k). Con d=k=4096 y r=16:
+#   full:  4096 * 4096      = 16.7 M por matriz
+#   LoRA:  16 * (4096+4096) =  131 K por matriz  -&gt;  ~128x menos</code></pre>
+
+<p>Dos hiperparámetros gobiernan a LoRA. El <strong>rango <code>r</code></strong> es la capacidad del adapter: más alto, más expresivo, más parámetros. Valores típicos van de 8 a 64; 16 es un default razonable para empezar. El <strong>alpha</strong> es un factor de escala: la actualización entra multiplicada por <code>alpha/r</code>. La heurística habitual es <code>alpha = 2·r</code> (o <code>alpha = r</code>), y lo importante es entender que subir alpha le da más peso al adapter frente al modelo congelado. <code>B</code> se inicializa en cero, así que al empezar el entrenamiento <code>ΔW = 0</code> y el modelo arranca comportándose exactamente como el base.</p>
+
+<pre><code class="lang-python">from peft import LoraConfig, get_peft_model
+
+lora = LoraConfig(
+    r=16,                       # rango: la capacidad del adapter
+    lora_alpha=32,              # escala: el update va multiplicado por alpha/r
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],  # a qué capas se les pone adapter
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(base, lora)
+model.print_trainable_parameters()
+# trainable params: 41,943,040 || all params: 8,072,204,288 || trainable%: 0.52</code></pre>
+
+<div class="info">
+  Fijate el <code>trainable%: 0.52</code>: estás entrenando medio por ciento de los parámetros. El artefacto que sale a guardar pesa decenas de MB (los adapters), no los 16 GB del modelo. Eso cambia todo lo que viene después —versionado, serving, tener veinte variantes— y es la razón por la que PEFT no es "una optimización", es el flujo por defecto.
+</div>
+
+<h3>QLoRA: LoRA sobre un modelo cuantizado</h3>
+
+<p>LoRA reduce lo que <em>entrenás</em>, pero el modelo base congelado igual hay que <em>tenerlo cargado</em>: 16 GB en bf16 para un 8B. <strong>QLoRA</strong> ataca eso: carga el modelo base <strong>cuantizado a 4 bits</strong> (con el formato <strong>NF4</strong>, <em>NormalFloat4</em>, diseñado para pesos con distribución normal) y le pone los adapters LoRA encima, que sí viven en bf16. Los cómputos se hacen des-cuantizando al vuelo a bf16, y los gradientes fluyen solo hacia los adapters. El modelo base pasa de 16 GB a ~4–5 GB, y de golpe un 8B entra en una GPU de consumo de 12 GB.</p>
+
+<pre><code class="lang-python">import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import prepare_model_for_kbit_training, get_peft_model
+
+qcfg = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",              # NormalFloat4: el corazón de QLoRA
+    bnb_4bit_compute_dtype=torch.bfloat16,  # los cómputos se hacen en bf16
+    bnb_4bit_use_double_quant=True,         # cuantiza también las constantes de cuantización
+)
+
+base = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    quantization_config=qcfg,
+    device_map="auto",
+)
+base = prepare_model_for_kbit_training(base)   # gradient checkpointing y ajustes para 4-bit
+model = get_peft_model(base, lora)             # los adapters de arriba van en bf16</code></pre>
+
+<p>Los números reales de memoria, para un 8B, ponen la decisión en perspectiva:</p>
+
+<table>
+<thead><tr><th>Estrategia (8B)</th><th>Qué se entrena</th><th>Memoria aprox.</th><th>Hardware típico</th></tr></thead>
+<tbody>
+<tr><td>Full fine-tuning (bf16 + Adam)</td><td>100% de los parámetros</td><td>~120–160 GB</td><td>Varias A100/H100 de 80 GB</td></tr>
+<tr><td>LoRA (base bf16 congelado)</td><td>~0.1–1% (adapters)</td><td>~18–24 GB</td><td>Una A100 de 40 GB</td></tr>
+<tr><td>QLoRA (base 4-bit congelado)</td><td>~0.1–1% (adapters)</td><td>~8–12 GB</td><td>Una GPU de consumo de 12 GB</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El precio de QLoRA no es gratis.</strong> La cuantización a 4 bits introduce un poquito de ruido y el entrenamiento es algo más lento por el des-cuantizado al vuelo. Para la enorme mayoría de las adaptaciones de comportamiento, esa pérdida es imperceptible frente al ahorro de memoria. Pero si buscás exprimir el último punto de calidad y tenés el hardware, LoRA en bf16 (sin cuantizar) le saca una pequeña ventaja. La regla práctica: <strong>QLoRA cuando la memoria es la restricción</strong> (que es casi siempre), LoRA cuando te sobra VRAM.
+</div>
+
+<h2>DS7.4 El dato es el 90%</h2>
+
+<p>Acá está el secreto peor guardado y menos practicado del fine-tuning: <strong>la calidad del dataset importa muchísimo más que el método</strong>. Podés elegir mal entre LoRA y QLoRA y el resultado va a andar; entrenás sobre un dataset sucio, desbalanceado o inconsistente y ninguna elección de hiperparámetros te salva. El modelo aprende <em>exactamente</em> lo que le mostrás, incluidos tus errores, tus sesgos y tus inconsistencias. Basura adentro, comportamiento basura afuera —pero pulido y con la confianza de un modelo grande, que es peor.</p>
+
+<h3>Formato: instrucción/respuesta y chat</h3>
+
+<p>Para SFT hay dos formatos dominantes. El de <strong>instrucción/respuesta</strong> (prompt + completion) y el de <strong>chat</strong> (una lista de turnos con roles). El de chat es hoy el más usado porque calza con cómo se sirven los modelos instruct, y porque el <em>chat template</em> del tokenizer se encarga de poner los tokens especiales de cada rol.</p>
+
+<pre><code class="lang-json">{"messages": [
+  {"role": "system", "content": "Sos el asistente de soporte de Acme. Respondés en pasos numerados."},
+  {"role": "user", "content": "¿Cómo exporto mis facturas del último trimestre?"},
+  {"role": "assistant", "content": "1. Entrá a Facturación &gt; Exportar.\n2. Elegí el rango 'Último trimestre'.\n3. Descargá el CSV con el botón 'Exportar'."}
+]}</code></pre>
+
+<div class="mistake">
+  <strong>El error de consistencia que arruina datasets.</strong> Si la mitad de tus respuestas de ejemplo usan pasos numerados y la otra mitad párrafos corridos, le estás enseñando al modelo que <em>las dos cosas están bien</em> —y va a elegir al azar. El fine-tuning premia la <strong>consistencia despiadada</strong>: si querés pasos numerados, los 500 ejemplos van en pasos numerados. Un dataset chico y férreamente consistente le gana a uno grande y desprolijo, siempre.
+</div>
+
+<h3>Tamaño: menos de lo que creés</h3>
+
+<p>La intuición dice "necesito decenas de miles de ejemplos". Para adaptar <em>comportamiento</em> sobre un buen modelo base, es falso. Con un modelo instruct moderno, unos <strong>cientos de ejemplos de altísima calidad</strong> suelen alcanzar para fijar un formato o un tono; entre 500 y 2.000 es un rango habitual y muchas veces suficiente. La razón es que no le estás enseñando el idioma ni a razonar —eso ya lo trae— sino a <em>aplicar</em> lo que ya sabe con tu forma. Es afinar, no educar desde cero.</p>
+
+<div class="rule">
+  <strong>📌 100 ejemplos impecables &gt; 10.000 ejemplos mediocres.</strong> El tiempo que ibas a gastar consiguiendo diez mil ejemplos ruidosos, gastalo curando quinientos perfectos: revisados a mano, consistentes, cubriendo los casos que importan. El retorno de curar datos es el más alto de todo el proyecto de fine-tuning, y es el que más se saltea porque no es glamoroso.
+</div>
+
+<h3>Diversidad y el peligro del dataset sesgado</h3>
+
+<p>Consistencia en el <em>formato</em>, sí; pero <strong>diversidad en los casos</strong>. Si tus 500 ejemplos son todos preguntas fáciles y felices, el modelo va a colapsar ante el primer caso borde, el cliente enojado o la pregunta ambigua. El dataset tiene que cubrir el rango real de entradas: casos difíciles, entradas mal escritas, preguntas fuera de alcance (y cómo querés que las rechace). Un dataset sesgado hacia un subconjunto produce un modelo que brilla en la demo y se rompe en producción.</p>
+
+<pre><code class="lang-python"># Higiene mínima de dataset ANTES de entrenar: deduplicar y filtrar basura
+from datasets import load_dataset
+
+ds = load_dataset("json", data_files="acme_sft.jsonl", split="train")
+
+def es_valido(ej):
+    r = ej["messages"][-1]["content"]          # la respuesta del assistant
+    return 20 &lt;= len(r) &lt;= 4000 and "TODO" not in r and "lorem ipsum" not in r.lower()
+
+antes = len(ds)
+ds = ds.filter(es_valido)
+# deduplicar por el texto exacto de la respuesta
+vistos, keep = set(), []
+for i, ej in enumerate(ds):
+    h = ej["messages"][-1]["content"].strip()
+    if h not in vistos:
+        vistos.add(h); keep.append(i)
+ds = ds.select(keep)
+print(f"{antes} -&gt; {len(ds)} ejemplos tras limpiar")   # sorpresa habitual: se cae 30%</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Los errores del dataset se vuelven comportamiento permanente.</strong> Si en tus ejemplos hay tres respuestas con un dato mal, el modelo no va a "promediarlo": va a aprender que ese error es una respuesta válida y lo va a reproducir con seguridad. Peor con datos sensibles: si el dataset tiene datos personales reales, el modelo puede memorizarlos y filtrarlos después. Revisá el dataset como revisarías código que va a producción, porque eso es exactamente lo que es.
+</div>
+
+<h2>DS7.5 SFT: Supervised Fine-Tuning con trl</h2>
+
+<p>El <strong>SFT</strong> (fine-tuning supervisado) es el caballito de batalla: le mostrás pares entrada→respuesta correcta y el modelo aprende a producir esas respuestas. La librería estándar es <strong>trl</strong> (de Hugging Face), que se apoya en <code>transformers</code>, <code>datasets</code> y <code>peft</code>. El flujo es corto, y todo lo importante está en los detalles.</p>
+
+<pre><code class="lang-bash"># Stack de fine-tuning 2026 — Python 3.11+, PyTorch 2.5+, CUDA 12.x
+pip install "torch&gt;=2.5" --index-url https://download.pytorch.org/whl/cu124
+pip install transformers datasets accelerate
+pip install peft trl bitsandbytes       # PEFT + entrenamiento + cuantización 4-bit
+
+# Verificá que la GPU esté visible ANTES de gastar una hora de setup
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"</code></pre>
+
+<h3>La máscara de loss: entrenar solo sobre la respuesta</h3>
+
+<p>Este es el detalle que separa un SFT que funciona de uno que aprende lo que no debe. Cuando le pasás al modelo un ejemplo completo (prompt + respuesta), la pérgunta es: ¿sobre qué tokens calcula el error? Si calcula el error sobre <em>todo</em>, el modelo gasta capacidad aprendiendo a <strong>reproducir los prompts</strong> —que en producción no genera, se los das vos— en vez de a responderlos. La solución es la <strong>máscara de loss</strong>: los tokens del prompt se marcan con <code>-100</code> (el valor que la cross-entropy ignora) y el gradiente sale <strong>solo de la respuesta</strong>.</p>
+
+<pre><code class="lang-python">from trl import SFTConfig, SFTTrainer
+
+cfg = SFTConfig(
+    output_dir="out-acme",
+    num_train_epochs=2,               # 1-3 suele bastar; más es sobreajuste
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,    # batch efectivo = 2 * 8 = 16
+    learning_rate=2e-4,               # LR alto porque solo movés el adapter
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    max_length=2048,
+    logging_steps=10,
+    assistant_only_loss=True,         # LA MÁSCARA: loss solo sobre turnos del assistant
+)
+
+trainer = SFTTrainer(model=base, args=cfg, train_dataset=ds, peft_config=lora)
+trainer.train()
+trainer.save_model("adapter-acme")    # guarda SOLO el adapter (~80 MB), no el 8B</code></pre>
+
+<div class="info">
+  El nombre exacto del flag de máscara cambió entre versiones de <code>trl</code> (vas a ver <code>assistant_only_loss</code>, <code>completion_only_loss</code>, o el <code>DataCollatorForCompletionOnlyLM</code> según la versión y el formato del dataset). Lo que <strong>no</strong> cambia es el invariante: <em>el loss se calcula solo sobre lo que el modelo debe generar</em>. Verificá en tu versión que la máscara esté activa —es el bug silencioso más común del SFT.
+</div>
+
+<h3>Los hiperparámetros que de verdad mueven la aguja</h3>
+
+<ul>
+  <li><strong>Learning rate.</strong> Con LoRA/QLoRA se usa alto (1e-4 a 2e-4) porque solo entrenás el adapter. En full fine-tuning es diez o veinte veces más chico (~1e-5): mover todos los pesos con LR alto los destroza.</li>
+  <li><strong>Épocas.</strong> 1 a 3. Fine-tuning sobreajusta rapidísimo con datasets chicos; si a la época 4 el loss de train sigue bajando pero el modelo empeora en tu golden set, estás memorizando.</li>
+  <li><strong>Longitud de secuencia (<code>max_length</code>).</strong> Truncar de más te corta respuestas; de menos, desperdicia memoria. Miralo contra la distribución real de largos de tu dataset.</li>
+  <li><strong>Rango y alpha de LoRA.</strong> <code>r</code> más alto = más capacidad y más riesgo de sobreajuste. Empezá en 16/32 y subí solo si la tarea lo pide.</li>
+  <li><strong>Batch efectivo.</strong> Con <code>gradient_accumulation_steps</code> simulás batches grandes sin más VRAM. Batches muy chicos hacen el entrenamiento ruidoso.</li>
+</ul>
+
+<h2>DS7.6 Alineación por preferencias: de RLHF a DPO</h2>
+
+<p>SFT te lleva lejos, pero tiene un techo: le enseña al modelo a imitar respuestas "buenas", y no siempre es fácil <em>escribir</em> la respuesta ideal. A veces es mucho más natural <strong>comparar</strong>: "entre estas dos respuestas, esta es mejor que esta otra". Ahí entra la <strong>alineación por preferencias</strong>, y es lo que hizo que los modelos de chat pasaran de correctos pero robóticos a útiles y con criterio.</p>
+
+<h3>RLHF, conceptualmente (y por qué duele)</h3>
+
+<p>El método clásico es <strong>RLHF</strong> (<em>Reinforcement Learning from Human Feedback</em>), en tres etapas: (1) hacés SFT; (2) entrenás un <strong>modelo de recompensa</strong> aparte que, dado un par de respuestas, aprende a puntuar cuál prefieren los humanos; (3) usás aprendizaje por refuerzo (típicamente PPO) para optimizar el modelo contra ese modelo de recompensa. Funciona, pero es una máquina cara y quisquillosa: mantenés <em>dos</em> modelos extra en memoria, el loop de RL es inestable, y afinarlo es un arte. Para la mayoría de los equipos, RLHF completo es inalcanzable.</p>
+
+<h3>DPO: el atajo que se comió el problema</h3>
+
+<div class="concept">
+  <strong>💡 Qué hizo DPO.</strong> <strong>DPO</strong> (<em>Direct Preference Optimization</em>) es hoy el caballo de batalla del fine-tuning por preferencias. Su truco: demostró que se puede optimizar <strong>directo sobre los pares de preferencia</strong>, sin entrenar un modelo de recompensa aparte y sin loop de RL. Reformula el problema como una pérdida de clasificación simple sobre pares <em>(elegido, rechazado)</em>, usando el propio modelo SFT como referencia. Menos piezas móviles, mucho más estable, y entrenable con las mismas herramientas que el SFT.</div>
+
+<p>El dataset de DPO no tiene "la respuesta correcta": tiene, para cada prompt, una respuesta <strong>elegida</strong> (chosen) y una <strong>rechazada</strong> (rejected). El modelo aprende a subir la probabilidad de la elegida y bajar la de la rechazada, sin alejarse demasiado del modelo de referencia (eso lo controla el hiperparámetro <code>beta</code>).</p>
+
+<pre><code class="lang-python">from trl import DPOConfig, DPOTrainer
+
+# Cada ejemplo: {"prompt": "...", "chosen": "respuesta buena", "rejected": "respuesta peor"}
+cfg = DPOConfig(
+    output_dir="out-dpo",
+    beta=0.1,                  # cuánto se puede alejar del modelo de referencia
+    learning_rate=5e-6,        # MUCHO más bajo que en SFT
+    num_train_epochs=1,
+    bf16=True,
+)
+
+# Partís del modelo YA hecho SFT. Con LoRA, la referencia es el base+SFT congelado
+# y la policy es el adapter entrenable: no necesitás una segunda copia en memoria.
+trainer = DPOTrainer(model=sft_model, args=cfg, train_dataset=prefs, peft_config=lora)
+trainer.train()</code></pre>
+
+<div class="warn">
+  <strong>Cuándo hace falta DPO —y cuándo no.</strong> DPO es la segunda etapa, después del SFT, y sirve cuando lo que querés ajustar es <em>preferencia</em>: que entre dos respuestas válidas elija el tono más adecuado, que sea más conciso, que rechace mejor lo que no corresponde. Para fijar un <strong>formato</strong> o una <strong>tarea</strong>, el SFT solo casi siempre alcanza y DPO es sobreingeniería. No agregues una etapa de preferencias porque quede sofisticado: agregala cuando tengas un problema de preferencias de verdad y datos de pares para resolverlo.
+</div>
+
+<h2>DS7.7 Herramientas: Unsloth, Torchtune, Axolotl</h2>
+
+<p>Sobre el stack base (transformers + peft + trl) hay tres herramientas que vale la pena conocer, cada una optimizada para un escenario distinto. Elegir la correcta te ahorra días.</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Fuerte en</th><th>Cuándo elegirla</th></tr></thead>
+<tbody>
+<tr><td><strong>Unsloth</strong></td><td>Velocidad y memoria en una sola GPU: kernels propios que dan ~2× de velocidad y hasta ~60% menos VRAM</td><td>QLoRA de un modelo grande en una sola GPU (de consumo o cloud). El default para empezar barato.</td></tr>
+<tr><td><strong>Torchtune</strong></td><td>PyTorch-native, oficial, recetas limpias (LoRA/QLoRA/full/DPO), buen soporte distribuido</td><td>Cuando querés idioms de PyTorch, multi-GPU serio, e integrarlo a un stack ya PyTorch.</td></tr>
+<tr><td><strong>Axolotl</strong></td><td>Configuración por YAML, muchísimos modelos y métodos, corridas reproducibles</td><td>Equipos que quieren experimentos declarativos y versionables, sin escribir el loop.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># Unsloth: el mismo QLoRA, más rápido y con menos memoria, en pocas líneas
+from unsloth import FastLanguageModel
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "unsloth/Llama-3.1-8B-Instruct-bnb-4bit",   # base ya cuantizado en 4-bit
+    max_seq_length=2048,
+    load_in_4bit=True,
+)
+model = FastLanguageModel.get_peft_model(
+    model, r=16, lora_alpha=32,
+    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+)
+# A partir de acá seguís con SFTTrainer de trl exactamente igual.</code></pre>
+
+<div class="tip">
+  No hay una herramienta "mejor": hay una mejor para tu restricción. ¿Una sola GPU y querés que entre y vaya rápido? Unsloth. ¿Cluster con varias GPUs y ya vivís en PyTorch? Torchtune. ¿Un equipo que corre veinte experimentos y necesita que sean reproducibles por config? Axolotl. Las tres terminan produciendo adapters LoRA compatibles con <code>peft</code>, así que la decisión no te encierra.
+</div>
+
+<h2>DS7.8 Evaluar el fine-tuning</h2>
+
+<p>Un fine-tuning sin evaluación es fe, no ingeniería. Y evaluar acá tiene una trampa propia: no alcanza con medir si mejoró en la tarea objetivo; hay que medir, <strong>en paralelo</strong>, si no <em>rompió</em> algo que antes andaba. Fine-tunear sobre datos estrechos puede degradar capacidades generales del modelo —el fenómeno se llama <strong>catastrophic forgetting</strong> (olvido catastrófico)— y es sigiloso: tu modelo ahora responde bárbaro los tickets de soporte y de golpe no sabe sumar ni seguir una instrucción simple que antes seguía.</p>
+
+<div class="concept">
+  <strong>💡 El golden set.</strong> Antes de entrenar, congelás un conjunto de casos representativos con su respuesta esperada —el <strong>golden set</strong>— que <em>no</em> entra al entrenamiento. Es tu vara. Después evaluás <strong>siempre contra el baseline</strong> (el modelo base, con prompt/few-shot/RAG) en dos ejes: (1) ¿mejoró en la tarea objetivo?, y (2) ¿se mantuvieron las capacidades generales? Sin comparación contra el baseline no sabés si el fine-tuning aportó o solo movió cosas de lugar. Las métricas y el diseño de evaluación los viste en <a href="../index.html">DS3</a> y <a href="../index.html">DS5</a>: acá aplican igual.
+</div>
+
+<pre><code class="lang-python"># Evaluar SIEMPRE en dos ejes: tarea objetivo Y capacidades generales
+def evaluar(modelo, golden, generales):
+    tarea    = sum(acierta(modelo, ej) for ej in golden)    / len(golden)
+    general  = sum(acierta(modelo, ej) for ej in generales) / len(generales)
+    return {"tarea": tarea, "general": general}
+
+base_m = evaluar(modelo_base,       golden, generales)
+ft_m   = evaluar(modelo_finetuneado, golden, generales)
+
+print("baseline    ", base_m)   # p.ej. {'tarea': 0.61, 'general': 0.88}
+print("fine-tuneado ", ft_m)    # p.ej. {'tarea': 0.93, 'general': 0.84}
+# tarea: 0.61 -&gt; 0.93  (el objetivo mejoró, era el punto)
+# general: 0.88 -&gt; 0.84  (cayó un poco: aceptable, pero VIGILALO; si cae fuerte, es forgetting)</code></pre>
+
+<div class="mistake">
+  <strong>La demo que engaña.</strong> Es facilísimo probar tres ejemplos lindos, ver que el modelo fine-tuneado responde precioso, y declararlo un éxito. Esos tres ejemplos son casi siempre parecidos a los de entrenamiento. El golden set existe justamente para eso: casos que el modelo no vio, medidos contra el baseline, con el eje general puesto para cazar el olvido. Si tu evaluación es "lo probé y anda bien", no evaluaste.
+</div>
+
+<h2>DS7.9 Servir un modelo fine-tuneado</h2>
+
+<p>Terminaste el fine-tuning y tenés un adapter LoRA de 80 MB. ¿Cómo lo servís? Acá hay una decisión de arquitectura con consecuencias reales de costo y flexibilidad: <strong>mergear o no mergear</strong>.</p>
+
+<p>El adapter no es un modelo: es un delta que se carga <em>sobre</em> el modelo base. Con <code>peft</code> lo cargás en caliente y ya tenés el modelo adaptado. La pregunta es si dejás el adapter separado o lo "horneás" dentro de los pesos del base.</p>
+
+<pre><code class="lang-python">from transformers import AutoModelForCausalLM
+from peft import PeftModel
+
+base = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+model = PeftModel.from_pretrained(base, "adapter-acme")   # base + adapter, en caliente
+
+# --- Opción A: NO mergear (base + adapter separados) ---
+#   Un solo peso base en memoria sirve MUCHOS adapters distintos, ruteando por request.
+#   Servidores como vLLM sirven multi-LoRA sobre un mismo base: ideal para multi-tenant.
+#   Costo: un pelín de overhead por request al aplicar el adapter.
+
+# --- Opción B: MERGEAR (hornear el adapter en los pesos) ---
+merged = model.merge_and_unload()          # devuelve un modelo autónomo
+merged.save_pretrained("acme-8b-merged")   # un 8B completo, sin dependencia del adapter
+#   Sin overhead por request, pero perdés el hot-swap y cada variante es una copia entera del 8B.</code></pre>
+
+<table>
+<thead><tr><th>Criterio</th><th>No mergear (base + adapters)</th><th>Mergear</th></tr></thead>
+<tbody>
+<tr><td>Muchas variantes / multi-tenant</td><td>✅ Un base sirve N adapters</td><td>❌ Una copia del 8B por variante</td></tr>
+<tr><td>Overhead por request</td><td>Pequeño</td><td>✅ Ninguno</td></tr>
+<tr><td>Hot-swap de adapters</td><td>✅ Sí, en runtime</td><td>❌ No</td></tr>
+<tr><td>Simplicidad de despliegue</td><td>Depende del adapter + base</td><td>✅ Un solo artefacto autónomo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La heurística de serving.</strong> ¿Tenés <em>un</em> modelo fine-tuneado y querés máxima simplicidad y latencia? Mergealo. ¿Tenés <em>muchos</em> adapters (uno por cliente, por tarea, por idioma) y querés amortizar un solo base? No mergees y serví multi-LoRA. El detalle de la infra de inferencia y la observabilidad los cubren <a href="../index.html">DS4</a> y <a href="../index.html">DS5</a>; lo estructural es entender que el adapter separado es lo que hace barato tener veinte variantes.
+</div>
+
+<h2>DS7.10 El costo real</h2>
+
+<p>Fine-tunear tiene dos costos que la euforia del notebook esconde: las <strong>horas de GPU</strong> del entrenamiento, y —mucho más grande— el costo de <strong>servir el modelo propio 24×7</strong>. Una GPU dedicada se paga aunque esté ociosa. Y ahí aparece la pregunta que hay que hacerse antes de empezar: <strong>¿no me sale más barato la API de un modelo grande?</strong></p>
+
+<pre><code class="lang-python"># Comparar API de un modelo grande vs servir tu modelo fine-tuneado
+def comparar(api_usd_por_mtok, tokens_mes_millones, gpu_usd_hora):
+    api_mes      = api_usd_por_mtok * tokens_mes_millones
+    selfhost_mes = gpu_usd_hora * 24 * 30      # la GPU se paga 24x7, ociosa incluida
+    return api_mes, selfhost_mes
+
+# Escenario A: bajo volumen, tráfico intermitente
+api, self = comparar(api_usd_por_mtok=3.0, tokens_mes_millones=20, gpu_usd_hora=1.50)
+print(api, self)      # 60  vs  1080  -&gt;  la API gana por lejos
+
+# Escenario B: alto volumen sostenido con un modelo chico y eficiente
+api, self = comparar(api_usd_por_mtok=3.0, tokens_mes_millones=2000, gpu_usd_hora=1.50)
+print(api, self)      # 6000  vs  1080  -&gt;  ahora self-host tiene sentido</code></pre>
+
+<div class="info">
+  El cruce depende casi por completo del <strong>volumen y su regularidad</strong>. A bajo volumen o tráfico spiky, la API de un modelo grande casi siempre gana: pagás por token, no por GPU ociosa, y no mantenés infra. Self-host y fine-tuning se justifican con <strong>volumen alto y sostenido</strong>, donde un modelo chico fine-tuneado sirviendo a tope amortiza la GPU y le gana a pagar por millón de tokens. Sumá siempre el costo oculto: MLOps, monitoreo, actualizaciones, guardias. La GPU es la parte visible del iceberg.
+</div>
+
+<h2>DS7.11 Cuándo NO fine-tunear</h2>
+
+<p>El consejo más valioso de este módulo es una lista de razones para <strong>no</strong> hacerlo. Fine-tuning es seductor —suena a "modelo propio"— y esa seducción hace que se elija por deseo, no por diagnóstico.</p>
+
+<ul>
+  <li><strong>Cuando RAG alcanza.</strong> Si lo que falta es conocimiento, sobre todo si cambia, fine-tuning es la herramienta equivocada. RAG es más barato, actualizable en el acto y auditable.</li>
+  <li><strong>Cuando no tenés datos de calidad.</strong> Sin un dataset curado, consistente y representativo, el fine-tuning te da un modelo peor con más pasos. No hay método que compense datos malos.</li>
+  <li><strong>Cuando el prompt engineering no se agotó.</strong> Si nunca probaste en serio un system prompt bien escrito ni un few-shot, no ganaste el derecho a fine-tunear. Empezá por el escalón barato.</li>
+  <li><strong>Cuando el modelo base ya hace la tarea.</strong> A veces el modelo ya la hace bien y el equipo fine-tunea "para mejorarla" un margen que ni se mide. Si el base pasa tu golden set, guardá la GPU.</li>
+</ul>
+
+<div class="danger">
+  <strong>⚠️ El anti-patrón número uno.</strong> "Queremos que el modelo <em>sepa</em> de nuestro producto, así que vamos a fine-tunear." Nueve de cada diez veces, lo que quieren es <em>conocimiento</em> (RAG), no <em>comportamiento</em> (fine-tuning). Terminan con un modelo que suena confiado, alucina detalles del producto, y quedó desactualizado el día que cambió el catálogo. El worked example de abajo es exactamente ese equipo —y cómo se lo desarma.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "queremos que el modelo sepa de nuestro producto"</h2>
+
+<blockquote>Un equipo de producto llega decidido: "Vamos a fine-tunear un modelo para que sepa todo de nuestra plataforma —las features, los precios, cómo se configura cada cosa— y responda como nuestro equipo de soporte." Ya reservaron GPUs. ¿Está bien planteado?</blockquote>
+
+<p><strong>Paso 1 — Separar cómo de qué.</strong> En vez de aceptar el "fine-tuneemos todo", listamos <em>qué</em> quieren exactamente y clasificamos cada ítem con la pregunta de DS7.1: ¿esto es forma o conocimiento? ¿Cambia el mes que viene?</p>
+
+<table>
+<thead><tr><th>Lo que quieren</th><th>¿Forma o conocimiento?</th><th>¿Cambia?</th><th>Técnica</th></tr></thead>
+<tbody>
+<tr><td>Precios y planes actuales</td><td>Conocimiento</td><td>Sí, seguido</td><td>RAG</td></tr>
+<tr><td>Qué features existen y qué hace cada una</td><td>Conocimiento</td><td>Sí, con cada release</td><td>RAG</td></tr>
+<tr><td>Pasos de configuración de la plataforma</td><td>Conocimiento</td><td>Sí</td><td>RAG</td></tr>
+<tr><td>Responder en pasos numerados, tono de la marca</td><td>Forma</td><td>No</td><td>Fine-tuning</td></tr>
+<tr><td>Estructura fija: resumen + pasos + link de ayuda</td><td>Forma</td><td>No</td><td>Fine-tuning</td></tr>
+<tr><td>Rechazar con elegancia lo fuera de alcance</td><td>Forma</td><td>No</td><td>Fine-tuning</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 2 — El diagnóstico.</strong> El <strong>~80%</strong> de lo que pedían es <em>conocimiento que cambia</em>: eso va a <a href="../ds6-rag/lecture.html">RAG</a>, y fine-tunearlo hubiera sido un desastre —cada cambio de precio obligaría a reentrenar y reevaluar. El <strong>~20%</strong> restante es <em>forma</em>: la estructura de la respuesta y el tono, que sí es estable y sí justifica fine-tuning. El equipo estaba por gastar semanas de GPU en el 80% equivocado.</p>
+
+<p><strong>Paso 3 — Diseñar la solución combinada.</strong> No es "RAG o fine-tuning": es RAG <em>para</em> el conocimiento y un QLoRA chico <em>para</em> la forma, evaluados contra el baseline.</p>
+
+<table>
+<thead><tr><th>Parte</th><th>Técnica</th><th>Detalle</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>Conocimiento (features, precios, config)</td><td>RAG (DS6)</td><td>Retrieval sobre los docs de producto, inyectado en contexto</td><td>Bajo · actualizable sin reentrenar</td></tr>
+<tr><td>Forma (estructura + tono + rechazos)</td><td>QLoRA sobre ~500 ejemplos</td><td>SFT con máscara de loss; adapter de ~80 MB sobre un 8B</td><td>Unas horas de una GPU de 12 GB</td></tr>
+<tr><td>Validación</td><td>Golden set vs baseline</td><td>Base+RAG+prompt vs (base+QLoRA)+RAG, en tarea y general</td><td>Bajo · pero imprescindible</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># El pipeline combinado, en esqueleto: fine-tuning para la FORMA, RAG para el QUÉ
+# 1) SFT (QLoRA) con 500 ejemplos que demuestran SOLO la forma deseada
+#    (la respuesta usa el tono/estructura; el conocimiento concreto no se memoriza)
+adapter = entrenar_qlora(base="Llama-3.1-8B-Instruct", data="forma_soporte.jsonl", r=16)
+
+# 2) En runtime: RAG trae el conocimiento fresco, el modelo fine-tuneado le da forma
+def responder(pregunta):
+    contexto = recuperar_docs(pregunta)              # RAG (DS6): precios/features ACTUALES
+    prompt   = armar_prompt(pregunta, contexto)      # el conocimiento entra por contexto
+    return modelo_ft.generate(prompt)                # el adapter pone estructura y tono
+
+# 3) Evaluar SIEMPRE contra el baseline, en golden set, en dos ejes (DS7.8)
+assert evaluar(pipeline_ft_rag, golden)["tarea"]   &gt; evaluar(base_rag, golden)["tarea"]
+assert evaluar(pipeline_ft_rag, golden)["general"] &gt;= 0.83   # no romper capacidades generales</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá RAG".</strong> Es que "queremos que el modelo sepa X" casi nunca es una sola cosa: es un 80% de conocimiento y un 20% de forma, mezclados, y el trabajo senior es <em>separarlos</em> antes de reservar una GPU. La solución correcta casi siempre combina las dos técnicas —cada una en la parte del problema que le toca— y se valida contra el baseline para probar que aportó. El equipo terminó con menos costo, conocimiento siempre actualizado, y una respuesta que suena a su marca. Ninguna de esas tres cosas la daba el "fine-tuneemos todo" del principio.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu equipo quiere que el chatbot conozca los precios de tu catálogo, que cambian cada semana. ¿Fine-tuning o RAG, y por qué?</summary>
+<p>RAG, sin dudarlo. Los precios son <strong>conocimiento que cambia</strong>: la respuesta correcta es distinta cada semana, y tenés que poder auditar de dónde salió el número. Fine-tunearlos significaría reentrenar y reevaluar el modelo cada vez que cambia un precio —lento, caro y frágil— y encima el modelo alucinaría precios viejos con total seguridad. Con RAG, el precio actual entra por contexto en cada consulta, se actualiza modificando un documento, y es trazable. La regla que lo decide en un segundo: "¿esto cambia el mes que viene?". Si sí, es conocimiento, va a RAG.</p></details>
+
+<details><summary>Vas a hacer QLoRA de un modelo de 8B en una GPU de 12 GB. ¿Qué es lo que hace que entre, si en bf16 el modelo solo ya pesa 16 GB?</summary>
+<p>Dos cosas combinadas. Primero, <strong>QLoRA carga el modelo base cuantizado a 4 bits</strong> (formato NF4): un 8B pasa de ~16 GB a ~4–5 GB. Segundo, <strong>LoRA congela ese base y solo entrena los adapters de bajo rango</strong> (~0.1–1% de los parámetros), así que los gradientes y los estados del optimizador de Adam —que en full fine-tuning son el grueso de la memoria, ~16 bytes por parámetro— viven solo sobre esos poquísimos parámetros del adapter. El base cuantizado y congelado no aporta gradientes ni estados de optimizador. Entre eso y el gradient checkpointing, el total baja a ~8–12 GB. No se borran capas ni se entrena todo "más rápido": se cuantiza el base y se entrena un delta chico.</p></details>
+
+<details><summary>Fine-tuneaste y en la demo el modelo responde bárbaro los casos de tu dominio. ¿Por qué eso todavía no es una evaluación válida?</summary>
+<p>Porque una demo con casos parecidos a los de entrenamiento no mide las dos cosas que importan. Falta (1) comparar <strong>contra el baseline</strong> —el modelo base con prompt/few-shot/RAG— para saber si el fine-tuning realmente aportó y no solo movió cosas de lugar; y (2) medir en un eje aparte si <strong>no se rompieron las capacidades generales</strong> (catastrophic forgetting): un modelo puede volverse un genio de tu dominio y perder la habilidad de seguir instrucciones simples que antes tenía. La evaluación válida usa un <strong>golden set</strong> congelado (casos que el modelo no vio), mide tarea objetivo y capacidades generales, y compara siempre contra el baseline. "Lo probé y anda bien" no es eso.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Fine-tuning cambia <strong>cómo</strong> responde el modelo (forma, tono, tarea), <strong>no</strong> le agrega conocimiento confiable. Para conocimiento —sobre todo si cambia— está <strong>RAG</strong>. La pregunta "¿esto cambia el mes que viene?" decide el 90% de los casos.</li>
+  <li>Lo más común no es elegir uno: es <strong>combinar</strong> fine-tuning (comportamiento) con RAG (conocimiento fresco). Se potencian.</li>
+  <li>Hay un <strong>espectro</strong>: prompt engineering → few-shot → RAG → fine-tuning → pre-training. No saltes un escalón sin agotar el anterior; cada uno multiplica costo e irreversibilidad.</li>
+  <li><strong>PEFT</strong> es el default: <strong>LoRA</strong> entrena adapters de bajo rango (~0.5% de los params); <strong>QLoRA</strong> cuantiza el base a 4-bit (NF4) y mete un 8B en 12 GB. Full fine-tuning cuesta ~120–160 GB y casi nunca hace falta.</li>
+  <li><strong>El dato es el 90%.</strong> Consistencia férrea de formato, diversidad de casos, cientos (no decenas de miles) de ejemplos impecables. Los errores del dataset se vuelven comportamiento permanente.</li>
+  <li><strong>SFT</strong> con <code>trl</code>: la <strong>máscara de loss</strong> (entrenar solo sobre la respuesta) es el detalle que no podés equivocar. LR alto para LoRA, 1–3 épocas, cuidado con el sobreajuste.</li>
+  <li><strong>DPO</strong> reemplazó al RLHF completo para preferencias: optimiza directo de pares (elegido/rechazado), sin modelo de recompensa aparte ni loop de RL. Es la segunda etapa, y solo cuando el problema es de preferencia.</li>
+  <li><strong>Herramientas</strong>: Unsloth (una GPU, rápido y liviano), Torchtune (PyTorch-native, distribuido), Axolotl (config por YAML, reproducible).</li>
+  <li><strong>Evaluá</strong> contra el baseline, con golden set, en dos ejes: tarea objetivo y capacidades generales (para cazar el <em>catastrophic forgetting</em>).</li>
+  <li><strong>Servir</strong>: adapter separado (un base, muchos adapters, multi-tenant) vs mergeado (autónomo, sin overhead). Elegí por cantidad de variantes.</li>
+  <li><strong>Costo real</strong>: a bajo volumen o tráfico spiky, la API de un modelo grande casi siempre gana; self-host + fine-tuning se justifican con volumen alto y sostenido.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá tres pedidos reales de "queremos que el modelo sepa/haga X" de tu trabajo o inventados, y clasificá cada uno como <em>forma</em> (fine-tuning) o <em>conocimiento</em> (RAG) usando la pregunta "¿esto cambia el mes que viene?". Justificá cada uno en dos líneas.</li>
+  <li>Con la fórmula de ~16 bytes/parámetro, calculá la memoria de un full fine-tuning para un modelo de 3B, 8B y 70B. Después estimá cuánto baja con QLoRA (base a 4-bit + adapter chico) y armá una tabla con el hardware necesario en cada caso.</li>
+  <li>Escribí un <code>LoraConfig</code> para un 8B con <code>r=8</code> y otro con <code>r=64</code>. Corré <code>print_trainable_parameters()</code> (o estimalo a mano) y explicá qué ganás y qué arriesgás al subir el rango.</li>
+  <li>Armá 20 ejemplos de un dataset de chat para una tarea tuya, con <strong>consistencia férrea de formato</strong>. Después meté a propósito 3 ejemplos inconsistentes y escribí qué comportamiento erróneo esperarías que aprenda el modelo por culpa de esos 3.</li>
+  <li>Explicá con tus palabras la <strong>máscara de loss</strong> del SFT: qué pasa si entrenás sobre el prompt <em>y</em> la respuesta, y por qué se marcan los tokens del prompt con <code>-100</code>. Después revisá la doc de tu versión de <code>trl</code> y anotá cómo se activa la máscara ahí.</li>
+  <li>Diseñá el dataset de un DPO (pares prompt/chosen/rejected) para "que el asistente sea más conciso". Escribí 3 pares y explicá por qué SFT solo no resolvería esto tan bien como una etapa de preferencias.</li>
+  <li>Usando la función <code>comparar()</code> de DS7.10, encontrá el volumen de tokens/mes donde self-host (GPU a $1.50/h, 24×7) empata con una API a $3/Mtok. Repetí con una GPU a $2.50/h y explicá cómo se mueve el punto de equilibrio.</li>
+</ol>
+
+<section class="quiz" id="quizDS7">
+  <style>
+    #quizDS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS7 .q{margin-bottom:1.5rem}
+    #quizDS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS7 .opt:hover{border-color:var(--accent)}
+    #quizDS7 .opt:disabled{cursor:default}
+    #quizDS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizDS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizDS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS7 .exp.show{display:block}
+    #quizDS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Un equipo quiere que el modelo conozca los precios de su catálogo, que cambian cada semana. ¿Fine-tuning o RAG?</p>
+    <button class="opt">Fine-tuning, así el conocimiento queda "adentro" del modelo y responde más rápido</button>
+    <button class="opt">RAG: es conocimiento que cambia; fine-tunearlo obligaría a reentrenar cada semana y el modelo alucinaría precios viejos</button>
+    <button class="opt">Pre-training desde cero incorporando los precios en el corpus</button>
+    <div class="exp">Los precios son conocimiento volátil y auditable: el caso de manual para RAG. Fine-tuning cambia <em>cómo</em> responde, no <em>qué</em> sabe de forma confiable; meter datos que cambian en los pesos significa reentrenar con cada cambio y arriesgar alucinaciones de valores viejos. La pregunta "¿esto cambia el mes que viene?" lo resuelve: si sí, es conocimiento, va a RAG.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Estás por hacer QLoRA de un modelo de 8B en una GPU de 12 GB. ¿Qué hace que entre en esa memoria?</p>
+    <button class="opt">El base se carga cuantizado a 4-bit (~4–5 GB) y solo se entrenan los adapters de bajo rango; los estados del optimizador viven sobre esos pocos parámetros</button>
+    <button class="opt">LoRA entrena todos los parámetros del modelo pero de forma más rápida</button>
+    <button class="opt">QLoRA elimina la mitad de las capas del modelo para que ocupe menos</button>
+    <div class="exp">QLoRA combina dos cosas: cuantiza el modelo base a 4 bits (NF4), que baja un 8B de ~16 GB a ~4–5 GB, y lo congela; LoRA entrena solo los adapters (~0.5% de los params), así que gradientes y estados de Adam —el grueso de la memoria en full fine-tuning, ~16 bytes por parámetro— existen solo sobre esos poquísimos parámetros. No se borran capas ni se entrena "todo más rápido".</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>3. Hiciste SFT sin máscara de loss: entrenaste calculando el error sobre el prompt <em>y</em> la respuesta. ¿Cuál es el riesgo?</p>
+    <button class="opt">Ninguno: da igual sobre qué tokens caiga el loss</button>
+    <button class="opt">El entrenamiento no compila sin la máscara activada</button>
+    <button class="opt">El modelo gasta capacidad aprendiendo a reproducir los prompts en vez de a responderlos, y la señal útil de la tarea se diluye</button>
+    <div class="exp">La máscara de loss marca los tokens del prompt con <code>-100</code> para que la cross-entropy los ignore y el gradiente salga solo de la respuesta —lo único que el modelo genera en producción. Sin máscara, el modelo también aprende a "predecir" los prompts (que en realidad se los das vos), desperdiciando capacidad y diluyendo la señal de la tarea. Es el bug silencioso más común del SFT: compila igual, pero el resultado es peor.</div>
+  </div>
+
+  <div class="score" id="scoreDS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds6-rag/lecture.html">← DS6: RAG en producción</a>
+  <a href="../ds8-observabilidad/lecture.html">DS8: Observabilidad y drift →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS2 — Entrenamiento a escala: PyTorch en serio · Datos/ML Senior</title>
+  <meta name="description" content="El bucle de entrenamiento por dentro (autograd, zero_grad, .item()), torch.compile, precisión mixta bf16, memoria de GPU (checkpointing y accumulation), el DataLoader como cuello de botella, DDP vs FSDP, reproducibilidad, LR schedules, debugging de loss/NaNs y experiment tracking.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS2</span>
+  <span class="badge">⏱ 35–95 min</span>
+  <span class="badge">🎯 Pre-req: DS1</span>
+  <span class="badge">🔥 PyTorch</span>
+</div>
+
+<article>
+
+<h1>DS2 — Entrenamiento a escala: PyTorch en serio</h1>
+
+<h2>DS2.0 Por qué este módulo</h2>
+
+<p>En el curso base entrenaste una red: definiste el modelo, un optimizador, un bucle con <code>loss.backward()</code>, y la loss bajó. Funcionó. Ese es el punto de partida, no el destino. <strong>Entrenar un modelo que converge es fácil. Entrenar uno que converge rápido, reproducible y sin desperdiciar la GPU es el oficio</strong>, y es lo que separa a alguien que "sabe PyTorch" de alguien a quien le confiás una corrida de 40 horas en una A100 que cuesta plata por minuto.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo lo que hace lento, caro o irreproducible a un entrenamiento se explica con cuatro cuellos de botella concretos: <strong>(1)</strong> la GPU esperando datos que el CPU no alcanza a preparar, <strong>(2)</strong> cómputo en precisión más alta de la que hace falta, <strong>(3)</strong> memoria de GPU mal administrada que te obliga a batches diminutos, y <strong>(4)</strong> falta de instrumentación, que hace que ni siquiera sepas cuál de los tres te está matando. Este módulo es, sobre todo, aprender a <em>medir</em> cuál es tu cuello y aplicar la herramienta correcta.
+</div>
+
+<p>Nada de esto es opcional en 2026. Con <strong>PyTorch 2.5+</strong> sobre <strong>CUDA 12.x</strong>, <code>torch.compile</code> dejó de ser un experimento y es el estándar; la precisión mixta en <strong>bf16</strong> es la configuración por defecto de cualquier entrenamiento serio; y las técnicas de eficiencia de memoria —<em>gradient checkpointing</em>, <em>accumulation</em>, FSDP— son parte del vocabulario básico, no trucos de expertos. Este no es un módulo sobre <em>qué</em> es una red neuronal: es sobre cómo se la entrena en producción sin quemar presupuesto.</p>
+
+<div class="info">
+  Damos por sabido el pre-requisito de <a href="../ds1-pipelines/lecture.html">DS1 (Pipelines de datos)</a>: acá los datos ya llegan versionados y limpios. Y no repetimos la introducción a PyTorch del curso base (M10–M11): asumimos que sabés qué es un tensor, un <code>Module</code> y un optimizador. Empezamos donde ese curso terminó.
+</div>
+
+<h2>DS2.1 El bucle de entrenamiento por dentro</h2>
+
+<p>Antes de optimizar nada hay que entender qué hace, exactamente, cada línea del bucle canónico. Este es el que vas a escribir mil veces:</p>
+
+<pre><code class="lang-python">model.train()                          # modo entrenamiento (dropout ON, batchnorm actualiza stats)
+for x, y in loader:
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()              # (1) borrar los gradientes de la iteración anterior
+    pred = model(x)                    # (2) forward: construye el grafo de autograd
+    loss = criterion(pred, y)
+    loss.backward()                    # (3) backward: llena .grad de cada parámetro
+    optimizer.step()                   # (4) update: usa .grad para mover los pesos</code></pre>
+
+<p>La clave está en entender que PyTorch usa <strong>autograd por modo inverso</strong> (<em>reverse-mode autodiff</em>). Durante el <em>forward</em>, cada operación sobre un tensor con <code>requires_grad=True</code> se registra en un grafo dinámico: qué operación fue, qué entradas tuvo, cómo derivarla. Ese grafo se arma <em>en cada iteración</em> y describe el cómputo desde las entradas hasta la loss.</p>
+
+<p>Cuando llamás <code>loss.backward()</code>, PyTorch recorre ese grafo <strong>al revés</strong>, desde la loss hacia los parámetros, aplicando la regla de la cadena. El resultado se <em>acumula</em> (se suma) en el atributo <code>.grad</code> de cada tensor entrenable. Y esa palabra —<em>acumula</em>— es la que explica los tres bugs clásicos que siguen.</p>
+
+<h3>Bug 1 — olvidar <code>zero_grad()</code></h3>
+
+<p>Como <code>.backward()</code> <strong>suma</strong> los gradientes en vez de reemplazarlos, si no los borrás al principio de cada iteración, el gradiente del batch actual se mezcla con el del anterior, y el anterior, y así. Tu <code>optimizer.step()</code> termina aplicando una dirección que es la suma de gradientes de batches distintos. La loss se comporta raro desde el primer momento: oscila, no baja, o directamente diverge.</p>
+
+<div class="mistake">
+  <strong>Por qué el default acumula.</strong> Podría parecer un mal diseño, pero es deliberado: la acumulación es exactamente lo que permite <em>gradient accumulation</em> (DS2.4), donde a propósito no borrás los gradientes durante varios micro-batches. PyTorch te da la primitiva de bajo nivel y vos decidís cuándo borrar. Desde PyTorch 2.0, <code>zero_grad()</code> por defecto pone los gradientes en <code>None</code> (<code>set_to_none=True</code>) en vez de en cero: es más rápido y ahorra memoria.
+</div>
+
+<h3>Bug 2 — <code>.item()</code> que acumula el grafo</h3>
+
+<p>Quisiste llevar la loss promedio de la época y escribiste esto:</p>
+
+<pre><code class="lang-python">total = 0
+for x, y in loader:
+    loss = criterion(model(x), y)
+    loss.backward(); optimizer.step(); optimizer.zero_grad()
+    total += loss          # 🐛 BUG: total ahora referencia el grafo de ESTE batch</code></pre>
+
+<p>El problema: <code>loss</code> no es un número, es un <em>tensor con grafo de autograd colgando detrás</em>. Al hacer <code>total += loss</code>, mantenés vivo ese grafo —con todas sus activaciones intermedias— para que no lo libere el recolector. Iteración a iteración, la memoria de GPU sube en escalera hasta que reventás con un OOM después de N pasos. La corrección es pedir el valor escalar, que corta el grafo:</p>
+
+<pre><code class="lang-python">    total += loss.item()   # ✅ float de Python, sin grafo. O loss.detach() si querés seguir en tensor.</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla mental.</strong> Todo lo que guardes fuera del bucle para loguear o promediar —loss, accuracy, métricas— tiene que ser <code>.item()</code> o <code>.detach()</code>. Si guardás el tensor "vivo", guardás su grafo, y el grafo pesa. Este bug es tan común que vale grabárselo: <em>un OOM que aparece recién después de decenas de pasos casi siempre es un tensor con grafo que se está acumulando.</em>
+</div>
+
+<h3>Bug 3 — <code>model.eval()</code> faltante</h3>
+
+<p>Para validar o inferir tenés que cambiar el modelo de modo. <code>model.train()</code> y <code>model.eval()</code> no son decorativos: cambian el comportamiento de capas como <strong>Dropout</strong> (en <code>eval</code> se apaga) y <strong>BatchNorm</strong> (en <code>train</code> usa las estadísticas del batch y actualiza su media/varianza corridas; en <code>eval</code> usa las corridas, congeladas). Validar en modo <code>train</code> te da métricas ruidosas y sesgadas —y peor, cada pasada de validación <em>corrompe</em> las estadísticas de BatchNorm—. Y para no gastar memoria calculando gradientes que no vas a usar, envolvé la validación en <code>torch.no_grad()</code>:</p>
+
+<pre><code class="lang-python">model.eval()
+with torch.no_grad():
+    for x, y in val_loader:
+        pred = model(x.to(device))
+        # ... acumular métricas con .item()
+model.train()             # ⚠️ volver a train antes de seguir entrenando</code></pre>
+
+<div class="warn">
+  El error simétrico y más silencioso es <strong>olvidar volver a <code>model.train()</code></strong> después de validar. El entrenamiento sigue "andando" pero con dropout apagado y batchnorm congelada: no se rompe, solo entrena peor, y lo descubrís tarde. Por eso muchos arman la validación como una función que garantiza el <code>train()</code> al salir.
+</div>
+
+<h2>DS2.2 <code>torch.compile</code>: de intérprete a kernels fusionados</h2>
+
+<p>PyTorch en modo <em>eager</em> ejecuta tu modelo operación por operación, como un intérprete: cada capa es una llamada a Python que lanza uno o varios kernels de CUDA. Eso tiene dos costos que no se ven pero se pagan: el <strong>overhead de Python</strong> por operación, y el <strong>lanzamiento de kernels</strong> pequeños que no aprovechan el ancho de banda de memoria de la GPU.</p>
+
+<p><code>torch.compile</code> ataca los dos. Es una sola línea:</p>
+
+<pre><code class="lang-python">model = torch.compile(model)           # eso es todo; el resto del bucle no cambia</code></pre>
+
+<p>Por dentro hace dos cosas. Primero, <strong>captura el grafo</strong>: <em>TorchDynamo</em> traza tu bytecode de Python y extrae un grafo de operaciones de tensores (una representación intermedia, la FX graph), sin que reescribas nada. Segundo, <strong>compila y fusiona kernels</strong>: el backend por defecto, <em>TorchInductor</em>, toma ese grafo y genera kernels optimizados —<em>Triton</em> en GPU, C++/OpenMP en CPU— fusionando muchas operaciones chicas en una sola. Diez operaciones que en eager eran diez viajes a la memoria de la GPU pueden volverse un kernel que lee una vez, calcula todo y escribe una vez.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Realidad medida en 2.5+</th></tr></thead>
+<tbody>
+<tr><td>Ganancia típica en entrenamiento</td><td>1.3×–2× según el modelo; más en inferencia</td></tr>
+<tr><td>Dónde más rinde</td><td>Modelos <em>compute-bound</em> con muchas ops chicas que fusionan</td></tr>
+<tr><td>Primer paso</td><td>Lento: la compilación ocurre en la primera pasada (warmup)</td></tr>
+<tr><td>Modo agresivo</td><td><code>mode="max-autotune"</code> busca los mejores kernels; compila más lento</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Cuándo rompe (o deja de ayudar).</strong> <code>torch.compile</code> asume que puede trazar tu forward como un grafo estable. Cuando no puede, cae en un <em>graph break</em>: control de flujo dependiente de los datos, formas (<em>shapes</em>) que cambian en cada batch, <code>print</code>/logging en medio del forward, u operaciones que no sabe trazar. Cada <em>break</em> parte el grafo y te devuelve al modo eager en ese tramo. Y lo más caro: si la forma de entrada cambia todo el tiempo, PyTorch <strong>recompila</strong> una y otra vez, y la compilación es tan lenta que perdés toda la ganancia. La defensa es fijar las formas (padding a un tamaño constante) o compilar con <code>dynamic=True</code> para que trace una vez con formas simbólicas.
+</div>
+
+<pre><code class="lang-python"># Diagnosticar cuántos graph breaks tenés: si son muchos, ahí se va la ganancia
+import torch._dynamo as dynamo
+explanation = dynamo.explain(model)(ejemplo_x)
+print(explanation.graph_break_count)   # idealmente 0 o muy pocos en el hot path</code></pre>
+
+<h2>DS2.3 Precisión mixta: por qué bf16 ganó</h2>
+
+<p>Por defecto todo en PyTorch es <strong>fp32</strong>: 32 bits por número, 4 bytes. Es preciso y tiene un rango enorme, pero para entrenar redes es un lujo que casi nunca hace falta. Las GPUs modernas (Ampere en adelante: A100, H100, RTX 30xx/40xx) tienen <em>tensor cores</em> que hacen matrices en 16 bits al doble o cuádruple de velocidad, y usar 16 bits además <strong>halva la memoria</strong> de activaciones. La pregunta es <em>cuál</em> formato de 16 bits.</p>
+
+<table>
+<thead><tr><th>Formato</th><th>Bits (exp / mantisa)</th><th>Rango dinámico</th><th>Problema</th></tr></thead>
+<tbody>
+<tr><td><strong>fp32</strong></td><td>8 / 23</td><td>Enorme</td><td>Ninguno, pero pesa el doble y va más lento</td></tr>
+<tr><td><strong>fp16</strong></td><td>5 / 10</td><td>Chico (~6e-5 a 65504)</td><td>Los gradientes chicos se van a cero (<em>underflow</em>)</td></tr>
+<tr><td><strong>bf16</strong></td><td>8 / 7</td><td>Igual que fp32</td><td>Menos mantisa (menos precisión decimal), pero entrena bien</td></tr>
+</tbody>
+</table>
+
+<p>Acá está la idea que hay que entender: <strong>fp16 y bf16 pesan lo mismo (2 bytes) pero reparten sus bits distinto.</strong> fp16 gasta 10 bits en mantisa (precisión) y solo 5 en exponente (rango). Ese rango chico es el problema: en el entrenamiento aparecen gradientes muy pequeños que en fp16 caen por debajo del mínimo representable y se vuelven cero. Un gradiente que es cero no actualiza nada: el entrenamiento se estanca.</p>
+
+<p><strong>bf16 usa los mismos 8 bits de exponente que fp32</strong>, así que tiene <em>el mismo rango dinámico</em>. Sacrifica mantisa (7 bits), o sea precisión decimal, pero resulta que el entrenamiento de redes tolera esa pérdida de precisión mucho mejor que la pérdida de rango. Por eso bf16 ganó: <strong>simplemente funciona, sin gimnasia.</strong></p>
+
+<h3>La gimnasia que bf16 te ahorra: <code>GradScaler</code></h3>
+
+<p>Con fp16, para que los gradientes chicos no hagan <em>underflow</em>, hay que <strong>escalar la loss</strong>: multiplicarla por un factor grande antes del backward (así los gradientes suben al rango representable) y dividir de vuelta antes del <code>step</code>. Eso es lo que hace <code>GradScaler</code>, y ajusta el factor de forma dinámica:</p>
+
+<pre><code class="lang-python"># fp16: NECESITA GradScaler
+scaler = torch.amp.GradScaler("cuda")
+for x, y in loader:
+    optimizer.zero_grad()
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        loss = criterion(model(x), y)
+    scaler.scale(loss).backward()      # escala la loss para evitar underflow
+    scaler.step(optimizer)             # des-escala y aplica (o saltea si hubo inf/NaN)
+    scaler.update()                    # ajusta el factor de escala</code></pre>
+
+<pre><code class="lang-python"># bf16: SIN GradScaler, porque el rango alcanza
+for x, y in loader:
+    optimizer.zero_grad()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        loss = criterion(model(x), y)
+    loss.backward()
+    optimizer.step()</code></pre>
+
+<div class="info">
+  <code>autocast</code> no pasa <em>todo</em> a 16 bits: es selectivo. Corre las multiplicaciones de matrices y convoluciones en baja precisión (donde los tensor cores brillan) pero mantiene en fp32 las operaciones sensibles a la precisión —reducciones, <em>softmax</em>, cálculo de la loss, normalizaciones—. De ahí el nombre <em>precisión mixta</em>: cada operación corre en el formato que le conviene. Los pesos "maestros" suelen mantenerse en fp32 y solo se usan copias de 16 bits en el forward.
+</div>
+
+<div class="rule">
+  <strong>📌 El default sano en 2026.</strong> Si tu GPU es Ampere o más nueva, entrená en <strong>bf16</strong> con <code>autocast</code> y sin <code>GradScaler</code>. Es menos código, menos cosas que salen mal, y el <em>trade-off</em> memoria/precisión juega a tu favor: la mitad de memoria de activaciones y throughput mayor a cambio de una pérdida de precisión que en la práctica no mueve la métrica final. fp16 quedó para hardware viejo que no soporta bf16.
+</div>
+
+<h2>DS2.4 Memoria de GPU: la restricción real</h2>
+
+<p>El límite práctico de casi todo entrenamiento no es el tiempo: es cuánto entra en la GPU. Si entendés qué ocupa la memoria, entendés por qué te da OOM y qué palanca tocar. Durante el entrenamiento conviven cuatro consumidores:</p>
+
+<table>
+<thead><tr><th>Consumidor</th><th>Tamaño (con Adam, fp32)</th><th>Notas</th></tr></thead>
+<tbody>
+<tr><td><strong>Parámetros</strong> (pesos)</td><td>4 bytes × P</td><td>El modelo en sí</td></tr>
+<tr><td><strong>Gradientes</strong></td><td>4 bytes × P</td><td>Un <code>.grad</code> por parámetro</td></tr>
+<tr><td><strong>Estados del optimizador</strong></td><td>8 bytes × P</td><td>Adam guarda 2 buffers (momento <em>m</em> y <em>v</em>) por parámetro</td></tr>
+<tr><td><strong>Activaciones</strong></td><td>Variable, a menudo domina</td><td>Intermedios guardados en el forward para el backward</td></tr>
+</tbody>
+</table>
+
+<p>Los primeros tres son <em>fijos</em>: dependen del tamaño del modelo, no del batch. Con Adam en fp32 son <strong>16 bytes por parámetro</strong> antes de una sola activación. Hacé la cuenta para un modelo de mil millones de parámetros: 1e9 × 16 = <strong>16 GB solo de estado</strong>, en una GPU de 24 GB, sin haber procesado un dato. Por eso Adam es "caro en memoria" y por eso SGD con momento (un solo buffer, 12 bytes/param) o SGD puro (8 bytes/param) a veces se eligen por memoria, no por convergencia.</p>
+
+<p>El cuarto consumidor, las <strong>activaciones</strong>, es el que escala con el batch y la profundidad, y el que suele terminar dominando. Son los tensores intermedios que el forward guarda porque el backward los necesita para la regla de la cadena. Un batch más grande o una secuencia más larga multiplican esa memoria. Y acá aparecen las dos técnicas centrales del módulo.</p>
+
+<h3>Gradient checkpointing: cambiar cómputo por memoria</h3>
+
+<p>Las activaciones se guardan para no recalcularlas en el backward. <em>Gradient checkpointing</em> (o <em>activation checkpointing</em>) invierte ese trato: guarda solo algunas activaciones (los <em>checkpoints</em>) y, cuando el backward necesita las que faltan, <strong>las recalcula haciendo un forward parcial de nuevo</strong>. Pagás más cómputo (típicamente un ~30% extra, un forward adicional) a cambio de bajar la memoria de activaciones de lineal a aproximadamente su raíz cuadrada. Es la herramienta cuando el modelo entra pero el batch que necesitás no.</p>
+
+<pre><code class="lang-python">from torch.utils.checkpoint import checkpoint
+
+# En vez de: y = self.bloque_pesado(x)
+y = checkpoint(self.bloque_pesado, x, use_reentrant=False)
+# No guarda las activaciones internas de bloque_pesado; las recomputa en el backward.</code></pre>
+
+<h3>Gradient accumulation: batch grande sin la memoria de uno grande</h3>
+
+<p>A veces querés el <em>efecto estadístico</em> de un batch grande (gradientes menos ruidosos, mejor convergencia) pero no te entra en memoria. <em>Gradient accumulation</em> lo simula: procesás K micro-batches, acumulás sus gradientes (sin borrarlos), y recién después de los K hacés un solo <code>step</code>. El batch efectivo es <code>micro_batch × K</code>, pero en memoria solo vive la activación de <em>un</em> micro-batch por vez.</p>
+
+<pre><code class="lang-python">accum_steps = 4                        # batch efectivo = batch_del_loader × 4
+optimizer.zero_grad()
+for i, (x, y) in enumerate(loader):
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        loss = criterion(model(x), y) / accum_steps   # normalizar: promedio, no suma
+    loss.backward()                    # acumula en .grad (¡acá NO borramos!)
+    if (i + 1) % accum_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad()          # recién ahora borramos</code></pre>
+
+<div class="mistake">
+  Dos detalles que se olvidan: <strong>(1)</strong> dividir la loss por <code>accum_steps</code>, porque estás sumando K gradientes y querés su promedio, no su suma (si no, tu <em>learning rate</em> efectivo se multiplica por K). <strong>(2)</strong> Con DDP (DS2.6), acumular gradientes hace un <em>all-reduce</em> en cada micro-paso, que es puro desperdicio de red; se envuelven los K−1 primeros pasos en <code>model.no_sync()</code> para sincronizar solo en el último.
+</div>
+
+<h3>Leer un OOM de CUDA</h3>
+
+<p>El mensaje asusta pero dice todo lo que necesitás:</p>
+
+<pre><code class="lang-bash">torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB.
+GPU 0 has a total capacity of 24.00 GiB of which 512.00 MiB is free.
+Of the allocated memory 20.10 GiB is allocated by PyTorch, and 2.90 GiB is reserved
+but unallocated. If reserved but unallocated memory is large try setting
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.</code></pre>
+
+<p>Hay que distinguir dos números: <strong>allocated</strong> (memoria en uso real por tensores) y <strong>reserved</strong> (memoria que el <em>caching allocator</em> de PyTorch le pidió a la GPU y retiene para no pedirla de nuevo). Si hay mucho "reserved pero no allocated", el problema es <strong>fragmentación</strong>: hay memoria libre pero en pedazos demasiado chicos para el bloque que pedís. La variable <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> (madura en CUDA 12.x) mitiga eso bastante.</p>
+
+<pre><code class="lang-python"># Instrumentar la memoria antes de que te sorprenda el OOM
+print(f"{torch.cuda.max_memory_allocated()/1e9:.2f} GB pico")
+print(torch.cuda.memory_summary())     # desglose completo por categoría</code></pre>
+
+<div class="rule">
+  <strong>📌 El orden para atacar un OOM.</strong> De más barato a más caro: (1) bajá el batch; (2) activá precisión mixta (bf16) si no la tenías; (3) gradient accumulation para recuperar el batch efectivo; (4) gradient checkpointing si las activaciones dominan; (5) recién si nada alcanza, el modelo no entra en una GPU y pasás a FSDP (DS2.6). Cada escalón cuesta más complejidad: subí uno solo por vez y medí.
+</div>
+
+<h2>DS2.5 El DataLoader como cuello de botella</h2>
+
+<p>Esta es la ineficiencia más común y la más invisible: <strong>la GPU esperando datos.</strong> La GPU es la pieza cara; si el CPU no le prepara los batches al ritmo que ella los consume, la GPU se queda ociosa entre batch y batch. Podés tener el modelo compilado, en bf16, perfecto —y estar usando la GPU al 40% porque pasa más de la mitad del tiempo esperando que el <code>DataLoader</code> le traiga el próximo lote.</p>
+
+<pre><code class="lang-python">loader = DataLoader(
+    dataset,
+    batch_size=64,
+    num_workers=8,             # subprocesos que preparan batches EN PARALELO al entrenamiento
+    pin_memory=True,           # memoria "pinneada": transferencia CPU→GPU más rápida y asíncrona
+    persistent_workers=True,   # no re-crear los workers en cada época
+    prefetch_factor=2,         # cuántos batches adelanta cada worker
+)</code></pre>
+
+<p>Qué hace cada parámetro y por qué importa:</p>
+
+<ul>
+  <li><strong><code>num_workers</code></strong>: con 0 (el default), el proceso principal carga los datos, y mientras carga <em>no entrena</em>: todo es secuencial. Con N workers, N subprocesos preparan los próximos batches mientras la GPU trabaja en el actual. Un punto de partida razonable es la cantidad de núcleos de CPU (o unos 4 por GPU); demasiados saturan la RAM y agregan overhead de cambio de contexto.</li>
+  <li><strong><code>pin_memory=True</code></strong>: reserva los batches en memoria "pinneada" (no paginable), lo que permite copiarlos a la GPU por DMA de forma asíncrona. Combinado con <code>x.to(device, non_blocking=True)</code>, la transferencia se solapa con el cómputo en vez de bloquearlo.</li>
+  <li><strong><code>persistent_workers=True</code></strong>: evita el costo de matar y re-lanzar los workers al empezar cada época.</li>
+</ul>
+
+<h3>Cómo se diagnostica</h3>
+
+<p>El síntoma es <strong>utilización de GPU baja u oscilante</strong>. La herramienta rápida:</p>
+
+<pre><code class="lang-bash">nvidia-smi dmon -s u          # imprime la utilización (sm%) cada segundo, en vivo</code></pre>
+
+<p>Si el <code>sm%</code> (uso del núcleo de cómputo) baila entre 20% y 50% con caídas rítmicas en vez de quedarse alto y estable, la GPU está <em>hambrienta</em>: el pipeline de datos no la alimenta. La confirmación fina la da el profiler de PyTorch, que te muestra cuánto tiempo se va literalmente esperando el próximo batch:</p>
+
+<pre><code class="lang-python">from torch.profiler import profile, ProfilerActivity
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    for i, (x, y) in enumerate(loader):
+        # ... un puñado de pasos
+        if i &gt;= 10: break
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+# Si aparece mucho tiempo en 'enumerate(DataLoader)' o el CPU domina, el cuello son los datos.</code></pre>
+
+<div class="analogy">
+  <strong>La cocina y el mozo.</strong> La GPU es un cocinero rapidísimo; el DataLoader es el mozo que le trae los ingredientes. Si hay un solo mozo (<code>num_workers=0</code>) y el cocinero termina cada plato antes de que le traigan lo del siguiente, el cocinero mira el techo la mitad del turno. No necesitás un cocinero más rápido (una GPU más cara): necesitás más mozos y que traigan la comida ya preparada en bandejas listas (<code>pin_memory</code>). Poner más GPU cuando el cuello es el DataLoader es tirar plata.
+</div>
+
+<h2>DS2.6 Multi-GPU: DataParallel, DDP y FSDP</h2>
+
+<p>Cuando una GPU no alcanza —por tiempo o por tamaño— hay que repartir el trabajo. Hay tres enfoques y solo dos que deberías usar hoy.</p>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Cómo reparte</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><strong>DataParallel (DP)</strong></td><td>Un proceso con hilos; replica el modelo por batch y junta en la GPU 0</td><td><strong>Nunca.</strong> Obsoleto: limitado por el GIL, desbalancea la GPU 0, lento</td></tr>
+<tr><td><strong>DistributedDataParallel (DDP)</strong></td><td>Un proceso por GPU, réplica completa en cada una; sincroniza gradientes con <em>all-reduce</em></td><td>El modelo <strong>entra</strong> en una GPU y querés ir más rápido con más GPUs (o más nodos)</td></tr>
+<tr><td><strong>FSDP</strong></td><td><em>Shardea</em> parámetros, gradientes y estados del optimizador entre GPUs (estilo ZeRO)</td><td>El modelo <strong>no entra</strong> en una sola GPU</td></tr>
+</tbody>
+</table>
+
+<p><strong>DDP</strong> (<em>DistributedDataParallel</em>) es el caballo de batalla de la paralelización de datos. Lanza un proceso por GPU, cada uno con una copia completa del modelo, procesando una porción distinta del batch. Durante el backward, los gradientes se promedian entre todas las GPUs con un <em>all-reduce</em> (vía NCCL) que se solapa con el propio cómputo del backward, así que la comunicación es casi gratis. Se lanza con <code>torchrun</code>:</p>
+
+<pre><code class="lang-python">import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+dist.init_process_group("nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+model = DDP(model.to(local_rank), device_ids=[local_rank])
+# El DataLoader usa DistributedSampler para que cada proceso vea datos distintos.</code></pre>
+
+<pre><code class="lang-bash">torchrun --nproc_per_node=4 train.py    # 4 procesos, uno por GPU</code></pre>
+
+<p><strong>FSDP</strong> (<em>Fully Sharded Data Parallel</em>) resuelve un problema distinto: modelos que <em>no entran</em> en una GPU ni con checkpointing. En vez de replicar el modelo entero en cada GPU (como DDP), lo <strong>parte</strong>: cada GPU guarda solo un pedazo (<em>shard</em>) de los parámetros, gradientes y estados del optimizador. Cuando se necesita una capa completa para el cómputo, se junta al vuelo entre GPUs y se descarta después. Es la idea de ZeRO. A cambio de más comunicación, te deja entrenar modelos mucho más grandes que una sola GPU. En 2026, la API moderna es FSDP2 (<code>fully_shard</code>, sharding por parámetro).</p>
+
+<div class="rule">
+  <strong>📌 La regla de decisión.</strong> ¿El modelo con su optimizador entra en una GPU? → <strong>DDP</strong> y sumás GPUs para ir más rápido. ¿No entra? → <strong>FSDP</strong>. ¿Es DataParallel la respuesta? → nunca, es una reliquia. Y antes de saltar a multi-GPU, exprimí la GPU que tenés (DS2.4 y DS2.5): mucha gente pide un cluster cuando en realidad tiene el DataLoader ahogado.
+</div>
+
+<h2>DS2.7 Reproducibilidad del entrenamiento</h2>
+
+<p>"Reentrené con el mismo código y me dio distinto" no es una curiosidad: es un problema serio. Si no podés reproducir un resultado, no podés depurar una regresión (¿cambió por mi fix o por el ruido?), no podés atribuir una mejora a un cambio en vez de a la suerte, y no podés auditar cómo se produjo un modelo que está en producción. La reproducibilidad es la base sobre la que se apoya todo el método experimental de DS3.</p>
+
+<p>El primer nivel son las <strong>semillas</strong>. Hay varias fuentes de aleatoriedad y hay que sembrarlas todas:</p>
+
+<pre><code class="lang-python">import random, numpy as np, torch
+
+def sembrar(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)   # todas las GPUs
+# Además: los workers del DataLoader necesitan worker_init_fn / un generator sembrado,
+# o cada subproceso arranca con una semilla distinta.</code></pre>
+
+<p>El segundo nivel es el <strong>determinismo</strong>, y acá aparece el <em>trade-off</em>. Muchas operaciones de GPU son no deterministas por defecto porque usan algoritmos paralelos más rápidos cuyo orden de reducción varía —y como la suma en punto flotante no es asociativa, el resultado cambia en los últimos bits. Forzar determinismo cuesta velocidad:</p>
+
+<pre><code class="lang-python">torch.use_deterministic_algorithms(True)   # error si una op no tiene versión determinista
+torch.backends.cudnn.benchmark = False     # apaga el autotuning de kernels (que es no determinista)
+# y a veces: la env var CUBLAS_WORKSPACE_CONFIG=:4096:8</code></pre>
+
+<div class="warn">
+  <strong>El determinismo no es gratis.</strong> <code>cudnn.benchmark = False</code> apaga la búsqueda automática del kernel más rápido para tus formas (por eso, en entrenamiento normal con formas fijas, conviene tenerlo en <em>True</em>). Y <code>use_deterministic_algorithms(True)</code> puede hacer <em>fallar</em> operaciones que no tienen implementación determinista, u obligar a variantes más lentas. La reproducibilidad bit a bit se paga en tiempo: la usás para depurar y para el <em>paper</em>, no necesariamente en cada corrida de exploración.
+</div>
+
+<div class="mistake">
+  Aun con todo sembrado, hay cosas que rompen la reproducibilidad y no son "bugs": cambiar <code>num_workers</code>, cambiar el <code>batch_size</code>, cambiar de GPU o de versión de CUDA/cuDNN. El determinismo bit a bit <em>entre máquinas distintas</em> suele ser imposible. La meta realista es la reproducibilidad <em>controlada</em>: misma máquina, versiones pinneadas (DS1), semillas fijas. Eso alcanza para casi todo lo que importa.
+</div>
+
+<h2>DS2.8 Hiperparámetros con método</h2>
+
+<p>De todos los hiperparámetros, el <strong>learning rate es el que más importa</strong>, por lejos. Demasiado alto y la loss oscila o explota; demasiado bajo y el entrenamiento se arrastra o se queda atascado en una meseta. Antes de tocar el tamaño de red, la regularización o el optimizador, se ajusta el LR.</p>
+
+<h3>Schedules: warmup y cosine</h3>
+
+<p>El LR casi nunca se deja constante. Dos piezas forman el <em>schedule</em> estándar:</p>
+
+<ul>
+  <li><strong>Warmup</strong>: arrancar con un LR muy chico y subirlo linealmente durante los primeros cientos de pasos. Estabiliza el arranque, sobre todo con optimizadores adaptativos (Adam), batches grandes o transformers, donde un LR alto de entrada desestabiliza los primeros pasos.</li>
+  <li><strong>Cosine annealing</strong>: después del warmup, bajar el LR suavemente siguiendo una curva coseno hasta casi cero. Es un default fuerte: le da pasos grandes al principio (cuando está lejos del óptimo) y pasos finos al final (para asentarse).</li>
+</ul>
+
+<pre><code class="lang-python">from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+warmup = LinearLR(optimizer, start_factor=0.01, total_iters=500)
+cosine = CosineAnnealingLR(optimizer, T_max=total_steps - 500)
+scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[500])
+
+for step, (x, y) in enumerate(loader):
+    # ... forward, backward, optimizer.step()
+    scheduler.step()                   # avanzar el LR (después del step del optimizador)</code></pre>
+
+<h3>Búsqueda eficiente: no grid search</h3>
+
+<p>La tentación es el <em>grid search</em>: probar todas las combinaciones de una grilla. Es exponencialmente caro (la maldición de la dimensionalidad) y, peor, ineficiente: como la mayoría de los hiperparámetros casi no mueven la aguja, la grilla malgasta corridas variando lo que no importa. Está demostrado que el <strong>random search rinde más que el grid</strong> con el mismo presupuesto, porque cubre mejor los pocos hiperparámetros que sí importan. Y por encima están los métodos que <em>aprenden</em> dónde buscar:</p>
+
+<table>
+<thead><tr><th>Método</th><th>Idea</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td>Grid search</td><td>Todas las combinaciones</td><td>Casi nunca; solo con 1–2 hiperparámetros discretos</td></tr>
+<tr><td>Random search</td><td>Muestreo al azar del espacio</td><td>Buen default, difícil de superar por su simpleza</td></tr>
+<tr><td>Bayesiano / TPE</td><td>Modela qué zonas prometen y muestrea ahí</td><td>Cuando cada corrida es cara</td></tr>
+<tr><td>Hyperband / ASHA</td><td>Corta temprano las corridas malas</td><td>Cuando podés evaluar parcialmente y descartar</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Un <em>sweep</em> (barrido de hiperparámetros) es un <strong>experimento versionado</strong>, no una tarde de probar cosas a mano. Herramientas como Optuna, Ray Tune o W&amp;B Sweeps definen el espacio de búsqueda en un archivo, registran cada corrida con sus hiperparámetros y su métrica, y hacen que "la mejor configuración" sea reproducible y comparable. Sin eso, encontrás un buen número y a la semana no sabés con qué lo lograste.
+</div>
+
+<h2>DS2.9 Debugging de entrenamiento</h2>
+
+<p>Los entrenamientos fallan de formas reconocibles. Saber leer la curva de loss te ahorra días.</p>
+
+<h3>La loss no baja</h3>
+
+<p>Puede ser tuning (LR muy bajo) pero muchas veces es un <em>bug</em>: etiquetas desalineadas con las entradas, normalización mal hecha, parámetros que no llegaron al optimizador, <code>requires_grad</code> apagado sin querer, o la loss calculada sobre el tensor equivocado. El test de humo que separa bug de tuning:</p>
+
+<div class="rule">
+  <strong>📌 Sobreajustá un solo batch.</strong> Tomá <em>un</em> batch y entrenalo cientos de pasos. Un modelo sano tiene que llegar a loss casi cero: si puede memorizar un batch, el circuito forward-backward-update funciona. Si <strong>no</strong> puede, no tenés un problema de hiperparámetros, tenés un bug —y lo encontrás en dos minutos en vez de esperar una época entera para sospecharlo.
+</div>
+
+<h3>La loss explota (o da NaN)</h3>
+
+<p>Sube en vez de bajar, o se va a <code>inf</code>/<code>NaN</code>. Causas típicas: LR demasiado alto, <strong>gradientes que explotan</strong> (redes profundas, RNNs), o inestabilidad numérica (<code>log(0)</code>, división por cero, <em>overflow</em> en fp16). La herramienta principal contra los gradientes que explotan es el <em>gradient clipping</em>: recortar la norma del gradiente a un techo antes del <code>step</code>.</p>
+
+<pre><code class="lang-python">loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # recorta ANTES del step
+optimizer.step()</code></pre>
+
+<p>Para cazar de dónde sale un <code>NaN</code>, PyTorch tiene un detector de anomalías que marca la operación exacta del backward que lo generó (es lento, solo para depurar):</p>
+
+<pre><code class="lang-python">torch.autograd.set_detect_anomaly(True)   # ⚠️ solo en debug: penaliza mucho la velocidad</code></pre>
+
+<div class="tip">
+  Si los NaN aparecen con fp16, probá <strong>bf16</strong>: buena parte de esos <em>overflow</em> desaparecen por el rango dinámico más amplio (DS2.3). Y revisá siempre las entradas: un <code>NaN</code> en los datos —una división por cero en un feature, un log de un valor no positivo en el preprocesamiento— se propaga a toda la red.
+</div>
+
+<h3>Baja en train pero no en validación</h3>
+
+<p>La loss de entrenamiento baja hermosa y la de validación se estanca o sube: es <strong>overfitting</strong>. El modelo memoriza en vez de generalizar. Las respuestas —regularización, más datos, <em>early stopping</em>— y, sobre todo, <em>cómo medir bien</em> la generalización para no engañarte, son el tema de <a href="../ds3-evaluacion/lecture.html">DS3 (Evaluación y validación)</a>. Acá basta con reconocer la firma: si tus dos curvas se separan, el problema no es el entrenamiento, es la generalización.</p>
+
+<h2>DS2.10 Experiment tracking: sin esto, es irreproducible</h2>
+
+<p>Un entrenamiento sin <em>tracking</em> es un experimento que no podés repetir ni comparar. ¿Qué hiperparámetros produjeron este <em>checkpoint</em>? ¿Con qué versión de los datos (DS1)? ¿Con qué commit del código? ¿Qué semilla? Si la respuesta vive en tu memoria y en nombres de archivo como <code>modelo_final_v3_bueno.pt</code>, ya perdiste la reproducibilidad. No escala más allá de la tercera corrida.</p>
+
+<p>Las herramientas —<strong>MLflow</strong> (open source, self-host) o <strong>Weights &amp; Biases</strong> (hosted)— registran cada corrida con todo su contexto. El patrón es siempre el mismo: al empezar, logueás los hiperparámetros; durante, las métricas por paso; al final, los artefactos.</p>
+
+<pre><code class="lang-python">import mlflow
+
+with mlflow.start_run():
+    mlflow.log_params({"lr": 3e-4, "batch": 64, "optim": "adamw", "precision": "bf16"})
+    mlflow.log_param("data_version", dataset_hash)      # atar a la versión de datos de DS1
+    mlflow.log_param("git_sha", commit_actual())        # atar al código exacto
+
+    for epoch in range(n_epochs):
+        train_loss = entrenar_una_epoca(...)
+        val_loss   = validar(...)
+        mlflow.log_metrics({"train_loss": train_loss, "val_loss": val_loss,
+                            "gpu_util": leer_gpu_util()}, step=epoch)
+
+    mlflow.log_artifact("checkpoint.pt")                 # el modelo, con todo su contexto</code></pre>
+
+<div class="rule">
+  <strong>📌 El tracking es la capa de reproducibilidad.</strong> Junto con el versionado de datos de DS1 y el commit de git del código, el <em>experiment tracking</em> cierra el triángulo: datos + código + hiperparámetros/semilla. Con los tres registrados, cualquier corrida se puede reconstruir. Sin uno de ellos, "mi mejor modelo" es un golpe de suerte que no vas a poder volver a pegar. Loguear la <strong>utilización de GPU</strong> como una métrica más, además, hace que el desperdicio de DS2.5 sea visible en cada corrida en vez de una sorpresa.
+</div>
+
+<h2>DS2.11 Cuándo NO entrenar desde cero</h2>
+
+<p>Todo este módulo asume que vas a entrenar. Pero la decisión senior más rentable suele ser <strong>no entrenar desde cero</strong>. Entrenar desde parámetros aleatorios necesita muchísimos datos y muchísimo cómputo, y casi nunca es el default correcto.</p>
+
+<ul>
+  <li><strong>Transfer learning</strong>: partís de un modelo pre-entrenado, congelás el cuerpo (que ya aprendió features generales) y entrenás solo una cabeza nueva para tu tarea. Funciona porque las primeras capas aprenden representaciones reutilizables.</li>
+  <li><strong>Fine-tuning</strong>: seguís entrenando un modelo pre-entrenado sobre tus datos, entero o —lo habitual hoy con modelos grandes— con métodos eficientes en parámetros (LoRA y compañía). Es el tema de <a href="../ds7-finetuning/lecture.html">DS7 (Fine-tuning)</a>.</li>
+  <li><strong>Usar el modelo tal cual</strong>: a veces un modelo pre-entrenado, o una API, resuelve tu problema en <em>zero-shot</em> sin que entrenes nada. El mejor entrenamiento es el que no hacés.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 La pregunta antes de la corrida.</strong> ¿Existe un modelo pre-entrenado cercano a tu tarea? Si sí, empezá por ahí: transfer learning o fine-tuning te dan el 90% del resultado por el 1% del cómputo. Entrenar desde cero se justifica solo cuando tu dominio o tu arquitectura son genuinamente nuevos, o cuando tenés datos abundantes y únicos que ningún modelo previo vio. Gastar semanas de GPU replicando algo que podías descargar es el error caro que este módulo también busca evitar.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "tarda 6 horas y la GPU está al 40%"</h2>
+
+<blockquote>Un entrenamiento de visión tarda <strong>6 horas</strong> por corrida: 10 épocas a ~36 min cada una. Alguien mira <code>nvidia-smi</code> y ve la GPU oscilando alrededor del <strong>40%</strong>. El equipo pide presupuesto para una segunda GPU. Antes de gastar, diagnostiquemos.</blockquote>
+
+<p><strong>Paso 0 — Medir, no adivinar.</strong> Corremos <code>nvidia-smi dmon -s u</code> y vemos el <code>sm%</code> bailando entre 25% y 45% con caídas rítmicas: patrón de sierra. Eso no es un modelo pesado corriendo a fondo; es una GPU <em>hambrienta</em>, esperando datos. El profiler de PyTorch lo confirma: buena parte del tiempo del paso se va en <code>enumerate(DataLoader)</code>. Además, el código entrena en fp32 puro. Tenemos dos problemas: <strong>el DataLoader ahoga a la GPU</strong> y <strong>no usa precisión mixta</strong>.</p>
+
+<p><strong>Paso 1 — Destapar el DataLoader.</strong> Estaba con <code>num_workers=0, pin_memory=False</code>: el proceso principal cargaba y aumentaba las imágenes de forma secuencial. Subimos a <code>num_workers=8, pin_memory=True, persistent_workers=True</code> y medimos de nuevo.</p>
+
+<p><strong>Paso 2 — Precisión mixta bf16.</strong> Envolvemos el forward en <code>autocast(dtype=torch.bfloat16)</code>. Los tensor cores entran en juego y la memoria de activaciones se halva (dejando margen para subir el batch más adelante). Medimos.</p>
+
+<p><strong>Paso 3 — <code>torch.compile</code>.</strong> Una línea, <code>model = torch.compile(model)</code>. La primera época paga la compilación (más lenta), pero de la segunda en adelante los kernels fusionados aceleran cada paso. Medimos.</p>
+
+<table>
+<thead><tr><th>Paso</th><th>GPU-Util (sm%)</th><th>min/época</th><th>Qué aportó</th></tr></thead>
+<tbody>
+<tr><td>Baseline (fp32, sin workers)</td><td>~40%</td><td>36:00</td><td>—</td></tr>
+<tr><td>+ num_workers=8, pin_memory</td><td>~72%</td><td>21:00</td><td>La GPU deja de esperar datos: el mayor salto</td></tr>
+<tr><td>+ bf16 autocast</td><td>~84%</td><td>13:00</td><td>Tensor cores + menos memoria; ahora la GPU sí computa</td></tr>
+<tr><td>+ torch.compile</td><td>~91%</td><td>9:00</td><td>Fusión de kernels sobre una GPU ya bien alimentada</td></tr>
+</tbody>
+</table>
+
+<p><strong>Resultado:</strong> de 36 a 9 minutos por época, <strong>4× más rápido</strong>. La corrida pasó de 6 horas a ~1 hora y media, en la misma GPU, sin gastar un peso en hardware. La métrica final del modelo quedó igual (bf16 no la movió).</p>
+
+<div class="rule">
+  <strong>📌 La lección no es "usá estas cuatro cosas".</strong> Es el <em>orden</em>. Arreglamos el DataLoader <strong>primero</strong>, porque compilar un modelo que está hambriento de datos solo lo hace esperar más rápido: la ganancia de <code>torch.compile</code> sobre una GPU al 40% habría sido invisible, tapada por el cuello del pipeline. Medí cuál es tu cuello real, atacá ese, y recién después el siguiente. Y todo esto sale de <em>mirar la utilización de GPU</em> —el número que casi nadie mira y que resuelve el desperdicio más común del oficio.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Guardás la loss con <code>total += loss</code> y a los 30 pasos te da OOM. ¿Qué pasó y cómo se arregla?</summary>
+<p><code>loss</code> es un tensor con el grafo de autograd de ese batch colgando detrás. Al sumarlo a <code>total</code>, mantenés vivo ese grafo —con sus activaciones— para que no lo libere el recolector. Paso a paso, la memoria de GPU sube en escalera hasta reventar. La firma clásica es justamente esa: un OOM que no aparece al principio sino después de N iteraciones. Se arregla cortando el grafo: <code>total += loss.item()</code> (un <em>float</em> de Python) o <code>loss.detach()</code> si querés seguir trabajando con un tensor.</p></details>
+
+<details><summary>¿Por qué bf16 no necesita <code>GradScaler</code> y fp16 sí?</summary>
+<p>Porque el problema que <code>GradScaler</code> resuelve es el <em>underflow</em> de gradientes chicos, y ese problema existe por el <strong>rango dinámico</strong>, no por la precisión. fp16 tiene solo 5 bits de exponente, así que su rango es chico y los gradientes pequeños caen a cero; hay que escalar la loss para subirlos al rango representable y des-escalar después. bf16 tiene 8 bits de exponente —el <em>mismo</em> rango que fp32—, así que los gradientes chicos siguen siendo representables y no hace falta escalar nada. bf16 paga con menos mantisa (menos precisión decimal), pero el entrenamiento tolera eso mucho mejor que la pérdida de rango.</p></details>
+
+<details><summary>Tu entrenamiento usa la GPU al 45% y va lento. ¿Cuál es la primera hipótesis y cómo la verificás?</summary>
+<p>El DataLoader está ahogando a la GPU: el CPU no prepara los batches al ritmo que la GPU los consume, así que la GPU pasa la mitad del tiempo esperando. Se verifica en segundos con <code>nvidia-smi dmon -s u</code> (si el <code>sm%</code> baila con caídas rítmicas en vez de quedarse alto, es hambre de datos) o con el profiler de PyTorch (tiempo perdido en <code>enumerate(DataLoader)</code>). La respuesta casi nunca es una GPU más grande: es subir <code>num_workers</code>, activar <code>pin_memory</code> y <code>persistent_workers</code>, y mover el aumento de datos a un pipeline más rápido. Comprar hardware cuando el cuello es el pipeline es tirar plata.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El bucle vive de un grafo de autograd que <code>.backward()</code> recorre al revés y <em>acumula</em> en <code>.grad</code>. De ahí los tres bugs: sin <code>zero_grad</code> los gradientes se mezclan; <code>total += loss</code> (sin <code>.item()</code>) filtra el grafo hasta el OOM; sin <code>model.eval()</code> validás con dropout y batchnorm mal.</li>
+  <li><strong><code>torch.compile</code></strong> captura el grafo y fusiona kernels: 1.3×–2× típico, gratis en código. Rompe con <em>graph breaks</em> (control dinámico, formas cambiantes) que provocan recompilaciones.</li>
+  <li><strong>bf16</strong> es el default de precisión mixta: mismo rango que fp32 (sin <code>GradScaler</code>), la mitad de memoria de activaciones, tensor cores al doble. fp16 quedó para hardware viejo.</li>
+  <li>La memoria la ocupan <strong>parámetros + gradientes + estados del optimizador</strong> (16 bytes/param con Adam fp32, fijos) más <strong>activaciones</strong> (variables, suelen dominar). Palancas: bajar batch → bf16 → accumulation → checkpointing → FSDP. Un OOM distingue <em>allocated</em> de <em>reserved</em>; lo segundo es fragmentación.</li>
+  <li>El desperdicio más común es la <strong>GPU esperando datos</strong>. Se diagnostica con la utilización de GPU baja u oscilante y se cura con <code>num_workers</code>, <code>pin_memory</code>, <code>persistent_workers</code>.</li>
+  <li>Multi-GPU: <strong>DDP</strong> si el modelo entra en una GPU, <strong>FSDP</strong> si no entra, DataParallel nunca.</li>
+  <li><strong>Reproducibilidad</strong> = semillas + determinismo (que cuesta velocidad) + versiones pinneadas. "Reentrené y me dio distinto" bloquea todo el método experimental.</li>
+  <li>El <strong>LR</strong> es el hiperparámetro que más importa: warmup + cosine de default, random search &gt; grid, y el sweep es un experimento versionado.</li>
+  <li>Sin <strong>experiment tracking</strong> (MLflow/W&amp;B) atando datos + código + hiperparámetros, un entrenamiento es irreproducible.</li>
+  <li>Y antes de entrenar desde cero: transfer learning, fine-tuning o usar un modelo pre-entrenado. El mejor entrenamiento es el que no hacés.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí el bucle mínimo de entrenamiento e introducí a propósito, uno por vez, los tres bugs de DS2.1 (sacar <code>zero_grad</code>, usar <code>total += loss</code>, sacar <code>model.eval()</code> en la validación). Documentá el síntoma exacto de cada uno: qué le pasa a la loss, a la memoria o a las métricas.</li>
+  <li>Tomá un modelo mediano y medí <code>torch.cuda.max_memory_allocated()</code> entrenándolo con SGD y con Adam. Explicá la diferencia a partir de los estados del optimizador (¿cuántos buffers guarda cada uno?) y calculá los bytes por parámetro en cada caso.</li>
+  <li>En un entrenamiento tuyo, medí la utilización de GPU con <code>nvidia-smi dmon -s u</code> antes y después de subir <code>num_workers</code> y activar <code>pin_memory</code>. Reportá el <code>sm%</code> y el tiempo por época en una tabla, con tus números reales.</li>
+  <li>Compará fp32 contra bf16 (<code>autocast</code>) en el mismo modelo: tiempo por época, memoria pico y loss final. ¿La precisión reducida movió la métrica? ¿Cuánta memoria ganaste?</li>
+  <li>Aplicá <em>gradient accumulation</em> con <code>accum_steps=4</code> para simular un batch 4× mayor sin OOM. Verificá que la loss converge parecido a la de un batch grande real (si te entra en memoria), y comprobá que dividiste la loss por <code>accum_steps</code>.</li>
+  <li>Activá el determinismo completo (<code>use_deterministic_algorithms(True)</code>, <code>cudnn.benchmark=False</code>, semillas), corré dos veces y verificá que la loss coincide. Después medí cuánto más lento es respecto de <code>cudnn.benchmark=True</code>.</li>
+  <li>Configurá un <em>schedule</em> warmup + cosine y graficá el LR por paso. Corré el mismo entrenamiento con y sin warmup y compará la estabilidad de la loss en los primeros cientos de pasos.</li>
+  <li>Instrumentá una corrida con MLflow (o W&amp;B): logueá hiperparámetros, la loss de train y val por época, la utilización de GPU y el <em>checkpoint</em> como artefacto. Corré dos configuraciones y compará las curvas en la interfaz.</li>
+</ol>
+
+<section class="quiz" id="quizDS2">
+  <style>
+    #quizDS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS2 .q{margin-bottom:1.5rem}
+    #quizDS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS2 .opt:hover{border-color:var(--accent)}
+    #quizDS2 .opt:disabled{cursor:default}
+    #quizDS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizDS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizDS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS2 .exp.show{display:block}
+    #quizDS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu entrenamiento va lento y <code>nvidia-smi</code> muestra la GPU oscilando alrededor del 40%. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">La GPU es demasiado chica: hay que conseguir una más potente</button>
+    <button class="opt">El DataLoader ahoga a la GPU: falta subir <code>num_workers</code> y activar <code>pin_memory</code></button>
+    <button class="opt">Falta compilar el modelo con <code>torch.compile</code> para que los hilos escalen</button>
+    <div class="exp">Una utilización baja y oscilante es la firma de una GPU hambrienta: el CPU no le prepara los batches al ritmo que ella los consume, así que espera. Se confirma en segundos con <code>nvidia-smi dmon -s u</code> o el profiler (tiempo en <code>enumerate(DataLoader)</code>). La cura es el pipeline de datos —<code>num_workers</code>, <code>pin_memory</code>, <code>persistent_workers</code>—, no hardware más caro ni compilar un modelo que igual seguiría esperando datos.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Por qué bf16 se volvió el estándar de precisión mixta por encima de fp16?</p>
+    <button class="opt">Porque bf16 usa menos bits que fp16, así que ocupa menos memoria</button>
+    <button class="opt">Porque bf16 tiene más precisión decimal, y eso mejora la métrica final</button>
+    <button class="opt">Porque bf16 tiene el mismo rango dinámico que fp32, así que no necesita <code>GradScaler</code> ni sufre <em>underflow</em></button>
+    <div class="exp">bf16 y fp16 pesan lo mismo (2 bytes). La diferencia es cómo reparten los bits: fp16 tiene 5 bits de exponente (rango chico → gradientes chicos que hacen <em>underflow</em> a cero, y por eso necesita escalar la loss con <code>GradScaler</code>). bf16 tiene 8 bits de exponente, el mismo rango que fp32, así que los gradientes chicos siguen siendo representables y no hace falta escalar nada. Paga con menos mantisa (menos precisión decimal), pero el entrenamiento tolera eso bien.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Guardás la loss de cada batch con <code>total += loss</code> dentro del bucle y a las decenas de pasos te da OOM. ¿Cuál es la causa?</p>
+    <button class="opt"><code>loss</code> es un tensor con el grafo de autograd colgando, y sumarlo lo mantiene vivo iteración a iteración; hay que usar <code>.item()</code></button>
+    <button class="opt">El optimizador Adam guarda demasiados estados; hay que cambiar a SGD</button>
+    <button class="opt">Falta llamar a <code>torch.cuda.empty_cache()</code> al final de cada batch</button>
+    <div class="exp">La firma —un OOM que aparece recién después de N pasos, no al principio— delata una acumulación. <code>loss</code> no es un número: arrastra el grafo de autograd de ese batch, con sus activaciones. Al hacer <code>total += loss</code> guardás ese grafo y evitás que se libere; la memoria sube en escalera hasta reventar. Se corta el grafo con <code>total += loss.item()</code> (float de Python) o <code>loss.detach()</code>. No es cosa del optimizador ni de la caché.</div>
+  </div>
+
+  <div class="score" id="scoreDS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds1-pipelines/lecture.html">← DS1: Pipelines de datos</a>
+  <a href="../ds3-evaluacion/lecture.html">DS3: Evaluación y validación →</a>
+</nav>
+
+</div>
+</body>
+</html>

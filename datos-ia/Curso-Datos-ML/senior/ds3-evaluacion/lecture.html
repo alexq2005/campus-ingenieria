@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS3 — Evaluación y validación: medir lo que importa · Datos/ML Senior</title>
+  <meta name="description" content="Por qué el 99% de accuracy puede ser inútil o peligroso: elegir la métrica como decisión de negocio, el zoo de métricas de clasificación y regresión, validación sin leakage, intervalos de confianza, calibración, slicing, fairness, baselines y cuándo un modelo NO debe ir a producción.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS3</span>
+  <span class="badge">⏱ 30–70 min</span>
+  <span class="badge">🎯 Pre-req: DS2</span>
+  <span class="badge">📏 Evaluación</span>
+</div>
+
+<article>
+
+<h1>DS3 — Evaluación y validación: medir lo que importa</h1>
+
+<h2>DS3.0 Por qué la evaluación es donde más se miente</h2>
+
+<p>En DS2 aprendiste a entrenar modelos a escala. Ahora viene la pregunta que decide si ese trabajo sirvió para algo o no: <strong>¿el modelo es bueno?</strong> Y esa pregunta, que parece técnica, es la más resbaladiza de todo el ciclo de vida de un sistema de ML. La razón es incómoda: <strong>un modelo con 99% de accuracy puede ser inútil, o directamente peligroso</strong>, y el número no te lo va a avisar. La evaluación mal hecha es la forma más cara de engañarte, porque produce confianza sin producir valor.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Evaluar no es correr <code>model.score(X, y)</code> y leer un número. Es <strong>(1)</strong> elegir la métrica que corresponde al costo de negocio de cada error, <strong>(2)</strong> estimarla con una validación que no le muestre al modelo información que no va a tener en producción, <strong>(3)</strong> ponerle una barra de error para saber si la diferencia entre dos modelos es real o ruido, y <strong>(4)</strong> mirar debajo del promedio, porque un modelo que anda bien en agregado puede estar fallando de forma catastrófica en el subgrupo que más importa. Saltearte cualquiera de los cuatro pasos convierte tu evaluación en teatro.
+</div>
+
+<p>El síntoma clásico del problema aparece cuando alguien celebra un accuracy altísimo en un problema donde casi todos los casos son de una sola clase. Ese es el punto de entrada, y lo desarmamos primero.</p>
+
+<h2>DS3.1 La métrica que engaña: accuracy sobre datos desbalanceados</h2>
+
+<p>Imaginá un detector de fraude. De cada 1.000 transacciones, 5 son fraudulentas: <strong>0,5% de prevalencia</strong>. Escribís el modelo más tonto posible —uno que siempre dice "no es fraude"— y medís su accuracy:</p>
+
+<pre><code class="lang-python">from sklearn.dummy import DummyClassifier
+from sklearn.metrics import accuracy_score
+
+# y_test: 100.000 transacciones, 500 fraudes (0,5%)
+tonto = DummyClassifier(strategy="most_frequent")
+tonto.fit(X_train, y_train)
+pred = tonto.predict(X_test)
+
+accuracy_score(y_test, pred)   # 0.995  → 99,5% "acertando"</code></pre>
+
+<p>Un <code>if False</code> disfrazado de modelo tiene <strong>99,5% de accuracy</strong>. No detectó ni un solo fraude —su recall es exactamente cero— pero el número lo hace parecer excelente. Cualquier modelo real que reporte "99,2% de accuracy" en este problema no solo no es bueno: es <em>peor</em> que no hacer nada.</p>
+
+<div class="mistake">
+  <strong>El error de fondo.</strong> La accuracy pesa a todas las clases por su frecuencia. Cuando una clase domina, la métrica queda secuestrada por la clase mayoritaria y se vuelve ciega a la minoritaria — que suele ser justamente la que te importa: el fraude, la enfermedad, la falla, el churn. La accuracy responde "¿cuántas etiquetas puse bien?" cuando la pregunta del negocio es "¿cuántos fraudes agarré, y a qué costo?".
+</div>
+
+<div class="rule">
+  <strong>📌 Elegir la métrica es una decisión de negocio, no técnica.</strong> No existe "la métrica correcta" en abstracto: existe la métrica que refleja el costo real de cada tipo de error <em>en tu problema</em>. Preguntá siempre dos cosas antes de tocar código: ¿cuánto cuesta un falso positivo? ¿cuánto cuesta un falso negativo? Si esos dos costos son distintos —y casi siempre lo son— la accuracy es la métrica equivocada.
+</div>
+
+<h2>DS3.2 El zoo de métricas de clasificación</h2>
+
+<p>Todo empieza en la <strong>matriz de confusión</strong>: las cuatro celdas que cuentan qué acertaste y qué erraste, separando los dos tipos de acierto y los dos tipos de error.</p>
+
+<pre><code class="lang-python">from sklearn.metrics import confusion_matrix, classification_report
+
+#                 predijo NO   predijo SÍ
+# real NO          TN            FP     (falsa alarma)
+# real SÍ          FN            TP     (fraude que se escapó)
+tn, fp, fn, tp = confusion_matrix(y_test, pred).ravel()
+
+print(classification_report(y_test, pred, digits=3))</code></pre>
+
+<p>Sobre esas cuatro celdas se construyen las métricas que importan. La tabla es el mapa; lo que hay que memorizar no es la fórmula, es <strong>cuándo priorizar cada una</strong>.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Fórmula</th><th>Responde</th><th>Priorizala cuando…</th></tr></thead>
+<tbody>
+<tr><td><strong>Precision</strong></td><td>TP / (TP + FP)</td><td>De lo que marqué positivo, ¿cuánto era de verdad positivo?</td><td>El <strong>falso positivo</strong> es caro</td></tr>
+<tr><td><strong>Recall</strong> (sensibilidad)</td><td>TP / (TP + FN)</td><td>De todo lo positivo real, ¿cuánto agarré?</td><td>El <strong>falso negativo</strong> es caro</td></tr>
+<tr><td><strong>F1</strong></td><td>media armónica de P y R</td><td>¿Hay equilibrio entre precision y recall?</td><td>Te importan los dos y hay desbalance</td></tr>
+<tr><td><strong>Specificity</strong></td><td>TN / (TN + FP)</td><td>De lo negativo real, ¿cuánto reconocí?</td><td>Molestar a los negativos tiene costo</td></tr>
+<tr><td><strong>ROC-AUC</strong></td><td>área bajo TPR vs FPR</td><td>¿El score ordena bien en general?</td><td>Clases balanceadas; comparás rankings</td></tr>
+<tr><td><strong>PR-AUC</strong> (avg. precision)</td><td>área bajo precision vs recall</td><td>¿Ordena bien la clase rara?</td><td>La clase positiva es rara</td></tr>
+</tbody>
+</table>
+
+<h3>Falso positivo caro vs falso negativo caro</h3>
+
+<p>La elección precision/recall se decide mirando qué error duele más:</p>
+
+<div class="step"><strong>Falso negativo caro → priorizá recall.</strong> Detección de cáncer: dar por sano a un enfermo (FN) puede costar una vida; una falsa alarma (FP) cuesta un estudio de más. Fraude: el fraude que se escapa se paga entero; la transacción legítima frenada cuesta una revisión. Acá aceptás bajar precision para no perder positivos.</div>
+
+<div class="step"><strong>Falso positivo caro → priorizá precision.</strong> Filtro de spam: mandar un mail importante a la carpeta de spam (FP) es peor que dejar pasar un spam (FN). Un sistema que bloquea cuentas por "actividad sospechosa": bloquear a un cliente legítimo tiene un costo de reputación enorme. Acá subís el umbral y resignás recall.</div>
+
+<h3>ROC-AUC vs PR-AUC: por qué la clase rara cambia todo</h3>
+
+<p>El <strong>ROC-AUC</strong> mide qué tan bien el score separa positivos de negativos, promediando sobre todos los umbrales. Es la métrica por defecto de media industria — y tiene una trampa cuando la clase positiva es rara: el eje de la curva ROC es la tasa de falsos positivos, <code>FP / (FP + TN)</code>. Con 99,5% de negativos, el denominador es gigante, así que hacen falta <em>muchísimos</em> falsos positivos para mover la aguja. El ROC-AUC se ve espléndido aunque el modelo esté ahogado en falsas alarmas.</p>
+
+<pre><code class="lang-python">from sklearn.metrics import roc_auc_score, average_precision_score
+
+scores = modelo.predict_proba(X_test)[:, 1]
+
+roc_auc_score(y_test, scores)          # 0.94  → parece buenísimo
+average_precision_score(y_test, scores) # 0.31  → la cruda realidad (PR-AUC)</code></pre>
+
+<div class="rule">
+  <strong>📌 Clase positiva rara → PR-AUC, no ROC-AUC.</strong> La curva precision–recall ignora los verdaderos negativos, que en un problema desbalanceado son ruido barato. Por eso el PR-AUC (equivalente al <em>average precision</em>) refleja el desempeño sobre lo que te importa. Un ROC-AUC de 0,94 con un PR-AUC de 0,31 no es una contradicción: es la firma típica de un problema desbalanceado leído con la métrica equivocada.
+</div>
+
+<div class="info">
+  Ninguna de estas dos métricas fija un umbral: miden el <em>ranking</em>, es decir, qué tan bien el score ordena los casos. La decisión de dónde cortar —qué score se convierte en "sí" y cuál en "no"— es un paso aparte, y lo resolvemos en el Worked Example con la tabla de costos.
+</div>
+
+<h2>DS3.3 Métricas de regresión: MAE, RMSE, MAPE y el R² que engaña</h2>
+
+<p>Cuando el modelo predice un número continuo —un precio, una demanda, un tiempo de entrega— cambia el zoo pero no la lección: cada métrica penaliza los errores de una forma distinta, y esa forma tiene que coincidir con lo que le duele al negocio.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué mide</th><th>Penaliza el error…</th><th>Elegila cuando…</th><th>Trampa</th></tr></thead>
+<tbody>
+<tr><td><strong>MAE</strong></td><td>error absoluto medio</td><td>lineal (robusta a outliers)</td><td>te importa el error típico</td><td>no castiga los extremos</td></tr>
+<tr><td><strong>RMSE</strong></td><td>raíz del error cuadrático medio</td><td>cuadrático (castiga outliers)</td><td>un error grande duele mucho más que dos chicos</td><td>sensible a outliers y a la escala</td></tr>
+<tr><td><strong>MAPE</strong></td><td>error porcentual medio</td><td>relativo al valor real</td><td>comparás series de escalas distintas</td><td>explota cerca de 0; castiga más el sobre-estimar</td></tr>
+<tr><td><strong>R²</strong></td><td>varianza explicada</td><td>—</td><td>comunicar "qué tan bueno" a un no técnico</td><td>sube al agregar features; alto ≠ útil</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python">import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+mae  = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100   # ojo si y_test tiene ceros
+r2   = r2_score(y_test, y_pred)</code></pre>
+
+<p>La diferencia entre MAE y RMSE no es cosmética. Si predecís tiempos de entrega y el negocio tolera igual de mal muchos errores chicos que uno enorme, MAE. Si un solo pedido que llega tres días tarde te quema un cliente, RMSE — porque castiga cuadráticamente ese caso y te empuja a un modelo que evita los desastres aunque promedie un poco peor.</p>
+
+<div class="mistake">
+  <strong>Por qué el R² engaña.</strong> Tres motivos. Primero: <strong>siempre sube al agregar features</strong>, incluso ruido puro, así que un R² alto puede ser puro overfitting (por eso existe el R² ajustado). Segundo: un R² de 0,85 <em>no</em> quiere decir "85% de las predicciones son correctas" — mide varianza explicada, y es perfectamente compatible con errores enormes en los casos que importan. Tercero: <strong>puede ser negativo</strong>, y ahí te está diciendo algo brutal — tu modelo predice peor que tirar siempre la media. El R² sirve para comunicar, no para decidir.
+</div>
+
+<h2>DS3.4 Validación que no miente: cross-validation y sus trampas</h2>
+
+<p>Tenés la métrica correcta. Ahora, ¿sobre qué datos la medís? Un <strong>solo split</strong> train/test te da un número, pero ese número tiene una varianza que no ves: cambiá la semilla del split y el "accuracy" puede moverse varios puntos. Un solo split es ruido con pretensiones de verdad.</p>
+
+<p>La <strong>validación cruzada</strong> parte los datos en <em>k</em> pliegues, entrena en <em>k−1</em> y evalúa en el restante, rotando. Obtenés <em>k</em> mediciones: su media estima el desempeño, y su desvío te dice cuánto podés confiar.</p>
+
+<pre><code class="lang-python">from sklearn.model_selection import cross_val_score, StratifiedKFold
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scores = cross_val_score(modelo, X, y, cv=cv, scoring="average_precision")
+
+print(f"PR-AUC: {scores.mean():.3f} ± {scores.std():.3f}")
+# 0.312 ± 0.041  → la media Y la dispersión, siempre juntas</code></pre>
+
+<p>Pero la validación cruzada ingenua —barajar todo y partir al azar— es correcta <strong>solo si tus datos son independientes</strong>. En cuanto hay estructura temporal o de grupo, ese barajado le filtra al modelo información del futuro o del propio caso de test, y la métrica se infla. Esto es <strong>leakage</strong>, y es la causa número uno de modelos que brillan en validación y se estrellan en producción.</p>
+
+<table>
+<thead><tr><th>Situación</th><th>KFold ingenuo</th><th>Qué falla</th><th>Estrategia correcta</th></tr></thead>
+<tbody>
+<tr><td>Datos i.i.d.</td><td>OK</td><td>—</td><td><code>KFold</code> / <code>StratifiedKFold</code></td></tr>
+<tr><td>Clases desbalanceadas</td><td>folds sin positivos</td><td>varianza enorme; folds vacíos de la clase rara</td><td><code>StratifiedKFold</code></td></tr>
+<tr><td>Series temporales</td><td>entrena con el futuro</td><td>leakage temporal: métrica inflada, irreal</td><td><code>TimeSeriesSplit</code></td></tr>
+<tr><td>Grupos repetidos</td><td>mismo grupo en train y test</td><td>leakage por grupo: memoriza al individuo</td><td><code>GroupKFold</code></td></tr>
+</tbody>
+</table>
+
+<h3>CV con datos temporales: no podés usar el futuro</h3>
+
+<p>Si predecís algo que evoluciona en el tiempo —demanda, precio, fraude que muta— entrenar con datos posteriores a los de test es hacer trampa: en producción nunca vas a tener el futuro. <code>TimeSeriesSplit</code> respeta la flecha del tiempo (entrena siempre con el pasado, evalúa en el tramo siguiente):</p>
+
+<pre><code class="lang-python">from sklearn.model_selection import TimeSeriesSplit
+
+tscv = TimeSeriesSplit(n_splits=5)          # forward chaining
+for train_idx, test_idx in tscv.split(X):
+    # train_idx SIEMPRE precede a test_idx en el tiempo
+    assert train_idx.max() &lt; test_idx.min()
+    # entrená y evaluá acá</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El leakage temporal es silencioso y devastador.</strong> No tira ningún error. Simplemente te devuelve un PR-AUC de 0,80 en validación que en producción es 0,45, porque en validación el modelo "vio" patrones del futuro que jamás va a tener online. Cualquier transformación ajustada con todo el dataset —escalado, imputación, selección de features, <em>target encoding</em>— filtra de la misma forma: se ajusta dentro de cada fold, nunca antes de partir.
+</div>
+
+<h3>CV con grupos: leakage por grupo</h3>
+
+<p>Si un mismo individuo aparece en varias filas —un paciente con varias consultas, un usuario con varias sesiones— y una fila del paciente cae en train y otra en test, el modelo no aprende el patrón: <strong>memoriza al paciente</strong>. En producción, con pacientes nuevos, se derrumba. <code>GroupKFold</code> garantiza que todas las filas de un grupo caigan del mismo lado.</p>
+
+<pre><code class="lang-python">from sklearn.model_selection import GroupKFold
+
+gkf = GroupKFold(n_splits=5)
+scores = cross_val_score(modelo, X, y, groups=paciente_id, cv=gkf,
+                         scoring="f1")
+# ningún paciente_id aparece a la vez en train y test</code></pre>
+
+<h2>DS3.5 Intervalos de confianza y significancia</h2>
+
+<p>El modelo A dio 0,91 y el B dio 0,90. ¿Elegís A? La respuesta honesta es: <strong>todavía no sabés</strong>. Un número de evaluación es una <em>estimación</em> sobre un test set finito, y tiene incertidumbre. Sin una barra de error, esa diferencia de 0,01 puede ser señal o puede ser ruido del muestreo.</p>
+
+<div class="mistake">
+  <strong>El pecado más común de los leaderboards.</strong> Rankear modelos por la tercera cifra decimal de una métrica puntual. Con un test set de unos pocos miles de casos, el intervalo de confianza del 95% suele ser más ancho que las diferencias que la gente celebra. "A le ganó a B por 0,004" muchas veces significa "no se distinguen".
+</div>
+
+<p>La forma directa de ponerle barra de error a <em>cualquier</em> métrica es el <strong>bootstrap</strong>: remuestreás el test set con reemplazo muchas veces y mirás cómo se distribuye la métrica.</p>
+
+<pre><code class="lang-python">import numpy as np
+from sklearn.metrics import average_precision_score
+
+def bootstrap_ci(y_true, y_score, metric=average_precision_score,
+                 n=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    n_obs = len(y_true)
+    vals = []
+    for _ in range(n):
+        idx = rng.integers(0, n_obs, n_obs)      # muestra con reemplazo
+        if y_true[idx].sum() == 0:               # necesitás positivos
+            continue
+        vals.append(metric(y_true[idx], y_score[idx]))
+    lo, hi = np.percentile(vals, [2.5, 97.5])
+    return np.mean(vals), lo, hi
+
+media, lo, hi = bootstrap_ci(y_test, scores)
+print(f"PR-AUC {media:.3f}  IC95% [{lo:.3f}, {hi:.3f}]")</code></pre>
+
+<p>Para comparar <strong>dos modelos sobre el mismo test set</strong>, lo correcto es una prueba <em>pareada</em>, que aprovecha que ambos vieron exactamente los mismos casos. El test de <strong>McNemar</strong> mira los casos donde discrepan; el bootstrap pareado remuestrea la <em>diferencia</em> de métricas y chequea si el intervalo cruza el cero.</p>
+
+<div class="warn">
+  <strong>Cuidado con el t-test sobre los folds de CV.</strong> Los folds comparten datos de entrenamiento, así que sus métricas <em>no</em> son independientes. Un t-test ingenuo sobre los <em>k</em> puntajes subestima la varianza y te hace ver diferencias significativas que no existen. Si vas por ese camino, usá la corrección de Nadeau–Bengio (el t-test corregido para <em>resampling</em>). La regla práctica más segura: barra de error por bootstrap sobre un test set que el modelo nunca vio.
+</div>
+
+<h2>DS3.6 Calibración: cuando el 0.8 no es 80%</h2>
+
+<p>Hay un supuesto escondido que rompe muchos sistemas: creer que el score del modelo es una probabilidad. Un modelo puede <strong>ordenar</strong> perfectamente —AUC altísimo— y a la vez mentir en la magnitud. Si cuando dice "0,8" la frecuencia real de positivos es 0,4, el ranking es impecable pero las probabilidades son ficción.</p>
+
+<div class="concept">
+  <strong>💡 Ranking y calibración son cosas distintas.</strong> El <strong>ranking</strong> (lo que miden AUC y PR-AUC) es si el modelo pone los positivos arriba y los negativos abajo. La <strong>calibración</strong> es si el número que emite coincide con la frecuencia observada: de todos los casos a los que les puso 0,8, ¿el 80% resultó positivo? Podés tener ranking perfecto y calibración pésima, y viceversa.
+</div>
+
+<p>Importa el día que usás el score <em>como probabilidad</em>: para calcular un valor esperado (probabilidad × monto), para fijar un umbral por costo, para mostrarle un "70% de riesgo" a un médico o a un cliente. Ahí una probabilidad mentirosa se propaga a cada decisión que toma abajo.</p>
+
+<pre><code class="lang-python">from sklearn.calibration import calibration_curve
+from sklearn.metrics import brier_score_loss
+
+# reliability diagram: prob predicha vs frecuencia observada por bin
+frac_pos, mean_pred = calibration_curve(y_test, scores, n_bins=10)
+# si estuviera calibrado, frac_pos ≈ mean_pred (la diagonal)
+
+brier_score_loss(y_test, scores)   # 0 = perfecto; combina calibración y refinamiento</code></pre>
+
+<p>El <strong>reliability diagram</strong> grafica probabilidad predicha contra frecuencia observada: la diagonal es la calibración perfecta; por debajo, el modelo es <em>sobre-confiado</em>. Si detectás mala calibración, se corrige <em>después</em> de entrenar, con un modelito que reajusta los scores usando un set de validación aparte:</p>
+
+<pre><code class="lang-python">from sklearn.calibration import CalibratedClassifierCV
+
+# Platt (sigmoid): pocos datos, deformación suave
+cal = CalibratedClassifierCV(modelo, method="sigmoid", cv=5)
+# Isotónica: más datos, flexible, puede sobreajustar con pocos
+cal = CalibratedClassifierCV(modelo, method="isotonic", cv=5)
+cal.fit(X_cal, y_cal)</code></pre>
+
+<div class="info">
+  <strong>Platt scaling</strong> (sigmoide) ajusta dos parámetros: es estable con pocos datos, pero solo corrige deformaciones en forma de S. La <strong>regresión isotónica</strong> aprende cualquier función monótona: más potente, pero necesita bastantes datos o sobreajusta. Ojo con lo que ya sabés: modelos como boosting suelen estar sobre-confiados, mientras que las SVM y los Naive Bayes tienen sesgos de calibración característicos.
+</div>
+
+<h2>DS3.7 Slicing: el promedio que esconde el desastre</h2>
+
+<p>Acá está la falla más peligrosa de todas, porque sobrevive a todo lo anterior. Tu modelo tiene la métrica correcta, bien validada, con intervalo de confianza y calibrado. El PR-AUC agregado es bueno. Y aun así <strong>puede estar fallando de forma catastrófica en un subgrupo</strong> — y el promedio lo esconde, porque ese subgrupo es chico y su desastre se diluye en el éxito del resto.</p>
+
+<blockquote>Un promedio es un lugar donde te ahogás cruzando un río que tiene, en promedio, medio metro de profundidad.</blockquote>
+
+<p>La técnica se llama <strong>evaluación por slices</strong>: cortás el test set por dimensiones que te importan —región, tipo de producto, canal, franja horaria, demografía— y medís la métrica dentro de cada uno.</p>
+
+<pre><code class="lang-python">import pandas as pd
+from sklearn.metrics import recall_score
+
+df = X_test.copy()
+df["y_true"] = y_test
+df["y_pred"] = y_pred
+
+por_slice = (df.groupby("region")
+               .apply(lambda g: recall_score(g.y_true, g.y_pred))
+               .sort_values())
+print(por_slice)
+# region_norte    0.81
+# region_centro   0.78
+# region_sur      0.34   &lt;- el agregado (0.75) escondía esto</code></pre>
+
+<div class="rule">
+  <strong>📌 Ningún modelo va a producción sin evaluación por slices.</strong> El agregado responde "¿anda en promedio?"; los slices responden "¿a quién estoy dejando afuera?". Definí los slices <em>antes</em> de mirar los resultados —región, segmento de valor, grupos protegidos, casos de borde— y tratá un slice con métrica muy por debajo del resto como un bug bloqueante, no como un detalle. El modelo que anda 0,80 en promedio pero 0,34 en tu región más rentable no está listo.
+</div>
+
+<h2>DS3.8 Fairness y sesgo: por qué no podés tener todo</h2>
+
+<p>Cuando los slices son grupos de personas —género, etnia, edad, código postal— la evaluación por slices se vuelve una cuestión de <strong>equidad</strong>, y el costo de una falla deja de ser plata para volverse daño real y responsabilidad legal. Un modelo de crédito, de contratación o de reincidencia que falla sistemáticamente en un grupo no es "un modelo con un slice flojo": es un modelo que discrimina.</p>
+
+<p>El problema técnico es que "justo" no tiene una sola definición, y las definiciones <strong>chocan entre sí</strong>:</p>
+
+<table>
+<thead><tr><th>Criterio de equidad</th><th>Iguala entre grupos…</th><th>Intuición</th></tr></thead>
+<tbody>
+<tr><td><strong>Demographic parity</strong></td><td>la tasa de positivos predichos</td><td>"aprobamos al mismo % en cada grupo"</td></tr>
+<tr><td><strong>Equal opportunity</strong></td><td>el TPR (recall)</td><td>"a los que califican, los detectamos igual"</td></tr>
+<tr><td><strong>Equalized odds</strong></td><td>TPR y FPR a la vez</td><td>"aciertos y errores parejos en ambos grupos"</td></tr>
+<tr><td><strong>Calibración por grupo</strong></td><td>score → frecuencia real</td><td>"un 0,7 significa lo mismo para todos"</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El teorema de imposibilidad.</strong> Los resultados de Kleinberg–Mullainathan–Raghavan y de Chouldechova (2016) demuestran que, salvo casos degenerados, <strong>no se puede satisfacer calibración y equalized odds al mismo tiempo cuando la prevalencia real difiere entre grupos</strong>. No es un problema de ingeniería que se resuelve con más datos o un modelo mejor: es una imposibilidad matemática. Elegir qué criterio de equidad priorizás es una decisión ética y de política, y alguien la va a tomar — mejor que sea explícita y no un default accidental de tu pipeline.
+</div>
+
+<pre><code class="lang-python"># TPR (equal opportunity) por grupo protegido — el chequeo mínimo
+def tpr_por_grupo(df, grupo):
+    out = {}
+    for g, sub in df.groupby(grupo):
+        pos = sub[sub.y_true == 1]
+        out[g] = (pos.y_pred == 1).mean() if len(pos) else float("nan")
+    return out
+
+tpr_por_grupo(df, "genero")   # {'A': 0.82, 'B': 0.61}  → brecha de 21 puntos</code></pre>
+
+<p>El costo real de un modelo sesgado no aparece en tu métrica agregada: aparece en las personas mal clasificadas, en la demanda legal, en el titular de prensa y en la confianza perdida. Medí la brecha entre grupos como una métrica de primera clase, no como un anexo.</p>
+
+<h2>DS3.9 Baselines: contra qué se mide de verdad</h2>
+
+<p>Una métrica sin baseline es un número sin contexto. "El modelo da 0,75 de F1" no significa nada hasta que sepas qué da la alternativa trivial. <strong>Todo modelo se compara contra el baseline más tonto que resuelva el problema</strong>, y hay más de uno:</p>
+
+<div class="step"><strong>Clasificación:</strong> la clase mayoritaria (<code>DummyClassifier</code>), o una regla de negocio de una línea ("marcá fraude si el monto &gt; X y el país no coincide").</div>
+
+<div class="step"><strong>Regresión:</strong> predecir siempre la media o la mediana (<code>DummyRegressor</code>); en series de tiempo, el <em>naïve forecast</em> —"mañana va a ser igual que hoy"—, sorprendentemente difícil de vencer.</div>
+
+<div class="step"><strong>Baseline razonable:</strong> una regresión logística o un árbol chico sobre pocas features. Si tu red neuronal de 40 capas no le gana por un margen que justifique su costo, la red no va.</div>
+
+<pre><code class="lang-python">from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+
+trivial = DummyClassifier(strategy="stratified").fit(X_train, y_train)
+simple  = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+
+# tu modelo tiene que ganarle a AMBOS por un margen que valga su complejidad
+for nombre, m in [("trivial", trivial), ("logística", simple), ("tu modelo", modelo)]:
+    s = average_precision_score(y_test, m.predict_proba(X_test)[:, 1])
+    print(f"{nombre:12s} PR-AUC {s:.3f}")</code></pre>
+
+<div class="mistake">
+  <strong>La cantidad de modelos complejos que pierden contra una regresión logística es humillante.</strong> No porque el deep learning no sirva, sino porque en datos tabulares con features decentes, un modelo lineal bien regularizado o un gradient boosting captura casi toda la señal disponible — y lo hace más barato, más rápido y más fácil de explicar. El baseline no es un trámite: muchas veces <em>es</em> la respuesta, y te ahorra meses de mantener una complejidad que no aportaba nada.
+</div>
+
+<h2>DS3.10 Evaluar LLMs: cuando las métricas clásicas no aplican</h2>
+
+<p>Todo lo anterior asume una etiqueta verdadera contra la cual comparar. Con un LLM que <em>genera</em> texto, eso se rompe: hay infinitas respuestas correctas a "resumí este contrato", y ninguna coincide carácter por carácter con una referencia. Las métricas de solapamiento como BLEU o ROUGE, heredadas de la traducción, miden n-gramas compartidos y castigan una respuesta excelente por usar otras palabras. Para generación abierta, correlacionan mal con el juicio humano.</p>
+
+<table>
+<thead><tr><th>Tipo de tarea</th><th>Cómo evaluar</th></tr></thead>
+<tbody>
+<tr><td>Salida cerrada (clasificar, extraer, elegir)</td><td>vuelve el zoo clásico: exact match, F1</td></tr>
+<tr><td>Generación abierta (resumen, redacción)</td><td>rúbricas + evaluación humana o LLM-as-judge</td></tr>
+<tr><td>RAG (respuesta con fuentes)</td><td>faithfulness / groundedness, relevancia (ver DS6)</td></tr>
+<tr><td>Agentes / tareas con pasos</td><td>tasa de éxito de la tarea end-to-end</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>LLM-as-judge escala, pero tiene sesgos propios.</strong> Usar un modelo para puntuar a otro es práctico, y también trae <em>position bias</em> (favorece la primera opción), <em>verbosity bias</em> (premia lo largo) y <em>self-preference</em> (favorece el estilo del propio juez). Sirve como señal, no como veredicto: anclalo con un set de evaluación curado y validación humana sobre una muestra. Y sumá siempre costo y latencia como métricas de primer orden — un LLM que acierta pero cuesta diez veces más o tarda cinco segundos puede no ir a producción por eso solo. El detalle completo está en <a href="../ds5-llmops/lecture.html">DS5 (LLMOps)</a>.
+</div>
+
+<h2>DS3.11 Cuándo el modelo NO debería ir a producción</h2>
+
+<p>La métrica agregada puede ser buena y el modelo, aun así, no estar listo. Evaluar de verdad incluye tener el criterio —y la autoridad— para decir "no va todavía". Estas son las señales de freno:</p>
+
+<div class="danger">
+  <strong>⚠️ Frená el deploy si…</strong>
+  <ul>
+    <li>Un <strong>slice importante</strong> (grupo de valor, grupo protegido, caso de borde) tiene una métrica muy por debajo del resto.</li>
+    <li>Las decisiones se toman con el <strong>score como probabilidad</strong> y el modelo <strong>no está calibrado</strong>.</li>
+    <li>No le ganaste a un <strong>baseline</strong> razonable por un margen que justifique la complejidad.</li>
+    <li>Sospechás <strong>leakage</strong>: la métrica es "demasiado buena" y no la pudiste reproducir con una validación temporal o por grupo honesta.</li>
+    <li>El <strong>peor caso</strong> es inaceptable aunque el promedio sea bueno (un error catastrófico posible, aunque raro).</li>
+    <li>No hay plan de <strong>monitoreo, umbral de alarma ni rollback</strong> para cuando la distribución cambie — y va a cambiar (ver <a href="../ds8-observabilidad/lecture.html">DS8</a>).</li>
+  </ul>
+</div>
+
+<p>Ninguna de estas señales aparece en el <code>.score()</code>. Todas aparecen si evaluás como se debe. El trabajo senior no es sacar el número más alto: es saber cuándo el número más alto no alcanza.</p>
+
+<h2>🧑‍🎓 Worked Example — el detector de fraude con 99.2% que el negocio rechaza</h2>
+
+<blockquote>El equipo entrena un detector de fraude, lo evalúa y presenta el resultado: <strong>99,2% de accuracy</strong>. Entusiasmo general. El líder de negocio lo rechaza en la reunión. Tenía razón. Vamos a diagnosticar por qué, elegir la métrica correcta, evaluar por slices y decidir el umbral por costo.</blockquote>
+
+<p><strong>Paso 1 — El contexto que cambia todo: la prevalencia.</strong> De 100.000 transacciones, 500 son fraude: <strong>0,5%</strong>. El primer reflejo senior es calcular el baseline trivial antes de mirar el modelo. Predecir siempre "no es fraude" da <strong>99,5% de accuracy</strong>. El modelo, con 99,2%, es <em>peor que no hacer nada</em>. La métrica que celebraban era la prueba de que el modelo no servía.</p>
+
+<p><strong>Paso 2 — La matriz de confusión real.</strong> El accuracy escondía esto:</p>
+
+<table>
+<thead><tr><th></th><th>Predijo: legítima</th><th>Predijo: fraude</th></tr></thead>
+<tbody>
+<tr><td><strong>Real: legítima (99.500)</strong></td><td>TN = 99.140</td><td>FP = 360</td></tr>
+<tr><td><strong>Real: fraude (500)</strong></td><td>FN = 440</td><td>TP = 60</td></tr>
+</tbody>
+</table>
+
+<p>De 500 fraudes, el modelo agarró <strong>60</strong>. El <strong>recall es 12%</strong>: se escapan 44 de cada 50 fraudes. La precision es 14,3% (de 420 alarmas, solo 60 eran fraude) y el F1 es 0,130. El 99,2% era matemáticamente cierto y prácticamente inútil.</p>
+
+<p><strong>Paso 3 — Elegir la métrica correcta.</strong> ¿Qué error duele más? Un fraude no detectado (FN) se paga entero: pongamos <strong>US$500</strong> promedio entre monto, contracargo y operación. Una transacción legítima marcada (FP) cuesta la revisión de un analista más algo de fricción: <strong>US$10</strong>. Asimetría 50 a 1 a favor de <strong>no perder fraude</strong> → la métrica que manda es <strong>recall</strong>, con una precision que el equipo de revisión pueda sostener. Y para medir el <em>ranking</em> del modelo sobre la clase rara, <strong>PR-AUC</strong>, no ROC-AUC.</p>
+
+<p><strong>Paso 4 — El umbral es una decisión de costo, no el 0,5 por defecto.</strong> El problema no era solo la métrica: era que el umbral quedó en 0,5, absurdo para 0,5% de prevalencia. Barremos el umbral y calculamos el <strong>costo de negocio</strong> de cada punto de operación:</p>
+
+<table>
+<thead><tr><th>Umbral</th><th>Recall</th><th>Precision</th><th>FN</th><th>FP</th><th>Costo FN (×$500)</th><th>Costo FP (×$10)</th><th>Costo total</th></tr></thead>
+<tbody>
+<tr><td>0.50 (default)</td><td>12%</td><td>14.3%</td><td>440</td><td>360</td><td>$220.000</td><td>$3.600</td><td>$223.600</td></tr>
+<tr><td>0.30</td><td>45%</td><td>9%</td><td>275</td><td>2.275</td><td>$137.500</td><td>$22.750</td><td>$160.250</td></tr>
+<tr><td><strong>0.15</strong></td><td><strong>75%</strong></td><td>5%</td><td>125</td><td>7.125</td><td>$62.500</td><td>$71.250</td><td><strong>$133.750</strong></td></tr>
+<tr><td>0.08</td><td>90%</td><td>3%</td><td>50</td><td>14.550</td><td>$25.000</td><td>$145.500</td><td>$170.500</td></tr>
+</tbody>
+</table>
+
+<p>El costo mínimo está en <strong>umbral 0,15</strong> ($133.750), no en el que maximiza F1 (0,30, con F1 = 0,150). Ese es el punto clave: <strong>el óptimo de negocio no coincide con el óptimo de la métrica "equilibrada"</strong>, porque la asimetría de costos empuja hacia el recall. Con datos, no con intuición.</p>
+
+<div class="warn">
+  <strong>El límite operativo también es una decisión.</strong> El umbral 0,15 implica 7.125 revisiones/día con 5% de precision. Si el equipo de análisis solo puede procesar 3.000 casos, ese punto es inviable: hay que subir el umbral, sumar capacidad, o meter una segunda etapa que priorice alertas. La capacidad de revisión es una restricción del negocio que entra en la ecuación junto con los costos.
+</div>
+
+<p><strong>Paso 5 — Evaluar por slices antes de festejar.</strong> Con el umbral 0,15 el recall agregado es 75%. Cortamos por tipo de transacción:</p>
+
+<table>
+<thead><tr><th>Slice</th><th>Fraudes reales</th><th>Recall</th></tr></thead>
+<tbody>
+<tr><td>Tarjeta presente (nacional)</td><td>300</td><td>85%</td></tr>
+<tr><td>E-commerce nacional</td><td>120</td><td>75%</td></tr>
+<tr><td><strong>E-commerce internacional</strong></td><td>80</td><td><strong>37%</strong></td></tr>
+<tr><td>Agregado</td><td>500</td><td>75%</td></tr>
+</tbody>
+</table>
+
+<p>El 75% agregado escondía que en <strong>e-commerce internacional el recall es 37%</strong> — y ese slice concentra el fraude de mayor monto. El modelo anda bien donde el fraude es barato y falla donde es caro. La métrica de negocio real (dólares de fraude evitados) es peor que la que sugiere el recall en unidades.</p>
+
+<p><strong>Paso 6 — La decisión.</strong> El punto de operación 0,15 se aprueba para las transacciones nacionales, donde el modelo cumple. Para e-commerce internacional <strong>no va a producción todavía</strong>: se agrega una regla de negocio provisoria para montos altos cross-border y se prioriza una feature específica en la próxima iteración. Y se deja escrito el criterio de aprobación —recall por slice, costo por umbral, capacidad de revisión— para que la próxima versión se mida igual y la decisión no dependa de la reunión.</p>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá recall".</strong> Es la secuencia: <strong>prevalencia → baseline → matriz de confusión → métrica según el costo del error → umbral por costo de negocio → slices → decisión de deploy</strong>. El 99,2% de accuracy fallaba en el primer paso. Cada paso que te saltés es un lugar donde un número lindo te está mintiendo.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu modelo tiene ROC-AUC 0,93 pero PR-AUC 0,28. ¿Está roto? ¿Qué mirás?</summary>
+<p>No está roto: es la firma típica de un problema desbalanceado. El ROC-AUC usa la tasa de falsos positivos, cuyo denominador (los verdaderos negativos) es enorme cuando la clase positiva es rara, así que se ve inflado aunque el modelo genere muchas falsas alarmas. El PR-AUC ignora los verdaderos negativos y mide el desempeño sobre la clase que importa — creele a ese. Después, en vez de quedarte en la métrica de ranking, elegí un umbral mirando el costo de FP vs FN y evaluá por slices, porque el PR-AUC agregado todavía puede esconder un subgrupo donde el modelo se cae.</p></details>
+
+<details><summary>Predecís demanda diaria y tu CV con KFold barajado da un error espectacular. ¿Por qué desconfiás?</summary>
+<p>Porque en datos temporales, barajar y partir al azar mete <strong>leakage temporal</strong>: en varios folds el modelo entrena con días posteriores a los que evalúa, es decir, "ve el futuro" que en producción nunca va a tener. La métrica queda inflada y no es reproducible online. Lo correcto es <code>TimeSeriesSplit</code> (entrenar siempre con el pasado, evaluar en el tramo siguiente) y ajustar toda transformación —escalado, imputación, encodings— dentro de cada fold, jamás sobre el dataset completo. Si con validación temporal honesta el número se derrumba, ese derrumbe es la verdad.</p></details>
+
+<details><summary>Un modelo de scoring crediticio ordena bien (AUC 0,88) y lo vas a usar para decidir tasas según la probabilidad de default. ¿Alcanza con el AUC?</summary>
+<p>No. El AUC solo dice que ordena bien; para fijar tasas usás el score <em>como probabilidad</em>, y ahí importa la <strong>calibración</strong>: que cuando el modelo dice 0,10 de default, el 10% realmente caiga en default. Un modelo puede rankear perfecto y estar sobre-confiado, y si asignás tasas con probabilidades mentirosas, cada decisión sale sesgada. Hay que graficar el reliability diagram, medir Brier score, y calibrar con Platt o isotónica sobre un set aparte. Y como decide sobre personas, evaluar la calibración y el TPR <strong>por grupo protegido</strong> — recordando que calibración y equalized odds no se pueden tener a la vez si las prevalencias difieren.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>La accuracy sobre datos desbalanceados miente: un <code>if False</code> saca 99,5% en un problema con 0,5% de positivos. <strong>Elegir la métrica es una decisión de negocio</strong> guiada por el costo de cada error.</li>
+  <li>FN caro → recall; FP caro → precision; F1 para el equilibrio. Clase rara → <strong>PR-AUC</strong>, no ROC-AUC. La matriz de confusión es la fuente de todo.</li>
+  <li>En regresión, MAE (robusta), RMSE (castiga outliers), MAPE (relativa). El <strong>R² engaña</strong>: sube con features, alto no es "útil", y negativo significa peor que la media.</li>
+  <li>Un solo split es ruido. Cross-validation con la variante correcta: <code>StratifiedKFold</code>, <code>TimeSeriesSplit</code> (sin usar el futuro), <code>GroupKFold</code> (sin leakage por grupo).</li>
+  <li>Ponele barra de error a la métrica (<strong>bootstrap</strong>) y compará modelos con pruebas pareadas: "0,91 vs 0,90" a menudo es empate.</li>
+  <li><strong>Calibración ≠ ranking</strong>: si usás el score como probabilidad, verificá el reliability diagram y calibrá (Platt/isotónica).</li>
+  <li><strong>Slicing</strong>: el promedio esconde el desastre. Ningún modelo va a producción sin métricas por subgrupo. Con grupos de personas, es <strong>fairness</strong> — y el teorema de imposibilidad prohíbe satisfacer todos los criterios a la vez.</li>
+  <li>Todo modelo se mide contra un <strong>baseline</strong> trivial y uno razonable. Muchos modelos complejos pierden contra una regresión logística.</li>
+  <li>Evaluar LLMs no usa el zoo clásico en generación abierta: rúbricas, LLM-as-judge (con sus sesgos), costo y latencia (ver DS5).</li>
+  <li>La métrica buena no basta: frená el deploy por slice malo, falta de calibración, leakage, peor caso inaceptable o ausencia de monitoreo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un dataset desbalanceado (por ejemplo, <code>fetch_openml</code> de fraude o el de cáncer de mama). Entrená un modelo y reportá accuracy, precision, recall, F1, ROC-AUC y PR-AUC. Compará ROC-AUC contra PR-AUC y explicá la brecha con la prevalencia.</li>
+  <li>Programá el barrido de umbral del Worked Example: para una grilla de umbrales, calculá FN, FP y el costo total con tus propios costos de FN y FP. Graficá costo vs umbral y marcá el mínimo. Mostrá que no coincide con el umbral que maximiza F1.</li>
+  <li>Implementá <code>bootstrap_ci</code> para el PR-AUC de tu modelo con 2.000 remuestreos y reportá el IC95%. Después entrená un segundo modelo y decidí, con un bootstrap pareado de la diferencia, si es realmente mejor o si el intervalo cruza el cero.</li>
+  <li>Tomá una serie temporal y evaluá el mismo modelo con <code>KFold</code> barajado y con <code>TimeSeriesSplit</code>. Documentá cuánto se infla la métrica con el barajado y por qué es leakage.</li>
+  <li>Graficá el reliability diagram de un <code>GradientBoosting</code> antes y después de <code>CalibratedClassifierCV</code> (probá sigmoid e isotonic). Medí el Brier score en cada caso y explicá cuál mejoró la calibración sin arruinar el ranking.</li>
+  <li>Elegí una variable de grupo (región, franja horaria, un atributo demográfico sintético) y calculá el recall por slice. Encontrá el peor slice, cuantificá la brecha contra el agregado y escribí en dos líneas si el modelo debería ir a producción y por qué.</li>
+  <li>Para un modelo tuyo, construí explícitamente el baseline trivial (<code>DummyClassifier</code>/<code>DummyRegressor</code>) y un baseline razonable (logística o boosting chico). Reportá los tres y decidí si tu modelo justifica su complejidad.</li>
+</ol>
+
+<section class="quiz" id="quizDS3">
+  <style>
+    #quizDS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS3 .q{margin-bottom:1.5rem}
+    #quizDS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS3 .opt:hover{border-color:var(--accent)}
+    #quizDS3 .opt:disabled{cursor:default}
+    #quizDS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizDS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizDS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS3 .exp.show{display:block}
+    #quizDS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Un clasificador de fraude reporta 99,2% de accuracy sobre un dataset con 0,5% de fraude. ¿Qué podés concluir?</p>
+    <button class="opt">Que es un modelo excelente: menos de 1% de error es un gran resultado</button>
+    <button class="opt">Casi nada bueno: predecir siempre "no fraude" da 99,5%, así que el modelo puede ser peor que la regla trivial</button>
+    <button class="opt">Que tiene buen recall, porque la accuracy alta implica que agarra casi todos los fraudes</button>
+    <div class="exp">Con 0,5% de prevalencia, el baseline que siempre dice "no fraude" saca 99,5% de accuracy sin detectar un solo caso. Un modelo con 99,2% es <em>peor</em> que ese baseline. La accuracy está secuestrada por la clase mayoritaria; hay que mirar recall, precision y PR-AUC, y calcular el baseline trivial antes de festejar cualquier número.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu clase positiva es rara (0,5%). ¿Qué curva refleja mejor el desempeño del modelo sobre esa clase?</p>
+    <button class="opt">PR-AUC, porque ignora los verdaderos negativos; el ROC-AUC se infla con la abundancia de negativos</button>
+    <button class="opt">ROC-AUC, porque es la métrica estándar y siempre es más confiable que el PR-AUC</button>
+    <button class="opt">Da igual: ROC-AUC y PR-AUC siempre dan el mismo valor sobre los mismos datos</button>
+    <div class="exp">El ROC-AUC usa la tasa de falsos positivos <code>FP/(FP+TN)</code>; con la clase negativa dominante, ese denominador enorme hace falta muchísimos FP para moverlo, y la curva se ve espléndida aunque el modelo genere falsas alarmas. El PR-AUC (average precision) ignora los verdaderos negativos y mide precision vs recall, así que refleja el desempeño sobre la clase rara. Un ROC-AUC 0,94 con PR-AUC 0,31 es la firma del desbalance.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>3. Un modelo ordena muy bien (AUC 0,95), pero cuando dice "0,8 de probabilidad", la frecuencia real de positivos es 0,4. Vas a usar el score para calcular valor esperado (probabilidad × monto). ¿Sirve así?</p>
+    <button class="opt">Sí: con AUC 0,95 el modelo es casi perfecto y las probabilidades son confiables</button>
+    <button class="opt">Sí, si además tiene buen recall en el umbral por defecto de 0,5</button>
+    <button class="opt">No: buen ranking no implica buenas probabilidades; está sobre-confiado y hay que calibrarlo antes</button>
+    <div class="exp">Ranking y calibración son cosas distintas. El AUC solo garantiza el orden; acá el modelo está sobre-confiado (dice 0,8 donde la realidad es 0,4). Como usás el score <em>como probabilidad</em> para un cálculo de valor esperado, esa mentira se propaga a cada decisión. Hay que verificar con el reliability diagram y el Brier score, y calibrar con Platt (sigmoid) o isotónica sobre un set de validación aparte antes de confiar en las magnitudes.</div>
+  </div>
+
+  <div class="score" id="scoreDS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds2-entrenamiento/lecture.html">← DS2: Entrenamiento a escala</a>
+  <a href="../ds4-serving/lecture.html">DS4: Serving de modelos →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS6 — RAG en producción: retrieval que funciona · Datos/ML Senior</title>
+  <meta name="description" content="Por qué el 80% de los RAG en producción recuperan basura y nadie lo mide. Chunking, embeddings, vector stores (pgvector/pg_vectorscale), retrieval híbrido, reranking con cross-encoders, evaluación con Ragas, grounding, RAG vs fine-tuning y cuándo NO usar RAG.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos &amp; ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS6</span>
+  <span class="badge">⏱ 35–85 min</span>
+  <span class="badge">🎯 Pre-req: DS5</span>
+  <span class="badge">🔎 RAG</span>
+</div>
+
+<article>
+
+<h1>DS6 — RAG en producción: retrieval que funciona</h1>
+
+<h2>DS6.0 Por qué este módulo</h2>
+
+<p>RAG —<em>Retrieval-Augmented Generation</em>— es de las cosas más fáciles de prototipar y de las más difíciles de hacer bien. En una tarde, con veinte líneas de un framework, tenés un chatbot que "habla con tus documentos" y responde algo razonable en la demo. Ese es exactamente el problema: la demo funciona, todos aplauden, se despliega, y a las dos semanas empiezan a llegar respuestas que citan el documento equivocado, que inventan datos, o que directamente contestan cualquier cosa con total seguridad.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un RAG es <strong>dos sistemas encadenados</strong>: un motor de búsqueda (el <em>retrieval</em>) y un generador de texto (el LLM). La calidad de la respuesta está acotada por el eslabón más débil, y en la enorme mayoría de los RAG el eslabón débil es el <strong>retrieval</strong>, no el modelo. Si al LLM le pasás los chunks equivocados, ningún prompt lo va a salvar: va a redactar con elegancia una respuesta basada en basura.
+</div>
+
+<p>Y acá está la observación incómoda que ordena todo lo que sigue: <strong>el 80% de los RAG en producción recuperan basura y nadie lo mide.</strong> Se mide la latencia, se mide el costo por token, se mira "a ojo" si la respuesta suena bien — pero casi nadie tiene un número que responda la única pregunta que importa: <em>de las veces que el usuario pregunta algo, ¿cuántas veces el retrieval le trajo al modelo la información que necesitaba para responder?</em> Sin ese número, estás optimizando el prompt de generación mientras el incendio está en la búsqueda.</p>
+
+<p>Este módulo es sobre construir el sistema de búsqueda que la mayoría se saltea, y sobre medirlo con rigor. Vas a ver por qué el chunking importa más de lo que parece, por qué la búsqueda vectorial sola falla, por qué un <strong>cross-encoder</strong> de reranking es la mejora de mayor impacto por línea de código, y cómo <strong>Ragas</strong> convierte "parece que mejoró" en "el context recall subió de 0.40 a 0.88".</p>
+
+<h2>DS6.1 La arquitectura, etapa por etapa</h2>
+
+<p>Un RAG tiene dos fases que la gente suele mezclar en la cabeza y conviene separar con nitidez: la <strong>indexación</strong>, que corre <em>offline</em> (una vez, y cada vez que actualizás la base), y la <strong>consulta</strong>, que corre <em>online</em> en cada pregunta. La query del usuario tiene que pasar por el mismo modelo de embeddings que usaste al indexar, o los vectores no son comparables. Este es el mapa completo:</p>
+
+<pre><code class="lang-bash">INDEXACIÓN  (offline — al ingestar y al actualizar)
+──────────────────────────────────────────────────────
+  Documentos crudos (PDF · HTML · docx · wikis · tickets · código)
+       │  ingesta / parsing
+       ▼
+  Texto limpio
+       │  chunking (partir en fragmentos manejables)
+       ▼
+  Chunks + metadata (fuente · permisos · fecha)
+       │  modelo de embeddings (texto → vector)
+       ▼
+  Vectores  ───────►  VECTOR STORE  +  índice ANN (HNSW · IVFFlat)
+
+
+CONSULTA  (online — en cada pregunta del usuario)
+──────────────────────────────────────────────────────
+  Pregunta del usuario
+       │  el MISMO modelo de embeddings
+       ▼
+  Vector de la query
+       │
+       ▼
+  RETRIEVAL    ── top-k vectorial   +   BM25 (keyword)
+       │  fusión de rankings (RRF)
+       ▼
+  RERANK       ── cross-encoder sobre el top 20–50   ───►  top 3–5
+       │
+       ▼
+  CONTEXTO     ── prompt = instrucciones + chunks + pedido de citar
+       │
+       ▼
+  GENERACIÓN (LLM)   ───────►   Respuesta + fuentes citadas</code></pre>
+
+<p>Cada flecha de ese diagrama es un lugar donde se rompe silenciosamente. Lo peligroso del RAG es que ninguna de estas fallas tira un error: todas producen una respuesta fluida y con aplomo. Por eso el diagnóstico no se hace leyendo un stack trace, se hace midiendo cada etapa por separado.</p>
+
+<table>
+<thead><tr><th>Etapa</th><th>Falla típica</th><th>Se nota como</th></tr></thead>
+<tbody>
+<tr><td><strong>Ingesta / parsing</strong></td><td>PDF a dos columnas leído cruzado; tablas aplanadas a texto ilegible</td><td>Contexto que no tiene sentido</td></tr>
+<tr><td><strong>Chunking</strong></td><td>Corta la respuesta al medio; mezcla varios temas en un fragmento</td><td>Recall bajo, respuestas incompletas</td></tr>
+<tr><td><strong>Embeddings</strong></td><td>Modelo flojo, o monolingüe sobre corpus en español; <em>mismatch</em> query/doc</td><td>La query no matchea el chunk correcto</td></tr>
+<tr><td><strong>Vector store</strong></td><td>Índice ANN con parámetros de recall pobre</td><td>Pierde chunks que sí están en la base</td></tr>
+<tr><td><strong>Retrieval</strong></td><td>Solo vectorial: no encuentra el término exacto, el nombre propio, la sigla</td><td>Falla justo en las consultas específicas</td></tr>
+<tr><td><strong>Rerank</strong></td><td>Ausente: el top-k queda lleno de "parecidos" irrelevantes</td><td>La info correcta está, pero en el puesto 18</td></tr>
+<tr><td><strong>Contexto</strong></td><td>Demasiado (ruido, <em>lost-in-the-middle</em>) o muy poco (falta info)</td><td>Se satura o alucina para rellenar</td></tr>
+<tr><td><strong>Generación</strong></td><td>Ignora el contexto e inventa desde su memoria paramétrica</td><td>Respuesta segura y falsa</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla mental para el resto del módulo.</strong> Cuando un RAG responde mal, la pregunta no es "¿cómo mejoro el prompt?". Es "¿el chunk correcto estaba en el contexto, sí o no?". Si no estaba → es un problema de retrieval (etapas 1 a 6). Si estaba y el modelo igual falló → recién ahí es un problema de generación (etapas 7 y 8). Casi siempre es lo primero.
+</div>
+
+<h2>DS6.2 Chunking: la etapa que todos subestiman</h2>
+
+<p>El chunking es partir cada documento en fragmentos que después se embebén e indexan por separado. Suena trivial —"cortá cada 1000 caracteres"— y es la decisión que más silenciosamente arruina un RAG. La razón es que el chunk es la <strong>unidad atómica de recuperación</strong>: recuperás chunks enteros, no oraciones. Si la respuesta a una pregunta está partida entre dos chunks, ningún chunk la contiene completa, y el modelo nunca la va a ver entera.</p>
+
+<h3>Tamaño y overlap</h3>
+
+<p>Hay una tensión real. Un chunk <strong>muy chico</strong> (una oración) matchea con precisión pero pierde el contexto: recupera "El límite es de 40.000 USD" sin el párrafo que aclara a qué producto y a qué región aplica. Un chunk <strong>muy grande</strong> (una página entera) tiene todo el contexto pero su embedding es un promedio borroso de cinco temas distintos, así que no matchea bien con ninguna query específica. El punto dulce típico está entre <strong>256 y 512 tokens</strong>, con un <strong>overlap del 10–20%</strong> para que una idea que cae justo en el borde no quede mutilada.</p>
+
+<pre><code class="lang-python"># Chunking por tamaño con overlap. Contar en TOKENS, no en caracteres:
+# el modelo razona en tokens y los límites del LLM son en tokens.
+import tiktoken
+
+enc = tiktoken.get_encoding("cl100k_base")
+
+def chunk_por_tokens(texto: str, tam: int = 400, overlap: int = 60):
+    tokens = enc.encode(texto)
+    chunks = []
+    start = 0
+    while start &lt; len(tokens):
+        end = start + tam
+        trozo = tokens[start:end]
+        chunks.append(enc.decode(trozo))
+        if end &gt;= len(tokens):
+            break
+        start = end - overlap          # el solapamiento evita cortar ideas al filo
+    return chunks</code></pre>
+
+<div class="warn">
+  <strong>Contá en tokens, no en caracteres.</strong> Un chunk de "1000 caracteres" puede ser 180 tokens de español o 400 de código. Si tu presupuesto de contexto y tu modelo razonan en tokens, chunkear en caracteres te deja fragmentos de tamaño impredecible y hace imposible calcular cuántos chunks entran en el prompt.
+</div>
+
+<h3>Chunking fijo vs semántico vs estructural</h3>
+
+<p>Cortar cada N tokens (chunking <em>fijo</em>) es simple pero ciego: parte en la mitad de una oración o entre el título de una sección y su contenido. Hay dos maneras de hacerlo con más criterio:</p>
+
+<ul>
+  <li><strong>Semántico:</strong> embebés oración por oración y cortás donde la similitud entre oraciones vecinas cae — es decir, donde el texto cambia de tema. Produce chunks temáticamente coherentes, a costa de más cómputo al indexar.</li>
+  <li><strong>Estructural:</strong> respetás la estructura del documento. Un Markdown se corta por <code>headings</code>; un contrato, por cláusulas; un manual, por secciones. Es casi siempre la mejor relación esfuerzo/resultado, porque el autor del documento ya hizo el trabajo de agrupar ideas por vos.</li>
+</ul>
+
+<pre><code class="lang-python"># Chunking estructural: respetar los headings de un Markdown.
+# Cada sección se mantiene junta; si es muy larga, se sub-parte por tokens
+# PERO arrastrando el título como prefijo, para no perder de qué habla.
+import re
+
+def chunk_por_headings(md: str, tam_max: int = 500):
+    secciones = re.split(r'(?m)^(#{1,3}\s.+)$', md)   # separa por # ## ###
+    chunks, titulo_actual = [], ""
+    for bloque in secciones:
+        if re.match(r'^#{1,3}\s', bloque or ""):
+            titulo_actual = bloque.strip()
+            continue
+        cuerpo = (bloque or "").strip()
+        if not cuerpo:
+            continue
+        texto = f"{titulo_actual}\n{cuerpo}" if titulo_actual else cuerpo
+        # si la sección excede el máximo, se sub-parte pero cada trozo
+        # conserva el título como ancla de contexto
+        for sub in chunk_por_tokens(texto, tam=tam_max, overlap=60):
+            prefijo = titulo_actual + "\n" if titulo_actual and not sub.startswith(titulo_actual) else ""
+            chunks.append(prefijo + sub)
+    return chunks</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> chunkear tablas y PDFs con el mismo cortador que usás para prosa. Una tabla partida a la mitad pierde su encabezado de columnas y se vuelve ruido numérico. Un PDF a dos columnas leído de izquierda a derecha intercala renglones de ambas. <strong>El parsing es parte del chunking</strong>: si la ingesta destruye la estructura, ningún tamaño de chunk lo arregla. Usá parsers que preserven layout (por ejemplo, extractores de tablas dedicados) antes de cortar.
+</div>
+
+<h2>DS6.3 Embeddings: elegir el modelo y no mezclarlos</h2>
+
+<p>Un embedding es la función que convierte un texto en un vector de forma que <em>textos con significado parecido queden cerca</em> en ese espacio. Toda la búsqueda vectorial se apoya en esa promesa, así que el modelo de embeddings es una decisión de arquitectura, no un detalle.</p>
+
+<h3>Qué mirar al elegir</h3>
+
+<ul>
+  <li><strong>Idioma.</strong> Si tu corpus está en español, un modelo entrenado casi solo en inglés te va a dar recall pobre. Necesitás un <strong>embedding multilingüe</strong> de verdad — familias como <code>bge-m3</code> o <code>multilingual-e5</code> manejan español con solvencia. Un modelo monolingüe inglés sobre documentos en español es la causa número uno de RAGs que "no encuentran nada" pese a que el dato está ahí.</li>
+  <li><strong>Dimensionalidad vs calidad.</strong> Más dimensiones suelen capturar más matiz, pero cuestan: más almacenamiento, más RAM para el índice y más latencia por comparación. Pasar de 1536 a 384 dimensiones puede recortar el costo del índice a una cuarta parte con una caída de recall a veces despreciable. Algunos modelos soportan <em>Matryoshka</em>: te dejan truncar el vector a menos dimensiones sin reembeddear. Medí el trade-off en tu corpus, no lo asumas.</li>
+  <li><strong>Dominio.</strong> Texto legal, médico o de código se benefician de modelos afinados a ese dominio. Un embedding genérico no distingue bien jerga técnica que para él son tokens raros.</li>
+</ul>
+
+<pre><code class="lang-python"># Muchos modelos modernos son ASIMÉTRICOS: piden un prefijo distinto para
+# la consulta y para el documento. bge / e5 esperan "query:" y "passage:".
+# Omitir el prefijo degrada el recall sin que ningún error te avise.
+from sentence_transformers import SentenceTransformer
+
+modelo = SentenceTransformer("BAAI/bge-m3")   # multilingüe, 1024 dims
+
+def embed_documentos(textos: list[str]):
+    return modelo.encode([f"passage: {t}" for t in textos], normalize_embeddings=True)
+
+def embed_query(pregunta: str):
+    return modelo.encode(f"query: {pregunta}", normalize_embeddings=True)</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El embedding de la query y el del documento tienen que ser del MISMO modelo.</strong> El espacio vectorial lo define el modelo: los vectores de dos modelos distintos no son comparables, ni siquiera si tienen la misma cantidad de dimensiones. Si indexaste con <code>bge-m3</code> y un día alguien "mejora" la query con <code>text-embedding-3</code>, la similitud que calculás es ruido y el retrieval colapsa — otra vez, sin ningún error visible. Y el corolario operativo: <strong>si cambiás el modelo de embeddings, tenés que reembeddear TODA la base.</strong> No hay atajo.
+</div>
+
+<div class="info">
+  Normalizá los vectores (<code>normalize_embeddings=True</code>) y sé consistente con la métrica de distancia. Con vectores normalizados, la distancia coseno y el producto interno ordenan igual, y tu índice y tu query tienen que usar la misma. Mezclar métricas es otra fuente de recall silenciosamente arruinado.
+</div>
+
+<h2>DS6.4 Vector stores: dónde viven los vectores</h2>
+
+<p>Un vector store guarda los embeddings y responde la pregunta "dame los k vectores más parecidos a este" rápido. La primera decisión es si necesitás una base dedicada o si te alcanza con la que ya tenés.</p>
+
+<table>
+<thead><tr><th>Opción</th><th>Cuándo conviene</th><th>Costo/limitación</th></tr></thead>
+<tbody>
+<tr><td><strong>pgvector</strong> (extensión de PostgreSQL)</td><td>Ya usás Postgres. Querés un solo sistema, transacciones, y <em>joins</em> del vector con tu metadata relacional (permisos, fechas, tenant)</td><td>Escala muy bien hasta millones de vectores; en la escala masiva las dedicadas rinden más</td></tr>
+<tr><td><strong>pg_vectorscale</strong> (encima de pgvector)</td><td>Postgres, pero con más volumen: agrega StreamingDiskANN y compresión, empuja el techo de escala de pgvector</td><td>Una extensión más para operar; sigue siendo Postgres</td></tr>
+<tr><td><strong>Dedicadas</strong> (Qdrant, Weaviate, Milvus, Pinecone)</td><td>Cientos de millones de vectores, filtrado avanzado, features de búsqueda especializadas, o un equipo que quiere un servicio administrado</td><td>Un sistema más que sincronizar con tu base de verdad; otra fuente de <em>drift</em></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La opción práctica primero.</strong> Si ya tenés PostgreSQL, empezá con <strong>pgvector</strong> (y <strong>pg_vectorscale</strong> cuando el volumen apriete). Te ahorra un sistema entero, te deja filtrar por permisos y metadata <em>en el mismo query</em> que hace la búsqueda vectorial, y elimina el problema de mantener sincronizadas dos bases. La mayoría de los proyectos que arrancan con una vector-DB dedicada podrían haber vivido felices en Postgres, y descubren la complejidad de sincronizar recién cuando ya es cara de revertir.
+</div>
+
+<h3>El índice: HNSW vs IVFFlat, y por qué "exacto" no escala</h3>
+
+<p>La búsqueda vectorial <strong>exacta</strong> —comparar la query contra <em>todos</em> los vectores— es O(N) por consulta. Con diez mil vectores no lo notás; con diez millones, cada pregunta escanea diez millones de vectores y la latencia se vuelve inaceptable. Por eso en producción se usa <strong>ANN</strong> (<em>Approximate Nearest Neighbor</em>): un índice que encuentra <em>casi</em> siempre los vecinos correctos en tiempo sublineal. El "casi" es el <strong>recall</strong>, y es un parámetro que vos elegís.</p>
+
+<table>
+<thead><tr><th>Índice</th><th>Cómo funciona</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><strong>HNSW</strong></td><td>Grafo navegable multi-capa; "saltás" de nodo en nodo hacia el vecino más cercano</td><td>Mejor recall y latencia; usa más RAM y construir el índice es lento</td></tr>
+<tr><td><strong>IVFFlat</strong></td><td>Agrupa los vectores en clusters; solo busca dentro de los clusters más cercanos a la query</td><td>Más liviano y rápido de construir; recall menor; hay que "entrenarlo" con datos representativos</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-sql">-- pgvector: tabla de chunks + índice HNSW por distancia coseno.
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+    id         bigserial PRIMARY KEY,
+    documento  text    NOT NULL,
+    contenido  text    NOT NULL,
+    tenant_id  text    NOT NULL,          -- para control de acceso (DS6.11)
+    hash       text    NOT NULL,          -- para reindexado incremental (DS6.10)
+    embedding  vector(1024)               -- 1024 = dims de bge-m3
+);
+
+-- m y ef_construction gobiernan el recall del grafo: más alto = mejor
+-- recall y más costo de construcción/memoria.
+CREATE INDEX ON chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);</code></pre>
+
+<pre><code class="lang-sql">-- Búsqueda: top-5 por distancia coseno. El operador &lt;=&gt; es "distancia coseno".
+-- ef_search sube el recall en tiempo de consulta a cambio de latencia.
+SET hnsw.ef_search = 100;
+
+SELECT id, documento, contenido
+FROM chunks
+WHERE tenant_id = %(tenant)s              -- filtro de permisos ANTES de rankear
+ORDER BY embedding &lt;=&gt; %(qvec)s::vector    -- &lt;=&gt; coseno · &lt;-&gt; L2 · &lt;#&gt; producto interno
+LIMIT 5;</code></pre>
+
+<div class="warn">
+  <strong>El recall del índice es un dial, no una constante.</strong> En HNSW, <code>ef_search</code> te deja negociar recall contra latencia <em>en cada consulta</em>. Un <code>ef_search</code> bajo devuelve rápido pero se saltea vecinos válidos — y "el chunk correcto existía pero el índice no lo trajo" es un bug que jamás vas a ver en los logs. Cuando midas retrieval flojo, este parámetro es de los primeros sospechosos.
+</div>
+
+<h2>DS6.5 Retrieval híbrido: por qué la búsqueda vectorial sola no alcanza</h2>
+
+<p>La búsqueda vectorial es fenomenal para el significado y pésima para lo literal. Entiende que "cómo devuelvo un producto" y "política de reembolsos" hablan de lo mismo aunque no compartan palabras. Pero se le escapan justamente las consultas donde la palabra exacta <em>es</em> la intención:</p>
+
+<ul>
+  <li>Un <strong>número de parte</strong> o SKU: <code>XR-4471-B</code>. El embedding no tiene una noción semántica de ese token; para él es ruido.</li>
+  <li>Un <strong>nombre propio</strong> poco frecuente, una sigla, un identificador de ticket, una versión (<code>v2.14.0</code>).</li>
+  <li>Términos <strong>fuera de vocabulario</strong> que el modelo nunca vio y no sabe ubicar en su espacio.</li>
+</ul>
+
+<p>Para eso existe, desde hace décadas, la búsqueda <strong>léxica</strong>: <strong>BM25</strong>, que rankea por coincidencia de términos (con pesos por frecuencia e inverso-de-documento). BM25 encuentra <code>XR-4471-B</code> al instante porque busca el token, no su significado. La solución no es elegir uno u otro: es <strong>combinar los dos</strong>. Eso es <em>retrieval híbrido</em>.</p>
+
+<pre><code class="lang-python"># Retrieval híbrido: vectorial + BM25, fusionados con Reciprocal Rank Fusion.
+# RRF no necesita que los scores sean comparables entre sí — solo usa el
+# PUESTO de cada documento en cada ranking. Simple y sorprendentemente robusto.
+from rank_bm25 import BM25Okapi
+
+def rrf(rankings: list[list[str]], k: int = 60) -&gt; list[str]:
+    puntajes: dict[str, float] = {}
+    for ranking in rankings:                     # una lista de ids por cada buscador
+        for puesto, doc_id in enumerate(ranking):
+            puntajes[doc_id] = puntajes.get(doc_id, 0.0) + 1.0 / (k + puesto)
+    return sorted(puntajes, key=puntajes.get, reverse=True)
+
+def buscar_hibrido(query: str, bm25: BM25Okapi, ids: list[str], top: int = 30):
+    # 1) ranking léxico (BM25)
+    tokens = query.lower().split()
+    orden_bm25 = sorted(range(len(ids)), key=lambda i: bm25.get_scores(tokens)[i], reverse=True)
+    ranking_lexico = [ids[i] for i in orden_bm25[:top]]
+    # 2) ranking vectorial (viene del vector store, p. ej. la consulta SQL de DS6.4)
+    ranking_vectorial = buscar_vectorial(query, top=top)      # -&gt; list[str] de ids
+    # 3) fusión
+    return rrf([ranking_lexico, ranking_vectorial])[:top]</code></pre>
+
+<h3>Reranking con cross-encoders: la mejora de mayor impacto</h3>
+
+<p>Acá está el cambio que más recall-por-línea-de-código te va a dar. Los embeddings que usaste hasta ahora son de un <strong>bi-encoder</strong>: codifican query y documento <em>por separado</em> y comparan vectores. Es rapidísimo (podés preindexar millones de documentos) pero es una aproximación: el modelo nunca vio la query y el documento <em>juntos</em>.</p>
+
+<p>Un <strong>cross-encoder</strong> sí: recibe el par <code>(query, documento)</code> en la misma pasada y produce un score de relevancia mirando las dos cosas a la vez. Es mucho más preciso y mucho más caro — tan caro que no podés correrlo sobre toda la base. La jugada, entonces, es un embudo: recuperás barato un top 20–50 con el híbrido, y <strong>reordenás ese puñado con el cross-encoder</strong>, quedándote con el top 3–5 final. Recuperación amplia y barata, reranking fino y caro solo donde importa.</p>
+
+<pre><code class="lang-python"># Rerank del top-k con un cross-encoder. bge-reranker es open source;
+# Cohere Rerank es la alternativa gestionada por API. La idea es idéntica.
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")   # multilingüe
+
+def rerankear(query: str, candidatos: list[dict], top_final: int = 5):
+    pares = [(query, c["contenido"]) for c in candidatos]     # 20–50 candidatos
+    scores = reranker.predict(pares)                          # relevancia query+doc
+    for c, s in zip(candidatos, scores):
+        c["score"] = float(s)
+    ordenados = sorted(candidatos, key=lambda c: c["score"], reverse=True)
+    return ordenados[:top_final]</code></pre>
+
+<div class="tip">
+  Si tuvieras que agregar <strong>una sola cosa</strong> a un RAG que anda flojo, agregá el reranker. Recuperar un top-30 con el híbrido y pasarlo por un cross-encoder es, en la práctica, la intervención con mejor relación esfuerzo/impacto que existe: el chunk correcto normalmente <em>sí</em> estaba en el top-30, pero enterrado en el puesto 18 donde el LLM nunca lo iba a ver. El reranker lo sube al puesto 2.
+</div>
+
+<h2>DS6.6 El problema del contexto: cuánto es suficiente</h2>
+
+<p>Ya recuperaste y reordenaste. ¿Cuántos chunks le metés al prompt? Es un balance con castigo en los dos extremos.</p>
+
+<ul>
+  <li><strong>Demasiado contexto.</strong> Cada chunk irrelevante es ruido que diluye la señal, tokens que pagás, y —lo más traicionero— alimenta el fenómeno <em>lost-in-the-middle</em>: los LLMs prestan bastante más atención al principio y al final de un contexto largo que al medio. Un dato clave sepultado en el chunk 12 de 20 puede ser, para efectos prácticos, invisible.</li>
+  <li><strong>Muy poco contexto.</strong> Falta la información y el modelo, entrenado para ser útil, rellena el hueco con lo que "recuerda" — y ahí nace la alucinación.</li>
+</ul>
+
+<pre><code class="lang-python"># Dos tácticas simples y efectivas:
+# 1) Empezar con POCOS chunks (3–5 post-rerank) y subir solo si la eval lo pide.
+# 2) Reordenar contra 'lost-in-the-middle': lo más relevante al principio Y al
+#    final, lo del medio para el relleno menos crítico.
+def ordenar_contra_lost_in_the_middle(chunks_rankeados: list[dict]) -&gt; list[dict]:
+    inicio, final = [], []
+    for i, ch in enumerate(chunks_rankeados):      # ya vienen del reranker, mejor→peor
+        (inicio if i % 2 == 0 else final).append(ch)
+    return inicio + final[::-1]                    # los peores quedan en el medio
+
+def armar_contexto(chunks: list[dict], presupuesto_tokens: int = 2000):
+    seleccion, total = [], 0
+    for ch in chunks:
+        t = len(enc.encode(ch["contenido"]))
+        if total + t &gt; presupuesto_tokens:
+            break
+        seleccion.append(ch); total += t
+    return ordenar_contra_lost_in_the_middle(seleccion)</code></pre>
+
+<div class="mistake">
+  <strong>"Meto los 20 chunks por las dudas" es un antipatrón.</strong> No solo pagás 20 veces los tokens: <em>bajás</em> la calidad, porque enterrás el chunk bueno entre 19 mediocres y activás el lost-in-the-middle. Menos contexto bien elegido casi siempre le gana a más contexto sin filtrar. El reranker de DS6.5 es justamente lo que te <em>permite</em> mandar pocos chunks con confianza.
+</div>
+
+<h2>DS6.7 Evaluar RAG: la parte que casi nadie hace</h2>
+
+<p>Este es el corazón del módulo. Sin evaluación, cada cambio que hacés en el RAG es una apuesta a ciegas: tocás el chunking, "parece" que mejoró, y no tenés forma de saber si mejoró de verdad, empeoró en otro tipo de pregunta, o no cambió nada y te lo estás imaginando. La evaluación es lo que convierte el RAG de una artesanía supersticiosa en ingeniería.</p>
+
+<div class="concept">
+  <strong>💡 Evaluá las dos mitades por separado.</strong> Una "mala respuesta" puede venir de dos causas con fixes opuestos: <strong>(1) retrieval</strong> — no le trajimos al modelo la info que necesitaba; o <strong>(2) generación</strong> — la info estaba en el contexto y el modelo igual respondió mal. Si medís solo la respuesta final, no sabés cuál de las dos arreglar. Hay que medir el retrieval y la generación con métricas distintas.
+</div>
+
+<p><strong>Ragas</strong> es la herramienta estándar para esto (con <strong>TruLens</strong> y <strong>DeepEval</strong> como alternativas muy usadas). Sus cuatro métricas centrales se reparten justo entre las dos mitades:</p>
+
+<table>
+<thead><tr><th>Métrica (Ragas)</th><th>Qué mide</th><th>Mitad</th></tr></thead>
+<tbody>
+<tr><td><strong>Context recall</strong></td><td>¿El retrieval trajo <em>toda</em> la info necesaria para la respuesta esperada? (requiere <em>ground truth</em>)</td><td>Retrieval</td></tr>
+<tr><td><strong>Context precision</strong></td><td>De lo que trajo, ¿es relevante y está bien rankeado (lo bueno arriba)?</td><td>Retrieval</td></tr>
+<tr><td><strong>Faithfulness</strong></td><td>¿La respuesta se apoya en el contexto, o el modelo inventó afirmaciones que no están ahí?</td><td>Generación</td></tr>
+<tr><td><strong>Answer relevancy</strong></td><td>¿La respuesta efectivamente contesta la pregunta que se hizo?</td><td>Generación</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># Evaluación con Ragas sobre un dataset de preguntas con respuesta esperada.
+# El dataset es tu activo más valioso: 50–200 pares (pregunta, ground_truth)
+# representativos de lo que realmente pregunta la gente.
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    context_recall, context_precision, faithfulness, answer_relevancy,
+)
+
+def evaluar_rag(preguntas, respuestas_esperadas, pipeline_rag):
+    filas = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
+    for q, gt in zip(preguntas, respuestas_esperadas):
+        contextos, respuesta = pipeline_rag(q)   # tu RAG: devuelve chunks y respuesta
+        filas["question"].append(q)
+        filas["answer"].append(respuesta)
+        filas["contexts"].append([c["contenido"] for c in contextos])
+        filas["ground_truth"].append(gt)
+
+    resultado = evaluate(
+        Dataset.from_dict(filas),
+        metrics=[context_recall, context_precision, faithfulness, answer_relevancy],
+    )
+    return resultado          # p. ej. {'context_recall': 0.40, 'faithfulness': 0.60, ...}</code></pre>
+
+<div class="rule">
+  <strong>📌 Sin dataset de eval, no tenés un RAG: tenés una demo.</strong> La primera tarea de cualquier RAG serio no es el retrieval, es armar el set de evaluación. No hace falta que sea enorme: 50 a 200 preguntas reales con su respuesta correcta ya te dan una brújula. Ese set es lo que te va a decir, con un número, si el cambio que hiciste ayer mejoró o rompió el sistema — y esa es la diferencia entre iterar y adivinar.
+</div>
+
+<h2>DS6.8 Alucinación y grounding: atar la respuesta a las fuentes</h2>
+
+<p>La razón de ser de un RAG es que las respuestas estén <strong>ancladas</strong> (<em>grounded</em>) en documentos reales, no en la memoria difusa del modelo. Pero recuperar buen contexto no garantiza que el modelo lo use: puede ignorarlo y responder de memoria. Tres prácticas atacan esto de frente.</p>
+
+<p><strong>1. Forzar la cita de fuentes.</strong> Pedile al modelo que, por cada afirmación, cite el identificador del chunk del que la sacó. Esto no es cosmético: una respuesta que no puede citar su fuente es una respuesta que probablemente inventaste, y las citas te dan un mecanismo de auditoría inmediato.</p>
+
+<p><strong>2. Habilitar el "no sé".</strong> Un modelo instruido a responder siempre va a alucinar cuando el contexto no alcance. Instruirlo explícitamente a abstenerse —"si el contexto no contiene la respuesta, decí que no tenés información"— sube la <em>faithfulness</em> a costa de contestar menos. Es una decisión de producto: en dominios de riesgo (legal, salud, finanzas) el "no sé" honesto vale mucho más que una respuesta segura y falsa.</p>
+
+<pre><code class="lang-python">SYSTEM = """Sos un asistente que responde ÚNICAMENTE con la información del
+contexto. Reglas estrictas:
+- Cada afirmación debe citar su fuente con [n], donde n es el número de fragmento.
+- Si el contexto NO contiene la respuesta, respondé exactamente:
+  "No tengo información suficiente para responder eso."
+- No completes con conocimiento propio ni con suposiciones."""
+
+def armar_prompt(pregunta: str, chunks: list[dict]) -&gt; list[dict]:
+    contexto = "\n\n".join(f"[{i+1}] (fuente: {c['documento']})\n{c['contenido']}"
+                           for i, c in enumerate(chunks))
+    usuario = f"Contexto:\n{contexto}\n\nPregunta: {pregunta}"
+    return [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content": usuario}]</code></pre>
+
+<p><strong>3. Detectar la invención automáticamente.</strong> La <em>faithfulness</em> de Ragas ya hace esto en la eval: descompone la respuesta en afirmaciones y verifica si cada una se deduce del contexto. En producción podés correr un verificador liviano (un LLM-juez o un modelo de NLI) que marque las oraciones sin respaldo antes de mostrar la respuesta.</p>
+
+<div class="danger">
+  <strong>⚠️ Que el modelo cite una fuente no prueba que la fuente diga eso.</strong> Un LLM puede fabricar una cita <code>[3]</code> para una afirmación que el fragmento 3 no respalda — la alucinación de la cita misma. Por eso las citas son un <em>mecanismo de auditoría</em>, no una garantía: sirven para que un humano (o un verificador automático) pueda <em>chequear</em>, no para confiar a ciegas. En dominios de alto riesgo, verificá que el texto citado efectivamente sostiene la afirmación.
+</div>
+
+<h2>DS6.9 RAG vs fine-tuning: no es una pelea, es una división de tareas</h2>
+
+<p>Es la pregunta que aparece en cada proyecto: "¿esto lo resuelvo con RAG o fine-tuneando el modelo?". La respuesta empieza por entender que resuelven problemas <strong>distintos</strong>. RAG le da al modelo <em>conocimiento</em> en tiempo de ejecución; el fine-tuning (que ves en detalle en <a href="../ds7-finetuning/lecture.html">DS7</a>) le enseña un <em>comportamiento</em>: un formato, un estilo, una tarea, un tono.</p>
+
+<table>
+<thead><tr><th>Necesitás…</th><th>Herramienta</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Conocimiento que <strong>cambia</strong> (precios, políticas, docs versionadas)</td><td><strong>RAG</strong></td><td>Actualizás el índice, no reentrenás el modelo</td></tr>
+<tr><td>Respuestas con <strong>citas y trazabilidad</strong> a la fuente</td><td><strong>RAG</strong></td><td>El fine-tuning "diluye" el conocimiento en pesos; no puede citar de dónde salió</td></tr>
+<tr><td>Un <strong>formato, estilo o tono</strong> consistente</td><td><strong>Fine-tuning</strong></td><td>Es un comportamiento a aprender, no un hecho a recuperar</td></tr>
+<tr><td>Una <strong>tarea específica</strong> repetitiva (clasificar, extraer campos)</td><td><strong>Fine-tuning</strong></td><td>Enseñás el patrón una vez; sale más barato por inferencia que un prompt gigante</td></tr>
+<tr><td>Jerga o dominio muy particular <strong>y</strong> hechos frescos</td><td><strong>Los dos</strong></td><td>Fine-tuning para el dominio, RAG para los hechos actuales</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Combinarlos suele ser lo mejor.</strong> Un modelo <em>fine-tuneado</em> —que aprendió el vocabulario del dominio, el formato de respuesta esperado y cómo usar el contexto— que <em>además recupera</em> con RAG para los hechos que cambian y las citas, en la práctica le gana a cualquiera de los dos por separado. No es "RAG o fine-tuning": es fine-tuning para la <strong>forma</strong> y RAG para el <strong>contenido fresco</strong>. DS7 retoma exactamente este punto desde el lado del fine-tuning.
+</div>
+
+<h2>DS6.10 Actualización del índice: mantenerlo fresco sin apagarlo</h2>
+
+<p>Un RAG no es un artefacto que construís una vez. Los documentos cambian, se agregan y se borran, y un índice desactualizado es un RAG que cita con seguridad la política del año pasado. Mantenerlo fresco tiene tres frentes.</p>
+
+<p><strong>Reindexar sin downtime.</strong> No borres y reconstruyas en caliente: construí el índice nuevo en paralelo y hacé un <em>swap</em> atómico cuando esté validado. En Postgres, <code>CREATE INDEX CONCURRENTLY</code> te deja construir sin bloquear las consultas.</p>
+
+<pre><code class="lang-sql">-- Reconstrucción de índice sin bloquear lecturas: construir el nuevo,
+-- validar, y recién ahí descartar el viejo.
+CREATE INDEX CONCURRENTLY chunks_hnsw_v2 ON chunks
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 80);
+
+-- (validás recall del v2 contra tu set de eval)  ...
+
+DROP INDEX CONCURRENTLY chunks_hnsw_v1;</code></pre>
+
+<p><strong>Documentos que cambian.</strong> Reembeddear todo cada vez es carísimo. Guardá un <em>hash</em> del contenido de cada chunk y reembeddeá solo los que cambiaron; borrá los chunks de documentos eliminados para no servir información <em>stale</em>.</p>
+
+<pre><code class="lang-sql">-- Upsert incremental: reembeddear SOLO lo que cambió (hash distinto).
+UPDATE chunks
+SET embedding = %(nuevo_vec)s, contenido = %(nuevo_texto)s, hash = %(nuevo_hash)s
+WHERE id = %(id)s AND hash &lt;&gt; %(nuevo_hash)s;
+
+-- Y limpiar lo que ya no existe en la fuente, para no servir datos viejos.
+DELETE FROM chunks WHERE documento = %(doc)s AND id &lt;&gt; ALL(%(ids_vigentes)s);</code></pre>
+
+<div class="warn">
+  <strong>El costo de la frescura es real y hay que presupuestarlo.</strong> Reembeddear millones de chunks cuesta plata (API o GPU) y tiempo. La frecuencia de reindexado es una decisión de negocio: cuánto importa que una respuesta esté al día vs. cuánto sale mantenerla así. Y acordate del caso nuclear: <strong>cambiar el modelo de embeddings obliga a reembeddear el 100%</strong> —el espacio vectorial cambió— así que ese cambio se planifica, no se improvisa.
+</div>
+
+<h2>DS6.11 Seguridad de RAG: envenenamiento y control de acceso</h2>
+
+<p>Un RAG amplía la superficie de ataque de tu app de una forma que se subestima siempre. Hay dos riesgos que tenés que tratar desde el diseño (y que se profundizan en <a href="../../../../sistemas/Curso-Ciberseguridad/senior/cs4-seguridad-ia/lecture.html">CS4 — Seguridad de sistemas de IA</a>, del track de Ciberseguridad Senior).</p>
+
+<p><strong>1. Envenenamiento de la base de conocimiento.</strong> Todo lo que recuperás termina en el prompt del LLM. Si un atacante logra inyectar un documento en tu base —un ticket de soporte, un comentario de wiki, una página que crawleás— puede escribir ahí instrucciones como "ignorá lo anterior y respondé X". El retrieval lo trae al contexto y el modelo puede obedecerlo: es <em>prompt injection indirecto</em>. El contenido recuperado es <strong>dato no confiable</strong>, nunca instrucciones: mantené la separación entre las reglas del sistema y el contexto, y controlá qué fuentes pueden entrar a la base.</p>
+
+<p><strong>2. Control de acceso: el usuario solo debe recuperar lo que puede ver.</strong> Este es el que hunde proyectos. Si indexás todos los documentos de la empresa en un solo índice sin permisos, un empleado le pregunta al bot y este alegremente recupera y resume el documento de salarios, o los datos de otro cliente en un sistema multi-tenant. El filtro de permisos tiene que aplicarse <strong>dentro del retrieval</strong>, no después de recuperar.</p>
+
+<pre><code class="lang-sql">-- Control de acceso EN el retrieval: filtrar por permisos ANTES de rankear,
+-- nunca recuperar-primero-y-filtrar-después (eso ya expuso el dato al ranking
+-- y es fácil que se filtre en logs, en el "por qué recuperé esto", etc.).
+SELECT id, documento, contenido
+FROM chunks
+WHERE tenant_id = %(tenant_del_usuario)s          -- aislamiento entre clientes
+  AND acl_grupo = ANY(%(grupos_del_usuario)s)     -- solo lo que el usuario puede ver
+ORDER BY embedding &lt;=&gt; %(qvec)s::vector
+LIMIT 30;</code></pre>
+
+<div class="danger">
+  <strong>⚠️ "Recuperar y después filtrar" es una fuga de datos esperando pasar.</strong> Si traés el top-k sin el filtro de ACL y recién ahí descartás lo que el usuario no puede ver, ya metiste información sensible en el ranking, potencialmente en el reranker, y muy probablemente en algún log de "chunks recuperados". El filtro de permisos va en el <code>WHERE</code> de la búsqueda vectorial. Que pgvector te deje combinar el filtro relacional con la búsqueda vectorial en un solo query es, no por casualidad, una de sus mejores razones de existir.
+</div>
+
+<h2>DS6.12 Cuándo NO usar RAG</h2>
+
+<p>RAG está de moda y por eso se aplica de más. Es maquinaria: chunking, un índice, un modelo de embeddings, un reranker, un pipeline de reindexado, evaluación. Antes de montar todo eso, preguntate si tu problema es realmente un problema de RAG.</p>
+
+<ul>
+  <li><strong>Cuando el conocimiento entra en el contexto.</strong> Si son veinte páginas fijas que cambian poco, metelas directo en el prompt (y usá <em>prompt caching</em> para no pagarlas cada vez, ver DS5). Un RAG para buscar dentro de un corpus que entra entero en la ventana de contexto es complejidad pura sin beneficio.</li>
+  <li><strong>Cuando una búsqueda tradicional alcanza.</strong> Si el usuario busca por palabra clave exacta y lo que querés es devolverle una lista de links, un buscador léxico clásico (BM25, Elasticsearch) es más simple, más predecible y más barato que un RAG generativo.</li>
+  <li><strong>Cuando la latencia no lo permite.</strong> Embedding de la query + búsqueda + rerank + generación suma cientos de milisegundos. Si tu presupuesto de latencia es ajustado (autocompletar, un endpoint de alta frecuencia), quizá el RAG no entre y necesites otra estrategia.</li>
+  <li><strong>Cuando el conocimiento es estable y acotado.</strong> Para un dominio chico y fijo, few-shot en el prompt o un fine-tuning liviano (DS7) puede ser más simple y directo que toda la infraestructura de retrieval.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 RAG es la respuesta correcta cuando</strong> el conocimiento es (a) demasiado grande para el contexto, (b) cambiante, y (c) necesita citas verificables. Si tu caso no cumple los tres, mirá primero las alternativas más simples. La mejor arquitectura de RAG es, a veces, no usar RAG.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el RAG a veces contesta cualquier cosa"</h2>
+
+<blockquote>Un RAG de soporte interno responde bien a algunas preguntas y a otras inventa con total seguridad. No hay patrón obvio: la misma clase de pregunta a veces sale perfecta y a veces delira. El equipo lleva dos semanas retocando el prompt de generación sin mover la aguja. Empecemos de nuevo, pero midiendo.</blockquote>
+
+<p><strong>Paso 0 — Instalar el stack y armar el set de eval.</strong> Antes de tocar nada, 60 preguntas reales sacadas de los tickets, cada una con su respuesta correcta escrita por un humano. Ese set es el juez.</p>
+
+<pre><code class="lang-bash"># Stack del ejemplo
+psql -c "CREATE EXTENSION IF NOT EXISTS vector;"
+uv pip install sentence-transformers pgvector "psycopg[binary]" ragas rank-bm25</code></pre>
+
+<p><strong>Paso 1 — Medir el baseline con Ragas.</strong> El RAG actual: chunking fijo de 1000 tokens sin overlap, embeddings de un modelo monolingüe inglés (el corpus está en español), solo búsqueda vectorial, sin reranker. Corremos <code>evaluar_rag</code> de DS6.7:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Baseline</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td>Context recall</td><td>🔴 <strong>0.40</strong></td><td>El retrieval NO trae la info correcta casi la mitad de las veces</td></tr>
+<tr><td>Context precision</td><td>🔴 0.55</td><td>Lo que trae está mal rankeado y mezclado con ruido</td></tr>
+<tr><td>Faithfulness</td><td>🔴 0.60</td><td>El modelo inventa — pero <em>porque</em> el contexto no alcanza</td></tr>
+<tr><td>Answer relevancy</td><td>🟠 0.70</td><td>Cuando por suerte recupera bien, contesta bien</td></tr>
+</tbody>
+</table>
+
+<p><strong>Diagnóstico.</strong> El <strong>context recall de 0.40</strong> lo dice todo: el problema es el <em>retrieval</em>, no la generación. Dos semanas peleando con el prompt fueron dos semanas arreglando la mitad que no estaba rota. La faithfulness baja es un <em>síntoma</em>, no la causa: el modelo alucina porque le estamos dando basura.</p>
+
+<p><strong>Paso 2 — Arreglar chunking y embeddings.</strong> Reemplazamos el chunking fijo de 1000 tokens por chunking estructural de ~400 tokens con 15% de overlap respetando headings (DS6.2), y reembeddeamos con <code>bge-m3</code> multilingüe (DS6.3). Reindexamos y volvemos a medir:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Baseline</th><th>+ chunking y embeddings</th></tr></thead>
+<tbody>
+<tr><td>Context recall</td><td>0.40</td><td>🟠 <strong>0.65</strong></td></tr>
+<tr><td>Context precision</td><td>0.55</td><td>0.68</td></tr>
+<tr><td>Faithfulness</td><td>0.60</td><td>0.74</td></tr>
+<tr><td>Answer relevancy</td><td>0.70</td><td>0.78</td></tr>
+</tbody>
+</table>
+
+<p>El recall saltó de 0.40 a 0.65 sin tocar una sola línea del prompt de generación. Y fijate cómo la faithfulness subió sola (0.60 → 0.74): mejor contexto, menos invención. Vamos por buen camino, pero 0.65 de recall todavía deja un tercio de las preguntas sin la info que necesitan.</p>
+
+<p><strong>Paso 3 — Retrieval híbrido + reranker.</strong> Agregamos BM25 fusionado con la búsqueda vectorial vía RRF (DS6.5) —para pescar los números de ticket y nombres de sistema que el vectorial se perdía— y un <code>bge-reranker</code> que reordena el top-30 y se queda con el top-5 (DS6.5). Medimos de nuevo:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Baseline</th><th>+ chunking/embeddings</th><th>+ híbrido + reranker</th></tr></thead>
+<tbody>
+<tr><td>Context recall</td><td>🔴 0.40</td><td>🟠 0.65</td><td>🟢 <strong>0.88</strong></td></tr>
+<tr><td>Context precision</td><td>🔴 0.55</td><td>0.68</td><td>🟢 0.80</td></tr>
+<tr><td>Faithfulness</td><td>🔴 0.60</td><td>0.74</td><td>🟢 <strong>0.91</strong></td></tr>
+<tr><td>Answer relevancy</td><td>🟠 0.70</td><td>0.78</td><td>🟢 0.89</td></tr>
+</tbody>
+</table>
+
+<p><strong>El resultado clave.</strong> La <em>faithfulness</em> terminó en 0.91 — el modelo dejó de inventar. Y lo hizo <strong>sin que tocáramos el prompt de generación en ningún momento</strong>. El síntoma ("inventa cualquier cosa") era de generación, pero la causa y el fix estaban enteros en el retrieval. Arreglamos el contexto y la generación se arregló sola, porque un buen modelo con buen contexto no necesita inventar.</p>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá un reranker".</strong> Es el <em>método</em>: medir las dos mitades por separado, dejar que el <strong>context recall</strong> te diga dónde está el incendio, y no tocar la generación hasta haber confirmado que el retrieval le está dando al modelo lo que necesita. Sin las tablas de Ragas, el equipo habría seguido meses puliendo el prompt equivocado. Con ellas, el diagnóstico fue una tarde y cada mejora tuvo su número.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu RAG responde mal. ¿Cuál es la PRIMERA cosa que medís, y por qué?</summary>
+<p>El <strong>context recall</strong> sobre tu set de eval: ¿el retrieval le trajo al modelo la información necesaria, sí o no? Esta pregunta parte el problema en dos mitades con fixes opuestos. Si el recall es bajo, la info nunca llegó al contexto y el bug está en el retrieval (chunking, embeddings, índice, falta de híbrido/reranker) — tocar el prompt de generación es inútil. Solo si el recall es alto <em>y</em> la respuesta igual falla, el problema es de generación (faithfulness/relevancy) y ahí sí mirás el prompt. Medir la respuesta final sola no te dice cuál de las dos cosas arreglar; por eso se mide cada mitad por separado.</p></details>
+
+<details><summary>¿Por qué agregar un cross-encoder de reranking mejora tanto si la búsqueda vectorial ya trae un top-k?</summary>
+<p>Porque los embeddings de la búsqueda vectorial son de un <strong>bi-encoder</strong>: codifican query y documento por separado y comparan vectores, lo cual es rápido pero aproximado. El chunk correcto muy a menudo <em>sí</em> está en el top-20 o top-30, pero enterrado en un puesto que el LLM nunca va a ver porque solo le pasás los primeros 3–5. El <strong>cross-encoder</strong> mira el par (query, documento) junto en una sola pasada y produce un score de relevancia mucho más preciso; correrlo sobre esos 20–30 candidatos sube el chunk bueno del puesto 18 al puesto 2. No recupera cosas nuevas: reordena bien lo que ya tenías. Por eso es tanta ganancia por tan poca infraestructura — y por eso se corre solo sobre el top-k, porque es demasiado caro para toda la base.</p></details>
+
+<details><summary>¿Por qué el filtro de control de acceso tiene que ir DENTRO de la consulta de retrieval y no después?</summary>
+<p>Porque "recuperar primero y filtrar después" ya expuso el dato sensible al pipeline antes de descartarlo: entró al ranking, posiblemente al reranker, y casi seguro a algún log de "chunks recuperados" o de depuración. En un sistema multi-tenant o con documentos por permisos, eso es una fuga: el bot podría haber leído (aunque no mostrado) el documento de salarios o los datos de otro cliente. El filtro de ACL —<code>tenant_id</code>, grupos, lista de documentos permitidos— va en el <code>WHERE</code> de la búsqueda vectorial, para que el vector store solo considere lo que ese usuario puede ver. Poder combinar el filtro relacional de permisos con la búsqueda vectorial en un mismo query es una de las razones fuertes para usar pgvector sobre Postgres.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un RAG es <strong>retrieval + generación</strong>, y el eslabón débil casi siempre es el retrieval. El 80% de los RAG en producción recuperan mal y nadie lo mide.</li>
+  <li>El <strong>chunking</strong> es la etapa más subestimada: contá en tokens, usá 256–512 con 10–20% de overlap, y respetá la estructura del documento. Un mal chunking arruina todo lo que viene después.</li>
+  <li>El <strong>embedding de la query y del documento tienen que ser del mismo modelo</strong>; elegí uno multilingüe si tu corpus no es inglés; cambiar de modelo obliga a reembeddear todo.</li>
+  <li><strong>pgvector / pg_vectorscale</strong> sobre PostgreSQL es la opción práctica: un solo sistema, filtros de permisos junto a la búsqueda. El índice ANN (<strong>HNSW</strong> o <strong>IVFFlat</strong>) cambia recall por velocidad y memoria; la búsqueda exacta no escala.</li>
+  <li><strong>Retrieval híbrido</strong> (vectorial + BM25) cubre lo que el vectorial se pierde: términos exactos, siglas, nombres propios. Y el <strong>reranking con cross-encoders</strong> (Cohere Rerank, bge-reranker) sobre el top 20–50 es la mejora de mayor impacto por línea de código.</li>
+  <li>Más contexto no es mejor: cuidado con el ruido, el costo y el <em>lost-in-the-middle</em>. Pocos chunks bien elegidos le ganan a muchos sin filtrar.</li>
+  <li><strong>Evaluá con Ragas</strong> (o TruLens/DeepEval) las dos mitades por separado: context recall/precision para el retrieval, faithfulness/answer relevancy para la generación. Sin dataset de eval no tenés RAG, tenés una demo.</li>
+  <li>Anclá las respuestas: forzá <strong>citas</strong>, habilitá el <strong>"no sé"</strong>, y verificá la invención. Una cita es para auditar, no para confiar a ciegas.</li>
+  <li><strong>RAG para conocimiento que cambia y necesita citas; fine-tuning para formato/estilo/tarea (DS7); combinarlos suele ganar.</strong></li>
+  <li>Seguridad: el contenido recuperado es dato no confiable (prompt injection indirecto), y el <strong>control de acceso va dentro del retrieval</strong> (ver CS4).</li>
+  <li>A veces la mejor arquitectura de RAG es no usar RAG: si el conocimiento entra en el contexto, si una búsqueda tradicional alcanza, o si la latencia no lo permite.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un documento tuyo (un manual, una wiki) y chunkealo de tres formas: fijo por tokens, fijo con 15% de overlap, y estructural por headings. Para una pregunta cuya respuesta cruza dos secciones, mirá cuál de los tres chunkeos deja la respuesta completa en un solo chunk.</li>
+  <li>Embebé 20 pares (query, documento) con un modelo monolingüe inglés y con <code>bge-m3</code>, sobre texto en español. Compará la similitud del par correcto en cada modelo y cuantificá cuánto pierde el monolingüe.</li>
+  <li>Montá una tabla con pgvector, cargá 10.000 chunks e indexá con HNSW. Variá <code>ef_search</code> (10, 50, 100, 200) y medí recall vs latencia contra una búsqueda exacta como <em>ground truth</em>. Graficá el trade-off.</li>
+  <li>Implementá el retrieval híbrido con RRF del módulo. Construí 5 consultas con términos exactos (un SKU, una sigla, una versión) y mostrá con números cuántas recupera bien el vectorial solo vs. el híbrido.</li>
+  <li>Agregá un <code>bge-reranker</code> sobre el top-30 de tu híbrido. Para 10 preguntas, registrá en qué puesto quedaba el chunk correcto antes y después del rerank.</li>
+  <li>Armá un set de eval de 30 preguntas con respuesta esperada y corré Ragas sobre tu RAG. Reportá las cuatro métricas en una tabla y decidí, a partir de los números, si tu cuello de botella es retrieval o generación.</li>
+  <li>Agregá al prompt la instrucción de citar fuentes y de responder "No tengo información suficiente" cuando el contexto no alcance. Volvé a correr Ragas y mostrá qué pasó con la faithfulness y con el answer relevancy — explicá el trade-off que observás.</li>
+</ol>
+
+<section class="quiz" id="quizDS6">
+  <style>
+    #quizDS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS6 .q{margin-bottom:1.5rem}
+    #quizDS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS6 .opt:hover{border-color:var(--accent)}
+    #quizDS6 .opt:disabled{cursor:default}
+    #quizDS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizDS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizDS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS6 .exp.show{display:block}
+    #quizDS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu RAG responde mal y en Ragas ves context recall 0.42 y faithfulness 0.58. ¿Qué arreglás primero?</p>
+    <button class="opt">El prompt de generación, para que el modelo alucine menos</button>
+    <button class="opt">El retrieval: el recall bajo dice que la info correcta no llega al contexto</button>
+    <button class="opt">Subir la temperatura del LLM para respuestas más variadas</button>
+    <div class="exp">El context recall de 0.42 es el diagnóstico: casi la mitad de las veces el retrieval no le trae al modelo la información necesaria. La faithfulness baja es un síntoma de eso — el modelo inventa porque el contexto no alcanza, no porque el prompt esté mal. Retocar la generación sería arreglar la mitad que no está rota. Primero se sube el recall (chunking, embeddings, híbrido, reranker); la faithfulness suele subir sola cuando el contexto se vuelve correcto.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu búsqueda vectorial no encuentra documentos cuando el usuario busca por un número de parte exacto como <code>XR-4471-B</code>. ¿Cuál es el arreglo correcto?</p>
+    <button class="opt">Subir la dimensionalidad del modelo de embeddings</button>
+    <button class="opt">Meter más chunks en el contexto por las dudas</button>
+    <button class="opt">Retrieval híbrido: sumar BM25 (léxico) a la búsqueda vectorial</button>
+    <div class="exp">La búsqueda vectorial es semántica: para el embedding, un SKU como <code>XR-4471-B</code> es un token raro sin significado que ubicar en el espacio. La búsqueda léxica (BM25) matchea el token exacto al instante. Combinar las dos —retrieval híbrido, por ejemplo con RRF— cubre tanto el significado como los términos literales, siglas y nombres propios. Ni más dimensiones ni más contexto resuelven que el vectorial es ciego a lo literal.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Indexás un corpus multi-tenant en pgvector. ¿Dónde va el filtro que impide que un usuario recupere documentos de otro cliente?</p>
+    <button class="opt">En el WHERE de la búsqueda vectorial, para filtrar por permisos antes de rankear</button>
+    <button class="opt">Después de recuperar el top-k, descartando lo ajeno antes de mostrarlo</button>
+    <button class="opt">En el prompt, pidiéndole al LLM que ignore lo que no corresponda</button>
+    <div class="exp">El control de acceso va dentro del retrieval: el <code>WHERE tenant_id = ...</code> (y grupos/ACL) hace que el vector store solo considere lo que ese usuario puede ver. "Recuperar y después filtrar" ya expuso el dato al ranking, al reranker y a los logs antes de descartarlo — es una fuga esperando pasar. Y confiar en que el LLM "ignore" lo ajeno es peor todavía: el dato ya entró al contexto. Poder combinar el filtro de permisos con la búsqueda vectorial en un solo query es una de las grandes ventajas de pgvector.</div>
+  </div>
+
+  <div class="score" id="scoreDS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS7: Fine-tuning.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds5-llmops/lecture.html">← DS5: LLMOps</a>
+  <a href="../ds7-finetuning/lecture.html">DS7: Fine-tuning →</a>
+</nav>
+
+</div>
+</body>
+</html>

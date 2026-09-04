@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DS5 — LLMOps: servir y operar modelos de lenguaje · Datos/ML Senior</title>
+  <meta name="description" content="Servir LLMs con vLLM y PagedAttention, cuantización GPTQ/AWQ/INT4, local vs API, el prompt como código, parámetros de generación, evaluación con Ragas/DeepEval, guardrails, observabilidad de costo y caché semántico.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Datos/ML Senior</a>
+  <a href="../../index.html">📊 Curso de Datos & ML</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">DS5</span>
+  <span class="badge">⏱ 35–85 min</span>
+  <span class="badge">🎯 Pre-req: DS4</span>
+  <span class="badge">🤖 LLMOps</span>
+</div>
+
+<article>
+
+<h1>DS5 — LLMOps: servir y operar modelos de lenguaje</h1>
+
+<h2>DS5.0 Por qué operar un LLM es otra disciplina</h2>
+
+<p>En <a href="../ds4-serving/lecture.html">DS4</a> aprendiste a servir un modelo: lo empaquetás, lo ponés detrás de un endpoint, medís latencia y throughput, versionás. Un clasificador de fraude o un modelo de recomendación entran ahí sin drama. Un <strong>modelo de lenguaje grande</strong> (LLM) rompe casi todos los supuestos que traés de ese mundo, y por eso tiene su propia sub-disciplina: <strong>LLMOps</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Operar un LLM se diferencia de operar un modelo clásico en tres ejes que se refuerzan entre sí: <strong>(1)</strong> es <em>no-determinista</em> por diseño — la misma entrada puede dar salidas distintas, y "correcto" deja de ser una etiqueta binaria; <strong>(2)</strong> es <em>caro por token</em> y la memoria la domina una estructura que no existía antes, el KV cache; <strong>(3)</strong> <em>falla de formas nuevas</em> — no tira una excepción, te devuelve con total seguridad una respuesta inventada. LLMOps es la ingeniería de convivir con esas tres cosas sin fundirte ni mentirle al usuario.</p>
+</div>
+
+<p>Un modelo clásico que falla suele hacerlo de manera <em>legible</em>: baja el AUC, sube el error, salta una alarma de drift. Un LLM que falla te sonríe y te da una cita bibliográfica que no existe, con formato impecable. Y mientras tanto, cada request que atendés se paga en tokens o en horas de GPU. Este módulo es el manual de campo para las decisiones que definen si tu producto con LLM es sostenible o una hemorragia de plata con alucinaciones.</p>
+
+<div class="rule">
+  <strong>📌 Regla de encuadre.</strong> Todo lo que sigue se ordena por una sola pregunta: <em>¿cuánto me cuesta cada respuesta, y cómo sé que es buena?</em> Serving, cuantización, caché y elección local-vs-API atacan el costo. Prompt-como-código, evaluación y guardrails atacan la calidad. Observabilidad es cómo te enterás de ambas cosas antes que el usuario.
+</div>
+
+<h2>DS5.1 Por qué servir un LLM es distinto</h2>
+
+<p>Servir un modelo clásico es, en esencia, una función: entra un vector, sale un número, en una sola pasada (<em>forward</em>). Servir un LLM es servir un <strong>bucle</strong>. El modelo es <strong>autoregresivo</strong>: genera <strong>un token por vez</strong>, y cada token nuevo se agrega a la entrada para producir el siguiente. Una respuesta de 400 tokens son 400 pasadas por la red, una atrás de la otra, imposibles de paralelizar dentro de la misma secuencia.</p>
+
+<h3>Prefill vs decode: dos fases con costos opuestos</h3>
+
+<p>La generación tiene dos fases con perfiles de rendimiento radicalmente distintos, y confundirlas es el primer error de capacity planning:</p>
+
+<table>
+<thead><tr><th>Fase</th><th>Qué hace</th><th>Cuello de botella</th><th>Uso de GPU</th></tr></thead>
+<tbody>
+<tr><td><strong>Prefill</strong></td><td>Procesa TODO el prompt de una, en paralelo</td><td>Cómputo (FLOPs)</td><td>Alto: la GPU se satura</td></tr>
+<tr><td><strong>Decode</strong></td><td>Genera un token, luego otro, uno por uno</td><td>Ancho de banda de memoria</td><td>Bajo: la GPU espera datos</td></tr>
+</tbody>
+</table>
+
+<p>El <strong>prefill</strong> es como leer un párrafo entero de un vistazo: costoso en cómputo pero muy eficiente porque la GPU trabaja a pleno. El <strong>decode</strong> es escribir la respuesta letra por letra: cada paso mueve toda la memoria del modelo para producir un solo token, así que el limitante no es cuánto calcula la GPU sino cuán rápido lee su propia memoria. Por eso una respuesta larga es cara aunque el prompt haya sido corto, y por eso las dos métricas de latencia que importan son distintas (lo vemos en DS5.9).</p>
+
+<h3>El KV cache: la estructura que domina la memoria</h3>
+
+<p>Para no recalcular la atención sobre todos los tokens anteriores en cada paso, el modelo <strong>cachea</strong> las claves y valores (Key/Value) de cada token ya visto. Ese es el <strong>KV cache</strong>, y crece <strong>linealmente con la longitud de la secuencia y con la cantidad de secuencias concurrentes</strong>. En cargas reales, el KV cache —no los pesos— es lo que primero llena la VRAM.</p>
+
+<pre><code class="lang-python">def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, dtype_bytes=2):
+    """Memoria del KV cache (FP16 = 2 bytes). Factor 2 = una K y una V por token."""
+    return 2 * n_layers * n_kv_heads * head_dim * seq_len * batch * dtype_bytes
+
+# Llama-2-13B SIN grouped-query attention: 40 capas, 40 heads, head_dim 128
+por_token = kv_cache_bytes(40, 40, 128, seq_len=1, batch=1)
+print(por_token / 1e6)          # ~1.64 MB por TOKEN
+print(por_token * 2048 / 1e9)   # ~3.4 GB para UNA secuencia de 2048 tokens
+
+# Con GQA (p. ej. 8 KV heads en vez de 40) el cache baja ~5x:
+con_gqa = kv_cache_bytes(40, 8, 128, seq_len=2048, batch=1)
+print(con_gqa / 1e9)            # ~0.67 GB — misma calidad, 5x menos memoria de cache</code></pre>
+
+<div class="info">
+  <strong>Grouped-Query Attention (GQA)</strong> es la razón por la que los modelos modernos (Llama 3, Mistral, Qwen) sirven contextos largos sin explotar: varias "query heads" comparten las mismas "KV heads", así que el cache que domina la memoria se achica varias veces sin casi tocar la calidad. Si te toca elegir un modelo para servir contexto largo, mirá si usa GQA — cambia por completo cuántas requests concurrentes te entran en una GPU.
+</div>
+
+<p>Ahora se entiende por qué el <strong>batching</strong> de LLMs es más difícil que el de un modelo clásico. En un clasificador armás un lote de 64 vectores del mismo tamaño y listo. Acá cada secuencia tiene un largo de prompt distinto, genera una cantidad de tokens distinta, y termina en un momento distinto. Un batching ingenuo hace que toda la GPU espere a que termine la secuencia más larga del lote. Resolver eso bien es, literalmente, el motivo por el que existe vLLM.</p>
+
+<h2>DS5.2 vLLM y PagedAttention</h2>
+
+<p>El problema concreto que resuelve <strong>vLLM</strong> es la <strong>fragmentación del KV cache</strong>. Los motores previos reservaban un bloque contiguo de memoria del tamaño <em>máximo</em> posible por cada secuencia. Como casi ninguna respuesta llega a ese máximo, se desperdiciaba muchísima VRAM: el paper de PagedAttention midió que solo entre el 20% y el 40% de la memoria reservada terminaba usándose. El resto era fragmentación pura.</p>
+
+<div class="analogy">
+  <strong>🧩 La analogía del sistema operativo.</strong> PagedAttention le hace al KV cache lo que la memoria virtual con paginación le hizo a la RAM en los años 60. En vez de exigir un bloque contiguo gigante por proceso, parte el cache en <strong>páginas</strong> de tamaño fijo que se asignan bajo demanda y se referencian con una tabla. La memoria de una secuencia ya no tiene que ser contigua, así que la fragmentación se desploma de ~60–80% desperdiciado a menos del 4%. Y como las páginas se pueden compartir, dos requests con el mismo prefijo de prompt comparten esas páginas sin duplicarlas.
+</div>
+
+<p>Sobre esa base, vLLM implementa <strong>continuous batching</strong> (también llamado <em>in-flight batching</em>): en vez de esperar a que todo un lote termine para armar el siguiente, cuando <em>una</em> secuencia del lote termina, su lugar se libera y <strong>entra una request nueva en el próximo paso de decode</strong>. La GPU nunca queda ociosa esperando a la secuencia más lenta. La combinación de PagedAttention + continuous batching es lo que convirtió a vLLM en el estándar de facto para serving de alto throughput.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Serving ingenuo (static batching)</th><th>vLLM (PagedAttention + continuous)</th></tr></thead>
+<tbody>
+<tr><td>Memoria de KV cache útil</td><td>20–40% (resto fragmentado)</td><td>&gt;96%</td></tr>
+<tr><td>Requests que entran en la misma GPU</td><td>Pocas: la reserva máxima ahoga</td><td>Muchas más: se asigna por página</td></tr>
+<tr><td>GPU esperando a la secuencia más larga</td><td>Sí, constantemente</td><td>No: los huecos se rellenan al vuelo</td></tr>
+<tr><td>Throughput reportado (paper PagedAttention)</td><td>línea base</td><td>hasta 24× vs Transformers de HuggingFace; 2–4× vs sistemas previos</td></tr>
+</tbody>
+</table>
+
+<p>Levantar un servidor vLLM con API compatible con OpenAI es una línea. Ese detalle —hablar el mismo protocolo que la API comercial— es lo que te deja cambiar de proveedor a self-hosting (y a la inversa) sin reescribir el cliente:</p>
+
+<pre><code class="lang-bash"># Servidor de inferencia con API OpenAI-compatible
+pip install vllm
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90     # cuánta VRAM puede tomar para pesos + KV cache</code></pre>
+
+<pre><code class="lang-python"># El cliente es el MISMO SDK de OpenAI, solo cambia base_url.
+# Esa portabilidad es una decisión de arquitectura, no una comodidad.
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-no-importa")
+
+stream = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "Resumí en una línea qué es el KV cache."}],
+    temperature=0,
+    stream=True,               # streaming: el usuario ve el primer token ya (ver TTFT)
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content or ""
+    print(delta, end="", flush=True)</code></pre>
+
+<div class="tip">
+  El parámetro <code>--gpu-memory-utilization</code> no es cosmético: le decís a vLLM qué fracción de la VRAM puede tomar para pesos + KV cache. Más alto = más requests concurrentes, pero si te pasás, un pico de contexto largo te tira un out-of-memory en producción. Es un dial que se calibra con <em>tu</em> distribución real de largos de prompt, no con el default.
+</div>
+
+<h2>DS5.3 Cuantización: correr modelos grandes en hardware chico</h2>
+
+<p>Un modelo se guarda, por defecto, en punto flotante de 16 bits (FP16 o BF16): <strong>2 bytes por parámetro</strong>. Esa es la cuenta que decide si un modelo entra o no en tu GPU:</p>
+
+<pre><code class="lang-python">def vram_pesos_gb(num_params_billones, bytes_por_param):
+    return num_params_billones * 1e9 * bytes_por_param / 1e9
+
+for n in (7, 13, 70):
+    print(f"{n}B  FP16={vram_pesos_gb(n,2):5.0f}GB  "
+          f"INT8={vram_pesos_gb(n,1):5.0f}GB  INT4={vram_pesos_gb(n,0.5):5.0f}GB")
+# 7B   FP16=   14GB  INT8=    7GB  INT4=    4GB
+# 13B  FP16=   26GB  INT8=   13GB  INT4=    7GB
+# 70B  FP16=  140GB  INT8=   70GB  INT4=   35GB   (+ KV cache aparte)</code></pre>
+
+<p>Un modelo de 70B en FP16 pide ~140 GB solo de pesos: dos GPUs de 80 GB, cosa de datacenter. En <strong>INT4</strong> baja a ~35 GB y de golpe entra en una sola GPU de 48 GB, o en dos de consumo de 24 GB. Esa es la magia de la <strong>cuantización</strong>: representar los pesos con menos bits para gastar menos memoria y mover menos datos (y acordate de DS5.1: el decode está limitado por ancho de banda de memoria, así que menos bytes por peso también acelera la generación).</p>
+
+<h3>GPTQ y AWQ: cómo se cuantiza sin romper todo</h3>
+
+<p>Redondear a lo bruto a 4 bits destruiría el modelo. Los dos métodos post-entrenamiento que hoy son estándar son más finos:</p>
+
+<div class="step"><strong>GPTQ</strong> — cuantiza capa por capa resolviendo un problema de mínimos cuadrados: elige los valores de 4 bits que <em>minimizan el error de reconstrucción</em> de las activaciones, usando un pequeño set de calibración. Es el que vas a ver más seguido en modelos ya publicados en formato cuantizado.</div>
+
+<div class="step"><strong>AWQ</strong> (Activation-aware Weight Quantization) — parte de una observación: no todos los pesos importan igual. Un porcentaje chico de pesos "salientes", identificados por la <em>magnitud de las activaciones</em> que producen, se protegen con más cuidado, y el resto se comprime agresivo. Suele preservar mejor la calidad a igual tamaño, y vLLM lo sirve nativamente.</div>
+
+<pre><code class="lang-bash"># Servir un modelo AWQ ya cuantizado: mismo comando, flag de cuantización
+vllm serve TheBloke/Llama-3.1-70B-Instruct-AWQ \
+  --quantization awq \
+  --max-model-len 8192
+# Un 70B corriendo en hardware que jamás habría aguantado los 140 GB de FP16</code></pre>
+
+<div class="warn">
+  <strong>Qué se pierde y qué se gana — con números, no con fe.</strong> En modelos grandes (30B+), 4 bits bien hechos suelen costar menos del 1% de degradación en perplejidad: prácticamente imperceptible en la mayoría de las tareas. Pero <strong>en modelos chicos (7B o menos) el mismo 4 bits duele más</strong>, y en tareas de razonamiento fino o código la pérdida puede ser real. La regla del módulo aplica acá con toda su fuerza: <em>no confíes en el número del README, medí la calidad de la versión cuantizada en TU golden set</em> (DS5.7) antes de mandarla a producción.
+</div>
+
+<div class="rule">
+  <strong>📌 El intercambio de la cuantización, en una frase.</strong> Cambiás una pérdida de calidad —que tenés que <em>medir</em>, no suponer— por menos VRAM, más requests concurrentes y decode más rápido. Casi siempre conviene en modelos grandes; en modelos chicos, verificalo.
+</div>
+
+<h2>DS5.4 Local vs API: la decisión de costo y privacidad</h2>
+
+<p>La primera gran decisión de arquitectura de un producto con LLM no es qué prompt escribís: es <strong>de dónde sale la inferencia</strong>. Y no hay una respuesta correcta universal — hay una tabla honesta que tenés que llenar con tus propios números.</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>API comercial (OpenAI, Anthropic, etc.)</th><th>Self-hosting / local (vLLM, Ollama)</th></tr></thead>
+<tbody>
+<tr><td><strong>Modelo de costo</strong></td><td>Por token (input y output se cobran aparte; el output suele costar más)</td><td>Por GPU/hora, la pagues o no la uses</td></tr>
+<tr><td><strong>Costo a volumen bajo/variable</strong></td><td>✅ Barato: pagás solo lo que consumís</td><td>❌ La GPU cuesta igual a las 3am sin tráfico</td></tr>
+<tr><td><strong>Costo a volumen alto/sostenido</strong></td><td>❌ Se dispara linealmente con los tokens</td><td>✅ Amortizás la GPU; el token marginal es casi gratis</td></tr>
+<tr><td><strong>Privacidad de los datos</strong></td><td>Los datos salen de tu perímetro hacia un tercero</td><td>✅ Nunca salen: control total</td></tr>
+<tr><td><strong>Calidad de punta</strong></td><td>✅ Acceso a los modelos más capaces</td><td>Los open-weights están cerca, pero no siempre alcanzan</td></tr>
+<tr><td><strong>Operación</strong></td><td>✅ Cero: es el problema del proveedor</td><td>❌ Tuya: GPUs, drivers, escalado, OOMs, guardias</td></tr>
+</tbody>
+</table>
+
+<p>Para local, dos herramientas dominan. <strong>Ollama</strong> y <strong>llama.cpp</strong> están pensados para correr modelos cuantizados en una sola máquina —incluso sin GPU, o en la tuya— con una ergonomía inmejorable para prototipar y para casos de privacidad estricta. vLLM es lo que ponés cuando el volumen justifica una (o varias) GPU dedicadas y necesitás throughput.</p>
+
+<pre><code class="lang-python"># Local con Ollama: mismo protocolo OpenAI, corre en tu máquina, los datos no salen
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+r = client.chat.completions.create(
+    model="llama3.1:8b-instruct-q4_0",   # q4_0 = cuantizado a 4 bits
+    messages=[{"role": "user", "content": "Clasificá el sentimiento: 'el pedido llegó tarde'"}],
+    temperature=0,
+)
+print(r.choices[0].message.content)</code></pre>
+
+<p>El análisis de <strong>costo</strong> real se reduce a un punto de equilibrio. La API cuesta <em>por token</em>; el self-hosting cuesta <em>por hora de GPU</em>, tengas tráfico o no. Existe un volumen mensual a partir del cual amortizar la GPU sale más barato que pagar tokens — y por debajo de ese volumen, la API gana con comodidad. La conclusión no la dicta la moda: la dicta tu tráfico.</p>
+
+<pre><code class="lang-python">def break_even(precio_gpu_hora, precio_por_1k_tokens, tokens_por_request):
+    """¿Cuántos requests/mes hacen que la GPU dedicada empate a la API?"""
+    costo_gpu_mes = precio_gpu_hora * 24 * 30            # GPU prendida 24/7
+    costo_api_por_request = precio_por_1k_tokens * tokens_por_request / 1000
+    return costo_gpu_mes / costo_api_por_request
+
+# GPU a USD 1.80/h, API a USD 6/1M tokens (0.006/1k), ~1900 tokens por request
+print(f"{break_even(1.80, 0.006, 1900):,.0f} requests/mes para empatar")
+# ~113.000 requests/mes. Por debajo: API. Por arriba y sostenido: self-hosting.</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La dimensión de privacidad no es negociable con un número.</strong> Cuando mandás un prompt a una API comercial, <strong>los datos del usuario salen de tu perímetro</strong>. Si esos datos son historias clínicas, información financiera o secretos de la empresa, el análisis de costo es secundario: puede que la regulación o el contrato directamente te prohíban mandarlos a un tercero. El lado de <em>seguridad</em> de esta decisión —qué datos podés exponer, cómo tratás la salida no confiable del modelo, prompt injection— se trabaja en <a href="../../../../sistemas/Curso-Ciberseguridad/senior/cs4-seguridad-ia/lecture.html">Ciberseguridad Senior CS4 (Seguridad de IA)</a>. LLMOps y AppSec se tocan justo acá.
+</div>
+
+<h2>DS5.5 El prompt es código: prompt engineering como ingeniería</h2>
+
+<p>El pecado original de la mayoría de los productos con LLM es tratar al prompt como un <strong>string mágico</strong> hardcodeado en medio de una función, que alguien tuneó a mano una tarde y nadie volvió a tocar por miedo. Ese string es la parte del sistema que más determina la calidad de la salida, y lo estás tratando peor que a cualquier otra pieza de código.</p>
+
+<div class="concept">
+  <strong>💡 El cambio de mentalidad.</strong> El prompt es un <strong>artefacto de software de primera clase</strong>: se versiona, se testea, tiene un dueño, y cambiarlo es un deploy. "Prompt engineering como ingeniería" significa que un cambio de prompt pasa por las mismas puertas que un cambio de código — revisión, evaluación (DS5.7), y capacidad de rollback — porque tiene el mismo poder de romper producción.
+</div>
+
+<pre><code class="lang-python"># El prompt como artefacto versionado y testeable, no como string suelto
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Prompt:
+    id: str
+    version: str
+    template: str
+    def render(self, **kwargs) -&gt; str:
+        return self.template.format(**kwargs)
+
+CLASIFICADOR_SOPORTE = Prompt(
+    id="clasificar_ticket",
+    version="3.2.0",                       # versionado: un cambio de prompt es un deploy
+    template=(
+        "Clasificá el ticket en una de: [facturacion, tecnico, cuenta, otro].\n"
+        "Ejemplos:\n"
+        "  'no me anda el login' -&gt; tecnico\n"          # few-shot: mostrar, no explicar
+        "  'me cobraron de mas' -&gt; facturacion\n"
+        "Ticket: {texto}\n"
+        "Respondé SOLO con la etiqueta."
+    ),
+)
+
+# El prompt tiene tests, como cualquier función:
+def test_clasificador_facturacion(llm):
+    salida = llm(CLASIFICADOR_SOPORTE.render(texto="me duplicaron el débito"))
+    assert salida.strip() == "facturacion"</code></pre>
+
+<h3>Las tres técnicas que más rinden</h3>
+
+<div class="step"><strong>Few-shot.</strong> En vez de <em>explicar</em> con palabras qué querés, <em>mostrás</em> dos o tres ejemplos de entrada→salida. Para tareas de formato o clasificación, un par de ejemplos bien elegidos rinden más que tres párrafos de instrucciones.</div>
+
+<div class="step"><strong>Structured output.</strong> Pedir texto libre y después parsearlo con expresiones regulares es una fuente inagotable de bugs. En vez de eso, forzás al modelo a devolver una estructura —JSON con un esquema— que validás. Deja de ser "esperemos que venga bien formateado" y pasa a ser un contrato.</div>
+
+<div class="step"><strong>Function calling.</strong> El modelo no ejecuta acciones: <em>declara</em> qué función quiere llamar y con qué argumentos, en una estructura que vos validás y ejecutás. Es la forma correcta de conectar un LLM con herramientas y APIs sin dejar que "decida" ejecutar cosas por su cuenta.</div>
+
+<pre><code class="lang-json">// Structured output: un esquema JSON es un CONTRATO, no una esperanza.
+// El modelo se obliga a llenar estos campos, y vos los validás antes de confiar.
+{
+  "name": "clasificar_ticket",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "categoria":  { "type": "string", "enum": ["facturacion", "tecnico", "cuenta", "otro"] },
+      "urgencia":   { "type": "integer", "minimum": 1, "maximum": 5 },
+      "resumen":    { "type": "string", "maxLength": 120 }
+    },
+    "required": ["categoria", "urgencia", "resumen"],
+    "additionalProperties": false
+  }
+}</code></pre>
+
+<div class="tip">
+  Los motores serios (incluido vLLM) soportan <em>constrained decoding</em>: fuerzan al modelo, token a token, a producir solo salidas que respeten la gramática del esquema. No es que el modelo "trata" de devolver JSON válido — es que <strong>no puede</strong> emitir un token que rompa el esquema. Structured output deja de ser un ruego y pasa a ser una garantía a nivel de decodificación.
+</div>
+
+<h2>DS5.6 Parámetros de generación y reproducibilidad</h2>
+
+<p>La misma pregunta a un LLM puede darte dos respuestas distintas. Eso no es un bug: es cómo funciona el <em>sampling</em>. En cada paso el modelo produce una distribución de probabilidad sobre el próximo token, y dos parámetros controlan cuánto azar metés al elegir:</p>
+
+<table>
+<thead><tr><th>Parámetro</th><th>Qué hace</th><th>Efecto en reproducibilidad</th></tr></thead>
+<tbody>
+<tr><td><strong>temperature</strong></td><td>Escala los logits antes del softmax. Alta = distribución más plana = más azar. Baja = más picuda = más determinista</td><td><code>0</code> = greedy (elige siempre el más probable) → reproducible</td></tr>
+<tr><td><strong>top_p</strong> (nucleus)</td><td>Muestrea solo del conjunto más chico de tokens cuya probabilidad acumulada llega a <code>p</code></td><td>Recorta la cola larga de tokens improbables</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># Dos regímenes, dos propósitos.
+
+# Extracción / clasificación / cualquier tarea con UNA respuesta correcta: sin azar.
+r = client.chat.completions.create(
+    model=MODELO, messages=msgs,
+    temperature=0,          # greedy: la salida más probable, siempre
+)
+
+# Redacción creativa / brainstorming: querés variedad.
+r = client.chat.completions.create(
+    model=MODELO, messages=msgs,
+    temperature=0.8, top_p=0.95,   # dejá entrar azar controlado
+)</code></pre>
+
+<div class="rule">
+  <strong>📌 Cuándo temperature 0.</strong> Siempre que la tarea tenga una respuesta correcta y quieras que la salida sea estable entre corridas: extracción de datos, clasificación, function calling, cualquier cosa que después parsees o valides. Reservá temperature alta para lo genuinamente generativo, donde la variedad es una feature y no un defecto.
+</div>
+
+<div class="mistake">
+  <strong>El error sutil: temperature 0 no garantiza determinismo bit a bit.</strong> Con <code>temperature=0</code> eliminás el azar del <em>sampling</em>, pero la inferencia batcheada en GPU introduce otra fuente de variación: la suma en punto flotante <strong>no es asociativa</strong>, y el orden en que se acumulan las operaciones cambia según cómo se armó el lote en ese instante. Resultado: la misma entrada puede darte, muy de vez en cuando, un token distinto. Para la mayoría de las apps es irrelevante; si construís tests que exigen salida idéntica byte a byte, te vas a volver loco buscando un fantasma. Testeá <em>propiedades</em> de la salida (que la categoría sea válida, que el JSON valide), no igualdad exacta de strings.
+</div>
+
+<h2>DS5.7 Evaluar LLMs: el problema difícil</h2>
+
+<p>Esta es la sección más importante del módulo, y la que más se saltea. En un modelo clásico la evaluación está resuelta: hay un <em>ground truth</em> y una métrica (accuracy, F1, AUC, RMSE) que te da un número. En un LLM que genera texto libre, <strong>¿qué es "correcto"?</strong> Hay mil formas válidas de responder bien la misma pregunta, y las métricas clásicas de solapamiento de palabras (BLEU, ROUGE) miden si el texto <em>se parece</em> a una referencia, no si es <em>bueno</em> — dos cosas que casi no correlacionan.</p>
+
+<div class="concept">
+  <strong>💡 Qué es realmente la evaluación de un LLM.</strong> No es un número lindo para un reporte. Es <strong>lo único que te deja cambiar de modelo, de prompt o de proveedor sin romper todo a ciegas</strong>. Sin una eval, cada cambio es una apuesta y "mejoró" es una opinión. Con una eval, cambiás el modelo de 70B por uno de 8B cuantizado y sabés, con un número defendible, cuánta calidad perdiste. La eval es la red que te permite optimizar el costo sin volar la calidad por el aire.
+</div>
+
+<h3>LLM-as-judge: usar un modelo para evaluar a otro</h3>
+
+<p>La técnica que hizo escalable la evaluación es <strong>LLM-as-judge</strong>: le das a un modelo (idealmente uno fuerte) la pregunta, la respuesta a evaluar y una rúbrica, y le pedís que puntúe. Es órdenes de magnitud más barato y rápido que la evaluación humana. Pero un juez LLM trae <strong>sesgos documentados</strong> que tenés que conocer para no engañarte:</p>
+
+<table>
+<thead><tr><th>Sesgo del juez</th><th>Qué es</th><th>Mitigación</th></tr></thead>
+<tbody>
+<tr><td><strong>Posición</strong></td><td>Prefiere la primera (o la última) respuesta cuando compara dos</td><td>Correr en ambos órdenes y promediar</td></tr>
+<tr><td><strong>Verbosidad</strong></td><td>Puntúa más alto las respuestas largas, aunque no sean mejores</td><td>Rúbrica explícita que penalice el relleno</td></tr>
+<tr><td><strong>Auto-preferencia</strong></td><td>Un modelo tiende a preferir salidas de su propia familia</td><td>Juez de otra familia que el evaluado</td></tr>
+<tr><td><strong>Formato</strong></td><td>Se deja impresionar por markdown, bullets, negritas</td><td>Instruir a juzgar contenido, no presentación</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># LLM-as-judge con rúbrica y mitigación de sesgo de posición
+JUEZ = (
+    "Sos un evaluador estricto. Puntuá la RESPUESTA a la PREGUNTA de 1 a 5 según:\n"
+    "  - factualidad (¿es correcta?)\n"
+    "  - relevancia (¿responde lo que se pregunta?)\n"
+    "Ignorá el largo y el formato. Respondé SOLO con el número.\n\n"
+    "PREGUNTA: {pregunta}\nRESPUESTA: {respuesta}"
+)
+
+def juzgar(juez_llm, pregunta, respuesta) -&gt; int:
+    salida = juez_llm(JUEZ.format(pregunta=pregunta, respuesta=respuesta), temperature=0)
+    return int(salida.strip())</code></pre>
+
+<h3>Ragas y DeepEval: la evaluación como suite automatizada</h3>
+
+<p>No armás esto a mano desde cero. Dos frameworks son estándar en 2026: <strong>Ragas</strong>, orientado sobre todo a evaluar sistemas de recuperación + generación (faithfulness, relevancia de la respuesta, precisión y recall del contexto — clave para el <a href="../ds6-rag/lecture.html">RAG de DS6</a>), y <strong>DeepEval</strong>, que trae una experiencia estilo <code>pytest</code>: escribís asserts sobre métricas de LLM y los corrés en tu CI como cualquier test.</p>
+
+<pre><code class="lang-python"># DeepEval: la evaluación de LLM se ve y se corre como pytest
+from deepeval import assert_test
+from deepeval.metrics import AnswerRelevancyMetric, HallucinationMetric
+from deepeval.test_case import LLMTestCase
+
+def test_respuesta_de_soporte():
+    caso = LLMTestCase(
+        input="¿Cuánto tarda un reembolso?",
+        actual_output=mi_app("¿Cuánto tarda un reembolso?"),
+        context=["Los reembolsos se procesan en 5 a 7 días hábiles."],
+    )
+    # Umbrales que fallan el build si la calidad cae por debajo
+    assert_test(caso, [
+        AnswerRelevancyMetric(threshold=0.7),
+        HallucinationMetric(threshold=0.3),     # penaliza afirmaciones no respaldadas por el contexto
+    ])</code></pre>
+
+<div class="rule">
+  <strong>📌 La jerarquía de la evaluación.</strong> <strong>Golden set</strong> curado a mano (decenas o cientos de casos con la respuesta esperada, tu fuente de verdad) → <strong>LLM-as-judge</strong> para escalar a miles de casos automáticamente → <strong>evaluación humana</strong> puntual sobre una muestra, para validar que el juez LLM no se está mintiendo a sí mismo. Los tres niveles se necesitan: el golden set ancla, el juez escala, el humano audita al juez.
+</div>
+
+<div class="warn">
+  <strong>El golden set es el activo, no el modelo.</strong> Los modelos se reemplazan cada seis meses; tu golden set —los casos reales, difíciles y representativos de tu dominio, con la respuesta correcta acordada— es lo que sobrevive a todos ellos y lo que te deja comparar peras con peras. Invertí en curarlo y mantenerlo. Es la infraestructura de calidad de todo tu producto con LLM.
+</div>
+
+<h2>DS5.8 Guardrails: toda salida del LLM es no confiable</h2>
+
+<p>Un guardrail es una <strong>capa de validación</strong> alrededor del LLM, en las dos direcciones: valida lo que <em>entra</em> (para frenar prompt injection, PII que no debería llegar al modelo, entradas abusivas) y valida lo que <em>sale</em> (para frenar respuestas mal formadas, tóxicas, o alucinadas) antes de que llegue al usuario o a otro sistema.</p>
+
+<pre><code class="lang-python"># Guardrail de salida: validar contra un esquema ANTES de confiar en la respuesta
+from pydantic import BaseModel, field_validator
+
+class RespuestaTicket(BaseModel):
+    categoria: str
+    urgencia: int
+    resumen: str
+
+    @field_validator("categoria")
+    @classmethod
+    def categoria_valida(cls, v):
+        if v not in {"facturacion", "tecnico", "cuenta", "otro"}:
+            raise ValueError(f"categoría inválida: {v}")   # el LLM alucinó una categoría
+        return v
+
+    @field_validator("urgencia")
+    @classmethod
+    def urgencia_en_rango(cls, v):
+        if not 1 &lt;= v &lt;= 5:
+            raise ValueError(f"urgencia fuera de rango: {v}")
+        return v
+
+def clasificar_con_guardrail(texto):
+    crudo = llm_json(CLASIFICADOR_SOPORTE.render(texto=texto))  # el modelo devuelve JSON
+    return RespuestaTicket.model_validate_json(crudo)  # falla ruidosamente si no cumple
+    # Clave: si el LLM se sale del contrato, te enterás ACÁ, no en el sistema de abajo.</code></pre>
+
+<h3>Detección de alucinación por groundedness</h3>
+
+<p>La alucinación más peligrosa es la que suena bien. La defensa estructural es la <strong>verificación de groundedness</strong>: comprobar que cada afirmación de la respuesta esté <em>respaldada por una fuente</em> que le pasaste al modelo (el contexto recuperado en un RAG, por ejemplo). Si la respuesta afirma algo que no está en el contexto, es una alucinación por definición, y el guardrail la marca o la bloquea.</p>
+
+<div class="danger">
+  <strong>⚠️ La conexión con seguridad: toda salida del LLM es entrada no confiable.</strong> Un LLM es, para tu backend, tan poco confiable como un usuario anónimo de internet. Nunca ejecutes su salida (<code>eval</code>, <code>exec</code>, shell), nunca la metas cruda en una query SQL, nunca la renderices sin sanitizar (riesgo de XSS), y nunca la trates como una autorización. Si el modelo procesa contenido de terceros —un email, una página web, un documento subido— ese contenido puede llevar un <strong>prompt injection</strong> que secuestre tus instrucciones. Este es el terreno de <a href="../../../../sistemas/Curso-Ciberseguridad/senior/cs4-seguridad-ia/lecture.html">Ciberseguridad Senior CS4</a>: los guardrails de LLMOps y el modelo de amenazas de AppSec son la misma defensa vista desde dos lados.
+</div>
+
+<h2>DS5.9 Observabilidad: el costo es una métrica de primera clase</h2>
+
+<p>No podés operar lo que no medís, y un LLM tiene métricas que un modelo clásico no. La más disruptiva: <strong>el costo por request es una señal operativa de primera clase</strong>, al nivel de la latencia y el error rate. Un prompt que creció sin que nadie lo notara, o un usuario que manda contextos enormes, se ven primero en la factura.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué es</th><th>Por qué importa</th></tr></thead>
+<tbody>
+<tr><td><strong>TTFT</strong> (time to first token)</td><td>Cuánto tarda en aparecer el primer token</td><td>Es la latencia <em>percibida</em>: con streaming, el usuario ya está leyendo</td></tr>
+<tr><td><strong>TPOT</strong> (time per output token)</td><td>Velocidad de generación una vez arrancó</td><td>Define cuán "fluida" se siente la respuesta</td></tr>
+<tr><td><strong>Latencia total (e2e)</strong></td><td>TTFT + TPOT × tokens generados</td><td>El tiempo hasta la respuesta completa</td></tr>
+<tr><td><strong>Tokens (in / out)</strong></td><td>Consumo por request, desglosado</td><td>Es el costo. El output suele pesar más que el input</td></tr>
+<tr><td><strong>Costo por request</strong></td><td>Tokens × precio, o prorrateo de GPU/hora</td><td>Métrica de negocio, no solo técnica</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-python"># Tracing mínimo: cada request deja traza de tokens, costo y latencia percibida
+import time, logging
+
+PRECIO_IN, PRECIO_OUT = 0.5 / 1e6, 1.5 / 1e6   # USD por token (in/out), ilustrativo
+
+def llamar_con_traza(client, model, messages, **kw):
+    t0 = time.perf_counter()
+    r = client.chat.completions.create(model=model, messages=messages, **kw)
+    u = r.usage
+    costo = u.prompt_tokens * PRECIO_IN + u.completion_tokens * PRECIO_OUT
+    logging.info(
+        "llm.call model=%s in=%d out=%d costo_usd=%.5f latencia_s=%.2f",
+        model, u.prompt_tokens, u.completion_tokens, costo, time.perf_counter() - t0,
+    )
+    return r
+    # Con esto en cada llamada, un prompt que se infló o un abuso se ven en el dashboard,
+    # no en la factura de fin de mes.</code></pre>
+
+<div class="tip">
+  Las plataformas de observabilidad de LLM (Langfuse, LangSmith, Phoenix, Helicone, y el estándar abierto OpenLLMetry sobre OpenTelemetry) hacen esto y más: <em>tracing</em> de cadenas multi-paso, guardado del prompt exacto que se envió, atribución de costo por usuario o feature, y detección de regresiones de calidad. No lo agregues al final: instrumentá desde el día uno, porque las preguntas caras (¿por qué subió el costo?, ¿qué prompt causó esta queja?) no se pueden responder hacia atrás si no guardaste la traza.
+</div>
+
+<h2>DS5.10 Caching semántico</h2>
+
+<p>Muchas cargas reales tienen una cola larga de preguntas casi idénticas: en un bot de soporte, "¿cuánto tarda el envío?" llega escrita de cuarenta maneras distintas. Un caché exacto (clave = string literal) no sirve porque ninguna coincide byte a byte. El <strong>caché semántico</strong> resuelve eso: embebe la consulta en un vector, y si su similitud con una consulta ya cacheada supera un umbral, devuelve la respuesta guardada <strong>sin volver a llamar al modelo</strong>.</p>
+
+<pre><code class="lang-python"># Caché semántico: acierta por SIGNIFICADO, no por texto literal
+import numpy as np
+
+class CacheSemantico:
+    def __init__(self, embed, umbral=0.95):
+        self.embed, self.umbral = embed, umbral
+        self.claves, self.respuestas = [], []
+
+    def get(self, pregunta):
+        if not self.claves:
+            return None
+        v = self.embed(pregunta)
+        sims = np.array(self.claves) @ v            # coseno (vectores normalizados)
+        i = int(sims.argmax())
+        if sims[i] &gt;= self.umbral:                   # suficientemente parecida → hit
+            return self.respuestas[i]
+        return None
+
+    def put(self, pregunta, respuesta):
+        self.claves.append(self.embed(pregunta))
+        self.respuestas.append(respuesta)</code></pre>
+
+<p>El ahorro es directo: si el 40% de tus consultas son variantes semánticas de algo ya respondido, un caché con buen umbral te saca el 40% de las llamadas de inferencia — 40% menos costo y latencia casi nula en esos casos. Herramientas como GPTCache implementan esto listo para producción.</p>
+
+<div class="mistake">
+  <strong>El peligro del caché semántico: el umbral es un filo.</strong> Si lo ponés muy bajo, dos preguntas <em>parecidas pero distintas</em> ("¿cuánto tarda el envío?" vs "¿cuánto tarda el reembolso?") colisionan y le servís a alguien la respuesta equivocada con total seguridad. Un caché mal calibrado no baja la calidad de a poco: te sirve respuestas <em>seguras y erróneas</em>. Calibrá el umbral con datos reales y medí la tasa de falsos positivos como una métrica de calidad, no solo el hit-rate como métrica de ahorro.
+</div>
+
+<h2>DS5.11 Cuándo NO usar un LLM</h2>
+
+<p>El sesgo profesional del módulo es empujarte a usar LLMs. La marca de madurez es lo contrario: saber cuándo <strong>no</strong>. Un LLM es la herramienta más cara, más lenta y menos predecible del cajón. Si una regla, un modelo clásico o una búsqueda resuelven la tarea, esos <em>siempre</em> le ganan en costo, latencia y confiabilidad.</p>
+
+<table>
+<thead><tr><th>Si la tarea es…</th><th>La herramienta correcta suele ser…</th><th>Antes que un LLM porque…</th></tr></thead>
+<tbody>
+<tr><td>Validar un formato (email, CUIT, fecha)</td><td>Una regex o un parser</td><td>Determinista, gratis, microsegundos</td></tr>
+<tr><td>Clasificar con datos etiquetados abundantes</td><td>Un modelo clásico (DS2)</td><td>Más barato, más rápido, más predecible</td></tr>
+<tr><td>Encontrar un documento por palabras clave</td><td>Búsqueda / índice invertido</td><td>Exacto y auditable</td></tr>
+<tr><td>Un cálculo o una regla de negocio</td><td>Código común</td><td>El LLM puede equivocarse en aritmética</td></tr>
+<tr><td>Entender lenguaje libre, ambiguo, sin datos etiquetados</td><td>✅ Un LLM</td><td>Acá sí es la herramienta adecuada</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El LLM no es una bala de plata, es una bala de oro: cara y no siempre certera.</strong> Usalo donde su capacidad —entender lenguaje ambiguo sin datos etiquetados— justifica el costo y la incertidumbre. Para todo lo demás, la respuesta aburrida (una regla, un modelo chico, una búsqueda) casi siempre es la correcta. La pregunta de diseño no es "¿cómo meto un LLM acá?" sino "¿esta tarea de verdad necesita uno?".
+</div>
+
+<h2>🧑‍🎓 Worked Example — un chatbot que cuesta USD 8.000/mes</h2>
+
+<blockquote>Un chatbot de soporte responde ~1.000.000 de consultas por mes con un modelo de punta vía API. La factura llegó a <strong>USD 8.000/mes</strong> y crece, y el equipo reporta que "a veces inventa políticas de reembolso que no existen". Te lo pasan a vos. ¿Qué hacés?</blockquote>
+
+<p><strong>Paso 1 — Medir antes de tocar nada (audit-first).</strong> Instrumentás las llamadas (DS5.9) y mirás la distribución real, en vez de suponer. Los números que aparecen:</p>
+
+<pre><code class="lang-python"># Perfil real de una semana de tráfico, no estimaciones
+# 1.000.000 req/mes · ~1.500 tokens de input (system prompt gigante + few-shot) · ~400 de output
+IN, OUT = 1500, 400
+PRECIO_IN, PRECIO_OUT = 2.5 / 1e6, 10.0 / 1e6      # modelo de punta, USD/token (ilustrativo)
+por_req = IN * PRECIO_IN + OUT * PRECIO_OUT
+print(f"costo/request = USD {por_req:.5f}")         # ~0.00775
+print(f"costo/mes     = USD {por_req * 1_000_000:,.0f}")   # ~7.750 ≈ los 8.000 reportados</code></pre>
+
+<p><strong>Paso 2 — Diagnóstico.</strong> Cuatro problemas, y ninguno es "el modelo es malo":</p>
+
+<ul>
+  <li><strong>Modelo sobredimensionado.</strong> Se usa un modelo de razonamiento de punta para una tarea acotada de clasificación + respuesta guiada. Es matar una mosca con un cañón, y el cañón se cobra por bala.</li>
+  <li><strong>Sin caché.</strong> El 40% de las consultas son variantes de un puñado de preguntas frecuentes, y cada una se paga como si fuera nueva.</li>
+  <li><strong>Sin structured output.</strong> La respuesta es texto libre parseado con regex frágiles, y sin campos acotados el modelo tiene lugar para <em>inventar</em> políticas — de ahí las alucinaciones.</li>
+  <li><strong>Sin evaluación.</strong> Nadie puede afirmar cuán bueno es el bot hoy, así que nadie se anima a cambiar nada. La falta de eval es lo que <em>congela</em> el problema.</li>
+</ul>
+
+<p><strong>Paso 3 — El plan, en orden.</strong> Primero construir la red (eval), después optimizar sobre ella:</p>
+
+<div class="step"><strong>1. Montar la eval primero.</strong> Curás un golden set de ~200 consultas reales con la respuesta correcta acordada, y armás una suite con Ragas/DeepEval (DS5.7). Sin esto, cualquier cambio es a ciegas. Esta es la inversión que habilita todo lo demás.</div>
+
+<div class="step"><strong>2. Bajar a un modelo chico cuantizado.</strong> Reemplazás el modelo de punta por un 8B instruct en INT4 (AWQ), servido con vLLM (DS5.2/DS5.3) en una GPU propia. La eval te dice, con un número, cuánta calidad perdés — y para esta tarea acotada, resulta ser mínima.</div>
+
+<div class="step"><strong>3. Agregar structured output validado.</strong> La respuesta pasa a ser JSON con esquema (intención + texto + confianza), validado con Pydantic (DS5.8). Los campos acotados y la política inyectada desde una fuente confiable cortan de raíz las alucinaciones de reembolso.</div>
+
+<div class="step"><strong>4. Agregar caché semántico.</strong> Con umbral calibrado sobre el golden set (DS5.10), el 40% de las consultas frecuentes se responden sin tocar la GPU.</div>
+
+<p><strong>Paso 4 — La tabla de antes y después.</strong> La decisión se defiende con números, no con confianza:</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Antes</th><th>Después</th></tr></thead>
+<tbody>
+<tr><td>Modelo</td><td>Punta vía API</td><td>8B INT4 (AWQ) en vLLM</td></tr>
+<tr><td>Serving</td><td>API por token</td><td>1–2 GPUs dedicadas, continuous batching</td></tr>
+<tr><td>Caché</td><td>Ninguno</td><td>Semántico, ~40% hit-rate</td></tr>
+<tr><td>Formato de salida</td><td>Texto libre + regex</td><td>JSON con esquema validado</td></tr>
+<tr><td>Evaluación</td><td>Ninguna (nadie se anima a cambiar)</td><td>Golden set + Ragas en CI</td></tr>
+<tr><td><strong>Costo/mes</strong></td><td><strong>~USD 7.750</strong></td><td><strong>~USD 2.400</strong> (GPU + embeddings)</td></tr>
+<tr><td>Alucinación (medida en golden set)</td><td>No medida (¿?)</td><td>Medida, y baja por el structured output</td></tr>
+<tr><td>Capacidad de cambiar de modelo</td><td>Nula: a ciegas</td><td>Total: la eval mide cada cambio</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá un modelo chico".</strong> Es el <em>orden</em>: se construye la evaluación <strong>primero</strong>, porque es la que convierte "creemos que mejoró" en "medimos que perdimos 3 puntos de calidad y ganamos 68% de costo". Sin la eval, bajar de modelo es una apuesta temeraria. Con la eval, es una decisión de ingeniería. Y fijate que el ahorro de ~69% no salió de una sola bala mágica, sino de apilar cuatro optimizaciones modestas que la eval te dejó verificar una por una.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué el KV cache, y no los pesos del modelo, es lo que suele limitar cuántas requests concurrentes te entran en una GPU?</summary>
+<p>Los pesos se cargan una sola vez y ocupan una cantidad fija de VRAM. El KV cache, en cambio, crece con <em>cada</em> token de <em>cada</em> secuencia activa: dos requests con contexto largo pueden consumir varios GB solo de cache. En serving de alto throughput querés muchas secuencias concurrentes, y cada una suma su cache — por eso ese crecimiento lineal, y no el tamaño estático de los pesos, es lo que primero llena la memoria. Ahí está el valor de PagedAttention (elimina la fragmentación, así que el cache real cabe donde antes cabía la reserva máxima desperdiciada) y de GQA (achica el cache por token de entrada).</p></details>
+
+<details><summary>Alguien propone bajar de un modelo de 70B a uno de 8B cuantizado para ahorrar plata. ¿Cuál es el paso que NO puede saltearse antes de hacerlo?</summary>
+<p>Montar la evaluación. Sin un golden set y una suite (Ragas/DeepEval) que te dé un número de calidad, el cambio es una apuesta: no tenés forma de saber si perdiste 2 puntos aceptables o 20 inaceptables. La eval es lo que transforma "bajemos de modelo" de un salto de fe en una decisión medida — y es también lo que te avisa si la <em>cuantización</em> del 8B (que en modelos chicos duele más que en grandes) degradó la calidad más de lo tolerable. Primero la red, después el salto.</p></details>
+
+<details><summary>Tu backend recibe la salida de un LLM que resumió el email de un cliente. ¿Por qué no podés tratarla como un dato confiable?</summary>
+<p>Porque toda salida de un LLM es entrada no confiable, con el agravante de que el modelo procesó contenido de un tercero (el email), que pudo llevar un <strong>prompt injection</strong> diseñado para secuestrar las instrucciones. La salida podría contener una categoría inventada, una instrucción camuflada, o payloads de inyección (SQL, XSS, comandos). Se valida siempre contra un esquema estricto (DS5.8), nunca se ejecuta ni se interpola cruda en queries o HTML, y nunca se trata como una autorización. Es exactamente el modelo de amenazas que se trabaja en <a href="../../../../sistemas/Curso-Ciberseguridad/senior/cs4-seguridad-ia/lecture.html">Ciberseguridad Senior CS4</a>.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Operar un LLM es otra disciplina porque es <strong>no-determinista, caro por token y falla inventando</strong>. LLMOps ataca el costo (serving, cuantización, caché, local-vs-API) y la calidad (prompt-como-código, evaluación, guardrails), y usa observabilidad para enterarse de ambas cosas a tiempo.</li>
+  <li>Servir un LLM es servir un <strong>bucle autoregresivo</strong>. El <strong>KV cache</strong> domina la memoria; <strong>prefill</strong> (cómputo) y <strong>decode</strong> (ancho de banda) tienen costos opuestos; el batching es difícil porque cada secuencia es de largo distinto.</li>
+  <li><strong>vLLM</strong> gana con <strong>PagedAttention</strong> (mata la fragmentación del KV cache, de ~60–80% desperdiciado a menos del 4%) + <strong>continuous batching</strong> (la GPU nunca espera a la secuencia más lenta). Es el estándar de alto throughput.</li>
+  <li>La <strong>cuantización</strong> (GPTQ, AWQ, INT4) cambia calidad —que hay que <em>medir</em>— por memoria y velocidad. Un 70B pasa de ~140 GB a ~35 GB y entra en hardware accesible. En modelos grandes casi no duele; en chicos, verificalo.</li>
+  <li><strong>Local vs API</strong> es una decisión de costo (por token vs por GPU/hora, con un punto de equilibrio que fija tu volumen) <em>y</em> de privacidad (los datos salen o no de tu perímetro). El lado seguridad se profundiza en Ciberseguridad CS4.</li>
+  <li>El <strong>prompt es código</strong>: versionado, testeado, con dueño. Few-shot, structured output (un esquema es un contrato, no un ruego) y function calling son las técnicas que más rinden.</li>
+  <li><strong>temperature 0</strong> para tareas con una respuesta correcta; pero ni siquiera 0 garantiza determinismo bit a bit por la suma en punto flotante batcheada — testeá propiedades, no igualdad exacta.</li>
+  <li><strong>Evaluar</strong> es el problema difícil y lo que te deja cambiar de modelo sin romper todo: golden set → LLM-as-judge (ojo con sus sesgos) → humano que audita al juez, con Ragas/DeepEval en CI.</li>
+  <li><strong>Guardrails</strong> validan entrada y salida; toda salida del LLM es no confiable (nunca ejecutar, nunca interpolar cruda). <strong>Observabilidad</strong> hace del <em>costo por request</em> una métrica de primera clase. El <strong>caché semántico</strong> ahorra de verdad, pero un umbral mal calibrado sirve respuestas seguras y erróneas.</li>
+  <li>Y la marca de madurez: saber <strong>cuándo NO usar un LLM</strong>. Si una regla, un modelo clásico o una búsqueda alcanzan, le ganan en costo, latencia y confiabilidad.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Levantá un modelo chico con Ollama (o vLLM si tenés GPU) y armá un cliente con el SDK de OpenAI apuntando a <code>localhost</code>. Medí el TTFT con streaming y sin streaming, y explicá la diferencia en la latencia <em>percibida</em>.</li>
+  <li>Implementá la función <code>kv_cache_bytes</code> de DS5.1 y calculá la memoria del KV cache para un modelo con y sin GQA a 4096 tokens de contexto. ¿Cuántas secuencias concurrentes te entrarían en una GPU de 24 GB en cada caso, dejando lugar para los pesos?</li>
+  <li>Tomá un modelo en dos precisiones (FP16 e INT4) y corré 20 preguntas de tu dominio por ambos. Armá una tabla comparando calidad (juzgá vos o con LLM-as-judge) y velocidad de generación. ¿La pérdida de calidad justifica el ahorro de memoria?</li>
+  <li>Escribí el análisis de <em>break-even</em> local-vs-API con TUS números reales (precio de GPU que conseguís, precio de tokens del proveedor, tokens por request de tu caso). ¿En qué volumen mensual conviene self-hosting?</li>
+  <li>Convertí un prompt de texto libre a structured output con esquema JSON + validación Pydantic. Provocá una salida inválida (pedile una categoría inexistente) y comprobá que el guardrail la frena ruidosamente en vez de propagarla.</li>
+  <li>Curá un golden set de 20 casos de tu dominio y montá una suite con DeepEval que falle si la relevancia baja de un umbral. Corréla contra dos modelos distintos y compará. Después cambiá un prompt y verificá que la suite detecta la regresión.</li>
+  <li>Implementá el <code>CacheSemantico</code> de DS5.10 con un modelo de embeddings real. Calibrá el umbral con pares de preguntas <em>parecidas pero distintas</em> y reportá hit-rate <strong>y</strong> tasa de falsos positivos. Mostrá un umbral que ahorra mucho pero sirve respuestas equivocadas.</li>
+</ol>
+
+<section class="quiz" id="quizDS5">
+  <style>
+    #quizDS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizDS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizDS5 .q{margin-bottom:1.5rem}
+    #quizDS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizDS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizDS5 .opt:hover{border-color:var(--accent)}
+    #quizDS5 .opt:disabled{cursor:default}
+    #quizDS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizDS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizDS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizDS5 .exp.show{display:block}
+    #quizDS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Qué problema concreto resuelve PagedAttention y por qué eso sube el throughput?</p>
+    <button class="opt">Comprime los pesos del modelo a 4 bits para que entren en menos VRAM</button>
+    <button class="opt">Elimina la fragmentación del KV cache paginándolo, así entran muchas más secuencias concurrentes en la misma GPU</button>
+    <button class="opt">Hace el prefill más rápido cambiando la arquitectura de atención del modelo</button>
+    <div class="exp">PagedAttention ataca la <em>fragmentación</em> del KV cache: los motores previos reservaban un bloque contiguo del tamaño máximo por secuencia y desperdiciaban 60–80% de esa memoria. Al partir el cache en páginas asignadas bajo demanda (como la memoria virtual de un SO), el desperdicio cae a menos del 4%, así que caben muchas más secuencias concurrentes y el throughput se dispara. No toca los pesos (eso es cuantización) ni la arquitectura del modelo.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Vas a reemplazar el modelo de 70B de tu chatbot por uno de 8B cuantizado para ahorrar. ¿Cuál es el paso que habilita la decisión?</p>
+    <button class="opt">Subir temperature a 0 para que las respuestas sean deterministas</button>
+    <button class="opt">Activar el caché semántico antes de cambiar de modelo</button>
+    <button class="opt">Tener una evaluación (golden set + suite) que mida cuánta calidad perdés con el cambio</button>
+    <div class="exp">Sin una evaluación, bajar de modelo es una apuesta a ciegas: no sabés si perdiste 2 puntos tolerables o 20 inaceptables. El golden set + una suite tipo Ragas/DeepEval convierten "creemos que anda igual" en un número defendible, y encima detectan si la cuantización del modelo chico (que duele más que en los grandes) degradó demasiado. Por eso en el worked example la eval se monta <em>primero</em>. El caché y temperature son optimizaciones posteriores, no la red que habilita el salto.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu backend recibe la salida de un LLM que resumió el email de un cliente. ¿Cómo la tratás?</p>
+    <button class="opt">Como entrada no confiable: la validás contra un esquema y nunca la ejecutás ni la interpolás cruda</button>
+    <button class="opt">Como dato confiable, porque el modelo ya la procesó y le dio formato</button>
+    <button class="opt">La ejecuto directamente si viene como JSON, porque el JSON es seguro por definición</button>
+    <div class="exp">Toda salida de un LLM es tan poco confiable como un usuario anónimo de internet — y peor acá, porque procesó contenido de un tercero (el email) que pudo llevar un prompt injection para secuestrar las instrucciones. Se valida siempre contra un esquema estricto, nunca se ejecuta (<code>eval</code>/<code>exec</code>/shell) ni se mete cruda en SQL o HTML, y nunca se trata como autorización. Que "venga como JSON" no la hace segura: el contenido de los campos sigue siendo texto que un atacante pudo influir. Es el modelo de amenazas de Ciberseguridad CS4.</div>
+  </div>
+
+  <div class="score" id="scoreDS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizDS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreDS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con DS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../ds4-serving/lecture.html">← DS4: Serving de modelos</a>
+  <a href="../ds6-rag/lecture.html">DS6: RAG en producción →</a>
+</nav>
+
+</div>
+</body>
+</html>

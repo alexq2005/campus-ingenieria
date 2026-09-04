@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS3 — Seguridad cloud-native: identidad, Kubernetes y aislamiento · Ciberseguridad Senior</title>
+  <meta name="description" content="En la nube el perímetro es la identidad: IAM y menor privilegio, escalada de privilegios en IAM, credenciales efímeras, Kubernetes a fondo (RBAC, admission, Pod Security, NetworkPolicies), aislamiento de contenedores, supply chain de imágenes, IaC security y detección.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS3</span>
+  <span class="badge">⏱ 35–90 min</span>
+  <span class="badge">🎯 Pre-req: CS1</span>
+  <span class="badge">☁️ Cloud</span>
+</div>
+
+<article>
+
+<h1>CS3 — Seguridad cloud-native: identidad, Kubernetes y aislamiento</h1>
+
+<h2>CS3.0 Por qué este módulo</h2>
+
+<p>Durante décadas, la seguridad se pensó como un castillo: una muralla (el firewall), un foso (la DMZ) y adentro, confianza. Ese modelo asumía que la red tenía un <em>borde</em> nítido. En la nube ese borde se evaporó. Tu base de datos no vive en "tu" sala de servidores: vive en una cuenta compartida con millones de clientes, alcanzable por una API pública, y lo único que separa tus datos de los de otro es <strong>a quién le cree el proveedor que sos y qué le dejó hacer a esa identidad</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En cloud-native, <strong>el perímetro es la identidad, no la red</strong>. La inmensa mayoría de las brechas en la nube no son exploits de una vulnerabilidad en el código: son <strong>configuraciones y permisos</strong>. Un bucket público, un rol con más permisos de los que necesita, una clave de larga vida filtrada en un repositorio, un cluster de Kubernetes con los defaults inseguros. El atacante no <em>rompe</em> nada: usa lo que le dejaste abierto, con las credenciales que encontró tiradas.</p>
+</div>
+
+<p>Esto tiene una consecuencia incómoda para el ingeniero: el trabajo de seguridad más importante que vas a hacer en la nube no se parece a "hackear". Se parece a <strong>leer políticas, modelar quién puede llegar a qué, y cerrar caminos de escalada que nadie diseñó a propósito pero que emergen de la suma de permisos</strong>. Es tedioso, es de altísimo impacto, y casi nadie lo hace bien.</p>
+
+<div class="info">
+  Este módulo <strong>no repite</strong> el M09 (DevSecOps) del curso base, que ya cubrió pipeline, contenedores e IaC a nivel introductorio. Acá vamos al nivel experto: la mecánica interna del control de acceso en la nube, los agujeros reales de RBAC en Kubernetes, qué <em>no</em> aísla un contenedor y por qué, y cómo se detecta —y se cierra— una cadena de escalada de privilegios. Pre-requisito: CS1 (threat modeling), porque todo esto se ordena alrededor de "quién es el adversario y qué puede alcanzar".
+</div>
+
+<h2>CS3.1 IAM es el nuevo perímetro</h2>
+
+<p><strong>IAM</strong> (Identity and Access Management) es el sistema que decide, para cada llamada a la API del proveedor, si se permite o se deniega. Es el control de seguridad más central de la nube y el peor entendido. La regla que lo gobierna es vieja y simple de enunciar, y brutalmente difícil de aplicar: <strong>el principio de menor privilegio</strong> — cada identidad debe tener exactamente los permisos que necesita para su tarea, y ni uno más.</p>
+
+<h3>Roles vs políticas: la distinción que todo el mundo mezcla</h3>
+
+<p>Una <strong>política</strong> es un documento que enumera permisos: qué acciones, sobre qué recursos, bajo qué condiciones. Un <strong>rol</strong> es una identidad <em>sin credenciales de larga vida</em> que una entidad (una función serverless, una instancia, un pod, un usuario federado) <em>asume</em> temporalmente, y que lleva políticas adjuntas. La diferencia clave: un rol se puede asumir, y <em>quién</em> puede asumirlo lo define su <strong>trust policy</strong> (política de confianza), separada de lo que el rol <em>puede hacer</em> una vez asumido.</p>
+
+<pre><code class="lang-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LeerUnBucketPuntual",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::facturas-prod/*"
+    }
+  ]
+}</code></pre>
+
+<p>Esa política está bien acotada: una sola acción, sobre un solo bucket. El problema aparece cuando la gente, por comodidad, escribe esto:</p>
+
+<pre><code class="lang-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+
+<div class="mistake">
+  <strong>El comodín es deuda de seguridad que se paga con interés.</strong> <code>"Action": "s3:*"</code> sobre <code>"Resource": "*"</code> le da a esa identidad control total de <em>todo</em> el almacenamiento de la cuenta. Se escribe "por ahora, para que ande", y queda para siempre. Cuando esa identidad se ve comprometida —una clave filtrada, un SSRF que roba su token—, el atacante hereda ese comodín. La superficie de una brecha es exactamente el conjunto de permisos de la identidad comprometida.
+</div>
+
+<h3>Permisos transitivos: el permiso que parece inocente</h3>
+
+<p>Acá está el corazón del asunto senior. Menor privilegio no se rompe solo con comodines evidentes. Se rompe con <strong>permisos que, combinados, permiten alcanzar más de lo que cada uno permite por separado</strong>. El ejemplo canónico: <code>iam:PassRole</code>. Suena inofensivo — "permite pasarle un rol a un servicio". Pero si una identidad puede pasar un rol <em>administrador</em> a un servicio que ella controla, y luego ejecutar código en ese servicio, entonces esa identidad <strong>es</strong> administradora, sin que ninguna política diga la palabra "admin".</p>
+
+<pre><code class="lang-json">{
+  "Effect": "Allow",
+  "Action": [
+    "iam:PassRole",
+    "lambda:CreateFunction",
+    "lambda:InvokeFunction"
+  ],
+  "Resource": "*"
+}</code></pre>
+
+<p>Ninguna de esas tres acciones dice "hacete admin". Juntas, con <code>Resource: "*"</code>, permiten: crear una función, pasarle un rol privilegiado que exista en la cuenta, invocarla y ejecutar cualquier cosa con los permisos de ese rol. Es una <strong>cadena de escalada de privilegios</strong>, y la vas a trazar entera en el Worked Example.</p>
+
+<table>
+<thead><tr><th>Permiso "inocente"</th><th>Por qué escala</th></tr></thead>
+<tbody>
+<tr><td><code>iam:CreatePolicyVersion</code></td><td>Deja publicar una versión nueva —y por defecto activa— de una política adjunta: se reescribe a <code>*:*</code></td></tr>
+<tr><td><code>iam:PassRole</code> + cómputo</td><td>Pasa un rol privilegiado a un recurso que ejecuta tu código</td></tr>
+<tr><td><code>iam:AttachUserPolicy</code></td><td>Adjunta <code>AdministratorAccess</code> a la propia identidad</td></tr>
+<tr><td><code>iam:CreateAccessKey</code> sobre otro</td><td>Genera credenciales de larga vida de un usuario más privilegiado</td></tr>
+<tr><td><code>sts:AssumeRole</code> laxo</td><td>Salta a un rol cuya trust policy es demasiado abierta</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El control central de IAM no es escribir políticas: es analizar alcanzabilidad.</strong> La pregunta que importa no es "¿qué dice esta política?", sino "<strong>partiendo de esta identidad, ¿a qué puedo llegar por la suma de todos los caminos posibles?</strong>". Eso es un problema de grafos, no de lectura línea por línea, y por eso se automatiza (ver CS3.1 detección y el Worked Example).
+</div>
+
+<h3>Analizar "quién puede llegar a qué"</h3>
+
+<p>Los proveedores dan herramientas nativas para esto —AWS <strong>IAM Access Analyzer</strong>, GCP <strong>Policy Analyzer</strong>, Azure <strong>Access Reviews</strong>— y el ecosistema tiene analizadores de grafos (por ejemplo, herramientas que modelan la cuenta como nodos-identidad y aristas-permiso). Todas responden la misma familia de preguntas: qué identidades pueden asumir un rol dado, qué recursos son alcanzables desde afuera de la cuenta, y qué caminos de escalada existen. El entregable senior de una revisión de IAM no es "revisé las políticas": es <strong>un inventario de caminos de escalada, cada uno con la remediación que lo corta</strong>.</p>
+
+<h2>CS3.2 Credenciales efímeras: las claves de larga vida son deuda</h2>
+
+<p>Si el perímetro es la identidad, entonces las <strong>credenciales</strong> —lo que prueba esa identidad— son el activo más buscado. Y acá hay una jerarquía clara de riesgo: una clave de acceso de larga vida (un par <code>AKIA...</code> / secreto que no expira nunca) es lo peor que podés tener, porque combina tres propiedades tóxicas: no caduca, se copia sin dejar rastro, y suele terminar hardcodeada en código, imágenes de contenedor, variables de entorno o historiales de shell.</p>
+
+<div class="danger">
+  <strong>⚠️ Toda clave de larga vida es una brecha esperando su momento.</strong> El patrón repetido de incidentes reales: un secreto se commitea a un repo (aunque sea privado, aunque se borre después — queda en el historial de git), un bot lo encuentra en minutos, y como no caduca, el acceso es permanente hasta que <em>alguien</em> lo rota. El objetivo de diseño es simple de enunciar: <strong>que no exista ninguna credencial de larga vida que rotar</strong>, porque no hay ninguna.
+</div>
+
+<h3>OIDC federation y workload identity</h3>
+
+<p>La alternativa moderna es la <strong>identidad federada</strong>: en lugar de guardar una clave, el workload prueba <em>quién es</em> ante un proveedor de identidad (IdP) de confianza, y recibe a cambio credenciales <strong>de corta vida</strong> (minutos u horas). El mecanismo estándar es <strong>OIDC</strong> (OpenID Connect): el pipeline de CI, el pod de Kubernetes o la función serverless presentan un token firmado que dice "soy el job X del repo Y", y la cuenta cloud, que confía en ese emisor, entrega credenciales temporales acotadas.</p>
+
+<pre><code class="lang-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:mi-org/mi-repo:ref:refs/heads/main"
+      }
+    }
+  }]
+}</code></pre>
+
+<p>Esa trust policy dice: "solo el CI de <code>mi-org/mi-repo</code>, corriendo sobre la rama <code>main</code>, puede asumir este rol". No hay ninguna clave guardada en ningún lado. El token es efímero y está atado a un contexto verificable. Lo mismo se hace en Kubernetes con <strong>workload identity</strong> (una ServiceAccount del cluster mapeada a un rol cloud) y en cualquier plataforma seria de cómputo.</p>
+
+<div class="rule">
+  <strong>📌 La condición es la mitad del control.</strong> Federar sin condicionar el <code>sub</code> (el sujeto) es casi tan malo como una clave larga: si cualquier repo o cualquier rama puede asumir el rol, el atacante que controle un fork o un branch entra. La potencia de OIDC está en el <code>Condition</code> que ata el token a un contexto estrecho y verificable.
+</div>
+
+<h3>El metadata service como vector</h3>
+
+<p>Hay un lugar donde las credenciales efímeras se vuelven un blanco: el <strong>servicio de metadata de la instancia</strong> (IMDS). Cada instancia o pod puede pedirle a una dirección de enlace local (una IP interna, no ruteable) las credenciales temporales de su rol. Eso es cómodo — el SDK las toma solo — y es un vector: si tu aplicación tiene un <strong>SSRF</strong>, el atacante la usa para pedirle a <em>ella</em> que consulte esa URL interna y le devuelva las credenciales del rol.</p>
+
+<div class="danger">
+  <strong>⚠️ SSRF + metadata service = robo de credenciales del rol.</strong> Este es el puente entre una vulnerabilidad de aplicación y un compromiso de la cuenta cloud. Lo viste desde el lado de la app en el módulo base — <a href="../../m04-owasp-web/lecture.html">M04, SSRF: tu servidor como proxy del atacante</a>. Desde el lado cloud, la defensa es doble: <strong>(1)</strong> exigir la versión con token del metadata service (IMDSv2), que obliga a un <code>PUT</code> previo que un SSRF simple no puede hacer, y <strong>(2)</strong> —lo más importante— que el rol de la instancia tenga <em>menor privilegio</em>, para que robar su token valga poco.
+</div>
+
+<h2>CS3.3 Kubernetes a fondo</h2>
+
+<p>Kubernetes es la plataforma cloud-native por excelencia, y su postura de seguridad por defecto es <strong>deliberadamente permisiva</strong>: está pensado para que "arranque y funcione", no para que "arranque seguro". Un cluster recién instalado, sin endurecer, es inseguro en varios ejes a la vez. Vamos control por control.</p>
+
+<table>
+<thead><tr><th>Control</th><th>Default</th><th>Riesgo si no lo tocás</th></tr></thead>
+<tbody>
+<tr><td><strong>RBAC</strong></td><td>Existe, pero es fácil dar de más</td><td>ServiceAccounts con permisos de cluster-admin</td></tr>
+<tr><td><strong>NetworkPolicies</strong></td><td>Ninguna → todo se habla con todo</td><td>Movimiento lateral libre entre pods</td></tr>
+<tr><td><strong>Pod Security</strong></td><td>Sin restricción de privilegios del pod</td><td>Pods privilegiados, montaje del host, escape</td></tr>
+<tr><td><strong>Admission control</strong></td><td>Solo los webhooks que agregues</td><td>Nada valida lo que se despliega</td></tr>
+<tr><td><strong>Secrets</strong></td><td>base64 en etcd, sin cifrar por defecto</td><td>Quien lee etcd lee todos los secretos</td></tr>
+</tbody>
+</table>
+
+<h3>RBAC y sus agujeros</h3>
+
+<p>El <strong>RBAC</strong> de Kubernetes controla quién puede hacer qué sobre los objetos de la API. Es potente y granular; el problema es que la granularidad se ignora y la gente adjunta el <code>ClusterRole</code> incorporado <code>cluster-admin</code> "para que ande el operador". Un <code>Role</code> bien acotado se ve así:</p>
+
+<pre><code class="lang-yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: pagos
+  name: lector-de-configmaps
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]</code></pre>
+
+<p>Y el agujero típico se ve así — un comodín que parece práctico y es una llave maestra:</p>
+
+<pre><code class="lang-yaml">rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]</code></pre>
+
+<div class="mistake">
+  <strong>Algunos verbos son escalada aunque parezcan lectura.</strong> Poder crear un <code>pod</code> arbitrario en un namespace es, en la práctica, poder ejecutar como cualquier ServiceAccount de ese namespace (montás su token y actuás como ella). El verbo <code>escalate</code> sobre roles, el <code>bind</code>, el acceso a <code>pods/exec</code> y el poder editar un webhook de admisión son todos caminos a cluster-admin. Igual que en IAM: la pregunta no es qué dice el rol, es a qué se llega desde él.
+</div>
+
+<h3>Admission controllers y Pod Security Standards</h3>
+
+<p>Un <strong>admission controller</strong> es un punto de control que intercepta cada objeto <em>antes</em> de que se persista en el cluster, y puede validarlo o mutarlo. Es donde se aplica la política: "ningún pod privilegiado", "ninguna imagen sin firmar", "todo namespace lleva NetworkPolicy". Kubernetes trae los <strong>Pod Security Standards</strong> (PSS) con tres niveles —<code>privileged</code>, <code>baseline</code>, <code>restricted</code>— que se activan etiquetando el namespace:</p>
+
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: pagos
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted</code></pre>
+
+<p>Con <code>restricted</code>, el cluster rechaza pods que corran como root, que pidan capabilities peligrosas, que monten el filesystem del host o que activen <code>privileged: true</code>. Para políticas más finas que las que dan los PSS, se usan motores de policy-as-code como <strong>Kyverno</strong> u <strong>OPA Gatekeeper</strong>, que corren como admission webhooks y evalúan reglas declarativas.</p>
+
+<h3>NetworkPolicies: el default allow-all es el problema</h3>
+
+<p>Este es el error más subestimado. Por defecto, en Kubernetes <strong>todos los pods pueden hablar con todos los pods</strong>, en todos los namespaces. Eso significa que si un atacante compromete un pod cualquiera —el más expuesto, el menos importante—, tiene conectividad de red directa hacia tu base de datos, tu cache, tus servicios internos. El movimiento lateral es gratis. La defensa es adoptar una postura <strong>default-deny</strong> y abrir solo lo necesario:</p>
+
+<pre><code class="lang-yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: denegar-todo-ingress
+  namespace: pagos
+spec:
+  podSelector: {}          # aplica a todos los pods del namespace
+  policyTypes: ["Ingress"]
+  # sin reglas ingress = no se acepta ningún tráfico entrante</code></pre>
+
+<div class="rule">
+  <strong>📌 default-deny primero, permitir después.</strong> La forma correcta es negar todo el ingress (y, cuando podés, el egress) en cada namespace, y luego agregar NetworkPolicies puntuales que habiliten los flujos legítimos: "el frontend habla con la API", "la API habla con la base". Recién ahí el compromiso de un pod deja de ser el compromiso de la red entera. Requiere un CNI que implemente NetworkPolicies (no todos lo hacen).
+</div>
+
+<h3>Secrets y cifrado en reposo</h3>
+
+<p>Los <code>Secret</code> de Kubernetes no están cifrados por defecto: están codificados en <strong>base64</strong> —que no es cifrado, es una forma de escribir bytes— y se guardan en <strong>etcd</strong>, la base de datos del cluster. Quien lea etcd, o un backup de etcd, lee todos tus secretos en claro. Hay dos capas de defensa: activar el <strong>cifrado en reposo</strong> con un proveedor de claves (idealmente un KMS externo), y limitar por RBAC quién puede leer <code>secrets</code>.</p>
+
+<pre><code class="lang-yaml"># EncryptionConfiguration del api-server: cifra los Secret en etcd con un KMS
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources: ["secrets"]
+    providers:
+      - kms:
+          name: kms-prod
+          endpoint: unix:///var/run/kmsplugin/socket.sock
+      - identity: {}        # fallback de lectura para datos ya escritos</code></pre>
+
+<div class="info">
+  Muchos equipos van un paso más allá y <strong>no guardan secretos en Kubernetes en absoluto</strong>: usan un gestor externo (un vault, o el secrets manager del proveedor) y lo inyectan al pod con un operador. Así el secreto vive cifrado, auditado y rotado fuera del cluster, y etcd nunca lo ve. El punto de M07 del curso base —los secretos no van en el código— acá se extiende: tampoco van en claro en el datastore del orquestador.
+</div>
+
+<h2>CS3.4 Aislamiento de contenedores: qué NO aísla un contenedor</h2>
+
+<p>Hay un malentendido peligroso y extendido: creer que un contenedor es una máquina virtual, una caja sellada. No lo es. Un contenedor es un <strong>proceso normal del host</strong> al que el kernel le acota la vista del sistema con <strong>namespaces</strong> (qué procesos, redes y filesystems ve) y le limita el consumo con <strong>cgroups</strong>. Es la misma tecnología que estudiaste en <a href="../../../Curso-Linux/senior/ls3-namespaces-cgroups/lecture.html">Linux Senior, LS3 (namespaces y cgroups)</a> — vale la pena releerlo, porque la seguridad de contenedores <em>es</em> el uso defensivo de esos primitivos.</p>
+
+<div class="concept">
+  <strong>💡 La frontera crítica: todos los contenedores del host comparten el mismo kernel.</strong> Una VM tiene su propio kernel y un hypervisor entre ella y el hardware. Un contenedor comparte el kernel del host con todos los demás contenedores. Por lo tanto, <strong>una vulnerabilidad del kernel es una vulnerabilidad de aislamiento</strong>: si un proceso dentro del contenedor logra explotar el kernel, se sale del contenedor y compromete el host y a todos sus vecinos. El namespace no lo protege de eso; el namespace solo le oculta cosas.
+</div>
+
+<h3>Qué endurece un contenedor (y qué no)</h3>
+
+<table>
+<thead><tr><th>Sí aísla / limita</th><th>NO aísla por sí solo</th></tr></thead>
+<tbody>
+<tr><td>Vista de procesos, red y FS (namespaces)</td><td>El kernel: es compartido y es la superficie de escape</td></tr>
+<tr><td>Uso de CPU y memoria (cgroups)</td><td>Vulnerabilidades del kernel (una CVE = escape potencial)</td></tr>
+<tr><td>Syscalls permitidas (seccomp)</td><td>Un contenedor <code>privileged</code>: tira casi toda la protección</td></tr>
+<tr><td>Capabilities del proceso (drop de todas menos las justas)</td><td>Un socket de Docker montado adentro (= root del host)</td></tr>
+<tr><td>Perfil MAC (AppArmor / SELinux)</td><td>Un montaje del filesystem del host (<code>hostPath</code>)</td></tr>
+</tbody>
+</table>
+
+<p>Los escapes conocidos —conceptualmente, sin recetas operativas— caen casi siempre en una de estas categorías: <strong>(1)</strong> el contenedor corría como <code>privileged</code> o con capabilities de más (por ejemplo <code>CAP_SYS_ADMIN</code>), <strong>(2)</strong> se le montó algo del host que no debía (el socket del runtime, un directorio sensible), o <strong>(3)</strong> se explotó una vulnerabilidad del kernel o del runtime. Las tres se mitigan con la misma disciplina: <strong>menor privilegio también acá</strong> — dropear capabilities, no correr como root, aplicar seccomp y un perfil MAC, y jamás montar el socket del runtime dentro de un pod que procesa entrada no confiable.</p>
+
+<p>En Kubernetes, esa disciplina se declara en el <code>securityContext</code> del pod y del contenedor. Un pod endurecido —el que aprueba Pod Security <code>restricted</code>— se ve así:</p>
+
+<pre><code class="lang-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: worker-endurecido
+spec:
+  securityContext:
+    runAsNonRoot: true          # nunca como root
+    seccompProfile:
+      type: RuntimeDefault      # filtra syscalls peligrosas
+  containers:
+    - name: worker
+      image: registry.interno/worker@sha256:9f2b...
+      securityContext:
+        allowPrivilegeEscalation: false   # no gana privilegios vía SUID
+        readOnlyRootFilesystem: true      # FS de solo lectura
+        capabilities:
+          drop: ["ALL"]                   # sin capabilities de Linux
+      resources:
+        limits: { cpu: "500m", memory: "256Mi" }   # cgroups: techo de recursos</code></pre>
+
+<div class="tip">
+  Cada línea de ese <code>securityContext</code> cierra una vía de escape concreta: <code>runAsNonRoot</code> y <code>drop: ["ALL"]</code> quitan poder al proceso, <code>allowPrivilegeEscalation: false</code> corta la escalada por binarios SUID, <code>readOnlyRootFilesystem</code> impide que el atacante escriba herramientas en el contenedor, y <code>seccompProfile: RuntimeDefault</code> recorta la superficie de syscalls hacia el kernel. Ninguna requiere tocar tu aplicación: son controles de plataforma, gratis, y casi nadie los pone.
+</div>
+
+<h3>Aislamiento fuerte: gVisor, Kata y rootless</h3>
+
+<p>Cuando el aislamiento estándar no alcanza —multi-tenancy real, ejecución de código no confiable de terceros— existen <strong>sandboxes</strong> que meten una capa extra entre el contenedor y el kernel del host:</p>
+
+<div class="step"><strong>gVisor</strong> intercala un "kernel" en espacio de usuario: las syscalls del contenedor las atiende gVisor, no el kernel del host directamente. Reduce dramáticamente la superficie de escape a cambio de algo de rendimiento y compatibilidad.</div>
+
+<div class="step"><strong>Kata Containers</strong> corre cada contenedor (o pod) dentro de una <strong>micro-VM</strong> ligera con su propio kernel. Recuperás la frontera del hypervisor: un escape ya no llega al host, llega a una VM descartable.</div>
+
+<div class="step"><strong>Rootless</strong> —correr el runtime y los contenedores sin privilegios de root en el host— reduce el daño de un escape: aunque el proceso salga del contenedor, sale como un usuario sin privilegios, no como root.</div>
+
+<p>Se seleccionan por <code>RuntimeClass</code>, así que la política de "esta carga corre en sandbox fuerte" es declarativa:</p>
+
+<pre><code class="lang-yaml">apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc        # el runtime de gVisor
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: procesa-uploads-de-terceros
+spec:
+  runtimeClassName: gvisor
+  containers:
+    - name: worker
+      image: registry.interno/worker:1.4.2</code></pre>
+
+<h2>CS3.5 Supply chain de la imagen</h2>
+
+<p>Un contenedor corre una imagen, y esa imagen la construiste vos a partir de una imagen base, capas de dependencias y tu código. Cada eslabón es una oportunidad de inyección: una base comprometida, una dependencia con una puerta trasera, un registry al que alguien subió una imagen con el mismo nombre. La <strong>seguridad de la supply chain</strong> responde a una pregunta: <strong>¿la imagen que corre en producción es exactamente la que tu pipeline construyó, sin nada agregado en el camino?</strong></p>
+
+<h3>Firma con cosign / Sigstore</h3>
+
+<p><strong>Sigstore</strong> (y su herramienta <code>cosign</code>) firma imágenes de contenedor, idealmente con identidad efímera (keyless): el pipeline firma con un certificado de corta vida emitido contra su identidad OIDC, y la firma queda en un log público de transparencia. Verificar es comprobar que la firma existe y viene de la identidad esperada:</p>
+
+<pre><code class="lang-bash"># El pipeline firma (keyless: sin claves que guardar) tras construir
+cosign sign registry.interno/api@sha256:9f2b...  # se referencia por digest, no por tag
+
+# El cluster —o cualquiera— verifica antes de correr
+cosign verify \
+  --certificate-identity-regexp "https://github.com/mi-org/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  registry.interno/api@sha256:9f2b...</code></pre>
+
+<div class="rule">
+  <strong>📌 Referenciá imágenes por digest, no por tag.</strong> Un tag como <code>:latest</code> o <code>:1.4</code> es mutable: alguien puede reescribir a qué imagen apunta. El digest <code>sha256:...</code> es el hash del contenido: es inmutable y verificable. Un pipeline serio despliega por digest y verifica firma sobre ese digest.
+</div>
+
+<h3>SBOM, escaneo y admisión que rechaza lo no firmado</h3>
+
+<p>El <strong>SBOM</strong> (Software Bill of Materials) es el inventario de todo lo que hay dentro de la imagen: cada paquete, cada versión. Sirve para dos cosas: <strong>escanear</strong> (cruzar ese inventario contra bases de vulnerabilidades conocidas) y <strong>responder</strong> (cuando sale una CVE nueva, saber en segundos qué imágenes la contienen). El control que cierra el círculo es un <strong>admission policy que rechaza toda imagen sin firma válida</strong>:</p>
+
+<pre><code class="lang-yaml"># Kyverno: solo admite imágenes firmadas por la identidad del pipeline
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: exigir-imagenes-firmadas
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verificar-firma
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences: ["registry.interno/*"]
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/mi-org/*"
+                    issuer: "https://token.actions.githubusercontent.com"</code></pre>
+
+<h3>Provenance SLSA</h3>
+
+<p><strong>SLSA</strong> (Supply-chain Levels for Software Artifacts) es un marco de niveles que formaliza <em>cuánta</em> confianza podés tener en cómo se construyó un artefacto. Su pieza central es la <strong>provenance</strong>: un documento firmado y verificable que dice <em>quién</em> construyó el artefacto, <em>desde qué fuente</em>, con <em>qué proceso</em>. A mayor nivel SLSA, más garantías de que la build fue reproducible, aislada y no manipulable. Para el ingeniero, la meta práctica: que producción solo acepte artefactos con provenance verificable que apunte a tu pipeline, y nada más.</p>
+
+<h2>CS3.6 IaC security</h2>
+
+<p>La infraestructura como código (IaC) es una bendición para la seguridad —todo es revisable, versionado, repetible— y también un multiplicador de errores: un módulo de Terraform mal escrito no crea <em>un</em> bucket público, crea <em>cincuenta</em>. Los errores más caros de la nube casi siempre se pueden ver en el IaC antes de que existan en la realidad.</p>
+
+<table>
+<thead><tr><th>Error de IaC</th><th>Consecuencia</th></tr></thead>
+<tbody>
+<tr><td>Bucket de almacenamiento público</td><td>Exposición masiva de datos, indexable por buscadores</td></tr>
+<tr><td>Security group / firewall abierto a <code>0.0.0.0/0</code></td><td>Base de datos o admin accesible desde toda internet</td></tr>
+<tr><td>Cifrado en reposo apagado</td><td>Datos en claro; incumplimiento de compliance</td></tr>
+<tr><td>Logs de auditoría desactivados</td><td>Ceguera: un incidente sin rastro</td></tr>
+<tr><td>Rol con políticas comodín</td><td>Escalada de privilegios (CS3.1)</td></tr>
+</tbody>
+</table>
+
+<p>Un ejemplo clásico en CloudFormation (YAML) — un grupo de seguridad que deja el puerto de la base abierto a todo internet:</p>
+
+<pre><code class="lang-yaml">Resources:
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: base de datos
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0      # ← toda internet puede tocar el 5432</code></pre>
+
+<h3>Escaneo y policy-as-code</h3>
+
+<p>La defensa es <strong>escanear el IaC en el pipeline</strong>, antes del <code>apply</code>, y <strong>rechazar</strong> lo que viole la política. Herramientas como <code>checkov</code>, <code>tfsec</code>/<code>trivy</code> o <code>terrascan</code> traen cientos de reglas incorporadas; y para reglas propias se usa <strong>policy as code</strong> con <strong>OPA</strong> y <code>conftest</code>, que evalúa políticas declarativas contra el plan de Terraform:</p>
+
+<pre><code class="lang-bash"># Escaneo de reglas incorporadas sobre el código Terraform
+trivy config ./infra
+
+# Política propia (OPA/Rego) evaluada contra el plan, en el pipeline
+terraform plan -out plan.bin
+terraform show -json plan.bin &gt; plan.json
+conftest test plan.json --policy ./policies
+
+# Salida esperada si algo viola la política:
+# FAIL - plan.json - main - El SG DbSecurityGroup expone 0.0.0.0/0 al puerto 5432</code></pre>
+
+<div class="rule">
+  <strong>📌 El control se aplica en el pipeline, no en un PDF.</strong> "Está prohibido abrir bases a internet" escrito en una política de la empresa no impide nada. La misma regla escrita como policy-as-code que <em>falla el build</em> lo impide de verdad, en cada PR, sin depender de que un humano se acuerde de revisar. Esa es la diferencia entre política aspiracional y control efectivo.
+</div>
+
+<h3>Drift: cuando la realidad se aparta del código</h3>
+
+<p>Hay un supuesto silencioso en todo esto: que lo que corre en la nube <em>es</em> lo que dice el IaC. Se rompe con el <strong>drift</strong>: alguien entra a la consola y "arregla algo a mano" —abre un puerto para debuggear, agrega un permiso, apaga un cifrado— y nunca lo lleva al código. Ahora tu IaC miente, y el escaneo del pipeline valida un mundo que no existe. La detección de drift (comparar el estado real contra el declarado, de forma continua) es parte del control: sin ella, escanear el código da una <strong>falsa sensación</strong> de seguridad.</p>
+
+<h2>CS3.7 Detección en la nube</h2>
+
+<p>Todo lo anterior es prevención. La detección responde la otra pregunta: <strong>si alguien ya entró, ¿me entero?</strong> En la nube, el registro fundamental es el <strong>log de auditoría del plano de control</strong> —AWS <strong>CloudTrail</strong>, GCP <strong>Cloud Audit Logs</strong>, Azure <strong>Activity Log</strong>—: cada llamada a la API del proveedor queda registrada, con quién la hizo, desde dónde, cuándo y sobre qué.</p>
+
+<pre><code class="lang-json">{
+  "eventName": "GetSecretValue",
+  "eventSource": "secretsmanager.amazonaws.com",
+  "userIdentity": {
+    "type": "AssumedRole",
+    "arn": "arn:aws:sts::123456789012:assumed-role/rol-lambda-facturas/i-0abc"
+  },
+  "sourceIPAddress": "203.0.113.44",
+  "eventTime": "2026-09-04T02:14:07Z",
+  "requestParameters": { "secretId": "prod/db/master" }
+}</code></pre>
+
+<p>Ese evento, aislado, puede ser normal. En contexto es una alarma: el rol de una función de facturación leyendo el secreto <em>master</em> de la base, desde una IP externa, a las dos de la mañana. La detección efectiva no mira eventos sueltos: mira <strong>patrones y desviaciones de la línea de base</strong>.</p>
+
+<table>
+<thead><tr><th>Evento a vigilar</th><th>Por qué importa</th></tr></thead>
+<tbody>
+<tr><td>Cambios en políticas IAM / creación de roles</td><td>Preparación de una escalada o persistencia</td></tr>
+<tr><td><code>CreateAccessKey</code>, nuevos usuarios</td><td>El atacante se labra credenciales propias</td></tr>
+<tr><td>Lectura masiva de secretos / objetos</td><td>Fase de exfiltración</td></tr>
+<tr><td>Desactivar logging o alertas</td><td>El atacante intenta cegarte (¡alertá sobre esto!)</td></tr>
+<tr><td>Uso desde IPs/regiones/horarios anómalos</td><td>Credencial usada por alguien que no es el dueño</td></tr>
+<tr><td>Bucket que se vuelve público</td><td>Exposición de datos, intencional o por error</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El patrón de exfiltración típico tiene una forma reconocible.</strong> Casi todas las brechas cloud siguen la misma coreografía: <strong>(1)</strong> se obtiene una credencial (clave filtrada, SSRF al metadata, phishing); <strong>(2)</strong> reconocimiento — el atacante enumera qué permisos tiene esa identidad y qué alcanza; <strong>(3)</strong> escalada por una cadena de permisos (CS3.1); <strong>(4)</strong> persistencia — se crea claves o roles propios; <strong>(5)</strong> exfiltración — lectura masiva de datos, a veces hacia una cuenta del atacante. Cada paso deja huella en el audit log. Detectar temprano —en el reconocimiento o la escalada— es la diferencia entre un susto y una brecha reportable.
+</div>
+
+<h2>CS3.8 Multi-tenancy: cómo se aísla de verdad a los clientes</h2>
+
+<p>Si tu producto es SaaS, tenés muchos clientes (tenants) sobre la misma infraestructura, y la propiedad de seguridad más importante —la que si se rompe termina en titulares— es que <strong>ningún tenant pueda ver ni tocar los datos de otro</strong>. Hay un espectro de modelos de aislamiento, de más barato/más riesgoso a más caro/más fuerte:</p>
+
+<table>
+<thead><tr><th>Modelo</th><th>Aislamiento</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td>Fila compartida con <code>tenant_id</code></td><td>Lógico: depende 100% del código</td><td>Barato; un bug de filtrado = fuga entre tenants</td></tr>
+<tr><td>Esquema / base por tenant</td><td>Más fuerte a nivel datos</td><td>Más costo operativo; escala peor</td></tr>
+<tr><td>Namespace / cuenta por tenant</td><td>Fuerte, con frontera de plataforma</td><td>Caro; complejo de operar a gran escala</td></tr>
+<tr><td>Cómputo sandboxeado por tenant</td><td>El más fuerte (Kata, cuenta dedicada)</td><td>El más caro; para datos muy sensibles</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El bug de aislamiento clásico: el <code>WHERE tenant_id</code> que falta.</strong> En el modelo de fila compartida, todo el aislamiento vive en que <em>cada</em> consulta filtre por el tenant correcto. Una sola consulta que se olvide el filtro —o que tome el <code>tenant_id</code> de un parámetro que el usuario controla en vez de su sesión— y un cliente ve los datos de otro. Esto es <strong>IDOR</strong> a escala de tenant (lo viste en AppSec). La defensa robusta no es "acordate de filtrar": es forzar el aislamiento en una capa que no se pueda olvidar —RLS (row-level security) en la base, un middleware que inyecta el filtro, o directamente una frontera física por tenant para los datos que lo ameriten.
+</div>
+
+<h2>CS3.9 Cuándo la nube es MÁS segura que on-prem</h2>
+
+<p>Después de nueve secciones de riesgos, corresponde el contrapeso honesto: para la mayoría de las organizaciones, <strong>una nube bien configurada es más segura que un datacenter propio</strong>. No por magia, por división del trabajo y por escala.</p>
+
+<div class="step"><strong>Parches gestionados.</strong> El proveedor parcha el hipervisor, el hardware y —en servicios gestionados— el sistema operativo y el motor de base de datos, a una velocidad y con una cobertura que un equipo pequeño no iguala. La CVE crítica del kernel que a vos te llevaría semanas coordinar, en un servicio gestionado ya está aplicada.</div>
+
+<div class="step"><strong>Defaults que mejoran solos.</strong> Los proveedores fueron cerrando defaults inseguros: buckets públicos que ahora hay que habilitar a propósito y con advertencias, cifrado en reposo activado por defecto, versiones del metadata service más resistentes. La plataforma empuja hacia lo seguro, y esa presión no existe en tu rack.</div>
+
+<div class="step"><strong>Herramientas de seguridad de primera línea.</strong> Cifrado con KMS, gestión de secretos, detección de amenazas gestionada, análisis de acceso, logs de auditoría inmutables — todo disponible con un flag, mantenido por equipos dedicados. Reproducir ese arsenal on-prem cuesta una fortuna.</div>
+
+<div class="concept">
+  <strong>💡 "Cloud inseguro" casi siempre significa "config insegura".</strong> El <strong>modelo de responsabilidad compartida</strong> es la clave: el proveedor asegura la seguridad <em>de</em> la nube (hardware, hipervisor, red física); vos asegurás la seguridad <em>en</em> la nube (tus permisos, tus buckets, tus grupos de seguridad, tu código). Las brechas que ves en las noticias caen, casi sin excepción, del lado del cliente: un bucket que alguien hizo público, un rol con comodín, una clave filtrada. La nube no te hace inseguro; te da herramientas afiladas que, mal usadas, cortan. Este módulo entero trata de usarlas bien.
+</div>
+
+<h2>🧑‍🎓 Worked Example — la cadena de tres permisos a administrador</h2>
+
+<blockquote>En una cuenta de AWS, una función serverless de facturación tiene un rol de ejecución, <code>rol-lambda-facturas</code>. El equipo lo considera "de bajo riesgo": total, solo procesa facturas. Una revisión de IAM pregunta: partiendo de ese rol, ¿a qué se puede llegar? La respuesta es: a administrador de toda la cuenta, en tres pasos.</blockquote>
+
+<p><strong>Paso 1 — La política que nadie miró con desconfianza.</strong> El rol lleva, entre otras cosas, esta política. Se agregó "para que la función pudiera gestionar sus propios recursos". Cada permiso, por separado, se justificó en su momento:</p>
+
+<pre><code class="lang-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "iam:PassRole",
+      "lambda:CreateFunction",
+      "lambda:InvokeFunction"
+    ],
+    "Resource": "*"
+  }]
+}</code></pre>
+
+<p><strong>Paso 2 — Trazar la cadena de alcanzabilidad.</strong> El analista no lee la política pidiéndole permiso para "hacerse admin" —no lo dice—. Traza qué se <em>alcanza</em>:</p>
+
+<div class="step"><strong>Eslabón 1 — <code>iam:PassRole</code> sobre <code>*</code>:</strong> el rol puede pasarle a un servicio <em>cualquier</em> rol de la cuenta. Y en la cuenta existe <code>rol-org-admin</code>, con <code>AdministratorAccess</code>. Nada impide pasar ese rol.</div>
+
+<div class="step"><strong>Eslabón 2 — <code>lambda:CreateFunction</code>:</strong> el rol puede crear una función nueva y —acá se cierra con el eslabón 1— asignarle <code>rol-org-admin</code> como rol de ejecución.</div>
+
+<div class="step"><strong>Eslabón 3 — <code>lambda:InvokeFunction</code>:</strong> el rol puede invocar esa función nueva. El código que corra dentro lo hace con los permisos de <code>rol-org-admin</code>: es decir, con permisos de administrador. Desde ahí, adjuntarse <code>AdministratorAccess</code> a sí mismo, crear un usuario propio o leer cualquier dato es trivial.</div>
+
+<div class="danger">
+  <strong>⚠️ Ninguna política dijo "admin".</strong> El rol "de bajo riesgo" era administrador de facto. Esta es la naturaleza de la escalada por permisos transitivos: emerge de la <em>combinación</em>, y es invisible si revisás cada permiso en aislamiento. Por eso el control es el análisis de alcanzabilidad, no la lectura línea por línea.
+</div>
+
+<p><strong>Paso 3 — Cómo se detecta (sin explotar nada).</strong> Esto no se descubre atacando: se descubre con <strong>análisis de acceso</strong>. Un analizador de IAM modela la cuenta como un grafo —identidades, roles, políticas, relaciones de <code>PassRole</code> y <code>AssumeRole</code>— y responde la consulta "¿qué identidades pueden alcanzar privilegios de administrador, y por qué camino?". La respuesta incluye a <code>rol-lambda-facturas</code> con la ruta exacta. El mismo hallazgo se puede reforzar con una regla en el audit log: alertar si un rol de aplicación ejecuta <code>CreateFunction</code> pasando un rol privilegiado, algo que no debería pasar nunca en operación normal.</p>
+
+<p><strong>Paso 4 — Cerrar la cadena con menor privilegio y boundary policies.</strong> No alcanza con quitar un permiso: hay que cortar el camino <em>y</em> poner un techo que impida que reaparezca. Tres controles, en capas:</p>
+
+<div class="step"><strong>1. Acotar <code>PassRole</code>.</strong> El <code>Resource: "*"</code> se reemplaza por los ARNs exactos de los roles de baja privilegio que la función legítimamente necesita pasar, con una condición sobre el servicio destino:</div>
+
+<pre><code class="lang-json">{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::123456789012:role/rol-worker-facturas",
+  "Condition": {
+    "StringEquals": { "iam:PassedToService": "lambda.amazonaws.com" }
+  }
+}</code></pre>
+
+<div class="step"><strong>2. Permissions boundary.</strong> Se adjunta al rol un <em>límite de permisos</em>: un techo que dice "pase lo que pase, la permisología efectiva de este rol no puede exceder esto". Aunque en el futuro alguien le agregue una política amplia por error, el boundary la recorta. Es la red de seguridad que hace que menor privilegio no dependa de que nadie se equivoque nunca más.</div>
+
+<pre><code class="lang-json">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "TechoDeLaFuncion",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "logs:CreateLogStream", "logs:PutLogEvents"],
+    "Resource": [
+      "arn:aws:s3:::facturas-prod/*",
+      "arn:aws:logs:*:123456789012:log-group:/aws/lambda/facturas:*"
+    ]
+  }]
+}</code></pre>
+
+<div class="step"><strong>3. Guardarraíl organizacional (SCP).</strong> A nivel de toda la organización, una Service Control Policy que <em>deniega</em> pasar o asumir los roles administrativos salvo desde un conjunto muy chico de identidades de confianza. Así, aunque una cuenta individual se configure mal, el camino a admin sigue cortado desde arriba.</div>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "sacá <code>PassRole</code>".</strong> Es que en la nube el riesgo vive en las <em>combinaciones</em> de permisos, no en los permisos sueltos; que se encuentra con análisis de alcanzabilidad, no leyendo políticas de a una; y que se cierra en capas —acotar el permiso, poner un techo (boundary), y un guardarraíl organizacional— para que la corrección sobreviva al próximo ingeniero apurado que quiera "que ande".
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el perímetro es la identidad, ¿por qué sigue importando la red (NetworkPolicies, firewalls)?</summary>
+<p>Porque la identidad gobierna el <strong>plano de control</strong> —quién puede llamar a la API del proveedor y hacer qué—, pero el <strong>plano de datos</strong> sigue viajando por red. Un pod comprometido no necesita permisos de IAM para escanear la red interna y golpear tu base de datos si esta le acepta conexiones: ahí el control es la NetworkPolicy default-deny, no IAM. Defensa en profundidad: identidad estricta <em>y</em> segmentación de red. Una brecha real suele necesitar romper las dos, y cada capa que agregás sube el costo del ataque. Confiar solo en la identidad deja el movimiento lateral gratis; confiar solo en la red te devuelve al modelo del castillo que la nube ya rompió.</p></details>
+
+<details><summary>Corrés un contenedor sin privilegios, como usuario no-root, con capabilities dropeadas. ¿Estás aislado del host?</summary>
+<p>Mejor, pero no <em>aislado</em> en el sentido fuerte. Seguís compartiendo el kernel del host con todos los demás contenedores, así que una vulnerabilidad explotable del kernel sigue siendo un camino de escape — tus mitigaciones suben el costo y reducen la superficie, pero no ponen una frontera de hardware. Para aislamiento fuerte de verdad (código no confiable, multi-tenancy sensible) necesitás una capa extra: gVisor (kernel en espacio de usuario que intercepta las syscalls) o Kata (micro-VM con su propio kernel). Ahí sí un escape se queda en una VM descartable en vez de llegar al host. La regla mental: namespaces te <em>ocultan</em> cosas del host; no te <em>separan</em> del kernel.</p></details>
+
+<details><summary>Tu escaneo de IaC pasa en verde en cada PR. ¿Podés afirmar que la infraestructura en producción es segura?</summary>
+<p>No, por dos motivos. Primero, el escaneo valida el <em>código</em>, y la producción puede tener <strong>drift</strong>: cambios hechos a mano en la consola que nunca volvieron al IaC — un puerto abierto para debuggear, un cifrado apagado. El código dice una cosa y la realidad dice otra. Segundo, el escaneo solo detecta lo que sus reglas cubren; una mala configuración sin regla asociada pasa igual. La afirmación correcta es acotada: "el código, según las reglas que tenemos, no introduce las malas configuraciones conocidas". Para hablar de producción hace falta además detección de drift continua (comparar estado real contra declarado) y auditar el estado efectivo, no solo el deseado. Es exactamente el patrón runtime-≠-config: lo que el archivo dice no prueba lo que el sistema hace.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>En cloud-native <strong>el perímetro es la identidad</strong>. La mayoría de las brechas no son exploits: son configuraciones y permisos del lado del cliente.</li>
+  <li><strong>IAM</strong> se controla analizando <em>alcanzabilidad</em> ("¿a qué llego desde esta identidad?"), no leyendo políticas sueltas. La escalada vive en las <strong>combinaciones</strong> de permisos transitivos (<code>PassRole</code>, <code>CreatePolicyVersion</code>, etc.).</li>
+  <li>Las <strong>claves de larga vida son deuda</strong>. La meta es que no haya ninguna que rotar: <strong>OIDC federation</strong> y workload identity dan credenciales efímeras atadas a un contexto verificable. El <strong>metadata service</strong> es un vector vía SSRF: exigí IMDSv2 y menor privilegio en el rol.</li>
+  <li><strong>Kubernetes por defecto es inseguro</strong>: RBAC que se da de más, NetworkPolicies ausentes (allow-all), sin Pod Security, secrets sin cifrar en etcd. Se endurece con RBAC mínimo, default-deny de red, PSS <code>restricted</code>, admission policies y cifrado en reposo.</li>
+  <li>Un contenedor <strong>comparte el kernel del host</strong>: no aísla frente a vulnerabilidades del kernel. Para aislamiento fuerte: <strong>gVisor / Kata</strong> y rootless. Menor privilegio también acá: dropear capabilities, no root, nada de sockets del host.</li>
+  <li><strong>Supply chain</strong>: firmar (cosign/Sigstore), referenciar por digest, SBOM + escaneo, admission que rechaza imágenes sin firma, y provenance <strong>SLSA</strong>.</li>
+  <li><strong>IaC security</strong>: los errores caros (bucket público, SG a <code>0.0.0.0/0</code>, cifrado apagado) se atrapan escaneando en el pipeline y con policy-as-code (OPA/Conftest) que <em>falla el build</em>. Cuidado con el <strong>drift</strong>.</li>
+  <li><strong>Detección</strong>: el audit log del plano de control (CloudTrail y equivalentes) es la fuente. Vigilá cambios de IAM, creación de claves, lectura masiva de secretos y el apagado de logging. El patrón de exfiltración tiene forma reconocible.</li>
+  <li><strong>Multi-tenancy</strong>: el aislamiento fuerte no se delega al "acordate de filtrar por <code>tenant_id</code>"; se fuerza en una capa que no se pueda olvidar (RLS, frontera física).</li>
+  <li>Una nube <strong>bien configurada</strong> suele ser más segura que on-prem (parches gestionados, defaults que mejoran, herramientas de primera línea). "Cloud inseguro" casi siempre es "config insegura" — modelo de responsabilidad compartida.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá una política IAM real de un proyecto tuyo (o de un tutorial) y clasificá cada <code>Statement</code>: ¿tiene comodín en <code>Action</code> o <code>Resource</code>? Reescribí una para que quede acotada a lo mínimo necesario, y justificá cada acción que dejaste.</li>
+  <li>Diseñá una trust policy OIDC para tu pipeline de CI que solo permita asumir el rol desde un repo y una rama específicos. Explicá qué pasaría si omitieras la condición sobre el <code>sub</code>.</li>
+  <li>Modelá en papel la cadena de escalada del Worked Example y proponé una <em>segunda</em> cadena distinta (por ejemplo con <code>iam:CreatePolicyVersion</code> o con <code>AttachUserPolicy</code>). Para cada eslabón, escribí el control que lo corta.</li>
+  <li>Escribí un manifiesto de Kubernetes con: un namespace en Pod Security <code>restricted</code>, una NetworkPolicy default-deny de ingress, y un <code>Role</code>+<code>RoleBinding</code> de menor privilegio para una app que solo lee ConfigMaps. Explicá qué ataque frena cada pieza.</li>
+  <li>Compará gVisor, Kata y un contenedor estándar endurecido (rootless, capabilities dropeadas) en una tabla propia: superficie de escape, costo de rendimiento y caso de uso ideal de cada uno.</li>
+  <li>Tomá el ejemplo del SecurityGroup abierto a <code>0.0.0.0/0</code> y escribí (en pseudocódigo o Rego) la regla de policy-as-code que lo rechazaría en el pipeline. ¿Qué mensaje de error le mostrarías al desarrollador para que entienda cómo arreglarlo?</li>
+  <li>A partir del evento de CloudTrail de CS3.7, redactá tres reglas de detección concretas (condición + por qué es sospechoso) que dispararían una alerta. Definí para cada una qué sería un falso positivo esperable y cómo lo filtrarías.</li>
+</ol>
+
+<section class="quiz" id="quizCS_S3">
+  <style>
+    #quizCS_S3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S3 .q{margin-bottom:1.5rem}
+    #quizCS_S3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S3 .opt:hover{border-color:var(--accent)}
+    #quizCS_S3 .opt:disabled{cursor:default}
+    #quizCS_S3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S3 .exp.show{display:block}
+    #quizCS_S3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un rol de una función serverless tiene <code>iam:PassRole</code>, <code>lambda:CreateFunction</code> y <code>lambda:InvokeFunction</code> sobre <code>Resource: "*"</code>. Ninguna política menciona "admin". ¿Cuál es la conclusión correcta?</p>
+    <button class="opt">Es de bajo riesgo: sin una política que diga <code>AdministratorAccess</code>, no puede escalar</button>
+    <button class="opt">El riesgo se elimina rotando las credenciales de la función con frecuencia</button>
+    <button class="opt">Es administrador de facto: puede crear una función, pasarle un rol privilegiado e invocarla para ejecutar con esos permisos</button>
+    <div class="exp">Es una cadena de escalada por permisos transitivos. Con <code>PassRole</code> sobre <code>*</code> puede pasar un rol admin existente a una función nueva (<code>CreateFunction</code>) y ejecutarla (<code>InvokeFunction</code>), corriendo código con privilegios de administrador. El riesgo emerge de la <em>combinación</em>, es invisible leyendo permisos sueltos, y se encuentra con análisis de alcanzabilidad. Se cierra acotando <code>PassRole</code> a ARNs específicos con condición de servicio y poniendo una permissions boundary como techo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Instalás un cluster de Kubernetes con los defaults y desplegás tu app. Sobre la red entre pods, ¿qué es cierto por defecto?</p>
+    <button class="opt">Cada pod está aislado; hay que crear NetworkPolicies para habilitar cualquier comunicación</button>
+    <button class="opt">Todos los pods pueden hablar con todos los pods, en todos los namespaces: el movimiento lateral es libre</button>
+    <button class="opt">Solo se permite tráfico dentro del mismo namespace; entre namespaces está bloqueado</button>
+    <div class="exp">El default de Kubernetes es allow-all: sin NetworkPolicies, cualquier pod alcanza a cualquier otro, incluso en otros namespaces. Por eso comprometer el pod más expuesto da conectividad directa a la base de datos y a los servicios internos. La defensa es adoptar una postura default-deny (negar ingress/egress y abrir solo los flujos legítimos), lo que requiere un CNI que implemente NetworkPolicies. Es el error de configuración de red más subestimado en clusters reales.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu aplicación tiene un SSRF y corre en una instancia cloud. ¿Por qué esto puede escalar a un compromiso de la cuenta, y cuál es la mejor mitigación de fondo?</p>
+    <button class="opt">El SSRF puede pedirle a la app que consulte el metadata service y devuelva las credenciales del rol; la mejor defensa de fondo es que ese rol tenga menor privilegio (además de exigir IMDSv2)</button>
+    <button class="opt">No escala: el metadata service es una IP interna, inalcanzable desde cualquier vector de aplicación</button>
+    <button class="opt">Escala solo si la instancia tiene una clave de acceso de larga vida hardcodeada en disco</button>
+    <div class="exp">El servicio de metadata entrega las credenciales temporales del rol de la instancia a quien consulte su URL interna, y un SSRF permite forzar a la app a hacer esa consulta y filtrar el token. Exigir IMDSv2 sube la barrera (obliga a un PUT previo que un SSRF simple no hace), pero la mitigación de fondo es que robar ese token valga poco: menor privilegio en el rol. Así, aun con el token en la mano, el atacante alcanza casi nada. Defensa en profundidad entre la capa de app (arreglar el SSRF) y la capa cloud (rol acotado + IMDSv2).</div>
+  </div>
+
+  <div class="score" id="scoreCS_S3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cs2-appsec-avanzado/lecture.html">← CS2: AppSec avanzado</a>
+  <a href="../cs4-seguridad-ia/lecture.html">CS4: Seguridad de sistemas de IA →</a>
+</nav>
+
+</div>
+</body>
+</html>

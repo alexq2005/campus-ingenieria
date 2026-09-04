@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS6 — Red team y emulación de adversarios · Ciberseguridad Senior</title>
+  <meta name="description" content="Cómo se organiza y se aprovecha un red team a nivel de programa: pentest vs red team vs purple, emulación de adversarios con ATT&amp;CK, el ciclo del ejercicio y su marco legal, fases y el rastro que dejan, C2 conceptual, purple teaming, Atomic Red Team y Caldera, assumed breach, el reporte como narrativa y las métricas. Módulo conceptual y defensivo.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS6</span>
+  <span class="badge">⏱ 35–70 min</span>
+  <span class="badge">🎯 Pre-req: CS1, CS5</span>
+  <span class="badge">🔴 Red team</span>
+</div>
+
+<article>
+
+<h1>CS6 — Red team y emulación de adversarios</h1>
+
+<div class="danger">
+  <strong>⚠️ Este módulo es conceptual y metodológico, y no autoriza nada.</strong> Acá no hay exploits, ni payloads, ni comandos de explotación, ni técnicas de evasión operativas. Probar un sistema <strong>sin autorización escrita del dueño</strong> es delito en Argentina (<strong>Ley 26.388</strong>): con contrato firmado es una profesión; sin contrato, un proceso penal. Todo lo que sigue está pensado para que un <strong>defensor</strong> entienda cómo se organiza un red team y cómo exprimirle valor. Toda práctica se remite a laboratorios propios o entornos con permiso explícito.
+</div>
+
+<h2>CS6.0 Por qué este módulo</h2>
+
+<p>En el M11 del curso base diste vuelta la cámara por primera vez: viste que un defensor tiene que entender la ofensiva porque <strong>no se puede detectar lo que no se sabe cómo se ve</strong>. Ese módulo era la introducción — reglas de engagement, PTES, OSINT, la diferencia entre Kill Chain y ATT&amp;CK. Este es otro nivel: no vamos a mirar una evaluación aislada, vamos a mirar el <strong>programa</strong>. Cómo una organización adulta contrata, corre y aprovecha un red team a lo largo del tiempo, y qué separa un ejercicio que cambia el SOC de uno que termina en un PDF que nadie abre.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un pentest te dice <em>qué vulnerabilidades tenés</em>. Un red team te dice algo completamente distinto: <em>si tu organización se da cuenta cuando la atacan, y si responde a tiempo</em>. Son preguntas diferentes, con productos diferentes, y confundirlas es el error que hace que muchas empresas gasten mucho dinero en la respuesta equivocada. Vos no comprás un red team para encontrar bugs: lo comprás para <strong>poner a prueba la inversión que ya hiciste en detección y respuesta</strong> — el EDR, los logs centralizados, las reglas de detección que escribiste en <a href="../cs5-deteccion-ingenieria/lecture.html">CS5</a>, los runbooks, la gente de guardia.
+</div>
+
+<p>Y hay un salto de madurez que este módulo persigue: pasar de "hagamos que alguien intente entrar" a <strong>emular a un adversario concreto</strong>. No a un hacker genérico de película, sino al actor específico que tu modelo de amenazas (CS1) dice que te va a atacar, reproduciendo sus técnicas documentadas. Esa diferencia — improvisar versus emular — es lo que convierte un ejercicio en resultados accionables. La vamos a desarmar entera.</p>
+
+<h2>CS6.1 Pentest, red team y purple team: no son sinónimos</h2>
+
+<p>La industria vende las tres cosas y muchas veces las mezcla en una propuesta comercial. Como defensor senior tenés que saber exactamente qué estás comprando, porque cada una responde una pregunta distinta y produce un entregable distinto.</p>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Pentest</th><th>Red team</th><th>Purple team</th></tr></thead>
+<tbody>
+<tr><td><strong>Pregunta que responde</strong></td><td>¿Qué fallas explotables tengo?</td><td>¿Me detectan y responden mientras pasa?</td><td>¿Cómo mejoro mi detección, técnica por técnica?</td></tr>
+<tr><td><strong>Alcance</strong></td><td>Amplio: cubrir mucha superficie</td><td>Angosto y profundo: un objetivo concreto</td><td>Acotado: una lista de técnicas a validar</td></tr>
+<tr><td><strong>Duración típica</strong></td><td>1–3 semanas</td><td>1–3 meses</td><td>Días, y repetible siempre</td></tr>
+<tr><td><strong>Qué mide</strong></td><td>Cobertura de vulnerabilidades</td><td>Capacidad de detección y respuesta</td><td>Cobertura de detección por técnica</td></tr>
+<tr><td><strong>Quién sabe que está pasando</strong></td><td>El equipo técnico, casi todos</td><td>Muy pocos: el blue team NO sabe</td><td>Todos: rojo y azul en la misma sala</td></tr>
+<tr><td><strong>Sigilo</strong></td><td>Poco relevante</td><td>Central: evadir al defensor es parte del test</td><td>Nulo: el objetivo es que se vea todo</td></tr>
+<tr><td><strong>Producto</strong></td><td>Lista priorizada de hallazgos</td><td>Narrativa del ataque + mapa de detección</td><td>Reglas de detección nuevas o ajustadas</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Fijate la fila de "quién sabe": en un red team clásico el blue team <strong>no está avisado</strong>, porque medir la detección con el defensor mirando la contraminaría. En un purple pasa lo contrario: el valor está en que todos vean la pantalla al mismo tiempo. Esa sola diferencia cambia toda la logística, el presupuesto y hasta a quién le reportás.
+</div>
+
+<p>La consecuencia práctica es un <strong>orden de madurez</strong>. Una organización que todavía no arregló sus vulnerabilidades conocidas no necesita un red team: necesita un pentest y disciplina de parcheo. Una que ya tiene higiene pero nunca puso a prueba sus reglas de detección no necesita el peor escenario adversarial: necesita purple, para construir capacidad. El red team adversarial y sigiloso es la prueba de fuego que tiene sentido <strong>cuando ya invertiste en detectar y responder</strong> y querés saber si eso funciona bajo presión real. Contratar en el orden equivocado es tirar plata.</p>
+
+<h2>CS6.2 Emulación de adversarios: emular a alguien, no improvisar</h2>
+
+<p>Acá está el corazón del salto senior. Un red team genérico se sienta y hace "lo que se le ocurra" con la creatividad de sus operadores. Sirve, pero tiene un problema: los resultados dependen de <em>esa</em> gente en particular, no se pueden comparar entre ejercicios, y no responden la pregunta que importa: <strong>¿estoy preparado para el atacante que realmente me va a atacar?</strong></p>
+
+<p>La <strong>emulación de adversarios</strong> (adversary emulation) resuelve eso. En vez de improvisar, elegís un actor de amenaza concreto — uno documentado públicamente que ataca a tu sector, seleccionado con tu inteligencia de amenazas y tu modelo de CS1 — y reproducís <strong>su</strong> perfil de comportamiento: sus tácticas y técnicas tal como están catalogadas en <a href="../cs5-deteccion-ingenieria/lecture.html">ATT&amp;CK</a>. No inventás un ataque: representás uno que ese grupo ya hizo, con las mismas jugadas, en el mismo orden aproximado.</p>
+
+<div class="concept">
+  <strong>💡 Por qué esto da resultados accionables.</strong> Cuando emulás un actor específico, cada cosa que probás está atada a una <strong>amenaza real que tu organización enfrenta</strong>, no a una hipótesis. El resultado se puede <strong>priorizar</strong> (esta técnica la usa el grupo que golpea a nuestro sector → cubrirla es urgente), se puede <strong>repetir</strong> (la próxima vez emulamos el mismo perfil y medimos si mejoramos), y se puede <strong>comparar</strong> (contra la industria, contra vos mismo el trimestre pasado). Improvisar no te da nada de eso.
+</div>
+
+<p>El insumo es un <strong>plan de emulación</strong>: un documento que traduce la inteligencia sobre el actor en una secuencia de técnicas ATT&amp;CK a reproducir, cada una con lo que el defensor debería ver. Lo importante, para nosotros, no es la columna de "cómo se ejecuta" — eso es lo operativo y no nos ocupa — sino la columna de "qué telemetría debería producir", porque ahí es donde se juega la detección.</p>
+
+<pre><code class="lang-yaml"># Plan de emulación (extracto conceptual) — perfil de un actor
+# Lo que nos importa como defensores es la columna "senal_esperada",
+# NO el detalle operativo de cada técnica.
+actor_emulado: "operador de ransomware relevante para nuestro sector"
+fuente_inteligencia: "reportes públicos de CTI + ATT&amp;CK Groups"
+objetivo_del_actor: "cifrado masivo con extorsión (doble)"
+
+secuencia:
+  - tactica: "Initial Access"
+    tecnica_id: "T1566"          # Phishing (a nivel de categoría)
+    senal_esperada: "correo con adjunto/enlace + proceso hijo inusual del cliente de mail"
+    fuente_de_datos: "gateway de correo, EDR (creación de procesos)"
+
+  - tactica: "Execution"
+    tecnica_id: "T1059"          # intérprete de comandos y scripts
+    senal_esperada: "intérprete lanzado por una app ofimática"
+    fuente_de_datos: "EDR, registro de línea de comandos"
+
+  - tactica: "Persistence"
+    tecnica_id: "T1053"          # tarea/servicio programado
+    senal_esperada: "tarea nueva fuera de la ventana de cambios"
+    fuente_de_datos: "logs del sistema, EDR"
+
+  - tactica: "Credential Access"
+    tecnica_id: "T1003"          # volcado de credenciales
+    senal_esperada: "acceso anómalo a la memoria de un proceso de autenticación"
+    fuente_de_datos: "EDR"
+
+  - tactica: "Lateral Movement"
+    tecnica_id: "T1021"          # servicios remotos
+    senal_esperada: "una cuenta autenticando en equipos que nunca usó"
+    fuente_de_datos: "logs de autenticación centralizados"
+
+  - tactica: "Impact"
+    tecnica_id: "T1486"          # cifrado para impacto  (SE SIMULA, ver CS6.3)
+    senal_esperada: "escritura masiva y renombrado de archivos en poco tiempo"
+    fuente_de_datos: "auditoría de archivos, EDR"</code></pre>
+
+<div class="tip">
+  Ese documento no es teoría: la comunidad publica planes de emulación listos para usar. El <strong>Center for Threat-Informed Defense</strong> mantiene una <strong>Adversary Emulation Library</strong> con perfiles de grupos reales, y las <strong>ATT&amp;CK Evaluations</strong> de MITRE prueban productos de seguridad emulando actores concretos. Como defensor, esos planes son oro: te dicen qué técnicas priorizar sin que tengas que hacer la inteligencia desde cero.
+</div>
+
+<h2>CS6.3 El ciclo del ejercicio: objetivos, reglas y frenos</h2>
+
+<p>Un red team no arranca con "a ver qué encontramos". Arranca con un contrato de comportamiento que es, a la vez, un límite legal y un dispositivo de seguridad operacional. El M11 ya te presentó las reglas de engagement básicas; el nivel senior agrega tres cosas que en un ejercicio de programa no son opcionales: <strong>objetivos concretos (flags)</strong>, un <strong>canal de deconfliction</strong>, y — cuando se emulan técnicas destructivas — <strong>restricciones de seguridad explícitas</strong>.</p>
+
+<pre><code class="lang-yaml"># Carta de engagement (charter) — el documento que habilita y limita todo
+autorizacion:
+  firmada_por: "dueño del sistema (autoridad real, no un mando medio)"
+  marco_legal: "Ley 26.388 — sin esta firma, es delito"
+  carta_de_salida: "documento que el operador lleva encima por si lo frena seguridad física"
+
+objetivos:                      # los "flags": qué cuenta como éxito
+  - "llegar al servidor de backups y demostrar acceso"
+  - "acceder a una lectura de la base de facturación (registro sintético marcado)"
+
+alcance:
+  incluido: ["segmento corporativo", "dominio de identidad"]
+  excluido: ["producción de pagos", "sistemas de terceros", "personal (sin ingeniería social real)"]
+
+ventana:
+  fechas: "definidas y acotadas"
+  horario: "coordinado; probar fuera de la ventana es no tener permiso"
+
+acciones_prohibidas:            # los frenos de seguridad
+  - "cifrado real de datos (se SIMULA con un archivo marcador inofensivo)"
+  - "denegación de servicio / cualquier cosa que degrade producción"
+  - "modificar o borrar datos reales; exfiltrar datos reales de clientes"
+
+deconfliction:
+  contacto_24_7: "un canal directo entre el red team y un referente del cliente"
+  proposito: "distinguir en vivo el ejercicio de un incidente real"
+
+criterio_de_parada:
+  - "si aparece un atacante real, se frena y se avisa YA"
+  - "si algo amenaza la disponibilidad, se corta en minutos"</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Emular a un actor destructivo NO significa ser destructivo.</strong> Cuando el plan incluye técnicas de impacto como el cifrado (T1486) o inhabilitar la recuperación (T1490), <strong>no se ejecutan de verdad</strong>: se representan con marcadores inofensivos — un archivo canario, un flag, un renombrado sobre datos sintéticos en un recinto aislado. El objetivo es que el sensor <em>dispare la detección</em>, no que la organización pierda datos. Confundir emulación con detonación es el error que convierte un ejercicio autorizado en un incidente real y en un problema legal.
+</div>
+
+<div class="rule">
+  <strong>📌 El deconfliction es lo que evita el caos.</strong> Durante el ejercicio, el blue team (que no sabe) va a ver actividad sospechosa y va a empezar a responder. El canal de deconfliction le permite a un puñado de personas de confianza confirmar "sí, eso somos nosotros" o "no, eso es de verdad, activá el incidente". Sin ese canal, no podés distinguir tu propio ejercicio de un ataque real que aproveche el ruido — y esa confusión, en un momento crítico, es peligrosa.
+</div>
+
+<h2>CS6.4 Las fases mapeadas a ATT&amp;CK y el rastro que dejan</h2>
+
+<p>Un ejercicio de emulación se mueve por las tácticas de ATT&amp;CK más o menos en orden, y cada una deja un rastro distinto. Esta es la tabla que de verdad conecta el red team con la detección: para el defensor, cada fase no es "algo malo que pasó" sino <strong>una oportunidad de detección con una fuente de datos concreta</strong>. Todo esto está a nivel de categoría — el <em>qué</em> y el <em>qué se ve</em>, nunca el <em>cómo</em> operativo.</p>
+
+<table>
+<thead><tr><th>Fase (táctica)</th><th>Qué persigue, a nivel de categoría</th><th>Rastro / fuente de datos</th></tr></thead>
+<tbody>
+<tr><td><strong>Reconocimiento</strong></td><td>Mapear la organización desde afuera</td><td>Casi nulo si es pasivo; enumeración activa deja picos de 404 y tráfico raro (perímetro)</td></tr>
+<tr><td><strong>Acceso inicial</strong></td><td>Conseguir el primer pie adentro</td><td>Correo anómalo, login desde geografía nueva, proceso hijo inesperado (correo, identidad, EDR)</td></tr>
+<tr><td><strong>Ejecución</strong></td><td>Correr código en el equipo comprometido</td><td>Intérprete lanzado por una app que no debería, línea de comandos inusual (EDR)</td></tr>
+<tr><td><strong>Persistencia</strong></td><td>Sobrevivir a un reinicio</td><td>Tarea o servicio nuevo fuera de la ventana de cambios (logs de sistema, EDR)</td></tr>
+<tr><td><strong>Acceso a credenciales</strong></td><td>Dejar de explotar y empezar a iniciar sesión</td><td>Acceso anómalo a procesos de autenticación (EDR)</td></tr>
+<tr><td><strong>Descubrimiento</strong></td><td>Entender la red desde adentro</td><td>Un puesto consultando el directorio como si fuera un servidor (logs de identidad)</td></tr>
+<tr><td><strong>Movimiento lateral</strong></td><td>Saltar al equipo que sí tiene lo valioso</td><td>La misma cuenta autenticando en equipos que nunca usó (autenticación centralizada)</td></tr>
+<tr><td><strong>Comando y control</strong></td><td>Dirigir el acceso desde afuera</td><td>Salidas periódicas y parecidas hacia un destino nuevo (telemetría de red — CS6.5)</td></tr>
+<tr><td><strong>Objetivo (exfil / impacto)</strong></td><td>Robar o cifrar lo valioso</td><td>Salida atípica de datos; escritura y renombrado masivo; borrado de logs (auditoría de archivos, red, SIEM)</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El interior rinde más que el perímetro, y por eso el rastro cambia de naturaleza.</strong> En el perímetro buscás <em>archivos malos</em> y <em>firmas</em>. Adentro, el atacante con credenciales usa las mismas herramientas legítimas que tu equipo de IT: ya no hay un archivo malicioso que detectar, queda el <strong>contexto</strong> — quién, desde dónde, a qué hora, hacia qué. Las detecciones que valen en las fases internas son de comportamiento y de anomalía, no de firma. Esto es exactamente lo que construiste en CS5, y el red team es lo que lo pone a prueba.
+</div>
+
+<p>Notá una cosa importante: la <strong>densidad de rastro crece</strong> a medida que el atacante se interna. El reconocimiento pasivo es casi invisible; el acceso inicial deja poco; pero el movimiento lateral, el C2 y el impacto dejan huellas ricas y repetidas. Esa asimetría es una buena noticia para el defensor: aunque falles el primer paso, tenés muchas oportunidades después. Un programa de detección maduro no apuesta todo a frenar el acceso inicial — asume que a veces va a fallar y se asegura de <strong>ver las fases posteriores</strong>. Eso nos lleva directo al assumed breach (CS6.8).</p>
+
+<h2>CS6.5 Command and Control: lo que el blue team caza</h2>
+
+<p>El <strong>command and control</strong> (C2) es la infraestructura desde la que el operador dirige el acceso que consiguió: le manda instrucciones al equipo comprometido y recibe resultados. No vamos a ver <strong>nada</strong> de cómo se arma un C2 — eso es operativo y queda afuera de este curso. Lo que sí nos importa, y mucho, es por qué el tráfico de C2 es <strong>la pieza que más persigue el blue team</strong> y cómo se lo caza conceptualmente.</p>
+
+<div class="concept">
+  <strong>💡 El C2 es el eslabón que el atacante no puede evitar.</strong> Para dirigir un ataque desde afuera, el operador necesita que el equipo comprometido le "hable" periódicamente. Ese hilo de comunicación tiene que existir, tiene que salir por la red, y tiene que ser regular. Es una de las poquísimas cosas que el atacante <strong>no puede esconder del todo</strong>, porque es funcional a su operación. Por eso, cazar C2 es una de las apuestas de mayor rendimiento en detección.
+</div>
+
+<p>La trampa del principiante es buscar C2 por <strong>firma</strong> — el hash del implante, un puerto "famoso". Eso casi no sirve: el implante cambia en cada ejercicio y el tráfico se disfraza de tráfico normal. Lo que delata al C2 no es <em>qué</em> es, sino <strong>cómo se comporta</strong>. El blue team busca patrones de comportamiento en la telemetría de red:</p>
+
+<table>
+<thead><tr><th>Señal de comportamiento</th><th>Qué la delata</th><th>Fuente de datos</th></tr></thead>
+<tbody>
+<tr><td><strong>Beaconing</strong></td><td>Salidas a intervalos regulares — un latido demasiado prolijo para ser humano</td><td>Logs de conexiones de red / proxy</td></tr>
+<tr><td><strong>Rareza de destino</strong></td><td>Un destino nuevo, recién registrado, o que nadie más en la organización visita</td><td>Resolución de nombres, reputación, proxy</td></tr>
+<tr><td><strong>Volumen y dirección</strong></td><td>Poco que entra, mucho que sale (o al revés), fuera del patrón normal del host</td><td>Netflow / metadatos de tráfico</td></tr>
+<tr><td><strong>Protocolo que no encaja</strong></td><td>Un protocolo o puerto usado para algo que no es lo suyo</td><td>Inspección de metadatos de red</td></tr>
+<tr><td><strong>Huella de la sesión cifrada</strong></td><td>Características de la negociación TLS que no coinciden con la app que dice ser</td><td>Fingerprinting de la sesión (metadatos, sin descifrar)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-text">POR QUÉ EL BEACONING ES LA SEÑAL REINA
+
+  Un usuario navega de forma irregular: abre una pestaña, lee,
+  hace clic, se distrae. Su tráfico es "ruidoso" y desparejo.
+
+  Un implante de C2 llama a casa cada X segundos, siempre parecido.
+  Aunque le agreguen jitter (variación aleatoria) para disimular,
+  la REGULARIDAD ESTADÍSTICA sigue ahí y se puede medir.
+
+  humano        →  ▁▂▁▅▁▁▃▁▂▁▇▁▁▁▂   (irregular)
+  beacon        →  ▂__▂__▂__▂__▂__▂   (periódico, aunque con jitter)
+
+  El blue team no busca un archivo: busca ese ritmo en los metadatos.</code></pre>
+
+<div class="info">
+  Que el tráfico de C2 esté cifrado <strong>no protege al atacante tanto como cree</strong>. El defensor no necesita leer el contenido: le alcanza con los metadatos — quién habla con quién, cada cuánto, cuánto, con qué huella de sesión. Por eso las detecciones de C2 más robustas viven en la capa de red y de comportamiento, no en el contenido. Esa es una lección de diseño que vale para toda tu ingeniería de detección.
+</div>
+
+<h2>CS6.6 Purple teaming: el loop que construye detección</h2>
+
+<p>El purple no es un tercer equipo: es un <strong>modo de trabajo</strong> donde el rojo y el azul se sientan juntos y colaboran en vez de competir. El M11 ya te dio la intuición con la analogía del sparring. Acá vamos a lo importante para un programa: el <strong>loop</strong>, porque el purple bien hecho es un ciclo que se repite y que deja detección instalada de forma permanente.</p>
+
+<div class="step"><strong>1. El rojo ejecuta una técnica</strong> del plan de emulación, avisando cuándo y qué (por ejemplo, la técnica de persistencia T1053 del perfil del actor).</div>
+
+<div class="step"><strong>2. El azul mira su telemetría</strong> en vivo: ¿llegó el evento?, ¿la regla disparó una alerta?, ¿el analista la entendería? Se anota el resultado honesto: detectado, alertado, o brecha.</div>
+
+<div class="step"><strong>3. Si hubo brecha, se ajusta la detección</strong> ahí mismo: se escribe o corrige la regla (CS5), se agrega la fuente de datos que faltaba, se afina el umbral.</div>
+
+<div class="step"><strong>4. El rojo reejecuta la misma técnica</strong> y se verifica que ahora sí se ve. Recién ahí la brecha se considera cerrada.</div>
+
+<div class="concept">
+  <strong>💡 Por qué el purple suele rendir más que el adversarial puro.</strong> Un red team clásico te entrega un veredicto: "no nos vieron". Es información valiosa, pero es un <em>diagnóstico</em>, no una <em>cura</em>. El purple te entrega la cura: cada técnica que fallaste se convierte, en el mismo ejercicio, en una detección nueva y verificada. Salís con capacidad instalada, no con una lista de tareas pendientes. Para una organización que está construyendo su SOC, ese loop es el mejor retorno por peso invertido.
+</div>
+
+<p>El purple también resuelve un problema humano: alinea incentivos. En el modelo adversarial hay una tentación tóxica de que el rojo "gane" (que no lo vean) y el azul se ponga a la defensiva. En el purple ganan los dos cuando la organización mejora, y eso cambia por completo la cultura del ejercicio. El adversarial sigue teniendo su lugar — para medir el peor escenario de forma realista, una vez que ya construiste capacidad — pero como <strong>examen final</strong>, no como método de aprendizaje.</p>
+
+<h2>CS6.7 Atomic Red Team y Caldera: emulación para el defensor</h2>
+
+<p>No hace falta contratar un red team para empezar a probar tus detecciones. Existen frameworks de emulación abiertos, pensados justamente para que el <strong>defensor pruebe sus propias detecciones en su propio laboratorio</strong>. Los dos más usados son Atomic Red Team y MITRE Caldera, y cumplen roles distintos.</p>
+
+<table>
+<thead><tr><th>Framework</th><th>Qué es</th><th>Uso defensivo típico</th></tr></thead>
+<tbody>
+<tr><td><strong>Atomic Red Team</strong></td><td>Una biblioteca de pruebas pequeñas, una por técnica ATT&amp;CK, documentadas y catalogadas</td><td>Validar una detección puntual: "¿mi regla para T1053 dispara?"</td></tr>
+<tr><td><strong>MITRE Caldera</strong></td><td>Una plataforma que encadena técnicas para emular un adversario completo, de forma automatizada</td><td>Correr un perfil de actor de punta a punta y medir cobertura</td></tr>
+</tbody>
+</table>
+
+<p>La clave para usarlos bien —y para no meterse en problemas— es el <strong>encuadre</strong>: se corren en un <strong>laboratorio propio y aislado</strong>, sobre datos sintéticos, con autorización, para <strong>medir si tu telemetría y tus reglas ven lo que deberían ver</strong>. Para nosotros, cada prueba se lee por su lado de detección, no por su lado ofensivo. Mirá el esquema de una prueba atómica desde la óptica del defensor:</p>
+
+<pre><code class="lang-yaml"># Ficha de una prueba atómica, LEÍDA COMO DEFENSOR.
+# Omito a propósito el bloque de ejecución (el "cómo"): eso es lo operativo.
+# Lo que nos importa son las dos últimas claves.
+tecnica:
+  id: "T1053.005"
+  nombre: "tarea programada"
+  tactica: "Persistence"
+plataforma: "laboratorio aislado, host de prueba con datos sintéticos"
+
+# --- lo operativo va acá y NO lo reproducimos ---
+# ejecucion: (omitido a propósito)
+
+# --- lo que un defensor realmente usa ---
+fuente_de_datos_necesaria: "log de creación de tareas + registro de proceso"
+deteccion_esperada:
+  regla: "alerta si se crea una tarea fuera de la ventana de cambios"
+  resultado_a_verificar: "¿llegó el evento? ¿disparó la alerta? ¿en cuánto tiempo?"</code></pre>
+
+<div class="tip">
+  El flujo de validación de detección, expresado como una lista de verificación (no como comandos de ataque):
+</div>
+
+<pre><code class="lang-bash"># Runbook de VALIDACIÓN DE DETECCIÓN (pseudo-checklist, en laboratorio propio)
+# No hay comandos de explotación: es el proceso del defensor.
+
+# 1. Confirmar que la fuente de datos de la técnica está llegando al SIEM
+# 2. Confirmar que existe una regla que debería cubrir esa técnica
+# 3. Ejecutar la prueba de emulación en el host aislado (framework)
+# 4. Observar: ¿llegó el evento? ¿disparó la alerta? ¿cuánto tardó?
+# 5. Si hubo brecha  → ajustar regla/fuente (CS5) y volver al paso 3
+# 6. Si detectó      → registrar cobertura y pasar a la próxima técnica
+# 7. Limpiar el laboratorio y documentar el resultado en el mapa ATT&amp;CK</code></pre>
+
+<div class="rule">
+  <strong>📌 Estas herramientas son un multiplicador de tu ingeniería de detección, no un juguete de hacking.</strong> Usadas en el laboratorio, te dejan correr un ciclo de purple <strong>sin esperar al red team anual</strong>: podés validar cada regla nueva contra la técnica que dice cubrir, de forma continua, e integrarlo al pipeline (CS5). El día que llega el red team de verdad, no descubrís las brechas obvias — ya las cerraste vos.
+</div>
+
+<h2>CS6.8 Assumed breach: arrancar adentro</h2>
+
+<p>Durante años los ejercicios empezaban en el perímetro: el rojo intentaba entrar desde cero y quemaba días —a veces semanas— en el acceso inicial. El enfoque moderno da vuelta esa lógica con una premisa incómoda pero honesta: <strong>asumí que el atacante ya entró</strong>. Se le da al red team un punto de apoyo inicial (un equipo comprometido, una cuenta de usuario común) y el ejercicio arranca desde ahí.</p>
+
+<div class="concept">
+  <strong>💡 Por qué assumed breach da mejores resultados.</strong> Tres razones. <strong>(1) Estadística:</strong> con suficiente tiempo, alguien entra — el phishing tiene tasa de éxito distinta de cero, y basta un clic. Diseñar como si el perímetro fuera infranqueable es negar la realidad. <strong>(2) Presupuesto:</strong> el tiempo del red team es caro y finito; gastarlo entero en el acceso inicial deja sin probar todo lo demás — que es donde están la mayoría de tus brechas de detección. <strong>(3) Foco:</strong> las fases internas (movimiento lateral, credenciales, C2, impacto) son las que dejan más rastro y las que peor cubren la mayoría de las organizaciones. Empezar adentro va directo a lo que más importa medir.
+</div>
+
+<p>Esto no significa que el perímetro no importe — importa, y mucho, para <em>subir el costo</em> de entrar. Significa que la <strong>detección</strong> no puede depender de que el perímetro nunca falle. Un programa maduro invierte en el perímetro para encarecer el acceso inicial <em>y</em> asume que a veces va a fallar, asegurándose de tener ojos en todo lo que viene después. Assumed breach es la forma de poner a prueba esa segunda mitad, que es la que de verdad decide si un incidente se contiene en horas o en meses.</p>
+
+<div class="mistake">
+  <strong>El error de gastar todo en la puerta.</strong> ❌ "Tenemos un firewall carísimo y MFA en todo, estamos cubiertos." Eso encarece el acceso inicial, no lo hace imposible, y no dice <em>nada</em> sobre qué pasa el día después de que una credenciales válidas entren. ✅ Un programa serio mide su capacidad de detectar y frenar al atacante <strong>ya adentro</strong> — porque ese es el escenario que decide el impacto real.
+</div>
+
+<h2>CS6.9 El reporte: una narrativa, no una lista de vulnerabilidades</h2>
+
+<p>El producto de un red team no se parece al de un pentest. Un pentest entrega una lista priorizada de hallazgos: esto está roto, arreglalo. Un red team entrega una <strong>historia</strong>: qué se logró, por qué camino, qué vio el blue team y qué no vio, y qué hacer para ver mejor la próxima vez. Si el reporte de tu red team parece una lista de bugs, pediste —o te vendieron— el ejercicio equivocado.</p>
+
+<div class="step"><strong>1. Resumen ejecutivo.</strong> Una página sin jerga: qué objetivo se alcanzó, cuánto tardó el atacante, en qué momento (si en alguno) la organización se dio cuenta, y qué significa eso para el negocio.</div>
+
+<div class="step"><strong>2. La narrativa del ataque.</strong> El camino completo, en orden, contado como una historia: desde el punto de apoyo inicial hasta el objetivo, con una <strong>línea de tiempo</strong>. Es lo que le permite a un ejecutivo entender el riesgo sin leer telemetría.</div>
+
+<div class="step"><strong>3. El mapa de detección.</strong> El corazón técnico: para cada técnica del recorrido, si el blue team la <strong>vio</strong>, si <strong>alertó</strong>, y cuánto tardó. Mapeado a ATT&amp;CK para que sea comparable y priorizable.</div>
+
+<div class="step"><strong>4. Recomendaciones de detección y respuesta.</strong> No "parcheá el servidor X", sino "no tenés visibilidad de la fase de movimiento lateral; agregá esta fuente de datos y esta regla". El entregable apunta a la <strong>capacidad</strong>, no a un bug puntual.</div>
+
+<pre><code class="lang-text">MAPA DE DETECCIÓN — el artefacto central del reporte
+(qué se vio en cada fase, mapeado a ATT&amp;CK)
+
+FASE                  TÉCNICA    ¿EVENTO?   ¿ALERTA?   MTTD*      BRECHA
+Acceso inicial        T1566      sí         sí         8 min      —
+Ejecución             T1059      sí         no         —          regla ausente
+Persistencia          T1053      sí         sí         14 min     —
+Acceso a credenciales T1003      sí         no         —          fuente sin cobertura
+Movimiento lateral    T1021      no         no         —          sin telemetría
+Comando y control     —          sí         sí         3 min      —
+Impacto (simulado)    T1486      sí         sí         2 min      —
+
+*MTTD = tiempo hasta la detección.  "—" en alerta = brecha a cerrar.
+Lectura: el blue ve bien las puntas (acceso e impacto) pero está CIEGO
+en el medio (ejecución, credenciales, lateral). Ahí van las recomendaciones.</code></pre>
+
+<div class="mistake">
+  <strong>El pecado capital del reporte de red team.</strong> ❌ Entregar solo el veredicto — "entramos y llegamos al objetivo sin que nos vieran" — como si fuera un trofeo. Eso humilla al blue team y no deja capacidad instalada. ✅ El valor está en el <strong>mapa de qué se detectó y qué no</strong>, traducido en recomendaciones concretas que el SOC pueda ejecutar. Un red team que no mejora la detección de su cliente falló, por más impresionante que haya sido el ataque.
+</div>
+
+<h2>CS6.10 Métricas: qué mejora de verdad</h2>
+
+<p>"Nos fue bien" no es una métrica. Un programa de red team se justifica con números que se puedan comparar entre ejercicios y contra la industria. Tres importan por encima del resto, y todas miden <strong>capacidad de defensa</strong>, no cantidad de fallas.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué mide</th><th>Cómo debería moverse entre ejercicios</th></tr></thead>
+<tbody>
+<tr><td><strong>MTTD</strong> (tiempo hasta la detección)</td><td>Cuánto tarda el blue team en darse cuenta — el "dwell time"</td><td>Bajar: de días a horas, de horas a minutos</td></tr>
+<tr><td><strong>MTTC</strong> (tiempo hasta la contención)</td><td>Cuánto tarda en frenar al atacante una vez detectado</td><td>Bajar: la respuesta debe volverse rutina</td></tr>
+<tr><td><strong>Cobertura de la kill chain</strong></td><td>Qué porcentaje de las técnicas emuladas se detectó</td><td>Subir: cerrar las brechas del mapa, fase por fase</td></tr>
+<tr><td><strong>Ratio detectado / alertado / prevenido</strong></td><td>Diferencia entre "llegó el evento", "disparó la alerta" y "se frenó"</td><td>Subir la conversión de evento a alerta accionable</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Ojo con una distinción fina que separa a los equipos serios: <strong>tener el evento no es detectar</strong>, y <strong>detectar no es responder</strong>. Muchos SOC descubren, en un ejercicio, que la telemetría <em>estaba</em> pero nadie escribió la regla; o que la alerta <em>disparó</em> pero se perdió entre mil falsos positivos; o que se detectó pero nadie sabía qué hacer. El ratio detectado/alertado/prevenido expone exactamente en qué eslabón se rompe la cadena, y eso es lo que priorizás.
+</div>
+
+<p>El poder de estas métricas es que convierten el red team en un programa <strong>medible en el tiempo</strong>. El primer ejercicio establece la línea de base — probablemente incómoda. El segundo, seis meses después emulando el mismo perfil, muestra si las inversiones en detección movieron la aguja. Sin métricas comparables, cada ejercicio es una anécdota; con ellas, es una curva de mejora que podés defender ante la dirección y usar para justificar el próximo presupuesto de seguridad.</p>
+
+<h2>CS6.11 Cuándo NO hacer un red team</h2>
+
+<p>La recomendación más senior de todo el módulo es a veces "todavía no". Un red team sobre una organización que no está lista no es riguroso: es caro, desmoralizante e inútil. Hay dos señales claras de que no es el momento.</p>
+
+<div class="danger">
+  <strong>1. El programa de seguridad es inmaduro.</strong> Si no hay logs centralizados, ni EDR, ni reglas de detección, ni gente que las mire, el resultado del red team ya lo sabés antes de empezar: no van a detectar nada. Pagar para confirmar lo obvio no es una evaluación. El orden correcto es <strong>higiene y parcheo → ingeniería de detección (CS5) → purple para construir capacidad → y recién ahí red team adversarial</strong> para medir el peor caso.
+</div>
+
+<div class="danger">
+  <strong>2. No hay capacidad de responder a los hallazgos.</strong> Si el ejercicio va a producir un mapa de brechas pero la organización no tiene equipo, presupuesto ni voluntad de cerrarlas, el reporte va a un cajón. Un red team genera trabajo; si no hay quién lo haga, generaste frustración y una falsa sensación de haber "hecho algo por la seguridad". Primero asegurate de que existe la máquina que va a consumir y accionar los resultados.
+</div>
+
+<div class="rule">
+  <strong>📌 La pregunta de filtro.</strong> Antes de contratar, preguntate: "si el ejercicio encuentra diez brechas de detección, ¿tengo cómo cerrarlas en un plazo razonable?". Si la respuesta es no, ese presupuesto rinde muchísimo más invertido en construir la capacidad que hoy te falta. El red team es la prueba de una casa que ya construiste — no los cimientos.
+</div>
+
+<h2>🧑‍🎓 Worked Example — Emular un grupo de ransomware</h2>
+
+<blockquote>Sos responsable de seguridad de una empresa mediana. Tu inteligencia de amenazas dice que un operador de ransomware documentado viene golpeando a tu sector. La dirección aprobó un ejercicio. Objetivo: saber si detectarían y frenarían a ese actor <strong>antes</strong> de que cifre algo. Todo en laboratorio fiel, con autorización escrita, en modo purple.</blockquote>
+
+<p><strong>Paso 1 — Elegir el adversario y su perfil, no improvisar.</strong> No emulás "un ransomware genérico": tomás el actor concreto que tu CTI señaló, buscás su perfil en ATT&amp;CK Groups y en la Adversary Emulation Library, y armás la secuencia de técnicas que ese grupo usa de verdad. El plan es el de CS6.2: acceso inicial (T1566), ejecución (T1059), persistencia (T1053), acceso a credenciales (T1003), descubrimiento, movimiento lateral (T1021), y el objetivo — impacto por cifrado (T1486) e inhabilitar la recuperación (T1490).</p>
+
+<p><strong>Paso 2 — Definir objetivos y reglas, con los frenos de seguridad.</strong> El flag es concreto: "llegar al servidor de backups y a un recurso compartido de facturación marcado con datos sintéticos". Y acá está lo crítico del ejercicio con un actor destructivo — las acciones prohibidas de la carta de engagement (CS6.3):</p>
+
+<div class="danger">
+  <strong>⚠️ El cifrado se SIMULA.</strong> T1486 y T1490 <strong>no se ejecutan</strong> contra datos reales. Se representan escribiendo un <strong>archivo canario inofensivo</strong> en el recurso objetivo (datos sintéticos, recinto aislado) para que la detección de "escritura y renombrado masivo" dispare, y verificando que los backups reales están intactos y verificados <strong>antes</strong> de empezar. El objetivo es que el sensor grite, no que la empresa pierda un byte. Sin esta cláusula por escrito, el ejercicio no arranca.
+</div>
+
+<p><strong>Paso 3 — Ejecutar en modo purple, midiendo detección en cada fase.</strong> El rojo avanza técnica por técnica del plan; el azul mira su telemetría en vivo y anota, honestamente, el resultado de cada una. Assumed breach: se arranca desde un puesto con una cuenta común ya comprometida, para no gastar el ejercicio en el acceso inicial y llegar a lo que importa medir. Cada brecha se corrige en el momento y se reejecuta la técnica para confirmar el cierre (el loop de CS6.6).</p>
+
+<p><strong>Paso 4 — Producir el reporte con el mapa de detección.</strong> No una lista de vulnerabilidades: la narrativa del recorrido, la línea de tiempo, y el mapa ATT&amp;CK de qué se detectó y qué no, con MTTD por fase y recomendaciones concretas.</p>
+
+<pre><code class="lang-text">RESULTADO DEL EJERCICIO — mapa de detección
+
+FASE                    TÉCNICA   ¿DETECTÓ EL BLUE?   ACCIÓN
+Acceso inicial (dado)   T1566     n/a (assumed)       —
+Ejecución               T1059     no                  escribir regla (CS5)
+Persistencia            T1053     sí (14 min)         ok
+Acceso a credenciales   T1003     no                  falta fuente de datos EDR
+Descubrimiento          —         parcial             ajustar umbral
+Movimiento lateral      T1021     no                  sin telemetría de identidad
+C2                      —         sí (3 min)          ok — beaconing detectado
+Impacto (SIMULADO)      T1486     sí (2 min)          ok — canario disparó
+
+VEREDICTO: se frena el cifrado (bien), pero el atacante habría tenido
+semanas adentro sin ser visto (fases del medio ciegas). La prioridad
+número uno no es el cifrado: es la VISIBILIDAD del movimiento lateral
+y del acceso a credenciales, donde hoy la organización está ciega.</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "casi nos cifran".</strong> Es que la detección de impacto —lo último de la cadena— funcionó, pero el atacante habría vivido semanas adentro sin que nadie lo viera, y en un ataque real eso significa exfiltración de datos <em>antes</em> del cifrado (la doble extorsión). El mapa de detección convierte una sensación difusa ("estamos más o menos") en una prioridad quirúrgica: <strong>visibilidad del movimiento lateral y del acceso a credenciales</strong>. Eso es lo que un red team bien aprovechado te deja: no un susto, una hoja de ruta.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cuál es la diferencia de fondo entre lo que mide un pentest y lo que mide un red team, y por qué importa el orden?</summary>
+<p>El pentest mide <strong>qué tan vulnerable sos</strong>: encuentra fallas explotables para que las arregles. El red team mide <strong>qué tan bueno es tu blue team</strong>: si detecta y responde mientras el ataque ocurre. Son preguntas distintas con productos distintos. El orden importa porque un red team sobre una organización sin detección ni respuesta ya tiene la respuesta conocida (no van a ver nada): primero se hace higiene y pentest, después se construye detección (CS5), después purple para instalar capacidad, y recién ahí el red team adversarial como examen final. Contratar al revés es gastar en la pregunta equivocada.</p></details>
+
+<details><summary>¿Por qué emular un actor concreto con su perfil de ATT&amp;CK da resultados más accionables que un red team que improvisa?</summary>
+<p>Porque ata cada cosa que se prueba a una <strong>amenaza real que la organización enfrenta</strong>, no a una hipótesis o a la creatividad puntual de un operador. Eso hace que el resultado sea <strong>priorizable</strong> (cubrir lo que usa el grupo que golpea a tu sector es urgente), <strong>repetible</strong> (emulás el mismo perfil dentro de seis meses y medís si mejoraste) y <strong>comparable</strong> (contra vos mismo y contra la industria). Improvisar no da ninguna de esas tres propiedades: da una anécdota que no se puede medir ni volver a correr.</p></details>
+
+<details><summary>El tráfico de C2 suele estar cifrado. ¿Por qué el blue team igual lo caza, y qué busca exactamente?</summary>
+<p>Porque no necesita leer el contenido: le alcanza con el <strong>comportamiento</strong>, visible en los metadatos de red aunque el contenido esté cifrado. Busca patrones que el atacante no puede evitar del todo, porque el C2 le es funcional: <strong>beaconing</strong> (salidas periódicas, un latido demasiado regular para ser humano, aun con jitter), <strong>rareza de destino</strong> (un lugar nuevo o que nadie más visita), y anomalías de <strong>volumen, dirección y huella de la sesión</strong>. Buscarlo por firma (el hash del implante, un puerto "famoso") casi no sirve, porque eso cambia en cada operación; el ritmo del comportamiento, no.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un <strong>pentest</strong> mide vulnerabilidades; un <strong>red team</strong> mide si detectás y respondés; el <strong>purple</strong> construye detección técnica por técnica. Son productos distintos y hay un orden de madurez para contratarlos.</li>
+  <li>La <strong>emulación de adversarios</strong> — reproducir a un actor concreto con su perfil de ATT&amp;CK, en vez de improvisar — es lo que hace que los resultados sean priorizables, repetibles y comparables.</li>
+  <li>El ejercicio arranca con una <strong>carta de engagement</strong>: objetivos (flags), alcance, ventana, deconfliction, criterio de parada, y —si se emulan técnicas destructivas— la cláusula de que <strong>se simulan, no se ejecutan</strong>. Sin autorización escrita es delito (Ley 26.388).</li>
+  <li>Cada fase mapeada a ATT&amp;CK <strong>deja un rastro con una fuente de datos concreta</strong>, y la densidad de rastro crece hacia adentro: por eso conviene asegurar la visibilidad de las fases internas, no apostar todo al perímetro.</li>
+  <li>El <strong>C2</strong> se caza por <strong>comportamiento</strong> (beaconing, rareza de destino, metadatos), no por firma. Es el eslabón que el atacante no puede esconder del todo.</li>
+  <li><strong>Atomic Red Team</strong> y <strong>Caldera</strong> dejan que el defensor valide sus detecciones en su propio laboratorio, de forma continua, sin esperar al red team anual.</li>
+  <li><strong>Assumed breach</strong>: asumir que el atacante ya entró rinde más que gastar el ejercicio en el perímetro.</li>
+  <li>El <strong>reporte</strong> es una narrativa con mapa de detección y recomendaciones de capacidad, no una lista de bugs. Las <strong>métricas</strong> (MTTD, MTTC, cobertura de la kill chain) convierten el programa en una curva de mejora medible.</li>
+  <li><strong>Cuándo NO</strong>: si el programa es inmaduro o no hay capacidad de responder a los hallazgos, ese presupuesto rinde más construyendo la capacidad que falta.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Elegí un actor de amenaza documentado que sea plausible para tu sector (usá ATT&amp;CK Groups). Escribí un <strong>plan de emulación</strong> de 6 a 8 técnicas con su ID, la señal esperada y la fuente de datos de cada una — sin ningún detalle operativo.</li>
+  <li>Redactá la <strong>carta de engagement</strong> de un ejercicio imaginario sobre un proyecto propio: objetivos/flags, alcance incluido y excluido, ventana, deconfliction, criterio de parada y —clave— las cláusulas de seguridad para emular una técnica destructiva sin ejecutarla.</li>
+  <li>Tomá las nueve fases de la tabla de CS6.4 y, para tu organización o proyecto, marcá en cuáles <strong>tendrías telemetría hoy</strong> y en cuáles estarías ciego. El resultado es tu mapa de brechas antes de cualquier ejercicio.</li>
+  <li>Explicá con tus palabras, en un párrafo, por qué buscar C2 por firma casi no sirve y por qué el <strong>beaconing</strong> es una señal más robusta. Dibujá el contraste humano vs beacon.</li>
+  <li>Diseñá un <strong>loop de purple</strong> para una sola técnica: qué ejecuta el rojo, qué mira el azul, qué ajusta si falla y cómo verifica el cierre. Estimá qué fuente de datos necesitarías.</li>
+  <li>Armá una tabla de <strong>métricas</strong> (MTTD, MTTC, cobertura) con una fila "línea de base" y una fila "objetivo a seis meses", y explicá qué inversión concreta movería cada número.</li>
+  <li>Escribí el <strong>resumen ejecutivo</strong> (media página, sin jerga) de un ejercicio ficticio donde se frenó el impacto pero el atacante estuvo semanas sin ser visto. ¿Cuál es tu recomendación número uno y por qué no es "mejorar la detección de cifrado"?</li>
+</ol>
+
+<section class="quiz" id="quizCS_S6">
+  <style>
+    #quizCS_S6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S6 .q{margin-bottom:1.5rem}
+    #quizCS_S6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S6 .opt:hover{border-color:var(--accent)}
+    #quizCS_S6 .opt:disabled{cursor:default}
+    #quizCS_S6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S6 .exp.show{display:block}
+    #quizCS_S6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu organización todavía no centraliza logs ni tiene EDR, y no hay un proceso de respuesta escrito. La dirección quiere contratar un red team adversarial y sigiloso "para ver qué tan expuestos estamos". ¿Cuál es la recomendación senior?</p>
+    <button class="opt">Adelante: el red team va a revelar exactamente qué falta, y eso justifica la inversión</button>
+    <button class="opt">Frenar: sin telemetría ni respuesta, el resultado ya se conoce (no van a detectar nada). Primero higiene, después ingeniería de detección (CS5) y purple, y recién ahí un red team adversarial</button>
+    <button class="opt">Reemplazarlo por un escaneo de vulnerabilidades mensual, que mide lo mismo más barato</button>
+    <div class="exp">El red team mide capacidad de <strong>detección y respuesta</strong>. Sin logs, sin EDR y sin proceso, esa capacidad no existe todavía, así que el ejercicio confirmaría lo obvio a un costo alto y sería desmoralizante. El orden de madurez es higiene y parcheo → ingeniería de detección → purple para construir capacidad → red team adversarial como examen final. Y un escaneo de vulnerabilidades mide otra cosa (vulnerabilidades), no detección.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. ¿Por qué la emulación de un actor específico (con su perfil de ATT&amp;CK) suele dar resultados más accionables que un red team que "hace lo que se le ocurra"?</p>
+    <button class="opt">Porque prueba las TTPs que tu organización realmente enfrenta y las ata a detecciones concretas: el resultado es priorizable, repetible y comparable en el tiempo</button>
+    <button class="opt">Porque emular un actor real es más sigiloso y evade mejor las defensas del blue team</button>
+    <button class="opt">Porque al ser una simulación de un actor conocido, no hace falta pedir autorización escrita</button>
+    <div class="exp">La emulación ata cada prueba a una amenaza real (no a una hipótesis ni a la creatividad puntual de un operador), y eso la vuelve priorizable, repetible y comparable — las tres propiedades que un programa necesita para medir mejora. Las otras dos opciones son trampas: el objetivo de la emulación no es evadir mejor (eso es framing ofensivo), y <strong>ningún</strong> ejercicio, emulación incluida, elimina la necesidad de autorización escrita (Ley 26.388).</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Durante un ejercicio, el operador establece un canal de command and control. En la práctica, ¿qué es lo que el blue team busca para cazarlo?</p>
+    <button class="opt">La firma del archivo del implante en el antivirus: si el hash es conocido, salta</button>
+    <button class="opt">El patrón de comportamiento del tráfico: salidas periódicas (beaconing) hacia un destino nuevo o raro, con metadatos anómalos — no una firma estática</button>
+    <button class="opt">El puerto 4444, que es el único que puede usar un C2</button>
+    <div class="exp">El C2 se caza por <strong>comportamiento</strong>, no por firma: el implante y su contenido cambian en cada operación, pero el ritmo del tráfico (beaconing, aun con jitter), la rareza del destino y las anomalías de volumen y huella de sesión persisten porque le son funcionales al atacante. Buscar un hash conocido o un puerto "famoso" es la trampa del principiante: un C2 no está atado a ningún puerto fijo y su firma estática es trivial de cambiar.</div>
+  </div>
+
+  <div class="score" id="scoreCS_S6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cs5-deteccion-ingenieria/lecture.html">← CS5: Ingeniería de detección</a>
+  <a href="../cs7-cripto-aplicada/lecture.html">CS7: Criptografía aplicada avanzada →</a>
+</nav>
+
+</div>
+</body>
+</html>

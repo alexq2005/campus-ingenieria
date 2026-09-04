@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CS7 — Criptografía aplicada avanzada: protocolos, PKI y post-cuántica · Ciberseguridad Senior</title>
+  <meta name="description" content="Por qué los protocolos se rompen aunque las primitivas sean sólidas: AEAD a escala, forward secrecy y doble ratchet, PKI y revocación, mTLS, jerarquía de claves, semántica de firmas, migración post-cuántica (ML-KEM/ML-DSA/SLH-DSA) y crypto-agility.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Ciberseguridad Senior</a>
+  <a href="../../index.html">🛡️ Curso de Ciberseguridad</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">CS7</span>
+  <span class="badge">⏱ 35–65 min</span>
+  <span class="badge">🎯 Pre-req: CS1</span>
+  <span class="badge">🔐 Cripto</span>
+</div>
+
+<article>
+
+<h1>CS7 — Criptografía aplicada avanzada: protocolos, PKI y post-cuántica</h1>
+
+<h2>CS7.0 Por qué este módulo</h2>
+
+<p>El curso base te enseñó a <strong>usar primitivas</strong>: elegir AES-GCM y no ECB, hashear con Argon2id y no con SHA, generar tokens con un CSPRNG, no reusar un nonce. Ese módulo cubre el 90% de los errores criptográficos que verás en tu vida, porque el 90% son de ese tipo: alguien usó la herramienta correcta de forma incorrecta, o usó la incorrecta.</p>
+
+<p>Este módulo es sobre el otro 10% — el que cuesta caro. No es sobre las primitivas: es sobre <strong>componerlas en un protocolo</strong> y sobre las decisiones de arquitectura que las rodean. Cómo dos partes acuerdan una clave sin haberse visto nunca. Qué garantiza realmente un certificado y qué pasa cuando hay que revocarlo. Dónde vive la clave maestra y quién la toca. Cómo dejás un sistema preparado para cambiar de algoritmo dentro de diez años sin reescribirlo.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un desastre criptográfico moderno casi nunca es "rompieron AES". AES no se rompió; RSA-2048 no se rompió; SHA-256 no se rompió. Lo que se rompe es <strong>el pegamento entre las piezas</strong>: el orden en que cifrás y autenticás, cómo negociás el algoritmo, cómo manejás el nonce a escala, dónde guardás la clave, qué asumís que garantiza una firma. Ese pegamento no lo revisa ningún linter, no lo cubre ningún test unitario y no lo detecta ningún escáner. Lo revisa una persona que entiende el protocolo — o nadie.
+</div>
+
+<p>La consecuencia práctica de todo el módulo se puede adelantar en una frase, y conviene tenerla presente desde el principio: <strong>vas a aprender esto para decidir y para revisar, no para implementar</strong>. Un ingeniero senior de seguridad diseña el esquema, elige los algoritmos, define la jerarquía de claves y el plan de rotación — y después llama a una biblioteca auditada que hace el trabajo peligroso. La sección final del módulo es exactamente eso: cuándo <em>no</em> tocar criptografía. Todo lo del medio existe para que esa decisión sea informada y no una excusa.</p>
+
+<h2>CS7.1 Por qué los protocolos se rompen aunque las primitivas sean sólidas</h2>
+
+<p>Una primitiva criptográfica es una función con una garantía matemática estrecha y bien definida: AES-GCM garantiza confidencialidad e integridad <em>siempre que</em> no reuses el par (clave, nonce). Un protocolo es lo que construís encima para resolver un problema real, y el problema real tiene bordes que la garantía de la primitiva no cubre. Ahí viven los ataques.</p>
+
+<table>
+<thead><tr><th>Clase de ataque</th><th>Dónde vive el error</th><th>La primitiva estaba bien</th></tr></thead>
+<tbody>
+<tr><td><strong>Padding oracle</strong></td><td>Cifrado sin autenticar + mensajes de error distinguibles</td><td>AES-CBC es correcto; el protocolo filtra si el padding es válido</td></tr>
+<tr><td><strong>Nonce reuse a escala</strong></td><td>Generación de nonces sin coordinación entre nodos</td><td>GCM es correcto; el sistema no garantizó unicidad</td></tr>
+<tr><td><strong>Downgrade</strong></td><td>Negociación de algoritmo sin autenticar la negociación</td><td>Las suites fuertes existen; el atacante fuerza la débil</td></tr>
+<tr><td><strong>Replay</strong></td><td>Falta de frescura: no hay nonce, timestamp ni secuencia</td><td>La firma es válida — el problema es que sigue válida mañana</td></tr>
+</tbody>
+</table>
+
+<p>El <strong>padding oracle</strong> es el ejemplo perfecto de que la matemática puede ser impecable y el sistema igual filtrar todo. Con cifrado en modo CBC sin autenticación, el receptor descifra y revisa el <em>padding</em>; si está mal, responde distinto (un error, un tiempo, un código HTTP). Esa diferencia observable convierte al servidor en un <strong>oráculo</strong>: el atacante manda criptogramas modificados y, byte a byte, según el servidor diga "padding válido" o "inválido", reconstruye el texto claro <strong>sin conocer la clave</strong>. La lección no es "CBC es malo", es "cifrar sin autenticar te deja construir oráculos", y por eso AEAD —que rechaza cualquier criptograma alterado con un solo veredicto— cierra la categoría entera.</p>
+
+<div class="rule">
+  <strong>📌 La regla que resume esta sección.</strong> La seguridad de un protocolo no es la seguridad de su primitiva más fuerte: es la de su composición más débil. Un handshake con AES-256, RSA-4096 y SHA-512 se rompe entero si la negociación de esos algoritmos no está autenticada, porque el atacante negocia otra cosa. Diseñá asumiendo que el adversario controla la red, elige el orden de los mensajes, los repite, los corta y los reordena.
+</div>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> tratar la frescura como un detalle. Una firma o un MAC prueban <em>quién</em> y <em>qué</em>, nunca <em>cuándo</em>. Si tu endpoint de "transferir $100" acepta un mensaje firmado válido, un atacante que lo capture puede reenviarlo diez veces — cada copia es criptográficamente perfecta. La frescura se agrega aparte: un nonce de un solo uso, un número de secuencia, o una marca de tiempo con ventana corta. No sale gratis con la firma.
+</div>
+
+<h2>CS7.2 AEAD en serio: el nonce a escala</h2>
+
+<p>El curso base te dejó una regla dura: nunca reuses el par (clave, nonce) en GCM. Es correcta y es suficiente para un caso chico. A escala de sistema distribuido, esa regla deja de ser trivial de cumplir, y ahí aparece el matiz senior.</p>
+
+<div class="concept">
+  <strong>💡 El problema del nonce no es "no lo repitas", es "garantizá que nunca se repita — sin un coordinador central".</strong> En un solo proceso alcanza un contador. Con cincuenta instancias cifrando en paralelo detrás de un balanceador, ¿quién asegura que dos no elijan el mismo número? Un contador compartido es un cuello de botella y un punto único de falla; nonces aleatorios independientes no necesitan coordinación, pero tienen un límite matemático.
+</div>
+
+<p>El nonce de AES-GCM es de <strong>96 bits</strong>. Si lo generás al azar en cada mensaje, la probabilidad de colisión sigue la paradoja del cumpleaños: se vuelve no despreciable cerca de <strong>2³² mensajes por clave</strong> — unos cuatro mil millones. Suena enorme hasta que tenés una flota cifrando telemetría a decenas de miles de mensajes por segundo; entonces son días, no años. Y una sola colisión de nonce en GCM no es un rasguño: filtra el XOR de dos textos claros y compromete la clave de autenticación interna, habilitando falsificación.</p>
+
+<pre><code class="lang-python"># Estrategia de nonce segun el AEAD elegido (conceptual, no implementar a mano)
+#
+# AES-256-GCM     nonce 96 bits   nonce ALEATORIO seguro hasta ~2^32 msgs/clave
+#                                 (limite de cumpleanos: rotar la clave antes)
+# XChaCha20-Poly1305  nonce 192 bits  nonce aleatorio seguro sin coordinacion
+#                                 (el espacio es tan grande que colisionar es inviable)
+# AES-GCM-SIV     nonce 96 bits   RESISTENTE al mal uso: si repetis el nonce,
+#                                 solo se filtra si dos textos claros son iguales
+#                                 -- no hay catastrofe, solo una fuga minima</code></pre>
+
+<p>De ahí salen dos herramientas que el módulo base no nombró. <strong>XChaCha20-Poly1305</strong> extiende el nonce a 192 bits: con ese espacio, elegirlo al azar en cada nodo sin ninguna coordinación es seguro por diseño — es la opción por defecto cuando la generación del nonce es distribuida. Y los modos <strong>resistentes al mal uso</strong> (nonce-misuse-resistant) como <strong>AES-GCM-SIV</strong> degradan con gracia: si por un bug repetís un nonce, no perdés todo, solo revelás si dos mensajes eran idénticos. No es una licencia para ser descuidado; es defensa en profundidad para el día que el descuido ocurra igual.</p>
+
+<div class="rule">
+  <strong>📌 Decisión mecánica.</strong> ¿Un solo emisor con estado persistente? Contador de 96 bits que nunca se reinicia, GCM. ¿Muchos emisores sin coordinación? XChaCha20-Poly1305 con nonce aleatorio. ¿No podés garantizar unicidad y el costo de un error es inaceptable? Un modo resistente al mal uso. La pregunta de diseño nunca es "¿qué cifrado uso?", es "¿cómo garantizo la unicidad del nonce en mi topología real?".
+</div>
+
+<h2>CS7.3 Intercambio de claves y forward secrecy</h2>
+
+<p>El problema fundacional de la criptografía práctica es acordar una clave simétrica con alguien a quien nunca viste, sobre un canal que el atacante escucha entero. <strong>Diffie-Hellman</strong> lo resuelve: las dos partes intercambian valores públicos, cada una combina el ajeno con su secreto, y ambas llegan al mismo número compartido que el espía no puede calcular. En su versión moderna sobre curvas elípticas es <strong>ECDH</strong> (X25519), la base del handshake TLS.</p>
+
+<p>La distinción que importa a nivel arquitectura es <strong>estático vs efímero</strong>. En DH estático, la clave privada es de larga vida y siempre la misma; si mañana te la roban, el atacante puede descifrar <em>todo</em> el tráfico que grabó en los últimos años. En DH <strong>efímero</strong> (DHE / ECDHE), cada sesión genera un par nuevo, se acuerda la clave y se <strong>descarta el material privado</strong> al terminar. Eso da <strong>forward secrecy</strong>.</p>
+
+<div class="concept">
+  <strong>💡 Forward secrecy en una frase.</strong> Comprometer la clave de hoy no descifra el tráfico de ayer. Como cada sesión usó un secreto efímero que ya no existe en ningún disco, ni siquiera el dueño legítimo puede reconstruir esas claves. Es la propiedad que convierte "me robaron la clave privada del servidor" de catástrofe retroactiva total en incidente acotado al futuro.
+</div>
+
+<p>La forma más sofisticada de esta idea es el <strong>doble ratchet</strong>, el protocolo detrás de Signal (y de WhatsApp, y de la mensajería de muchos otros). Conceptualmente combina dos "trinquetes" que solo giran hacia adelante:</p>
+
+<div class="step"><strong>Ratchet simétrico (KDF chain).</strong> Cada mensaje deriva su clave de la anterior con una función unidireccional y descarta la vieja. Si te roban la clave de este mensaje, no podés retroceder a los anteriores: la función no tiene vuelta atrás. Eso es forward secrecy por mensaje, no por sesión.</div>
+
+<div class="step"><strong>Ratchet Diffie-Hellman.</strong> Cada vez que cambia el turno de la conversación, las partes hacen un nuevo ECDH y "reinyectan" frescura en la cadena. Esto agrega <strong>post-compromise security</strong> (o "future secrecy"): si el atacante te robó el estado en un momento, apenas ocurre el siguiente intercambio DH que él no vio, la conversación <strong>se autocura</strong> y vuelve a estar fuera de su alcance.</div>
+
+<div class="info">
+  El doble ratchet es la prueba viviente de la tesis del módulo: sus piezas son primitivas simples y conocidas (ECDH, un KDF, un AEAD), y toda su magia está en <strong>cómo se componen</strong>. Reimplementarlo a mano es un error clásico de ego — tiene una cantidad de casos de borde (mensajes fuera de orden, perdidos, sesiones concurrentes en varios dispositivos) que solo una biblioteca madura como <code>libsignal</code> maneja bien. Se usa; no se reescribe.
+</div>
+
+<h2>CS7.4 PKI a fondo: la cadena, la revocación y la transparencia</h2>
+
+<p>El intercambio de claves resuelve la confidencialidad, pero deja abierta la pregunta más difícil: <strong>¿con quién estás hablando?</strong>. Un ECDH con un atacante en el medio te da un canal cifrado perfecto... con el atacante. La respuesta es la <strong>infraestructura de clave pública</strong> (PKI): un sistema para probar que una clave pública pertenece a quien dice.</p>
+
+<p>La pieza es el certificado <strong>X.509</strong>: un documento que ata un nombre (el dominio, en el campo <em>Subject Alternative Name</em>) a una clave pública, con un período de validez y usos permitidos, todo <strong>firmado por una autoridad certificadora</strong> (CA). Tu navegador no conoce a <code>ejemplo.com</code>, pero confía en un conjunto de CA raíz preinstaladas. El certificado del sitio lo firma una CA intermedia, firmada a su vez por una raíz — la <strong>cadena de confianza</strong>. El cliente la verifica eslabón por eslabón: firma válida, nombre que coincide, no vencido, uso correcto.</p>
+
+<pre><code class="lang-bash"># Inspeccionar la cadena de confianza y el vencimiento de un sitio real
+openssl s_client -connect ejemplo.com:443 -servername ejemplo.com -showcerts
+
+# Ver emisor, sujeto y fechas de un certificado ya descargado
+openssl x509 -in cert.pem -noout -issuer -subject -dates -ext subjectAltName</code></pre>
+
+<h3>El problema de la revocación</h3>
+
+<p>Todo funciona hasta que una clave privada se compromete <em>antes</em> de que el certificado venza. Ahí necesitás <strong>revocarlo</strong>, y resulta que decirle al mundo "este certificado ya no vale" es sorprendentemente difícil. Es uno de los problemas no resueltos más viejos de la web.</p>
+
+<table>
+<thead><tr><th>Mecanismo</th><th>Cómo funciona</th><th>Su talón de Aquiles</th></tr></thead>
+<tbody>
+<tr><td><strong>CRL</strong></td><td>La CA publica una lista de seriales revocados</td><td>Enorme y cacheada: llega vieja o directamente no se descarga</td></tr>
+<tr><td><strong>OCSP</strong></td><td>El cliente pregunta a la CA por un serial puntual</td><td>Fuga de privacidad (la CA ve qué visitás) y <em>soft-fail</em>: si no responde, se acepta igual</td></tr>
+<tr><td><strong>OCSP stapling</strong></td><td>El servidor adjunta una respuesta OCSP fresca y firmada</td><td>Sin <em>must-staple</em>, el atacante simplemente no la adjunta</td></tr>
+<tr><td><strong>Vida corta</strong></td><td>El certificado dura días; el vencimiento <em>es</em> la revocación</td><td>Exige automatización total de emisión y despliegue</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Adónde fue la industria.</strong> Ganaron los <strong>certificados de vida corta</strong>. El razonamiento es elegante: si un certificado vive 7 o 90 días, la ventana en que un compromiso importa es esa, y la revocación en tiempo real —frágil y con <em>soft-fail</em>— deja de ser crítica. El propio vencimiento hace el trabajo. Por eso el CA/Browser Forum viene bajando la vida máxima de los certificados (rumbo a ~47 días hacia 2029) y la única forma de sobrevivir a eso es automatizar la renovación de punta a punta con ACME. La revocación clásica no se arregló: se volvió menos necesaria.
+</div>
+
+<h3>Certificate Transparency y el punto único de confianza</h3>
+
+<p>Queda un problema estructural que ni los certificados de vida corta resuelven: <strong>cualquier CA en la que tu navegador confíe puede emitir un certificado para cualquier dominio</strong>. Tu seguridad es la de la CA <em>más débil</em> del trust store, no la que vos elegiste. Una CA comprometida o coaccionada puede emitir un certificado válido para tu banco, y criptográficamente el navegador lo aceptará.</p>
+
+<div class="concept">
+  <strong>💡 No se puede impedir; se puede detectar.</strong> Esa es la idea de <strong>Certificate Transparency</strong> (CT): registros públicos, append-only y auditables donde queda anotado <em>cada</em> certificado emitido. Los navegadores exigen que un certificado venga con pruebas (SCTs) de estar en esos logs. No evita que una CA emita de más, pero hace que esa emisión sea <strong>visible para el dueño del dominio</strong>, que puede monitorear los logs y detectar un certificado que él no pidió. Convierte un fraude silencioso en un fraude registrado.
+</div>
+
+<pre><code class="lang-bash"># Limitar QUE autoridades pueden emitir para tu dominio (registro DNS CAA)
+ejemplo.com.   CAA 0 issue "letsencrypt.org"
+ejemplo.com.   CAA 0 iodef "mailto:security@ejemplo.com"
+
+# Monitorear Certificate Transparency para detectar emisiones no autorizadas:
+# consultar periodicamente los logs publicos (p. ej. via crt.sh) por tu dominio</code></pre>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> creer que el candado verde es una garantía de identidad de la organización. TLS con un certificado válido prueba que hablás con quien controla ese dominio y su clave — no que la organización detrás sea legítima ni que la CA no se haya equivocado. Un dominio de phishing saca su certificado gratis en segundos. La confianza en PKI es una cadena de suposiciones, y CT existe justamente porque una de esas suposiciones (la honestidad de todas las CA) no se sostiene sola.
+</div>
+
+<h2>CS7.5 mTLS: autenticación mutua y zero-trust</h2>
+
+<p>En TLS normal solo el servidor presenta certificado; el cliente se autentica después, por otro medio (una contraseña, un token). En <strong>mTLS</strong> (mutual TLS) <em>ambos</em> presentan certificado y ambos verifican al otro durante el handshake. La identidad deja de ser "quien sabe la contraseña" y pasa a ser "quien posee esta clave privada avalada por nuestra CA interna".</p>
+
+<p>Es la columna vertebral criptográfica de las arquitecturas <strong>zero-trust</strong> (ver <a href="../cs3-cloud-nativo/lecture.html">CS3</a>): en vez de confiar en un servicio porque está "dentro de la red", cada llamada entre servicios se autentica mutuamente con certificados. La red deja de ser el perímetro; la identidad criptográfica lo es. Un atacante que logra estar "adentro" no gana nada si no tiene un certificado válido.</p>
+
+<div class="rule">
+  <strong>📌 La parte difícil de mTLS no es el TLS: es la rotación.</strong> Emitir certificados a cada uno de miles de servicios, y <strong>rotarlos constantemente</strong>, es el problema operativo real. La solución moderna son identidades de workload de vida muy corta (SPIFFE/SPIRE): cada servicio recibe un certificado que dura horas y se renueva solo. Certificados de servicio de larga vida son deuda de seguridad — cuanto más viven, más vale robarlos y más caro es reaccionar cuando pasa.
+</div>
+
+<div class="info">
+  Fijate el patrón que se repite en todo el módulo: la vida corta más la automatización resuelven a la vez la revocación (CS7.4) y la rotación de identidades de servicio (CS7.5). No es coincidencia — es la misma idea de diseño aplicada dos veces. Un secreto que expira pronto y se renueva solo necesita mucha menos maquinaria de emergencia que uno de larga vida.
+</div>
+
+<h2>CS7.6 Gestión de claves: KEK, DEK y envelope encryption</h2>
+
+<p>Cifrar es fácil; el problema difícil de verdad es <strong>dónde vive la clave</strong>. Toda la criptografía "mueve el problema de proteger los datos al problema de proteger la clave" — este es el módulo donde ese problema se paga. Y la peor respuesta posible es la más común: la clave guardada junto al dato que protege.</p>
+
+<p>La estructura correcta es una <strong>jerarquía</strong>. En la base, las <strong>DEK</strong> (data-encryption keys) cifran los datos reales. Arriba, una <strong>KEK</strong> (key-encryption key) cifra las DEK. La KEK vive en un lugar especial —un <strong>HSM</strong> (hardware security module) o un KMS gestionado— del que <strong>nunca sale en claro</strong>: el hardware hace las operaciones criptográficas internamente y solo devuelve resultados, jamás el material de la clave.</p>
+
+<p>El patrón que implementa esto se llama <strong>envelope encryption</strong> (cifrado con sobre):</p>
+
+<pre><code class="lang-python"># Envelope encryption (patron KMS) -- conceptual
+#
+# CIFRAR:
+#   1. Pedir al KMS una data key nueva.
+#      Devuelve el par: { dek_plana, dek_cifrada_con_la_KEK }
+#   2. Cifrar el dato con dek_plana usando AES-GCM.
+#   3. BORRAR dek_plana de memoria.
+#   4. Guardar dek_cifrada JUNTO al dato (no es secreta: esta envuelta).
+#
+# DESCIFRAR:
+#   1. Mandar dek_cifrada al KMS → el HSM la desenvuelve con la KEK.
+#   2. Recibir dek_plana, descifrar el dato, borrar dek_plana.
+#
+# La KEK maestra NUNCA sale del HSM. Comprometer un servidor de aplicacion
+# no expone la KEK: expone, como mucho, las DEK que estuvieron en RAM.</code></pre>
+
+<p>Esto habilita la propiedad operativa que más se subestima: <strong>rotación sin downtime</strong>. La clave es que cada criptograma lleve grabado el identificador de la clave con que se hizo.</p>
+
+<pre><code class="lang-python"># Cada dato cifrado se autodescribe con su version de clave
+registro = {
+    "key_id": "kek-2026-v3",   # con QUE clave se envolvio la DEK
+    "wrapped_dek": "...",       # la DEK cifrada por esa KEK
+    "nonce": "...",
+    "ciphertext": "...",
+}
+# Descifrar: usar el key_id que trae el propio dato (v1, v2 o v3 conviven).
+# Cifrar nuevo: siempre con la KEK mas reciente (v3).
+# Rotar la KEK: re-envolver solo las DEK (barato). Los datos NO se tocan.
+# Rotar una DEK: re-cifrar el dato (caro) -- se hace de forma perezosa.</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La pregunta que define tu modelo de amenazas: ¿quién tiene la clave maestra?</strong> La KEK es la raíz de confianza — quien la controla puede descifrar todo. Por eso en sistemas serios <strong>nadie</strong> la tiene entera: se aplica conocimiento dividido y control dual (split knowledge, dual control), o se reparte con <em>secret sharing</em> de Shamir en varias personas que deben juntarse para reconstruirla. Si una sola persona, o un solo servidor, puede sacar la clave maestra en claro, esa persona o ese servidor <em>es</em> tu superficie de ataque, por más HSM que tengas debajo.
+</div>
+
+<h2>CS7.7 Firmas y su semántica real</h2>
+
+<p>Una firma digital parece simple —prueba quién emitió algo— pero su semántica exacta es una fuente inagotable de errores de arquitectura, porque la gente le atribuye garantías que no da.</p>
+
+<p>Lo que una firma <strong>sí</strong> garantiza: <strong>integridad</strong> (el mensaje no cambió) y <strong>autenticidad</strong> (lo produjo quien tiene la clave privada). Con clave asimétrica agrega <strong>no repudio</strong>: cualquiera verifica con la pública, y el firmante no puede negar que fue él. Lo que <strong>no</strong> garantiza: <strong>confidencialidad</strong> (un documento firmado se lee a simple vista), <strong>frescura</strong> (la firma es válida para siempre — de ahí el replay del CS7.1), y —sutil pero letal— no garantiza <em>en qué contexto</em> el firmante quiso firmar eso.</p>
+
+<div class="rule">
+  <strong>📌 Firma vs MAC, a nivel arquitectura.</strong> Un MAC (HMAC) usa un secreto compartido: quien verifica también puede generar, así que <strong>no da no repudio</strong> — cualquiera de las dos partes pudo haberlo hecho. Una firma separa firmar (privada) de verificar (pública). Regla: si dos partes que ya comparten un secreto quieren integridad entre ellas (cookies, webhooks, tokens internos), MAC — es más rápido y más simple. Si un tercero desconocido tiene que verificar, o necesitás que el firmante no pueda negarlo, firma. Elegir firma donde alcanzaba un MAC agrega gestión de PKI que no necesitabas; elegir MAC donde hacía falta no repudio te deja sin la propiedad el día que la necesitás en un juicio.
+</div>
+
+<div class="mistake">
+  <strong>Error clásico — separación de dominio.</strong> Si tu sistema firma "mensajes" genéricos, una firma válida para un propósito puede reproducirse como válida para otro. El atacante toma una firma legítima de "actualizá mi avatar" y, si el formato firmado no distingue el propósito, la presenta como "transferí fondos". La defensa es <strong>domain separation</strong>: incluir dentro de lo que se firma un prefijo o etiqueta de contexto ("v1:avatar-update:...") para que una firma jamás sea válida fuera de su dominio. Es el mismo patrón de ataque cross-protocol que hunde a los que "firman todo con la misma clave".
+</div>
+
+<div class="warn">
+  <strong>El no repudio "real" es más frágil de lo que suena.</strong> La matemática prueba que la firma la hizo esa clave privada — no que la hizo <em>esa persona</em> con intención. El firmante siempre puede alegar "me robaron la clave". El no repudio jurídicamente defendible no sale solo de la criptografía: necesita la clave en un HSM del que no puede extraerse, un registro de auditoría, y a menudo una autoridad de sellado de tiempo (timestamping) que pruebe <em>cuándo</em> se firmó. Es un argumento legal reforzado por criptografía, no un teorema. Prometer "no repudio" como si fuera automático es un error de diseño.
+</div>
+
+<h2>CS7.8 Post-cuántica: la migración ya empezó</h2>
+
+<p>El curso base ya te presentó la amenaza: una computadora cuántica suficientemente grande rompería con el algoritmo de Shor toda la criptografía asimétrica actual (RSA, ECDH, ECDSA, Ed25519), mientras que la simétrica solo pierde la mitad de su fuerza efectiva (AES-256 se comporta como AES-128). Acá lo tomamos como lo que es a nivel senior: <strong>una decisión de arquitectura que hay que tomar ahora</strong>, no un tema de futurología.</p>
+
+<div class="danger">
+  <strong>⚠️ "Harvest now, decrypt later" convierte un problema futuro en uno presente.</strong> La máquina no existe todavía, pero el ataque tiene dos etapas separadas en el tiempo y la primera ya es posible: un adversario con recursos <strong>graba hoy</strong> tu tráfico cifrado y lo archiva hasta que exista el hardware para descifrarlo. La pregunta de diseño no es "¿cuándo llega la computadora cuántica?", es "<strong>¿cuántos años tiene que seguir siendo secreto este dato?</strong>". Si la respuesta cruza el horizonte de una máquina criptográficamente relevante, la amenaza ya te aplica hoy.
+</div>
+
+<p>Por eso el NIST cerró los estándares y hay que usar sus nombres oficiales, no los históricos de los concursos:</p>
+
+<table>
+<thead><tr><th>Estándar NIST</th><th>Nombre (origen)</th><th>Para qué</th></tr></thead>
+<tbody>
+<tr><td><strong>FIPS 203 · ML-KEM</strong></td><td>Kyber</td><td>Encapsulación de clave (reemplaza al intercambio ECDH)</td></tr>
+<tr><td><strong>FIPS 204 · ML-DSA</strong></td><td>Dilithium</td><td>Firma digital (opción general)</td></tr>
+<tr><td><strong>FIPS 205 · SLH-DSA</strong></td><td>SPHINCS+</td><td>Firma basada en hashes (conservadora, sin supuestos de red)</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El intercambio de claves es urgente; las firmas pueden esperar.</strong> "Harvest now, decrypt later" ataca la <em>confidencialidad</em>: por eso migrar el intercambio de claves (a ML-KEM) corre contra el reloj — el tráfico grabado hoy se descifra mañana. Las firmas protegen <em>autenticidad en el momento</em>: una firma que nadie puede falsificar hoy no se puede falsificar retroactivamente cuando llegue la cuántica, así que la migración de firmas es importante pero no tiene la misma prisa. Esa asimetría ordena tus prioridades de migración.
+</div>
+
+<p>La adopción real es <strong>híbrida</strong>. En TLS ya se despliega <code>X25519MLKEM768</code>: se combina el intercambio clásico X25519 con el post-cuántico ML-KEM, y la clave de sesión depende de los dos. Para romperlo, el atacante necesita quebrar <strong>ambos</strong> — el clásico (que hoy sabemos seguro) y el post-cuántico (nuevo y menos probado). El híbrido cubre el riesgo de que el algoritmo nuevo tenga una falla todavía no descubierta, sin renunciar a la protección cuántica. Navegadores y CDNs grandes ya lo negocian por defecto.</p>
+
+<div class="rule">
+  <strong>📌 La propiedad de diseño que te salva: crypto-agility.</strong> El sistema que va a sufrir la transición no va a sufrir por la matemática — va a sufrir por tener el nombre del algoritmo <em>hardcodeado en cuarenta lugares</em>. Diseñá con agilidad criptográfica desde el día uno: un identificador de algoritmo y versión en cada artefacto cifrado o firmado, negociación en vez de suposición, y un camino de re-cifrado/re-firma probado. Si mañana ML-KEM tiene que reemplazarse por otra cosa, querés que sea un cambio de configuración, no una reescritura. La agilidad no es un lujo post-cuántico; es la única forma conocida de sobrevivir a <em>cualquier</em> transición criptográfica, y ya hubo varias (MD5, SHA-1, RSA-1024).
+</div>
+
+<h2>CS7.9 Errores de arquitectura criptográfica</h2>
+
+<p>Estos son los errores que no atrapan los tests, no marca el linter y no aparecen en un escáner de dependencias — porque cada primitiva, por separado, está bien usada. El defecto está en la composición.</p>
+
+<div class="mistake">
+  <strong>1. Cifrar sin autenticar.</strong> Cifrado que no verifica integridad habilita padding oracles, bit-flipping y manipulación silenciosa. Componer "cifrar y después MAC" a mano es un campo minado (MAC-then-encrypt vs encrypt-then-MAC, y todo lo que sale mal entre medio). La respuesta no es elegir bien el orden: es <strong>usar AEAD</strong>, que hace las dos cosas atadas y no te deja equivocarte.
+</div>
+
+<div class="mistake">
+  <strong>2. Reusar una clave para más de un propósito.</strong> La misma clave para cifrar y para MAC, o la misma clave compartida entre dos protocolos, abre ataques cross-protocol donde un mensaje de un contexto se reinterpreta en otro. Regla: <strong>una clave, un propósito</strong>. Si necesitás varias claves relacionadas, derivalas de una raíz con un KDF y una etiqueta distinta por uso (domain separation), no copies la misma en dos lugares.
+</div>
+
+<div class="mistake">
+  <strong>3. Guardar la clave junto al dato que protege.</strong> La clave AES en la misma tabla que el blob cifrado, o commiteada en el mismo repo. Cifrar y dejar la clave al lado equivale a no cifrar: el atacante que consigue el dato consigue la clave en el mismo movimiento. Este es el error que el <a href="../../m01-criptografia/lecture.html">M01 base</a> ya marcaba, y la jerarquía KEK/DEK de CS7.6 existe justamente para no cometerlo a escala.
+</div>
+
+<div class="mistake">
+  <strong>4. Rodar tu propio protocolo.</strong> El más caro. Componer primitivas correctas en un protocolo nuevo es donde viven los bugs sutiles, y la historia lo demuestra: los ataques a TLS (BEAST, CRIME, POODLE, Lucky Thirteen) no rompieron AES ni RSA — rompieron composiciones. Los innumerables bypass de JWT (<code>alg: none</code>, confusión RS256/HS256) no rompieron las firmas — rompieron cómo el protocolo las usaba. Si estás inventando un handshake, un esquema de tokens o un formato cifrado propio, la probabilidad de que tenga un defecto que vos no ves es cercana a uno.
+</div>
+
+<h2>CS7.10 Cuándo NO tocar criptografía</h2>
+
+<p>Toda la profundidad de este módulo desemboca en una conclusión que puede sonar paradójica: la aplicás, sobre todo, para saber <strong>cuánto no implementar</strong>. Entender el protocolo es lo que te permite elegir bien la biblioteca y revisar su uso — no reemplazarla.</p>
+
+<div class="rule">
+  <strong>📌 La señal de alarma.</strong> Si te encontrás llamando directamente a primitivas de bajo nivel —instanciar un cifrador AES, manejar el nonce a mano, concatenar bytes para un MAC, componer un handshake— probablemente ya estás en zona de peligro. Ese es el nivel donde los expertos se equivocan; no es donde vos deberías estar operando salvo que la criptografía sea, literalmente, tu producto.
+</div>
+
+<p>La alternativa correcta es una <strong>API de alto nivel resistente al mal uso</strong>: una que sea difícil de usar mal porque toma las decisiones peligrosas por vos. En orden de preferencia práctico:</p>
+
+<div class="step"><strong>libsodium / NaCl.</strong> Diseñada explícitamente para que el desarrollador no elija nonces, modos ni curvas: hay una función <code>secretbox</code> y una <code>box</code>, y hacen lo correcto. Es el estándar de oro de "API que no te deja pegarte un tiro".</div>
+
+<div class="step"><strong>La de tu lenguaje / plataforma.</strong> El módulo <code>cryptography</code> de Python (su capa <em>recipes</em>, como Fernet), Tink de Google, el <code>crypto/</code> de Go. Todas ofrecen construcciones de alto nivel con parámetros seguros por defecto.</div>
+
+<div class="step"><strong>Protocolos completos, no primitivas.</strong> Para transporte, TLS (no armes tu propio canal). Para mensajería E2E, <code>libsignal</code> (no reimplementes el ratchet). Para cifrado de archivos, <code>age</code>. Elegís y componés a nivel protocolo, no a nivel bloque.</div>
+
+<div class="info">
+  El juicio senior no es "sé criptografía, entonces la escribo". Es "sé lo suficiente de criptografía como para <strong>elegir</strong> la herramienta correcta, <strong>configurarla</strong> con los parámetros correctos, <strong>revisar</strong> que el equipo la use bien, y <strong>reconocer</strong> cuándo un requisito realmente exige algo a medida — que es casi nunca". Todo este módulo sirve para tomar esas cuatro decisiones con criterio, no para reemplazar a libsodium.
+</div>
+
+<h2>🧑‍🎓 Worked Example — cifrado de extremo a extremo para una app de mensajería</h2>
+
+<blockquote>Tu equipo tiene que agregar mensajería cifrada de extremo a extremo (E2E) a una app. Requisitos: solo emisor y receptor leen los mensajes (ni siquiera el servidor), forward secrecy, funciona entre varios dispositivos y con destinatarios offline, y tiene que sobrevivir a la transición post-cuántica. ¿Cómo lo diseñás?</blockquote>
+
+<p><strong>Paso 1 — Separar lo que decidís de lo que implementás.</strong> Antes de una línea de código, la decisión más importante ya está tomada: el protocolo criptográfico central <strong>no se escribe</strong>. Se adopta el protocolo de Signal vía <code>libsignal</code>. Todo lo que sigue es <em>elegir</em> y <em>componer</em>, no inventar.</p>
+
+<p><strong>Paso 2 — Intercambio de claves con destinatarios offline.</strong> El requisito "destinatario offline" descarta un ECDH interactivo simple: no podés hacer un handshake con alguien que no está conectado. La respuesta es <strong>X3DH</strong> (Extended Triple Diffie-Hellman): el destinatario publica de antemano un paquete de claves (prekeys) en el servidor, y el emisor acuerda una clave con ese material sin que el otro esté online. Es asíncrono por diseño.</p>
+
+<p><strong>Paso 3 — Forward secrecy continua.</strong> Sobre esa clave inicial corre el <strong>doble ratchet</strong> (CS7.3): forward secrecy por mensaje más autocuración post-compromiso. No hay que configurar nada — es lo que el protocolo hace.</p>
+
+<p><strong>Paso 4 — AEAD y nonce.</strong> Acá se conecta con CS7.2. La virtud del ratchet es que <strong>cada mensaje usa una clave derivada única</strong>, así que la reutilización de nonce es estructuralmente imposible: no hay dos mensajes bajo la misma clave. Con esa garantía, AES-GCM o ChaCha20-Poly1305 con la clave por-mensaje es correcto. El diseño del protocolo eliminó el problema del nonce en el nivel de arriba.</p>
+
+<p><strong>Paso 5 — Crypto-agility para lo post-cuántico.</strong> Un byte de versión en el formato de wire y negociación de la función DH del ratchet. Esto no es hipotético: Signal ya desplegó <strong>PQXDH</strong>, la versión post-cuántica de X3DH que combina X25519 con ML-KEM de forma híbrida (CS7.8). Si diseñaste con versión desde el día uno, adoptarlo es actualizar la librería y negociar, no reescribir.</p>
+
+<table>
+<thead><tr><th>Decisión</th><th>Elección</th><th>Trade-off que aceptás</th></tr></thead>
+<tbody>
+<tr><td>Protocolo central</td><td><code>libsignal</code> (no propio)</td><td>Dependés de una librería; a cambio, no cargás con sus bugs de composición</td></tr>
+<tr><td>Intercambio de clave</td><td>X3DH / PQXDH (asíncrono)</td><td>Necesitás un servidor de prekeys; a cambio, funciona offline</td></tr>
+<tr><td>Continuidad</td><td>Doble ratchet</td><td>Estado por conversación y por dispositivo; a cambio, FS + autocuración</td></tr>
+<tr><td>AEAD</td><td>ChaCha20-Poly1305, clave por-mensaje</td><td>Ninguno relevante: el ratchet garantiza unicidad del nonce</td></tr>
+<tr><td>Post-cuántico</td><td>Híbrido X25519 + ML-KEM, versionado</td><td>Mensajes algo más grandes; a cambio, resistencia a "harvest now"</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Qué NO implementás a mano, y qué sí es tuyo.</strong> No implementás: el ratchet, X3DH/PQXDH, ni las primitivas. Eso es <code>libsignal</code>. Lo que <strong>sí</strong> es tuyo y donde va tu esfuerzo de diseño: la <strong>verificación de identidad</strong> (los "números de seguridad" que dos usuarios comparan para descartar un intermediario), la <strong>gestión de dispositivos</strong> (agregar/revocar un teléfono sin romper la seguridad), y el <strong>modelo de confianza</strong> (qué pasa cuando cambia la clave de un contacto). La criptografía es la parte resuelta; la experiencia de confianza alrededor es la parte difícil, y es 100% tuya.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué XChaCha20-Poly1305 permite generar nonces al azar sin coordinación y AES-GCM no, si ambos son AEAD sólidos?</summary>
+<p>Por el tamaño del nonce. El de AES-GCM es de 96 bits: con nonces aleatorios, la paradoja del cumpleaños hace que la probabilidad de colisión deje de ser despreciable cerca de 2³² mensajes por clave, y una colisión en GCM es catastrófica (filtra XOR de textos claros y compromete la autenticación). XChaCha20-Poly1305 usa un nonce de 192 bits; ese espacio es tan grande que elegirlo al azar en cada nodo, sin ningún coordinador, jamás colisiona en la práctica. Por eso, en un sistema distribuido donde muchos emisores cifran en paralelo sin estado compartido, XChaCha es la opción natural — o, si no podés garantizar unicidad, un modo resistente al mal uso como AES-GCM-SIV, que degrada con gracia en vez de romperse.</p></details>
+
+<details><summary>La industria se movió a certificados de vida corta en lugar de arreglar la revocación. ¿Cuál es el razonamiento y qué exige a cambio?</summary>
+<p>La revocación en tiempo real siempre fue frágil: las CRL llegan viejas y cacheadas, y OCSP falla en modo <em>soft-fail</em> (si la consulta de estado no responde, el navegador acepta el certificado igual, así que un atacante que bloquee la consulta anula la revocación). En vez de seguir peleando ese problema, la industria acortó la vida de los certificados: si uno vive días, la ventana en que un compromiso importa es esa, y el propio vencimiento actúa como revocación automática. El costo es que exige automatización total de emisión y despliegue (ACME), porque renovar certificados a mano cada pocos días es inviable. Es el mismo patrón que aparece en mTLS con identidades de workload de vida corta: vida corta + automatización reemplazan a la maquinaria de revocación de emergencia.</p></details>
+
+<details><summary>¿Por qué "harvest now, decrypt later" hace urgente migrar el intercambio de claves, pero no las firmas, a algoritmos post-cuánticos?</summary>
+<p>Porque atacan propiedades distintas en el tiempo. El intercambio de claves protege confidencialidad, y ahí el ataque es diferido: un adversario graba hoy el tráfico cifrado y lo descifra cuando exista la computadora cuántica, así que todo lo que necesite seguir secreto por años ya está en riesgo hoy — por eso ML-KEM (FIPS 203), en modo híbrido con X25519, corre contra el reloj. Las firmas, en cambio, protegen autenticidad en el momento de verificar: una firma que hoy nadie puede falsificar no se vuelve falsificable retroactivamente cuando llegue la cuántica, porque para entonces ya la verificaste y seguiste. Migrar firmas (a ML-DSA o SLH-DSA) es importante para el futuro, pero no tiene la urgencia retroactiva del intercambio de claves. Esa asimetría es la que ordena las prioridades de una migración post-cuántica real.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Los desastres criptográficos modernos no rompen primitivas: rompen <strong>la composición</strong>. El error vive en el pegamento —orden de cifrado/autenticación, negociación, manejo de nonce, ubicación de la clave— que ningún linter revisa.</li>
+  <li><strong>AEAD a escala</strong> es un problema de unicidad de nonce en tu topología real: GCM con nonce aleatorio tiene un límite de cumpleaños (~2³²/clave); XChaCha20-Poly1305 (192 bits) permite aleatoriedad sin coordinación; AES-GCM-SIV degrada con gracia ante el mal uso.</li>
+  <li><strong>Forward secrecy</strong> = comprometer la clave de hoy no descifra lo de ayer, gracias a claves efímeras que se descartan. El <strong>doble ratchet</strong> lo lleva por mensaje y agrega autocuración post-compromiso — y es puro arte de composición.</li>
+  <li><strong>PKI</strong>: la cadena de confianza resuelve identidad, pero la revocación es un problema no resuelto que la industria esquivó con <strong>certificados de vida corta</strong>. La CA es un punto único de confianza: no se puede impedir una emisión maliciosa, solo <strong>detectarla</strong> con Certificate Transparency y limitarla con CAA.</li>
+  <li><strong>mTLS</strong> es la base criptográfica de zero-trust; su parte difícil es la rotación, resuelta con identidades de workload de vida corta.</li>
+  <li><strong>Gestión de claves</strong>: jerarquía KEK/DEK y envelope encryption; la clave maestra vive en un HSM/KMS y nunca sale; rotación sin downtime versionando cada criptograma; y control dividido sobre "quién tiene la clave maestra".</li>
+  <li>Una <strong>firma</strong> da integridad, autenticidad y no repudio, pero no confidencialidad, no frescura (replay) ni contexto (hace falta domain separation). El no repudio "real" es un argumento legal reforzado por cripto, no un teorema.</li>
+  <li><strong>Post-cuántica</strong>: NIST estandarizó ML-KEM (FIPS 203), ML-DSA (FIPS 204) y SLH-DSA (FIPS 205). "Harvest now, decrypt later" hace urgente migrar el intercambio de claves (híbrido en TLS ya desplegado); la <strong>crypto-agility</strong> es la propiedad de diseño que hace la migración un cambio de config y no una reescritura.</li>
+  <li>La conclusión de todo: entendé el protocolo para <strong>elegir y revisar</strong> bibliotecas de alto nivel resistentes al mal uso (libsodium, la de tu lenguaje, protocolos completos), no para reimplementarlas. Rodar tu propio protocolo es el error más caro.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un sistema tuyo (o uno conocido) que cifre datos en reposo. Dibujá su jerarquía de claves: ¿hay KEK y DEK separadas, o una sola clave hace todo? ¿Dónde vive la clave maestra? ¿Podrías rotarla sin re-cifrar todos los datos? Escribí el diseño objetivo con envelope encryption y <code>key_id</code> por criptograma.</li>
+  <li>Elegí tres servicios que uses y, con <code>openssl s_client</code>, inspeccioná sus certificados: ¿vida corta o larga? ¿emisor? ¿ofrecen OCSP stapling? Anotá cuál tiene la mejor postura de revocación y por qué.</li>
+  <li>Buscá tu dominio (o uno público) en un log de Certificate Transparency (por ejemplo crt.sh) y listá los certificados emitidos. ¿Reconocés todos los emisores? Escribí el registro CAA que deberías tener para limitar qué CA pueden emitir.</li>
+  <li>Diseñá la estrategia de nonce para tres escenarios: (a) un solo servicio con estado persistente, (b) cincuenta réplicas sin coordinación cifrando telemetría, (c) clientes móviles offline. Justificá el AEAD elegido en cada uno y el límite de mensajes por clave que aceptás.</li>
+  <li>Hacé el inventario "harvest now, decrypt later" de un sistema: listá cada tipo de dato sensible y cuántos años debe seguir siendo confidencial. Marcá cuáles cruzan un horizonte post-cuántico razonable (10-15 años) y por lo tanto ya deberían ir por un intercambio de claves híbrido.</li>
+  <li>Auditá un uso de firmas o tokens (JWT, webhooks, licencias) en tu código: ¿tiene separación de dominio? ¿tiene protección contra replay (nonce, secuencia o timestamp)? ¿usa firma donde alcanzaba un MAC, o al revés? Documentá cada hallazgo con la corrección.</li>
+  <li>Elegí una necesidad criptográfica real de un proyecto y escribí, en un párrafo, la decisión "no rodar el mío": qué biblioteca de alto nivel usarías, con qué parámetros por defecto, y qué parte del problema (verificación de identidad, gestión de dispositivos, modelo de confianza) sigue siendo tuya y no la resuelve la librería.</li>
+</ol>
+
+<section class="quiz" id="quizCS_S7">
+  <style>
+    #quizCS_S7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizCS_S7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizCS_S7 .q{margin-bottom:1.5rem}
+    #quizCS_S7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizCS_S7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizCS_S7 .opt:hover{border-color:var(--accent)}
+    #quizCS_S7 .opt:disabled{cursor:default}
+    #quizCS_S7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizCS_S7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizCS_S7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizCS_S7 .exp.show{display:block}
+    #quizCS_S7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu servicio cifra millones de mensajes por segundo con AES-256-GCM y genera el nonce de 96 bits al azar en cada uno. ¿Cuál es el riesgo real a esta escala y la mitigación más sólida?</p>
+    <button class="opt">Ninguno: 96 bits de nonce aleatorio no colisionan jamás en la práctica</button>
+    <button class="opt">Solo de rendimiento; conviene cachear el nonce y reutilizarlo entre mensajes</button>
+    <button class="opt">El límite de cumpleaños: cerca de 2³² mensajes por clave la colisión de nonce deja de ser despreciable; se mitiga con XChaCha20-Poly1305 (nonce de 192 bits) o un modo resistente al mal uso como AES-GCM-SIV</button>
+    <div class="exp">El nonce público no es el problema; su <strong>unicidad</strong> sí. Con 96 bits aleatorios, la paradoja del cumpleaños vuelve probable una colisión cerca de 2³² mensajes por clave, y una colisión en GCM filtra texto claro y compromete la autenticación. XChaCha (192 bits) hace la aleatoriedad segura sin coordinación; AES-GCM-SIV degrada con gracia si igual se repite. Cachear y reutilizar el nonce es exactamente el error catastrófico.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. La clave privada de un certificado de servidor se compromete. ¿Por qué la industria prefirió los certificados de vida corta antes que confiar en la revocación clásica?</p>
+    <button class="opt">Porque las CRL y OCSP son criptográficamente inseguras y sus respuestas se pueden falsificar</button>
+    <button class="opt">Porque la revocación en tiempo real es frágil —CRL viejas y cacheadas, OCSP en modo <em>soft-fail</em> que acepta si la consulta no responde— y un certificado que vive días hace que el propio vencimiento actúe como revocación</button>
+    <button class="opt">Porque los certificados de vida corta no necesitan ser firmados por una CA</button>
+    <div class="exp">CRL y OCSP no están rotos criptográficamente; son frágiles operativamente. Las CRL llegan viejas; OCSP filtra privacidad y falla en <em>soft-fail</em> (si la consulta se bloquea, el navegador acepta igual), así que un atacante anula la revocación cortando la consulta. Acortar la vida del certificado convierte el vencimiento en revocación automática — a cambio de exigir automatización total (ACME). Los certificados de vida corta siguen firmados por una CA.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu equipo tiene que agregar cifrado de extremo a extremo a una app de mensajería. ¿Cuál es la decisión de arquitectura senior correcta?</p>
+    <button class="opt">Usar un protocolo probado y auditado (el doble ratchet de Signal vía <code>libsignal</code>) y limitarte a componer e integrar, sin reimplementar el intercambio de claves ni las primitivas a mano</button>
+    <button class="opt">Diseñar tu propio handshake con AES-256 y SHA-512, que son primitivas sólidas, para no depender de terceros</button>
+    <button class="opt">Cifrar cada mensaje con RSA directamente usando la clave pública del contacto</button>
+    <div class="exp">La tesis del módulo aplicada: las primitivas no son el problema, la composición sí, y componer un protocolo E2E a mano (handshake, forward secrecy, mensajes offline, multidispositivo) es donde los expertos se equivocan. <code>libsignal</code> ya lo resolvió y está auditado. RSA directo por mensaje no da forward secrecy, no escala y tiene límites de tamaño. Tu esfuerzo va a la verificación de identidad y el modelo de confianza, no a la cripto.</div>
+  </div>
+
+  <div class="score" id="scoreCS_S7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizCS_S7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreCS_S7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con CS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../cs6-red-team/lecture.html">← CS6: Red team y emulación</a>
+  <a href="../cs8-gobernanza/lecture.html">CS8: Gobernanza, compliance y programa →</a>
+</nav>
+
+</div>
+</body>
+</html>
