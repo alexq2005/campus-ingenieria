@@ -1,0 +1,1473 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS2 — Traits avanzados: GATs, coherencia y dispatch · Rust Senior</title>
+  <meta name="description" content="Tipos asociados vs parámetros genéricos, monomorfización vs vtable con costos medidos, dyn compatibility, GATs y LendingIterator, RPITIT, async fn en traits con su letra chica, orphan rule y newtype, blanket impls, Send/Sync/Sized, Deref y las conversiones From/AsRef/Borrow.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS2</span>
+  <span class="badge">⏱ 60–190 min</span>
+  <span class="badge">🎯 Pre-req: RuS1</span>
+  <span class="badge">🧬 Tipos</span>
+</div>
+
+<article>
+
+<h1>RuS2 — Traits avanzados: GATs, coherencia y dispatch</h1>
+
+<h2>RuS2.0 Por qué este módulo</h2>
+
+<p>En la mayoría de los lenguajes orientados a objetos, cuando tenés que decidir cómo se organiza un sistema, la herramienta es la <strong>herencia</strong>: una clase base, subclases que la especializan, métodos virtuales que se sobrescriben. Rust no tiene nada de eso. No hay herencia de implementación, no hay clases abstractas, no hay <code>super.metodo()</code>. Lo único que hay son <strong>traits</strong>.</p>
+
+<p>Eso convierte al sistema de traits en algo mucho más grande que "las interfaces de Rust". Es <strong>el lenguaje de diseño completo</strong>: el polimorfismo, la reutilización, las conversiones, las garantías de concurrencia, la sobrecarga de operadores, el manejo de errores con <code>?</code> y hasta la seguridad de memoria entre hilos se expresan como traits. Si el diseño de traits está mal, no hay refactor cosmético que lo salve: la firma equivocada de un tipo asociado se propaga por cincuenta archivos.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todas las decisiones difíciles de arquitectura en Rust se reducen a cuatro preguntas, y las cuatro se contestan en este módulo: <strong>(1)</strong> ¿este tipo va como parámetro genérico o como tipo asociado? <strong>(2)</strong> ¿este trait se resuelve en compilación o en runtime? <strong>(3)</strong> ¿este trait tiene que ser usable como <code>dyn</code>? <strong>(4)</strong> ¿esto necesita ser un trait, o alcanzaba con una función? Las tres primeras son técnicas y tienen respuestas casi mecánicas. La cuarta es de criterio y es la que más código de más genera.
+</div>
+
+<p>Escribimos esto con <strong>Rust 1.95</strong> y la <strong>edición 2024</strong> como línea de base. Dos fechas importan mucho para lo que sigue: los <strong>GATs</strong> son estables desde <strong>1.65</strong> (noviembre 2022) y <code>async fn</code> en traits es estable desde <strong>1.75</strong> (diciembre 2023) — con una letra chica que vamos a leer entera, porque es la principal fuente de sorpresas en código async de producción.</p>
+
+<div class="info">
+  <strong>Nota de vocabulario.</strong> Lo que durante una década se llamó <em>object safety</em> ("¿este trait puede usarse como <code>dyn Trait</code>?") se renombró oficialmente a <strong><em>dyn compatibility</em></strong> a partir de Rust 1.83. El concepto es idéntico; cambió el nombre porque "safety" en Rust ya significa otra cosa (<code>unsafe</code>) y confundía. Vas a ver los dos términos: en el compilador moderno leés <em>"the trait is not dyn compatible"</em>, en el 90% de los blogs y libros vas a leer <em>"not object safe"</em>. Son lo mismo.
+</div>
+
+<h2>RuS2.1 Tipos asociados vs parámetros de tipo: la decisión que define tu API</h2>
+
+<p>Un trait puede recibir tipos de dos maneras completamente distintas. La diferencia parece cosmética la primera vez que la ves y es, de lejos, la decisión de diseño más costosa de revertir.</p>
+
+<pre><code class="lang-rust">// (A) Tipo asociado — el tipo es una SALIDA del trait.
+//     Dado Self, el tipo queda determinado. Hay UNA sola respuesta.
+trait Iterator {
+    type Item;
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&gt;;
+}
+
+// (B) Parámetro de tipo — el tipo es una ENTRADA del trait.
+//     El que llama elige. Puede haber MUCHAS respuestas para el mismo Self.
+trait From&lt;T&gt; {
+    fn from(valor: T) -&gt; Self;
+}</code></pre>
+
+<p>La formulación precisa es esta: un <strong>parámetro genérico</strong> hace que el trait sea, en realidad, una <em>familia</em> de traits — <code>From&lt;u8&gt;</code> y <code>From&lt;String&gt;</code> son traits distintos y un mismo tipo puede implementar los dos. Un <strong>tipo asociado</strong>, en cambio, es una función del tipo que implementa: dado <code>Self</code>, existe exactamente un <code>Self::Item</code>.</p>
+
+<div class="rule">
+  <strong>📌 El test de una línea.</strong> Preguntate: <em>«¿tiene sentido que un mismo tipo implemente este trait más de una vez, con tipos distintos?»</em> Si la respuesta es <strong>sí</strong>, va como parámetro genérico. Si es <strong>no</strong>, va como tipo asociado. No hay un tercer caso, y contestar mal esta pregunta se paga durante todo el ciclo de vida del código.
+</div>
+
+<h3>Por qué <code>Iterator::Item</code> es asociado y no parámetro</h3>
+
+<p><code>Iterator</code> es el caso testigo perfecto porque en las primeras versiones de Rust se debatió exactamente esto. Supongamos que fuera <code>Iterator&lt;Item&gt;</code>, con parámetro:</p>
+
+<pre><code class="lang-rust">// HIPOTÉTICO: si Iterator tuviera parámetro en vez de tipo asociado
+trait Iterator&lt;Item&gt; {
+    fn next(&amp;mut self) -&gt; Option&lt;Item&gt;;
+}
+
+struct Bytes { /* ... */ }
+
+impl Iterator&lt;u8&gt;   for Bytes { /* ... */ }   // legal
+impl Iterator&lt;char&gt; for Bytes { /* ... */ }   // TAMBIÉN legal
+
+// Y ahora esto es irresoluble:
+let b = Bytes::new();
+for x in b { }              // ¿x es u8 o char? El compilador no tiene forma de saberlo.
+let total: u32 = b.sum();   // ídem: ¿qué impl?</code></pre>
+
+<p>Con parámetro, cada uso de un iterador necesitaría anotación explícita. El <code>for</code>, que es la razón de existir del trait, dejaría de funcionar sin ayuda del programador. Con tipo asociado, en cambio, la inferencia tiene un camino único y todo el ecosistema de adaptadores (<code>map</code>, <code>filter</code>, <code>collect</code>) se escribe sin arrastrar parámetros.</p>
+
+<p>La contracara ergonómica se ve al escribir <em>límites</em> (bounds). Compará las dos firmas de la misma función:</p>
+
+<pre><code class="lang-rust">// Con tipo asociado: el tipo se restringe donde hace falta, sin agregar parámetros.
+fn sumar&lt;I&gt;(it: I) -&gt; u64
+where
+    I: Iterator&lt;Item = u64&gt;,
+{
+    it.sum()
+}
+
+// Con parámetro habría que arrastrarlo por TODA la cadena de llamadas:
+fn sumar_hipotetico&lt;T, I&gt;(it: I) -&gt; T
+where
+    I: Iterator&lt;T&gt;,
+    T: std::iter::Sum&lt;T&gt;,
+{
+    it.sum()
+}</code></pre>
+
+<p>Ese <code>T</code> extra no se queda quieto: cualquier función que llame a <code>sumar_hipotetico</code> y sea genérica también tiene que declararlo, y así hacia arriba hasta el <code>main</code>. Es la clase de deuda que no se ve en el primer archivo y se vuelve insoportable en el décimo.</p>
+
+<h3>El caso híbrido: <code>Add</code> tiene los dos</h3>
+
+<p>El operador <code>+</code> es el mejor ejemplo de que la decisión no es "asociado bueno, parámetro malo", sino que <em>cada tipo cumple un rol distinto</em>:</p>
+
+<pre><code class="lang-rust">// std::ops::Add — simplificado
+trait Add&lt;Rhs = Self&gt; {
+    type Output;
+    fn add(self, rhs: Rhs) -&gt; Self::Output;
+}</code></pre>
+
+<ul>
+  <li><strong><code>Rhs</code> es parámetro</strong> (con valor por defecto <code>Self</code>) porque un mismo tipo tiene que poder sumarse con varios: <code>Instant + Duration</code>, <code>Duration + Duration</code>, <code>String + &amp;str</code>. Son impls distintas y todas legítimas.</li>
+  <li><strong><code>Output</code> es asociado</strong> porque una vez fijados <code>Self</code> y <code>Rhs</code>, el tipo del resultado ya está decidido. Si <code>Output</code> fuera parámetro, <code>a + b</code> sería ambiguo y necesitarías anotar el tipo de cada suma.</li>
+</ul>
+
+<pre><code class="lang-rust">use std::ops::Add;
+
+#[derive(Debug, Clone, Copy)]
+struct Metros(f64);
+#[derive(Debug, Clone, Copy)]
+struct Pies(f64);
+
+// Mismo Self, dos impls: eso solo es posible porque Rhs es parámetro.
+impl Add&lt;Metros&gt; for Metros {
+    type Output = Metros;
+    fn add(self, o: Metros) -&gt; Metros { Metros(self.0 + o.0) }
+}
+
+impl Add&lt;Pies&gt; for Metros {
+    type Output = Metros;                       // Output determinado: no hay ambigüedad
+    fn add(self, o: Pies) -&gt; Metros { Metros(self.0 + o.0 * 0.3048) }
+}
+
+let d = Metros(10.0) + Pies(3.0);   // el compilador elige el impl por el tipo del Rhs</code></pre>
+
+<h3>Tabla de decisión</h3>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Tipo asociado (<code>type Item;</code>)</th><th>Parámetro genérico (<code>trait T&lt;X&gt;</code>)</th></tr></thead>
+<tbody>
+<tr><td><strong>Rol del tipo</strong></td><td>Salida: lo decide el <em>implementador</em></td><td>Entrada: lo decide el <em>que llama</em></td></tr>
+<tr><td><strong>Impls por tipo</strong></td><td>Exactamente una</td><td>Tantas como quieras</td></tr>
+<tr><td><strong>Inferencia</strong></td><td>Directa, sin anotaciones</td><td>Suele necesitar turbofish o anotación</td></tr>
+<tr><td><strong>Bounds</strong></td><td><code>I: Iterator&lt;Item = u64&gt;</code> — no suma parámetros</td><td>Agrega un parámetro que se propaga hacia arriba</td></tr>
+<tr><td><strong>Uso con <code>dyn</code></strong></td><td>Hay que fijarlo: <code>dyn Iterator&lt;Item = u8&gt;</code></td><td>Cada instancia es un trait distinto: <code>dyn From&lt;u8&gt;</code></td></tr>
+<tr><td><strong>Ejemplos en std</strong></td><td><code>Iterator::Item</code>, <code>Deref::Target</code>, <code>Future::Output</code>, <code>IntoIterator::IntoIter</code>, <code>TryFrom::Error</code></td><td><code>From&lt;T&gt;</code>, <code>Add&lt;Rhs&gt;</code>, <code>AsRef&lt;T&gt;</code>, <code>Borrow&lt;T&gt;</code>, <code>PartialEq&lt;Rhs&gt;</code></td></tr>
+<tr><td><strong>Costo de equivocarse</strong></td><td>Si necesitabas varias impls, hay que romper la API</td><td>Ruido de anotaciones en cada uso y errores de inferencia crípticos</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error más común:</strong> poner el tipo de <em>error</em> de un trait de servicio como parámetro genérico. <code>trait Repositorio&lt;E&gt;</code> obliga a que cada consumidor arrastre <code>E</code>, y el implementador —que es el único que sabe qué errores puede tirar— no lo controla. Va como asociado, igual que <code>TryFrom::Error</code>: <code>trait Repositorio { type Error; }</code>.
+</div>
+
+<h2>RuS2.2 Dispatch estático vs dinámico: qué pagás en cada caso</h2>
+
+<p>Rust ofrece las dos formas de polimorfismo y —a diferencia de casi cualquier otro lenguaje— te hace elegir explícitamente. No hay un default oculto.</p>
+
+<pre><code class="lang-rust">trait Dibujable {
+    fn dibujar(&amp;self) -&gt; String;
+}
+
+// (A) Dispatch ESTÁTICO: monomorfización.
+//     El compilador genera una copia de esta función POR CADA T concreto que uses.
+fn render_estatico&lt;T: Dibujable&gt;(items: &amp;[T]) -&gt; String {
+    items.iter().map(|i| i.dibujar()).collect()
+}
+
+// (B) Dispatch DINÁMICO: una sola copia, la decisión se toma en runtime.
+fn render_dinamico(items: &amp;[Box&lt;dyn Dibujable&gt;]) -&gt; String {
+    items.iter().map(|i| i.dibujar()).collect()
+}</code></pre>
+
+<h3>Qué hace exactamente la monomorfización</h3>
+
+<p>Si llamás <code>render_estatico</code> con <code>Circulo</code>, <code>Cuadrado</code> y <code>Texto</code>, el compilador emite <strong>tres funciones distintas</strong> en el binario, cada una con la llamada a <code>dibujar</code> resuelta y, muy probablemente, <em>inlineada</em>. Eso es lo que hace que los genéricos de Rust sean de costo cero en tiempo de ejecución: no queda ninguna indirección. Y también es lo que hace que el binario y el tiempo de compilación crezcan de manera lineal en la cantidad de instanciaciones.</p>
+
+<pre><code class="lang-rust">// Lo que "ve" el backend después de monomorfizar (pseudo-código):
+fn render_estatico__Circulo(items: &amp;[Circulo]) -&gt; String { /* dibujar de Circulo, inlineado */ }
+fn render_estatico__Cuadrado(items: &amp;[Cuadrado]) -&gt; String { /* ... */ }
+fn render_estatico__Texto(items: &amp;[Texto]) -&gt; String { /* ... */ }</code></pre>
+
+<h3>Qué es exactamente una vtable</h3>
+
+<p><code>dyn Trait</code> es un tipo <em>unsized</em>: no tiene tamaño conocido en compilación, así que siempre se usa detrás de un puntero (<code>&amp;dyn</code>, <code>Box&lt;dyn&gt;</code>, <code>Arc&lt;dyn&gt;</code>). Ese puntero es <strong>gordo</strong>: son dos palabras, una al dato y otra a la <em>vtable</em>, una tabla estática —una por cada par (tipo, trait)— con el destructor, el tamaño, la alineación y los punteros a cada método.</p>
+
+<pre><code class="lang-rust">use std::mem::size_of;
+
+fn main() {
+    println!("{}", size_of::&lt;&amp;u32&gt;());               // 8   — puntero fino
+    println!("{}", size_of::&lt;&amp;dyn Dibujable&gt;());     // 16  — datos + vtable
+    println!("{}", size_of::&lt;Box&lt;dyn Dibujable&gt;&gt;()); // 16
+    println!("{}", size_of::&lt;Option&lt;Box&lt;dyn Dibujable&gt;&gt;&gt;()); // 16 — niche optimization
+}</code></pre>
+
+<pre><code class="lang-rust">// Layout conceptual de la vtable que genera rustc para (Circulo, dyn Dibujable):
+// struct VTable {
+//     drop_in_place: fn(*mut ()),
+//     size:  usize,
+//     align: usize,
+//     dibujar: fn(*const ()) -&gt; String,   // un puntero por método del trait
+// }</code></pre>
+
+<h3>Los costos reales, uno por uno</h3>
+
+<table>
+<thead><tr><th>Costo</th><th>Estático (monomorfización)</th><th>Dinámico (<code>dyn Trait</code>)</th></tr></thead>
+<tbody>
+<tr><td><strong>Costo de la llamada</strong></td><td>Cero — llamada directa, casi siempre inlineada</td><td>Una carga desde la vtable + llamada indirecta (~1–3 ns; el predictor de saltos suele acertar)</td></tr>
+<tr><td><strong>Inlining</strong></td><td>Sí, y con él constant folding, vectorización, eliminación de branches</td><td>No. <em>Este es el costo grande, no la indirección.</em></td></tr>
+<tr><td><strong>Tamaño del binario</strong></td><td>Crece × cantidad de instanciaciones</td><td>Una sola copia del código + una vtable por tipo (decenas de bytes)</td></tr>
+<tr><td><strong>Tiempo de compilación</strong></td><td>Crece rápido: LLVM procesa cada copia por separado</td><td>Prácticamente constante</td></tr>
+<tr><td><strong>Tamaño del puntero</strong></td><td>1 palabra</td><td>2 palabras (afecta la densidad de caché en colecciones grandes)</td></tr>
+<tr><td><strong>Colección heterogénea</strong></td><td>Imposible: <code>Vec&lt;T&gt;</code> es de un solo tipo</td><td>Natural: <code>Vec&lt;Box&lt;dyn Trait&gt;&gt;</code></td></tr>
+<tr><td><strong>Carga en runtime (plugins, <code>dlopen</code>)</strong></td><td>Imposible</td><td>Es la única opción</td></tr>
+<tr><td><strong>Sustituir por un doble en tests</strong></td><td>Cambia la firma genérica de todo el árbol de llamadas</td><td>Se inyecta un <code>Box&lt;dyn&gt;</code> y listo</td></tr>
+<tr><td><strong>Errores del compilador</strong></td><td>Largos, con bounds sin satisfacer propagados</td><td>Cortos y locales</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla que uso.</strong> <strong>Dispatch dinámico en los bordes, estático en el núcleo caliente.</strong> Los bordes son donde la variedad es real y el costo por llamada es irrelevante frente al I/O: repositorios, transportes, formateadores de log, handlers de plugins. El núcleo caliente es donde hay millones de llamadas por segundo sobre uno o dos tipos concretos: ahí querés inlining. Si no sabés en cuál de los dos estás, <strong>estás en el borde</strong> — es lo más frecuente.
+</div>
+
+<h3>La tercera opción que casi nadie considera: un <code>enum</code></h3>
+
+<p>Cuando el conjunto de implementaciones es <em>cerrado</em> y lo controlás vos, un enum le gana a las dos:</p>
+
+<pre><code class="lang-rust">enum Forma {
+    Circulo(Circulo),
+    Cuadrado(Cuadrado),
+    Texto(Texto),
+}
+
+impl Forma {
+    fn dibujar(&amp;self) -&gt; String {
+        match self {
+            Forma::Circulo(c)  =&gt; c.dibujar(),
+            Forma::Cuadrado(c) =&gt; c.dibujar(),
+            Forma::Texto(t)    =&gt; t.dibujar(),
+        }
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th></th><th>Genérico</th><th><code>dyn Trait</code></th><th><code>enum</code></th></tr></thead>
+<tbody>
+<tr><td>Asignación en heap</td><td>No</td><td>Sí (con <code>Box</code>)</td><td>No</td></tr>
+<tr><td>Se puede inlinear</td><td>Sí</td><td>No</td><td>Sí (tras el <code>match</code>)</td></tr>
+<tr><td>Conjunto abierto</td><td>Sí (en tiempo de compilación)</td><td>Sí (también en runtime)</td><td><strong>No</strong></td></tr>
+<tr><td>Colección heterogénea</td><td>No</td><td>Sí</td><td>Sí</td></tr>
+<tr><td>Tamaño de cada elemento</td><td>El de <code>T</code></td><td>16 bytes + heap</td><td>El de la variante <strong>más grande</strong></td></tr>
+<tr><td>Agregar una variante</td><td>Transparente</td><td>Transparente</td><td>Rompe todos los <code>match</code> (a veces eso es lo que querés)</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Si el enum tiene una variante mucho más grande que las otras, cada elemento del <code>Vec</code> paga ese tamaño. La solución es <code>Box</code> solo esa variante: <code>Texto(Box&lt;TextoGigante&gt;)</code>. <code>clippy::large_enum_variant</code> te avisa. Y si el <code>match</code> repetido te molesta, la crate <code>enum_dispatch</code> lo genera con una macro.
+</div>
+
+<h2>RuS2.3 Object safety: por qué no todo trait puede ser <code>dyn</code></h2>
+
+<p>Cuando escribís <code>Box&lt;dyn Trait&gt;</code>, el compilador tiene que poder construir una vtable. Si alguna parte del trait hace eso imposible, el trait <strong>no es dyn-compatible</strong> y el error es <code>E0038</code>. Las reglas no son arbitrarias: cada una tapa un agujero concreto.</p>
+
+<table>
+<thead><tr><th>Regla</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Ningún método puede tener <strong>parámetros de tipo genéricos</strong></td><td>Habría que poner en la vtable una entrada por cada instanciación posible — un conjunto infinito y desconocido en el momento de generar la tabla</td></tr>
+<tr><td>El receptor debe ser <code>self</code>, <code>&amp;self</code>, <code>&amp;mut self</code>, <code>Box&lt;Self&gt;</code>, <code>Rc&lt;Self&gt;</code>, <code>Arc&lt;Self&gt;</code> o <code>Pin&lt;P&gt;</code></td><td>Solo esos receptores saben llegar al dato desde un puntero gordo</td></tr>
+<tr><td><code>Self</code> no puede aparecer <strong>por valor en el retorno</strong> ni como tipo de un parámetro</td><td>Detrás de <code>dyn</code>, <code>Self</code> es unsized: no se puede devolver ni pasar por valor</td></tr>
+<tr><td>Nada de <strong>constantes asociadas</strong></td><td>No hay dónde guardarlas por instancia y no hay forma de resolverlas por puntero</td></tr>
+<tr><td>Nada de <strong>tipos asociados genéricos (GATs)</strong></td><td>Mismo problema que los métodos genéricos: la tabla sería infinita</td></tr>
+<tr><td>Nada de <code>impl Trait</code> en retorno (RPITIT), y por lo tanto nada de <code>async fn</code></td><td>Cada impl devuelve un tipo opaco distinto y de tamaño distinto</td></tr>
+<tr><td>El trait no puede requerir <code>Self: Sized</code></td><td>Sería una contradicción directa con <code>dyn</code></td></tr>
+<tr><td>Todos los <strong>supertraits</strong> deben ser dyn-compatibles</td><td>La vtable incluye la de los supertraits</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">use std::io::Write;
+
+trait Serializador {
+    fn nombre(&amp;self) -&gt; &amp;str;
+    fn escribir&lt;W: Write&gt;(&amp;self, w: W);     // ✗ método genérico
+}
+
+// error[E0038]: the trait `Serializador` is not dyn compatible
+// note: for this to be dyn compatible, the method `escribir` cannot have generic type parameters
+let s: Box&lt;dyn Serializador&gt; = todo!();</code></pre>
+
+<h3>Los tres rediseños que resuelven el 95% de los casos</h3>
+
+<p><strong>1. Reemplazar el genérico por un <code>dyn</code> en el parámetro.</strong> Casi siempre es la solución correcta y el costo es una indirección más en un lugar donde ya estabas haciendo I/O:</p>
+
+<pre><code class="lang-rust">trait Serializador {
+    fn nombre(&amp;self) -&gt; &amp;str;
+    fn escribir(&amp;self, w: &amp;mut dyn Write) -&gt; std::io::Result&lt;()&gt;;   // ✓ dyn-compatible
+}
+
+let s: Box&lt;dyn Serializador&gt; = Box::new(Json);
+let mut buf = Vec::new();
+s.escribir(&amp;mut buf)?;</code></pre>
+
+<p><strong>2. Excluir el método problemático de la vtable con <code>where Self: Sized</code>.</strong> El método sigue existiendo para los tipos concretos, pero no se puede llamar a través de <code>dyn</code>. Es el truco que usa <code>Iterator</code> para que <code>dyn Iterator</code> exista pese a tener sesenta métodos con genéricos:</p>
+
+<pre><code class="lang-rust">trait Serializador {
+    fn escribir(&amp;self, w: &amp;mut dyn Write) -&gt; std::io::Result&lt;()&gt;;
+
+    // Azúcar cómoda, pero fuera de la vtable:
+    fn a_string(&amp;self) -&gt; String
+    where
+        Self: Sized,
+    {
+        let mut b = Vec::new();
+        self.escribir(&amp;mut b).unwrap();
+        String::from_utf8(b).unwrap()
+    }
+}</code></pre>
+
+<p><strong>3. Partir el trait en dos: núcleo <code>dyn</code>-compatible + trait de extensión con blanket impl.</strong> Es el patrón más limpio cuando querés las dos cosas: los métodos cómodos y la posibilidad de guardar <code>Box&lt;dyn&gt;</code>.</p>
+
+<pre><code class="lang-rust">// Núcleo mínimo, dyn-compatible. Es lo que se guarda e inyecta.
+trait Serializador {
+    fn escribir(&amp;self, w: &amp;mut dyn Write) -&gt; std::io::Result&lt;()&gt;;
+}
+
+// Extensión ergonómica: métodos genéricos, disponible para TODO Serializador,
+// incluido `dyn Serializador` (porque el blanket cubre `T: ?Sized`).
+trait SerializadorExt: Serializador {
+    fn a_vec(&amp;self) -&gt; std::io::Result&lt;Vec&lt;u8&gt;&gt; {
+        let mut b = Vec::new();
+        self.escribir(&amp;mut b)?;
+        Ok(b)
+    }
+}
+
+impl&lt;T: Serializador + ?Sized&gt; SerializadorExt for T {}</code></pre>
+
+<div class="concept">
+  <strong>💡 Ese <code>?Sized</code> del blanket impl es lo que hace que el patrón funcione.</strong> Sin él, <code>dyn Serializador</code> —que es unsized— no obtendría los métodos de extensión y tendrías que desreferenciar a mano en cada uso. Es exactamente lo que hacen <code>tokio::io::AsyncReadExt</code>, <code>futures::StreamExt</code> e <code>itertools::Itertools</code>.
+</div>
+
+<h3>El caso <code>Clone</code>: el que te va a morder seguro</h3>
+
+<p><code>Clone</code> no es dyn-compatible, porque <code>fn clone(&amp;self) -&gt; Self</code> devuelve <code>Self</code> por valor. Entonces <code>Box&lt;dyn MiTrait&gt;</code> nunca se puede clonar si <code>MiTrait: Clone</code>... y peor: ni siquiera podés declarar <code>trait MiTrait: Clone</code> y usar <code>dyn</code>. La salida estándar es devolver el <code>Box</code> ya construido:</p>
+
+<pre><code class="lang-rust">trait Politica {
+    fn evaluar(&amp;self, x: u32) -&gt; bool;
+    fn clonar(&amp;self) -&gt; Box&lt;dyn Politica&gt;;    // ✓ el retorno es Sized
+}
+
+impl&lt;T&gt; Politica for T
+where
+    T: 'static + Clone + PoliticaBase,
+{
+    fn evaluar(&amp;self, x: u32) -&gt; bool { self.evaluar_base(x) }
+    fn clonar(&amp;self) -&gt; Box&lt;dyn Politica&gt; { Box::new(self.clone()) }
+}
+
+// Y así Box&lt;dyn Politica&gt; sí puede implementar Clone:
+impl Clone for Box&lt;dyn Politica&gt; {
+    fn clone(&amp;self) -&gt; Self { self.clonar() }
+}</code></pre>
+
+<div class="tip">
+  La crate <code>dyn-clone</code> hace exactamente esto con dos líneas (<code>dyn_clone::clone_trait_object!(Politica);</code>). Vale la pena conocer el mecanismo igual: el día que el patrón aparezca con <code>PartialEq</code> o con <code>Hash</code> —que tampoco son dyn-compatibles— vas a tener que escribirlo a mano.
+</div>
+
+<h2>RuS2.4 GATs: el tipo asociado que necesitaba un lifetime</h2>
+
+<p>Hay una limitación de <code>Iterator</code> que es fácil de no notar hasta que te choca de frente: <strong>el ítem que devuelve <code>next</code> no puede tomar prestado del iterador</strong>. Y no es un capricho, es una consecuencia directa de que <code>Item</code> sea un tipo asociado <em>sin parámetros</em>.</p>
+
+<pre><code class="lang-rust">trait Iterator {
+    type Item;                                    // fijo, no depende de nada
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&gt;;     // el préstamo de self es local a la llamada
+}</code></pre>
+
+<p><code>Self::Item</code> se elige una vez, en el <code>impl</code>, sin acceso al lifetime del <code>&amp;mut self</code> de cada llamada. Por lo tanto el ítem <strong>no puede</strong> contener una referencia a los datos del iterador. Eso explica varias cosas que quizá viviste como rarezas:</p>
+
+<ul>
+  <li>No existe <code>slice::windows_mut</code> — cada ventana tomaría prestado el slice mutablemente.</li>
+  <li><code>BufRead::lines()</code> devuelve <code>io::Result&lt;String&gt;</code>: <strong>asigna un <code>String</code> por línea</strong>. Por eso, para leer un archivo grande, la versión rápida es <code>read_line</code> reusando un buffer, que no es un <code>Iterator</code>.</li>
+  <li>Un parser zero-copy que devuelva tokens apuntando a su propio buffer interno no puede exponerse como <code>Iterator</code>.</li>
+</ul>
+
+<h3>La solución: un tipo asociado que sí toma parámetros</h3>
+
+<p>Los <strong>GATs</strong> (Generic Associated Types), estables desde <strong>Rust 1.65</strong>, permiten que un tipo asociado tenga sus propios parámetros de lifetime o de tipo:</p>
+
+<pre><code class="lang-rust">trait LendingIterator {
+    type Item&lt;'a&gt;
+    where
+        Self: 'a;
+
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&lt;'_&gt;&gt;;
+}</code></pre>
+
+<p>Ahora <code>Item</code> es una <em>función de tipos</em>: dado un lifetime <code>'a</code>, produce un tipo. Y <code>next</code> puede instanciarlo con el lifetime del préstamo de <code>self</code>. Eso es lo que era literalmente imposible de expresar antes de 1.65 — se intentaba con traits auxiliares y bounds <code>for&lt;'a&gt;</code>, y el resultado eran firmas que nadie podía leer.</p>
+
+<pre><code class="lang-rust">struct VentanasMut&lt;'t, T&gt; {
+    datos: &amp;'t mut [T],
+    tam: usize,
+    pos: usize,
+}
+
+impl&lt;'t, T&gt; LendingIterator for VentanasMut&lt;'t, T&gt; {
+    type Item&lt;'a&gt; = &amp;'a mut [T]
+    where
+        Self: 'a;
+
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&lt;'_&gt;&gt; {
+        let inicio = self.pos;
+        if inicio + self.tam &gt; self.datos.len() {
+            return None;
+        }
+        self.pos += 1;                                   // mutamos ANTES de prestar
+        Some(&amp;mut self.datos[inicio..inicio + self.tam])
+    }
+}
+
+// Y el uso: cada ventana toma prestado el iterador, así que solo puede haber una viva.
+let mut v = [1, 2, 3, 4, 5];
+let mut it = VentanasMut { datos: &amp;mut v, tam: 3, pos: 0 };
+while let Some(w) = it.next() {
+    w.sort_unstable();          // ✓ mutamos la ventana en el lugar, sin copiar
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El <code>where Self: 'a</code> no es decorativo.</strong> Sin él, el compilador no puede saber que <code>Self::Item&lt;'a&gt;</code> —que puede contener referencias a datos de <code>Self</code>— sigue siendo válido durante <code>'a</code>. Es tan universalmente necesario que rustc directamente <em>te sugiere agregarlo</em> en el mensaje de error. Ponelo siempre en la declaración del trait; si algún impl no lo necesita, no molesta.
+</div>
+
+<h3>El otro uso de GATs: familias de tipos</h3>
+
+<p>El caso de lifetime es el más famoso, pero el patrón general es "quiero que el trait devuelva un <em>constructor</em> de tipos, no un tipo". Ejemplo típico: un trait que devuelve un iterador que toma prestado de <code>self</code>.</p>
+
+<pre><code class="lang-rust">trait Coleccion {
+    type Item;
+    type Iter&lt;'a&gt;: Iterator&lt;Item = &amp;'a Self::Item&gt;
+    where
+        Self: 'a,
+        Self::Item: 'a;
+
+    fn iterar(&amp;self) -&gt; Self::Iter&lt;'_&gt;;
+}
+
+impl&lt;T&gt; Coleccion for Vec&lt;T&gt; {
+    type Item = T;
+    type Iter&lt;'a&gt; = std::slice::Iter&lt;'a, T&gt;
+    where
+        T: 'a;
+
+    fn iterar(&amp;self) -&gt; Self::Iter&lt;'_&gt; { self.iter() }
+}</code></pre>
+
+<div class="info">
+  Para <em>este</em> caso concreto, desde Rust 1.75 hay una alternativa mucho más corta: <code>fn iterar(&amp;self) -&gt; impl Iterator&lt;Item = &amp;Self::Item&gt;;</code> con RPITIT (RuS2.5). Los GATs siguen haciendo falta cuando necesitás <strong>nombrar</strong> el tipo desde afuera, ponerle bounds adicionales, o cuando el parámetro no es un lifetime sino un tipo.
+</div>
+
+<h3>Honestidad sobre los límites</h3>
+
+<p>Los GATs son potentes y también incómodos. Vale la pena saberlo antes de basar una arquitectura en ellos:</p>
+
+<ul>
+  <li><strong>Un trait con GATs no es dyn-compatible.</strong> Adiós <code>Box&lt;dyn LendingIterator&gt;</code>.</li>
+  <li><strong><code>LendingIterator</code> no está en <code>std</code></strong> y probablemente tarde. No compone con los adaptadores existentes (<code>map</code>, <code>filter</code>, <code>collect</code> asumen que el ítem no toma prestado), no funciona con <code>for</code>, y varias operaciones simplemente no tienen sentido (no podés hacer <code>collect</code> de ítems que se invalidan en el próximo <code>next</code>).</li>
+  <li><strong>Los mensajes de error son de los peores de Rust.</strong> Un bound de lifetime mal puesto produce errores de varias pantallas.</li>
+  <li>Hay límites conocidos alrededor de HRTBs (<code>for&lt;'a&gt;</code>) e implicaciones de lifetime que se van resolviendo de a poco.</li>
+</ul>
+
+<div class="warn">
+  <strong>Criterio práctico:</strong> usá GATs cuando el préstamo <em>es</em> el punto del diseño — parsers zero-copy, arenas, filas de base de datos que reusan un buffer, wrappers de FFI que prestan memoria ajena. Si estás llegando a GATs para evitar un <code>clone()</code> de un <code>String</code> chico en un camino frío, medí primero: casi seguro el <code>clone</code> es más barato que la complejidad que estás por agregar.
+</div>
+
+<h2>RuS2.5 <code>impl Trait</code>: en argumento, en retorno y dentro de traits</h2>
+
+<p><code>impl Trait</code> significa cosas <strong>distintas</strong> según dónde aparezca. Confundirlas es una fuente clásica de errores raros.</p>
+
+<h3>En posición de argumento (APIT)</h3>
+
+<pre><code class="lang-rust">fn mostrar(x: impl std::fmt::Display) { println!("{x}"); }
+
+// Es casi azúcar de:
+fn mostrar_gen&lt;T: std::fmt::Display&gt;(x: T) { println!("{x}"); }</code></pre>
+
+<p>Casi. La diferencia es real y es de API: con <code>impl Trait</code> en argumento el que llama <strong>no puede usar turbofish</strong>. <code>mostrar::&lt;u32&gt;(1)</code> no compila; <code>mostrar_gen::&lt;u32&gt;(1)</code> sí. Por eso, cambiar de una forma a la otra en una función pública es un <strong>cambio incompatible</strong> aunque el código se vea equivalente.</p>
+
+<h3>En posición de retorno (RPIT)</h3>
+
+<pre><code class="lang-rust">fn pares(v: Vec&lt;u32&gt;) -&gt; impl Iterator&lt;Item = u32&gt; {
+    v.into_iter().filter(|x| x % 2 == 0)
+}</code></pre>
+
+<p>Acá <code>impl Trait</code> es un <strong>tipo opaco</strong>: existe un tipo concreto real (una <code>Filter&lt;IntoIter&lt;u32&gt;, [closure]&gt;</code> impronunciable), el compilador lo conoce y lo optimiza, pero el que llama solo ve los bounds que declaraste. Es la única forma de devolver closures e iteradores encadenados sin <code>Box</code>.</p>
+
+<div class="mistake">
+  <strong>Dos trampas de RPIT.</strong> <strong>(1)</strong> Solo puede haber <em>un</em> tipo concreto por función: si dos ramas de un <code>if</code> devuelven iteradores distintos, no compila — ahí necesitás <code>Box&lt;dyn Iterator&gt;</code>, <code>Either</code>, o un enum. <strong>(2)</strong> Los <em>auto traits</em> se filtran: si el tipo concreto resulta ser <code>Send</code>, el que llama puede usarlo como <code>Send</code> aunque vos no lo declaraste. Eso significa que un cambio interno tuyo que rompe <code>Send</code> le rompe la compilación a tus usuarios sin que la firma haya cambiado.
+</div>
+
+<pre><code class="lang-rust">// ✗ No compila: dos tipos concretos distintos para el mismo impl Trait
+fn elegir(cond: bool, v: Vec&lt;u32&gt;) -&gt; impl Iterator&lt;Item = u32&gt; {
+    if cond { v.into_iter().filter(|x| x &gt; &amp;0) }
+    else    { v.into_iter().map(|x| x * 2) }        // error[E0308]
+}
+
+// ✓ Con dyn: una sola firma, dos tipos posibles, a costa de una asignación
+fn elegir_ok(cond: bool, v: Vec&lt;u32&gt;) -&gt; Box&lt;dyn Iterator&lt;Item = u32&gt;&gt; {
+    if cond { Box::new(v.into_iter().filter(|x| x &gt; &amp;0)) }
+    else    { Box::new(v.into_iter().map(|x| x * 2)) }
+}</code></pre>
+
+<h3>Captura precisa de lifetimes y el cambio de la edición 2024</h3>
+
+<p>Un tipo opaco puede "capturar" lifetimes de los parámetros. En la <strong>edición 2021</strong>, un RPIT capturaba solo los lifetimes que aparecían explícitamente en los bounds, y había que escribir <code>+ '_</code> a mano todo el tiempo. En la <strong>edición 2024</strong> el default se invirtió: <strong>captura todos los lifetimes en alcance</strong>, que es lo que casi siempre querés. Para el caso raro en que <em>no</em> lo querés, existe la sintaxis de captura precisa <code>+ use&lt;...&gt;</code>, estable desde <strong>1.82</strong>:</p>
+
+<pre><code class="lang-rust">// Edición 2024: captura 'a y T por defecto — no hace falta el `+ 'a`
+fn nombres&lt;'a, T: Nombrable&gt;(v: &amp;'a [T]) -&gt; impl Iterator&lt;Item = &amp;'a str&gt; {
+    v.iter().map(|x| x.nombre())
+}
+
+// Captura precisa: "este opaco NO depende de 'a", y así el que llama
+// puede soltar el préstamo antes de consumir el resultado.
+fn conteo&lt;'a, T&gt;(v: &amp;'a [T]) -&gt; impl Iterator&lt;Item = usize&gt; + use&lt;&gt; {
+    (0..v.len()).collect::&lt;Vec&lt;_&gt;&gt;().into_iter()
+}</code></pre>
+
+<h3>RPITIT: <code>impl Trait</code> en retorno <em>dentro</em> de un trait</h3>
+
+<p>Estable desde <strong>Rust 1.75</strong>. Antes de eso, un trait que quisiera devolver un iterador tenía que declarar un tipo asociado y cada impl tenía que <em>nombrar</em> un tipo concreto — lo cual, con closures de por medio, era directamente imposible sin <code>Box</code>:</p>
+
+<pre><code class="lang-rust">// ANTES de 1.75 — el impl tenía que nombrar el tipo, y una closure no tiene nombre
+trait Almacen {
+    type Iter: Iterator&lt;Item = u32&gt;;
+    fn valores(&amp;self) -&gt; Self::Iter;
+}
+
+impl Almacen for MiAlmacen {
+    // ✗ imposible de escribir sin Box: el tipo de un `.filter(|x| ...)` no se puede nombrar
+    type Iter = std::vec::IntoIter&lt;u32&gt;;
+    fn valores(&amp;self) -&gt; Self::Iter { self.datos.clone().into_iter() }  // clone forzado
+}</code></pre>
+
+<pre><code class="lang-rust">// DESDE 1.75 — RPITIT
+trait Almacen {
+    fn valores(&amp;self) -&gt; impl Iterator&lt;Item = u32&gt;;
+}
+
+impl Almacen for MiAlmacen {
+    fn valores(&amp;self) -&gt; impl Iterator&lt;Item = u32&gt; {
+        self.datos.iter().copied().filter(|x| *x &gt; 0)   // ✓ sin clone, sin Box
+    }
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ RPITIT tiene un precio y hay que saberlo antes de usarlo:</strong> un trait con <code>impl Trait</code> en retorno <strong>deja de ser dyn-compatible</strong>. No hay <code>Box&lt;dyn Almacen&gt;</code>. Además el tipo de retorno es un tipo asociado <em>anónimo</em>: no lo podés nombrar, no le podés agregar bounds desde afuera (por ejemplo, exigir que sea <code>Send</code>) ni guardarlo en un campo de struct. Ese último límite es el que vuelve venenoso el próximo tema.
+</div>
+
+<h2>RuS2.6 <code>async fn</code> en traits: estable, con letra chica</h2>
+
+<p>Desde <strong>Rust 1.75</strong> podés escribir esto y compila:</p>
+
+<pre><code class="lang-rust">trait Repositorio {
+    async fn buscar(&amp;self, id: u64) -&gt; Option&lt;Usuario&gt;;
+    async fn guardar(&amp;self, u: &amp;Usuario) -&gt; Result&lt;(), RepoError&gt;;
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 La clave para entender todo lo que sigue:</strong> <code>async fn</code> en un trait <strong>no es una feature aparte</strong>. Es RPITIT con azúcar. La declaración de arriba desazucara exactamente a esto:
+  <pre><code class="lang-rust">trait Repositorio {
+    fn buscar(&amp;self, id: u64) -&gt; impl Future&lt;Output = Option&lt;Usuario&gt;&gt; + '_;
+    fn guardar&lt;'a&gt;(&amp;'a self, u: &amp;'a Usuario)
+        -&gt; impl Future&lt;Output = Result&lt;(), RepoError&gt;&gt; + 'a;
+}</code></pre>
+  Por lo tanto <strong>hereda las tres limitaciones de RPITIT</strong>: no es dyn-compatible, el futuro no se puede nombrar, y no le podés poner bounds desde afuera.
+</div>
+
+<h3>Límite 1 — no hay <code>Box&lt;dyn Repositorio&gt;</code></h3>
+
+<pre><code class="lang-rust">// error[E0038]: the trait `Repositorio` is not dyn compatible
+// note: method `buscar` returns an `impl Trait`
+let repos: Vec&lt;Box&lt;dyn Repositorio&gt;&gt; = vec![];</code></pre>
+
+<p>Y esto no es un detalle académico: es exactamente lo que necesitás para tener una colección heterogénea de backends, o para inyectar un doble en un test sin volver genérico todo el árbol de tipos.</p>
+
+<h3>Límite 2 — el problema de los bounds <code>Send</code></h3>
+
+<p>Este es el que más tiempo hace perder. <code>tokio::spawn</code> exige que el futuro sea <code>Send</code>. Con un trait genérico, no tenés forma de exigirlo:</p>
+
+<pre><code class="lang-rust">async fn procesar&lt;R: Repositorio&gt;(repo: R) {
+    tokio::spawn(async move {
+        repo.buscar(1).await;     // error: el futuro devuelto puede no ser Send
+    });
+}
+
+// Querrías escribir algo así, pero el tipo de retorno es anónimo:
+// async fn procesar&lt;R&gt;(repo: R) where R: Repositorio, R::buscar(..): Send  ← no es un bound común</code></pre>
+
+<p>Es un agujero real del lenguaje, no un error tuyo. La solución portátil y madura hoy es la crate <code>trait-variant</code>, que genera automáticamente una variante del trait con los bounds <code>Send</code> puestos en cada futuro:</p>
+
+<pre><code class="lang-rust">// Genera `RepositorioLocal` (sin Send) y `Repositorio: RepositorioLocal` con futuros Send.
+#[trait_variant::make(Repositorio: Send)]
+pub trait RepositorioLocal {
+    async fn buscar(&amp;self, id: u64) -&gt; Option&lt;Usuario&gt;;
+}
+
+// Ahora sí:
+async fn procesar&lt;R: Repositorio + Send + 'static&gt;(repo: R) {
+    tokio::spawn(async move { repo.buscar(1).await; });
+}</code></pre>
+
+<div class="info">
+  A nivel lenguaje, la respuesta definitiva a este problema es <strong>RTN</strong> (<em>Return Type Notation</em>): poder escribir <code>where R::buscar(..): Send</code> y hablar del tipo de retorno de un método sin nombrarlo. Es un área que se movió mucho entre 2024 y 2026; antes de apoyar una arquitectura en ella, verificá el estado exacto en la release que estés usando (<code>rustup doc --reference</code> o el changelog de tu versión). Mientras tanto, <code>trait-variant</code> funciona hoy y en toolchains viejos.
+</div>
+
+<h3>Límite 3 — el futuro no tiene nombre</h3>
+
+<p>No podés guardarlo en un campo de struct, ni ponerlo en un <code>Vec</code>, ni escribir <code>type MiFut = &lt;R as Repositorio&gt;::buscar::Future;</code>. Si tu diseño necesita <em>almacenar</em> futuros en vuelo —un pool, un scheduler propio, una máquina de estados— <code>async fn</code> nativo en trait no te alcanza.</p>
+
+<h3>Por qué <code>async-trait</code> sigue vivo en 2026</h3>
+
+<p>La macro <code>#[async_trait]</code> reescribe cada <code>async fn</code> como una función que devuelve un futuro <strong>boxeado</strong>:</p>
+
+<pre><code class="lang-rust">#[async_trait::async_trait]
+trait Repositorio: Send + Sync {
+    async fn buscar(&amp;self, id: u64) -&gt; Option&lt;Usuario&gt;;
+}
+
+// Genera, aproximadamente:
+// trait Repositorio: Send + Sync {
+//     fn buscar&lt;'a&gt;(&amp;'a self, id: u64)
+//         -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Option&lt;Usuario&gt;&gt; + Send + 'a&gt;&gt;;
+// }</code></pre>
+
+<p>Un tipo de retorno concreto y <code>Sized</code>, con <code>Send</code> ya puesto. Eso resuelve <strong>los tres límites de un saque</strong>: el trait vuelve a ser dyn-compatible, el futuro es nombrable (<code>BoxFuture</code>) y los bounds <code>Send</code> están declarados. El costo es explícito: <strong>una asignación en el heap por cada llamada</strong> y dispatch dinámico del futuro.</p>
+
+<table>
+<thead><tr><th>Cuándo</th><th>Qué usar</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>Trait interno, genérico, en camino caliente</td><td><code>async fn</code> nativo</td><td>Cero. La máquina de estados se inlinea</td></tr>
+<tr><td>Trait genérico que además hay que <code>spawn</code>ear</td><td><code>async fn</code> + <code>#[trait_variant::make(.. : Send)]</code></td><td>Cero en runtime; un macro más en el build</td></tr>
+<tr><td>Necesitás <code>Box&lt;dyn Trait&gt;</code> (plugins, DI, dobles de test, colección heterogénea)</td><td><code>#[async_trait]</code></td><td>Una asignación + indirección por llamada</td></tr>
+<tr><td>Necesitás <em>guardar</em> el futuro o controlar su tipo</td><td><code>fn f(&amp;self) -&gt; BoxFuture&lt;'_, T&gt;</code> escrito a mano</td><td>Igual que arriba, pero sin macro y con la firma visible</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 No es una derrota, es un trade-off explícito.</strong> Se lee mucho "usá <code>async fn</code> nativo, <code>async-trait</code> quedó obsoleto". Es falso a medias: quedó obsoleto para el caso genérico, que era el 60% de los usos. Para el 40% restante —todo lo que necesita <code>dyn</code>— sigue siendo <strong>la</strong> herramienta. Una asignación por llamada al lado de un round-trip a Postgres es ruido estadístico; en un loop que corre un millón de veces por segundo, no.
+</div>
+
+<h2>RuS2.7 Coherencia y la orphan rule</h2>
+
+<p><strong>Coherencia</strong> es la garantía de que, para un par (trait, tipo) dado, existe <strong>como máximo una implementación en todo el programa</strong>. No en tu crate: en todo el binario final, sumando todas las dependencias transitivas.</p>
+
+<p>Es una garantía más fuerte de lo que parece. Significa que <code>HashMap&lt;MiClave, V&gt;</code> hashea igual en tu código y adentro de una librería que ni sabés que existe. Significa que <code>a == b</code> no depende de qué módulo hizo la comparación. En lenguajes con clases de tipos "abiertas" (Scala con implicits, por ejemplo), estas garantías se pierden y aparecen bugs de los feos.</p>
+
+<p>La <strong>orphan rule</strong> es el mecanismo que hace cumplir la coherencia sin necesidad de un chequeo global. Simplificando: <code>impl Trait for Tipo</code> es legal si <strong>el trait es local a tu crate</strong> o <strong>el tipo es local a tu crate</strong>. Si los dos son ajenos, no.</p>
+
+<pre><code class="lang-rust">use std::fmt;
+
+// ✓ Trait ajeno, tipo propio
+struct MiTipo;
+impl fmt::Display for MiTipo { /* ... */ }
+
+// ✓ Trait propio, tipo ajeno
+trait Mediana { fn mediana(&amp;self) -&gt; Option&lt;f64&gt;; }
+impl Mediana for Vec&lt;f64&gt; { /* ... */ }
+
+// ✗ Los dos ajenos — error[E0117]
+impl fmt::Display for Vec&lt;String&gt; { /* ... */ }
+// error: only traits defined in the current crate can be implemented for types
+//        defined outside of the crate</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué la regla es tan estricta.</strong> Sin ella, la crate <code>ana</code> podría implementar <code>Display for Vec&lt;String&gt;</code> y la crate <code>beto</code> también. Cada una compila perfecto por separado. El día que alguien dependa de las dos, el programa no linkea — y el que rompe no es ninguna de las dos, es el usuario. Peor todavía: <strong>cualquier dependencia tuya podría romperte el build agregando un <code>impl</code></strong> en una versión de parche. La orphan rule convierte ese desastre distribuido en un error local y temprano.
+</div>
+
+<h3>Tipos fundamentales</h3>
+
+<p>Hay una excepción calculada: <code>&amp;T</code>, <code>&amp;mut T</code>, <code>Box&lt;T&gt;</code> y <code>Pin&lt;P&gt;</code> están marcados <code>#[fundamental]</code>, lo que significa que son "transparentes" para la orphan rule. Si <code>MiTipo</code> es local, <code>&amp;MiTipo</code> y <code>Box&lt;MiTipo&gt;</code> cuentan como locales:</p>
+
+<pre><code class="lang-rust">// ✓ legal: Box es fundamental, MiTipo es local
+impl fmt::Display for Box&lt;MiTipo&gt; { /* ... */ }
+
+// ✗ ilegal: Vec NO es fundamental
+impl fmt::Display for Vec&lt;MiTipo&gt; { /* ... */ }</code></pre>
+
+<h3>El newtype: la salida estándar</h3>
+
+<p>Cuando necesitás implementar un trait ajeno para un tipo ajeno, se envuelve el tipo en una struct propia de un solo campo:</p>
+
+<pre><code class="lang-rust">use std::fmt;
+
+#[repr(transparent)]                       // garantiza el mismo layout que el interno
+pub struct Csv(pub Vec&lt;String&gt;);
+
+impl fmt::Display for Csv {
+    fn fmt(&amp;self, f: &amp;mut fmt::Formatter&lt;'_&gt;) -&gt; fmt::Result {
+        write!(f, "{}", self.0.join(","))
+    }
+}
+
+let filas = Csv(vec!["a".into(), "b".into()]);
+println!("{filas}");     // "a,b"</code></pre>
+
+<div class="rule">
+  <strong>📌 El newtype es gratis en runtime y caro en ergonomía.</strong> Con <code>#[repr(transparent)]</code>, <code>Csv</code> ocupa exactamente lo mismo que <code>Vec&lt;String&gt;</code> y el compilador lo trata igual: cero overhead. Lo que perdés son los métodos del tipo interno — hay que delegarlos, exponer <code>into_inner()</code>/<code>as_slice()</code>, o (con mucho cuidado, ver RuS2.10) implementar <code>Deref</code>.
+</div>
+
+<p>El newtype no es solo un workaround de coherencia: es una de las mejores herramientas de diseño de Rust. <code>struct UserId(u64)</code> y <code>struct OrderId(u64)</code> son tipos distintos, y el compilador te impide pasarlos cambiados — un bug que en un lenguaje con <code>int</code> descubrís en producción.</p>
+
+<h3>El patrón alternativo: extension trait</h3>
+
+<p>Cuando lo que querés es agregar <em>métodos</em> a un tipo ajeno (y no cumplir un trait ajeno), no hace falta newtype: definí un trait local y hacele blanket impl.</p>
+
+<pre><code class="lang-rust">pub trait SliceExt&lt;T&gt; {
+    fn mediana(&amp;self) -&gt; Option&lt;f64&gt;;
+}
+
+impl&lt;T: Into&lt;f64&gt; + Copy&gt; SliceExt&lt;T&gt; for [T] {
+    fn mediana(&amp;self) -&gt; Option&lt;f64&gt; {
+        if self.is_empty() { return None; }
+        let mut v: Vec&lt;f64&gt; = self.iter().map(|x| (*x).into()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = v.len();
+        Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
+    }
+}
+
+// Con `use mi_crate::SliceExt;` en alcance:
+let m = [1u8, 3, 5, 7].mediana();</code></pre>
+
+<h2>RuS2.8 Blanket impls y los conflictos que traen</h2>
+
+<p>Un <strong>blanket impl</strong> implementa un trait para <em>todos</em> los tipos que cumplan cierta condición. El caso canónico está en <code>std</code>:</p>
+
+<pre><code class="lang-rust">// std, simplificado: todo lo que se puede mostrar se puede convertir a String
+impl&lt;T: fmt::Display + ?Sized&gt; ToString for T {
+    fn to_string(&amp;self) -&gt; String { /* ... */ }
+}
+
+// Y el que hace que nunca implementes Into a mano:
+impl&lt;T, U: From&lt;T&gt;&gt; Into&lt;U&gt; for T {
+    fn into(self) -&gt; U { U::from(self) }
+}</code></pre>
+
+<p>Es una herramienta potentísima —definís una vez, aplica a todo el universo de tipos que cumplan el bound— y también es la que produce los conflictos de coherencia más frustrantes.</p>
+
+<pre><code class="lang-rust">use std::fmt::Display;
+
+trait Serializar { fn ser(&amp;self) -&gt; String; }
+
+impl&lt;T: Display&gt; Serializar for T {
+    fn ser(&amp;self) -&gt; String { self.to_string() }
+}
+
+struct MiStruct { a: u32 }
+
+impl Serializar for MiStruct {              // error[E0119]
+    fn ser(&amp;self) -&gt; String { format!("{{\"a\":{}}}", self.a) }
+}
+// error[E0119]: conflicting implementations of trait `Serializar` for type `MiStruct`</code></pre>
+
+<div class="mistake">
+  <strong>Lo que sorprende:</strong> <code>MiStruct</code> <em>no implementa</em> <code>Display</code>. El conflicto igual existe, porque el chequeo de solapamiento <strong>no razona en negativo</strong>: no puede concluir "este impl no aplica porque el bound no se cumple", ya que ese bound podría cumplirse mañana (vos mismo agregando un <code>impl Display</code>, o una dependencia agregando uno). El resultado sería que un cambio aparentemente aditivo rompiera el programa. Rust prefiere rechazarlo hoy.
+</div>
+
+<h3>Las tres salidas</h3>
+
+<p><strong>1. Blanket sobre un marcador propio (opt-in).</strong> En vez de aplicar a todo lo que sea <code>Display</code>, aplicá a todo lo que <em>vos</em> marcaste:</p>
+
+<pre><code class="lang-rust">trait SerializarPorDisplay: Display {}      // marcador local, sin métodos
+
+impl&lt;T: SerializarPorDisplay&gt; Serializar for T {
+    fn ser(&amp;self) -&gt; String { self.to_string() }
+}
+
+impl SerializarPorDisplay for u32 {}        // opt-in explícito, una línea por tipo
+impl SerializarPorDisplay for String {}
+
+impl Serializar for MiStruct {              // ✓ ya no hay conflicto
+    fn ser(&amp;self) -&gt; String { format!("{{\"a\":{}}}", self.a) }
+}</code></pre>
+
+<p><strong>2. Wrapper explícito.</strong> Si querés el comportamiento por <code>Display</code> solo en algunos lugares, envolvé: <code>struct PorDisplay&lt;T&gt;(T);</code> con <code>impl&lt;T: Display&gt; Serializar for PorDisplay&lt;T&gt;</code>. Cero conflictos, el uso queda explícito.</p>
+
+<p><strong>3. No usar blanket impl.</strong> A menudo la respuesta correcta. Un <code>derive</code> macro que genere el impl por tipo te da lo mismo sin comprometer la coherencia: es literalmente lo que hace <code>serde</code>.</p>
+
+<div class="danger">
+  <strong>⚠️ Semver: agregar un blanket impl a un trait público es un cambio incompatible.</strong> Cualquier usuario de tu crate que tenga <code>impl TuTrait for SuTipo</code> deja de compilar si <code>SuTipo</code> cumple tu nuevo bound. No aparece en ningún diff de firmas y no lo detecta <code>cargo semver-checks</code> en todos los casos. Si publicás una librería: definí los blanket impls en la <strong>1.0</strong> o no los definas nunca.
+</div>
+
+<div class="info">
+  La feature que resolvería esto es <code>specialization</code> ("si hay un impl más específico, gana"). Lleva años en nightly con problemas de soundness abiertos, y <code>min_specialization</code> se usa <em>dentro</em> de <code>std</code> pero no está expuesto. <strong>No diseñes nada asumiendo que va a estabilizarse.</strong>
+</div>
+
+<h2>RuS2.9 Traits marcadores: <code>Send</code>, <code>Sync</code>, <code>Sized</code>, <code>?Sized</code></h2>
+
+<p>Algunos traits no tienen métodos: solo <em>marcan</em> una propiedad del tipo. Son la base de las garantías más fuertes de Rust y, por eso mismo, el compilador los maneja distinto.</p>
+
+<h3><code>Send</code> y <code>Sync</code></h3>
+
+<ul>
+  <li><strong><code>Send</code></strong>: es seguro <em>mover</em> el valor a otro hilo.</li>
+  <li><strong><code>Sync</code></strong>: es seguro <em>compartir</em> <code>&amp;T</code> entre hilos. Formalmente: <code>T: Sync</code> ⟺ <code>&amp;T: Send</code>.</li>
+</ul>
+
+<p>Son <strong>auto traits</strong>: el compilador los deriva estructuralmente. Una struct es <code>Send</code> si todos sus campos lo son. Nunca escribís <code>impl Send for X</code>; simplemente lo es o no lo es según de qué esté hecha.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th><code>Send</code></th><th><code>Sync</code></th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><code>u32</code>, <code>String</code>, <code>Vec&lt;T: Send&gt;</code></td><td>✅</td><td>✅</td><td>Datos propios, sin estado compartido</td></tr>
+<tr><td><code>Rc&lt;T&gt;</code></td><td>❌</td><td>❌</td><td>Contador no atómico: dos hilos lo corromperían</td></tr>
+<tr><td><code>Arc&lt;T&gt;</code></td><td>✅ si <code>T: Send + Sync</code></td><td>✅ si <code>T: Send + Sync</code></td><td>Contador atómico, pero el contenido se comparte</td></tr>
+<tr><td><code>Cell&lt;T&gt;</code>, <code>RefCell&lt;T&gt;</code></td><td>✅ si <code>T: Send</code></td><td>❌</td><td>Mutabilidad interior sin sincronización</td></tr>
+<tr><td><code>Mutex&lt;T&gt;</code></td><td>✅ si <code>T: Send</code></td><td>✅ si <code>T: Send</code></td><td>El candado <em>agrega</em> la sincronización que falta</td></tr>
+<tr><td><code>MutexGuard&lt;'_, T&gt;</code></td><td>❌</td><td>✅ si <code>T: Sync</code></td><td>En muchas plataformas el mutex debe liberarse en el hilo que lo tomó</td></tr>
+<tr><td><code>*const T</code>, <code>*mut T</code></td><td>❌</td><td>❌</td><td>El compilador no puede garantizar nada sobre punteros crudos</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Acá está la belleza del diseño.</strong> <code>Arc&lt;RefCell&lt;T&gt;&gt;</code> no compila entre hilos, y no porque exista una regla que diga "no uses RefCell con hilos": simplemente <code>RefCell</code> no es <code>Sync</code>, entonces <code>Arc&lt;RefCell&lt;T&gt;&gt;</code> no es <code>Send</code>, entonces <code>thread::spawn</code> lo rechaza. La regla de concurrencia <strong>emerge</strong> del sistema de tipos. Todo el "fearless concurrency" de Rust son estos dos traits vacíos.
+</div>
+
+<pre><code class="lang-rust">use std::marker::PhantomData;
+
+// Forzar !Send y !Sync sin usar features inestables: un puntero crudo fantasma.
+pub struct HandleDeGrafico {
+    raw: u64,
+    _no_thread: PhantomData&lt;*const ()&gt;,   // los punteros crudos son !Send + !Sync
+}
+
+// El caso inverso: SÍ es seguro, pero el compilador no puede probarlo.
+// Prometerlo requiere `unsafe` — y la prueba va en el comentario, no de adorno.
+pub struct HandleFfi(*mut std::ffi::c_void);
+
+// SAFETY: la librería C garantiza que el handle es válido desde cualquier hilo
+// y que todas sus funciones son thread-safe (ver docs vX.Y, sección "Threading").
+unsafe impl Send for HandleFfi {}</code></pre>
+
+<h3><code>Sized</code> y <code>?Sized</code></h3>
+
+<p><code>Sized</code> significa "el tamaño se conoce en tiempo de compilación". Lo especial es que es un bound <strong>implícito</strong>: cada parámetro genérico lo lleva puesto sin que lo escribas.</p>
+
+<pre><code class="lang-rust">fn f&lt;T&gt;(x: T) {}
+// El compilador lee, en realidad:
+fn f&lt;T: Sized&gt;(x: T) {}</code></pre>
+
+<p>Los tipos <strong>unsized</strong> son <code>str</code>, <code>[T]</code>, <code>dyn Trait</code> y cualquier struct cuyo último campo lo sea. Solo se pueden usar detrás de un puntero. Para aceptarlos en genéricos hay que <em>relajar</em> el bound con <code>?Sized</code>:</p>
+
+<pre><code class="lang-rust">use std::fmt::Display;
+
+fn imprimir&lt;T: Display&gt;(x: &amp;T) { println!("{x}"); }
+// imprimir("hola");            // ✗ str no es Sized
+// imprimir(&amp;d as &amp;dyn Display) // ✗ dyn Display no es Sized
+
+fn imprimir_ok&lt;T: Display + ?Sized&gt;(x: &amp;T) { println!("{x}"); }
+imprimir_ok("hola");             // ✓
+imprimir_ok(&amp;42 as &amp;dyn Display); // ✓</code></pre>
+
+<div class="rule">
+  <strong>📌 En una definición de trait, <code>Self</code> es <code>?Sized</code> por defecto</strong> — al revés que en funciones y structs. Es justamente lo que permite que <code>dyn Trait</code> implemente <code>Trait</code>. Si escribís <code>trait Foo: Sized</code>, estás cerrando la puerta a <code>dyn Foo</code> para siempre. Hacelo solo a propósito.
+</div>
+
+<div class="tip">
+  Regla de oro para librerías: si una función genérica solo toca <code>T</code> a través de una referencia, poné <code>?Sized</code>. Es gratis, no rompe a nadie, y hace que tu API acepte <code>&amp;str</code>, <code>&amp;[T]</code> y <code>&amp;dyn Trait</code>. Al revés —quitar <code>?Sized</code> después— sí es un cambio incompatible.
+</div>
+
+<h3>El resto de la familia</h3>
+
+<ul>
+  <li><strong><code>Unpin</code></strong>: auto trait, casi todo lo es. Marca que mover el valor después de haberlo "fijado" es seguro. Se vuelve central en async (RuS3).</li>
+  <li><strong><code>Copy</code></strong>: <em>no</em> es auto trait. Es opt-in con <code>derive</code> y cambia la semántica de movimiento a copia bit a bit. Requiere <code>Clone</code> como supertrait.</li>
+  <li><strong><code>'static</code></strong>: no es un trait, es un bound de lifetime, pero se comporta como marcador. <code>T: 'static</code> significa "no contiene referencias prestadas de nada" — <strong>no</strong> significa "vive para siempre". Es la confusión más frecuente del lenguaje.</li>
+</ul>
+
+<h2>RuS2.10 <code>Deref</code> y coerción: la herramienta que más se abusa</h2>
+
+<p><code>Deref</code> tiene dos efectos: el operador <code>*</code>, y la <strong>coerción por deref</strong>, que el compilador aplica automáticamente en los sitios de coerción y durante la resolución de métodos.</p>
+
+<pre><code class="lang-rust">fn saludar(nombre: &amp;str) { println!("hola {nombre}"); }
+
+let s: String = String::from("ana");
+saludar(&amp;s);          // &amp;String -&gt; &amp;str automáticamente, vía Deref&lt;Target = str&gt;
+
+let v: Vec&lt;u32&gt; = vec![3, 1, 2];
+let primero = v.first();      // `first` es de [T], no de Vec: autoderef lo encuentra
+
+let b: Box&lt;String&gt; = Box::new("x".into());
+let n = b.len();              // Box&lt;String&gt; -&gt; String -&gt; str: dos derefs encadenados</code></pre>
+
+<p>Es una de las razones por las que Rust se siente ergonómico pese a distinguir tantos tipos de referencia. Los usos <em>correctos</em> de <code>Deref</code> son todos del mismo tipo: <strong>punteros inteligentes</strong> — <code>Box</code>, <code>Rc</code>, <code>Arc</code>, <code>String</code>→<code>str</code>, <code>Vec&lt;T&gt;</code>→<code>[T]</code>, <code>MutexGuard&lt;T&gt;</code>→<code>T</code>, <code>Cow</code>.</p>
+
+<h3>El abuso: <code>Deref</code> para simular herencia</h3>
+
+<pre><code class="lang-rust">use std::ops::Deref;
+
+struct Usuario { id: u64, nombre: String }
+struct Admin { usuario: Usuario, permisos: Vec&lt;String&gt; }
+
+// ✗ ANTIPATRÓN: "Admin hereda de Usuario"
+impl Deref for Admin {
+    type Target = Usuario;
+    fn deref(&amp;self) -&gt; &amp;Usuario { &amp;self.usuario }
+}
+
+let a = Admin { /* ... */ };
+println!("{}", a.nombre);      // "funciona": parece herencia</code></pre>
+
+<p>Parece que funciona. Falla en cuanto salís de la sintaxis de punto:</p>
+
+<pre><code class="lang-rust">trait Identificable { fn id(&amp;self) -&gt; u64; }
+impl Identificable for Usuario { fn id(&amp;self) -&gt; u64 { self.id } }
+
+fn registrar&lt;T: Identificable&gt;(x: &amp;T) { /* ... */ }
+
+registrar(&amp;a);        // ✗ error: Admin no implementa Identificable.
+                      //   La coerción por deref NO aplica a la resolución de bounds.
+registrar(&amp;*a);       // ✓ pero hay que deshacer la ilusión a mano, en cada llamada</code></pre>
+
+<div class="mistake">
+  <strong>Los cuatro problemas de <code>Deref</code>-como-herencia.</strong>
+  <strong>(1)</strong> No hay subtipado: <code>Admin</code> no satisface <code>T: Identificable</code>, y ningún bound genérico lo va a aceptar.
+  <strong>(2)</strong> Sombreado silencioso: el día que agregues <code>Admin::nombre()</code>, todas las llamadas <code>a.nombre()</code> pasan a resolver al método nuevo <em>sin ningún aviso</em>, porque los métodos inherentes ganan antes que los del <code>Target</code>.
+  <strong>(3)</strong> Los mensajes de error empeoran mucho: el compilador habla de tipos que el lector nunca escribió.
+  <strong>(4)</strong> Rompe el contrato: las <em>Rust API Guidelines</em> (C-DEREF) dicen que <code>Deref</code> es solo para punteros inteligentes, y todo el ecosistema lee tu código con esa expectativa.
+</div>
+
+<div class="rule">
+  <strong>📌 Cuándo SÍ implementar <code>Deref</code>:</strong> el tipo es un puntero/contenedor transparente, la conversión es infalible, barata (idealmente un campo) y <em>no cambia el significado</em> del valor. <strong>Cuándo NO:</strong> para reutilizar métodos de un campo. Para eso: delegación explícita (aburrida y clarísima), o exponer <code>as_inner()</code>, o —si lo que querés es la conversión genérica— <code>AsRef</code>, que es exactamente el trait para eso y no dispara magia en la resolución de métodos.
+</div>
+
+<pre><code class="lang-rust">// ✓ La versión honesta del mismo diseño: composición + delegación explícita
+impl Admin {
+    pub fn usuario(&amp;self) -&gt; &amp;Usuario { &amp;self.usuario }
+    pub fn nombre(&amp;self) -&gt; &amp;str { &amp;self.usuario.nombre }
+}
+
+impl Identificable for Admin {
+    fn id(&amp;self) -&gt; u64 { self.usuario.id }     // tres líneas, cero sorpresas
+}
+
+impl AsRef&lt;Usuario&gt; for Admin {
+    fn as_ref(&amp;self) -&gt; &amp;Usuario { &amp;self.usuario }
+}</code></pre>
+
+<h2>RuS2.11 Conversiones: <code>From</code>, <code>Into</code>, <code>TryFrom</code>, <code>AsRef</code> y <code>Borrow</code></h2>
+
+<h3><code>From</code> e <code>Into</code>: implementá uno, obtené el otro</h3>
+
+<p>Por el blanket impl <code>impl&lt;T, U: From&lt;T&gt;&gt; Into&lt;U&gt; for T</code>, implementar <code>From</code> te da <code>Into</code> gratis. <strong>Nunca implementes <code>Into</code> a mano.</strong></p>
+
+<pre><code class="lang-rust">struct Celsius(f64);
+struct Fahrenheit(f64);
+
+impl From&lt;Celsius&gt; for Fahrenheit {
+    fn from(c: Celsius) -&gt; Self { Fahrenheit(c.0 * 9.0 / 5.0 + 32.0) }
+}
+
+let f: Fahrenheit = Celsius(100.0).into();      // gratis
+let f2 = Fahrenheit::from(Celsius(0.0));        // ídem</code></pre>
+
+<p>Dónde usar cada uno en una firma:</p>
+
+<pre><code class="lang-rust">// Ergonómico: acepta &amp;str, String, Cow&lt;str&gt;, ...
+pub fn nuevo(nombre: impl Into&lt;String&gt;) -&gt; Config {
+    Config { nombre: nombre.into() }
+}
+
+// En camino caliente: NO forzar la asignación si el que llama no la necesita
+pub fn buscar(&amp;self, clave: &amp;str) -&gt; Option&lt;&amp;Valor&gt; { /* ... */ }</code></pre>
+
+<div class="warn">
+  <code>impl Into&lt;String&gt;</code> es cómodo y tiene un costo real: obliga a materializar un <code>String</code> aunque el que llama ya tuviera uno prestado que le alcanzaba. En un constructor que corre una vez al arranque es perfecto; en una función llamada un millón de veces por segundo es una asignación por llamada. Elegí según la posición en el perfil, no por costumbre.
+</div>
+
+<h3><code>TryFrom</code>: cuando la conversión puede fallar</h3>
+
+<pre><code class="lang-rust">use std::convert::TryFrom;
+
+pub struct Edad(u8);
+
+#[derive(Debug)]
+pub struct EdadInvalida(i64);
+
+impl TryFrom&lt;i64&gt; for Edad {
+    type Error = EdadInvalida;               // tipo asociado: hay UNA respuesta por conversión
+
+    fn try_from(v: i64) -&gt; Result&lt;Self, Self::Error&gt; {
+        if (0..=130).contains(&amp;v) { Ok(Edad(v as u8)) } else { Err(EdadInvalida(v)) }
+    }
+}
+
+let e = Edad::try_from(42)?;
+let e2: Result&lt;Edad, _&gt; = 200i64.try_into();   // TryInto viene gratis, igual que Into</code></pre>
+
+<h3><code>?</code> es <code>From</code> disfrazado</h3>
+
+<p>Este es el punto donde el sistema de traits se vuelve invisible y omnipresente. El operador <code>?</code> desazucara, aproximadamente, a:</p>
+
+<pre><code class="lang-rust">// expr?  ==&gt;
+match expr {
+    Ok(v)  =&gt; v,
+    Err(e) =&gt; return Err(From::from(e)),       // ← acá está todo
+}</code></pre>
+
+<p>Es decir: <code>?</code> convierte automáticamente el error al tipo de error de la función, siempre que exista el <code>From</code>. Por eso una función puede propagar errores de tres orígenes distintos sin una sola línea de conversión explícita:</p>
+
+<pre><code class="lang-rust">use std::{fs, num::ParseIntError, path::Path};
+
+#[derive(Debug)]
+pub enum AppError {
+    Io(std::io::Error),
+    Numero(ParseIntError),
+    Vacio,
+}
+
+impl From&lt;std::io::Error&gt; for AppError {
+    fn from(e: std::io::Error) -&gt; Self { AppError::Io(e) }
+}
+impl From&lt;ParseIntError&gt; for AppError {
+    fn from(e: ParseIntError) -&gt; Self { AppError::Numero(e) }
+}
+
+pub fn leer_puerto(p: &amp;Path) -&gt; Result&lt;u16, AppError&gt; {
+    let texto = fs::read_to_string(p)?;        // io::Error   -&gt; AppError
+    let linea = texto.lines().next().ok_or(AppError::Vacio)?;
+    let puerto = linea.trim().parse::&lt;u16&gt;()?; // ParseIntError -&gt; AppError
+    Ok(puerto)
+}</code></pre>
+
+<div class="tip">
+  <code>thiserror</code> genera esos <code>From</code> con un atributo <code>#[from]</code> y además el <code>Display</code>. No es magia nueva: es exactamente el código de arriba, escrito por una macro. Saber qué genera es lo que te permite depurar cuando <code>?</code> "no encuentra la conversión" — el error siempre es que falta un <code>From</code>.
+</div>
+
+<h3><code>AsRef</code> vs <code>Borrow</code>: la diferencia importa de verdad</h3>
+
+<p>Los dos convierten <code>&amp;T</code> en <code>&amp;U</code> de forma barata. Parecen intercambiables. No lo son, y el que se equivoca produce bugs silenciosos.</p>
+
+<table>
+<thead><tr><th></th><th><code>AsRef&lt;U&gt;</code></th><th><code>Borrow&lt;U&gt;</code></th></tr></thead>
+<tbody>
+<tr><td><strong>Contrato</strong></td><td>Conversión barata de referencia a referencia. Nada más.</td><td>Además: <code>Hash</code>, <code>Eq</code> y <code>Ord</code> del prestado <strong>deben coincidir</strong> con los del dueño</td></tr>
+<tr><td><strong>Impls por tipo</strong></td><td>Varias (<code>String: AsRef&lt;str&gt;</code>, <code>AsRef&lt;[u8]&gt;</code>, <code>AsRef&lt;Path&gt;</code>, <code>AsRef&lt;OsStr&gt;</code>)</td><td>Varias, pero solo donde la equivalencia semántica se cumple</td></tr>
+<tr><td><strong>Para qué se usa</strong></td><td>Ergonomía de APIs genéricas</td><td>Búsquedas en colecciones ordenadas o hasheadas</td></tr>
+<tr><td><strong>Caso testigo</strong></td><td><code>fn open&lt;P: AsRef&lt;Path&gt;&gt;(p: P)</code></td><td><code>HashMap&lt;K, V&gt;::get&lt;Q&gt;(&amp;self, k: &amp;Q) where K: Borrow&lt;Q&gt;</code></td></tr>
+<tr><td><strong>Si lo implementás mal</strong></td><td>Molestia de tipos</td><td><strong>Búsquedas que no encuentran lo que sí está guardado</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">use std::collections::HashMap;
+
+let mut m: HashMap&lt;String, u32&gt; = HashMap::new();
+m.insert("ana".to_string(), 1);
+
+// Esto funciona gracias a `impl Borrow&lt;str&gt; for String` y a que
+// hash("ana") == hash(String::from("ana")). No hay que asignar un String para buscar.
+let v = m.get("ana");</code></pre>
+
+<pre><code class="lang-rust">// ✗ Un Borrow que rompe el contrato: normaliza, y por lo tanto cambia el hash.
+struct Clave(String);
+
+impl std::borrow::Borrow&lt;str&gt; for Clave {
+    fn borrow(&amp;self) -&gt; &amp;str { self.0.trim() }    // ✗ trim cambia la identidad
+}
+// Consecuencia: insertás Clave(" a ") y m.get("a") a veces encuentra y a veces no,
+// según cómo caiga el hash. El compilador NO te avisa: el contrato es de documentación.</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla operativa.</strong> Para <em>aceptar</em> muchos tipos en un parámetro: <code>AsRef</code>. Para que una colección pueda buscar con una forma prestada de la clave: <code>Borrow</code>, y solo si la equivalencia de <code>Hash</code>/<code>Eq</code>/<code>Ord</code> se cumple exactamente. Si dudás, usá <code>AsRef</code>: implementarlo de más no rompe nada, implementar <code>Borrow</code> de más sí.
+</div>
+
+<h2>RuS2.12 Cuándo NO hacer un trait</h2>
+
+<p>Todo lo anterior fue "cómo hacerlo bien". Esta sección es la que más código de más evita.</p>
+
+<div class="concept">
+  <strong>💡 La abstracción con una sola implementación no es una abstracción: es una indirección.</strong> Un trait con un solo impl no te da flexibilidad — te da un salto extra al leer, bounds genéricos que se propagan hacia arriba por todas las firmas, errores del compilador más largos, y un "punto de extensión" que en la práctica nadie va a extender porque fue diseñado mirando un solo caso.
+</div>
+
+<p>El argumento que casi siempre aparece es "lo necesito para testear". A veces es cierto. Muy seguido hay opciones más baratas:</p>
+
+<table>
+<thead><tr><th>Situación</th><th>Alternativa antes del trait</th></tr></thead>
+<tbody>
+<tr><td>Quiero sustituir <em>una</em> función (el reloj, un generador de IDs)</td><td>Un campo con una closure: <code>ahora: Box&lt;dyn Fn() -&gt; Instant&gt;</code></td></tr>
+<tr><td>Conjunto cerrado de comportamientos que controlo</td><td><code>enum</code> + <code>match</code>: exhaustivo, sin heap, sin vtable</td></tr>
+<tr><td>Quiero probar el código sin tocar la base de datos</td><td>Un test de integración con <code>testcontainers</code> o <code>wiremock</code>: prueba lo que realmente corre</td></tr>
+<tr><td>Un único punto de variación entre dev y prod</td><td><code>#[cfg(test)]</code> o una feature flag en la construcción del objeto</td></tr>
+<tr><td>Reutilizar lógica entre dos structs parecidas</td><td>Una función libre que reciba los datos que necesita</td></tr>
+</tbody>
+</table>
+
+<h3>Señales de que el trait sí se justifica</h3>
+
+<ul>
+  <li>Existen <strong>dos o más implementaciones reales</strong> hoy, no hipotéticas (regla de tres: extraé después del tercer uso, no antes del primero).</li>
+  <li>Es un <strong>borde de plugin</strong>: código de terceros va a implementarlo.</li>
+  <li>Publicás una <strong>librería</strong> y el usuario aporta la implementación (un trait <code>Backend</code>, un <code>Formatter</code>).</li>
+  <li>Necesitás una <strong>colección heterogénea</strong> genuina.</li>
+  <li>El trait expresa una <strong>capacidad transversal</strong> que aplica a tipos sin relación entre sí (<code>Serialize</code>, <code>Display</code>, <code>Hash</code>) — este es el uso más valioso de todos.</li>
+</ul>
+
+<h3>Señales de que no</h3>
+
+<ul>
+  <li>La segunda implementación la <em>inventaste vos</em> para justificar el trait, y es un <code>Fake</code> que solo se usa en tests.</li>
+  <li>El trait tiene exactamente los métodos de una struct, con los mismos nombres, y el impl es una línea por método.</li>
+  <li>El nombre del trait es el nombre de la struct con una <code>I</code> adelante, o con <code>Trait</code>/<code>able</code> pegado atrás por falta de mejor idea.</li>
+  <li>Para llamarlo hay que agregar un parámetro genérico a cinco funciones que no les importa.</li>
+</ul>
+
+<div class="warn">
+  <strong>Costo oculto que casi nadie cuenta:</strong> los bounds genéricos son <em>virales</em>. <code>fn servicio&lt;R: Repositorio&gt;(...)</code> obliga a que quien lo llame también sea genérico, o fije el tipo. En una capa de aplicación, un trait mal ubicado convierte cincuenta firmas concretas en cincuenta firmas genéricas — y ese refactor no se revierte con un <code>git revert</code> tranquilo seis meses después.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el trait de repositorio que bloqueó el testing</h2>
+
+<blockquote>Un servicio de pedidos necesita hablar con Postgres. El equipo define un trait <code>Repositorio</code> para poder sustituirlo en los tests. Compila. Cuando llega el momento de escribir el primer test con un doble, el <code>Box&lt;dyn Repositorio&gt;</code> no compila y el error tiene cuarenta líneas. Vamos a diagnosticarlo, rediseñarlo y <em>medir</em> las dos alternativas.</blockquote>
+
+<h3>Paso 1 — La primera versión, y por qué no anda</h3>
+
+<pre><code class="lang-rust">use serde::de::DeserializeOwned;
+
+trait Repositorio {
+    const TABLA: &amp;'static str;                                       // (a)
+
+    async fn buscar&lt;T: DeserializeOwned&gt;(&amp;self, id: u64)             // (b) + (c)
+        -&gt; Result&lt;Option&lt;T&gt;, RepoError&gt;;
+
+    async fn guardar(&amp;self, e: &amp;Pedido) -&gt; Result&lt;(), RepoError&gt;;    // (c)
+
+    fn clonar(&amp;self) -&gt; Self;                                        // (d)
+}</code></pre>
+
+<p>Cuatro violaciones distintas de dyn compatibility en nueve líneas:</p>
+
+<table>
+<thead><tr><th></th><th>Qué</th><th>Por qué rompe</th></tr></thead>
+<tbody>
+<tr><td>(a)</td><td>Constante asociada</td><td>No hay entrada en la vtable para constantes</td></tr>
+<tr><td>(b)</td><td>Método con parámetro de tipo</td><td>La vtable necesitaría una entrada por cada <code>T</code> posible</td></tr>
+<tr><td>(c)</td><td><code>async fn</code> (= RPITIT)</td><td>Cada impl devuelve un futuro opaco distinto y de tamaño distinto</td></tr>
+<tr><td>(d)</td><td>Devuelve <code>Self</code> por valor</td><td>Detrás de <code>dyn</code>, <code>Self</code> es unsized</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La lección de este paso.</strong> El equipo escribió el trait pensando en <em>lo que el repositorio hace</em>, no en <em>cómo se va a consumir</em>. Con genéricos, las cuatro cosas compilan perfecto. La incompatibilidad con <code>dyn</code> solo aparece cuando alguien intenta guardar el trait en una variable — y eso pasa el día que llega el test, o el día que hacen falta dos backends. <strong>Si vas a necesitar <code>dyn</code>, decidilo al declarar el trait, no seis semanas después.</strong>
+</div>
+
+<h3>Paso 2 — Rediseño dyn-compatible</h3>
+
+<p>Cuatro cambios, uno por problema:</p>
+
+<pre><code class="lang-rust">use futures::future::BoxFuture;
+
+pub trait Repositorio: Send + Sync {
+    /// (a) La constante pasa a método: entra en la vtable sin problema.
+    fn tabla(&amp;self) -&gt; &amp;'static str;
+
+    /// (b) El genérico se va: el tipo de entidad es un TIPO ASOCIADO.
+    ///     Es la elección correcta también por RuS2.1: un repositorio
+    ///     concreto maneja exactamente una entidad.
+    type Entidad: Send + Sync + 'static;
+
+    /// (c) El futuro se boxea explícitamente: tipo concreto, Sized, Send.
+    fn buscar(&amp;self, id: u64)
+        -&gt; BoxFuture&lt;'_, Result&lt;Option&lt;Self::Entidad&gt;, RepoError&gt;&gt;;
+
+    fn guardar&lt;'a&gt;(&amp;'a self, e: &amp;'a Self::Entidad)
+        -&gt; BoxFuture&lt;'a, Result&lt;(), RepoError&gt;&gt;;
+
+    /// (d) Devolvemos el Box ya construido, no Self.
+    fn clonar(&amp;self) -&gt; Box&lt;dyn Repositorio&lt;Entidad = Self::Entidad&gt;&gt;;
+}</code></pre>
+
+<pre><code class="lang-rust">// El impl real. `Box::pin` es la única asignación agregada por llamada.
+pub struct RepoPg { pool: sqlx::PgPool }
+
+impl Repositorio for RepoPg {
+    type Entidad = Pedido;
+
+    fn tabla(&amp;self) -&gt; &amp;'static str { "pedidos" }
+
+    fn buscar(&amp;self, id: u64) -&gt; BoxFuture&lt;'_, Result&lt;Option&lt;Pedido&gt;, RepoError&gt;&gt; {
+        Box::pin(async move {
+            sqlx::query_as::&lt;_, Pedido&gt;("SELECT * FROM pedidos WHERE id = $1")
+                .bind(id as i64)
+                .fetch_optional(&amp;self.pool)
+                .await
+                .map_err(RepoError::from)
+        })
+    }
+
+    fn guardar&lt;'a&gt;(&amp;'a self, e: &amp;'a Pedido) -&gt; BoxFuture&lt;'a, Result&lt;(), RepoError&gt;&gt; {
+        Box::pin(async move { /* ... */ Ok(()) })
+    }
+
+    fn clonar(&amp;self) -&gt; Box&lt;dyn Repositorio&lt;Entidad = Pedido&gt;&gt; {
+        Box::new(RepoPg { pool: self.pool.clone() })
+    }
+}</code></pre>
+
+<pre><code class="lang-rust">// Y AHORA sí se puede inyectar un doble, sin tocar ninguna firma del servicio.
+pub struct RepoFake { datos: std::sync::Mutex&lt;Vec&lt;Pedido&gt;&gt; }
+
+impl Repositorio for RepoFake {
+    type Entidad = Pedido;
+    fn tabla(&amp;self) -&gt; &amp;'static str { "memoria" }
+    fn buscar(&amp;self, id: u64) -&gt; BoxFuture&lt;'_, Result&lt;Option&lt;Pedido&gt;, RepoError&gt;&gt; {
+        Box::pin(async move {
+            Ok(self.datos.lock().unwrap().iter().find(|p| p.id == id).cloned())
+        })
+    }
+    // ...
+}
+
+pub struct Servicio {
+    repo: Box&lt;dyn Repositorio&lt;Entidad = Pedido&gt;&gt;,   // ← el punto de todo el rediseño
+}
+
+#[tokio::test]
+async fn cancela_un_pedido_pendiente() {
+    let s = Servicio { repo: Box::new(RepoFake::con(vec![Pedido::pendiente(7)])) };
+    assert!(s.cancelar(7).await.is_ok());
+}</code></pre>
+
+<div class="info">
+  Si preferís no escribir <code>BoxFuture</code> a mano, <code>#[async_trait]</code> genera <em>exactamente</em> estas firmas y te deja escribir <code>async fn</code>. Vale la pena haberlo hecho a mano una vez: cuando el error mencione <code>Pin&lt;Box&lt;dyn Future&gt;&gt;</code>, vas a saber de dónde salió.
+</div>
+
+<h3>Paso 3 — La variante genérica, y cómo se mide la diferencia</h3>
+
+<pre><code class="lang-rust">// Misma funcionalidad, dispatch estático.
+pub struct ServicioGen&lt;R: Repositorio&gt; {
+    repo: R,
+}
+
+impl&lt;R: Repositorio&lt;Entidad = Pedido&gt;&gt; ServicioGen&lt;R&gt; {
+    pub async fn cancelar(&amp;self, id: u64) -&gt; Result&lt;(), ServicioError&gt; {
+        // ~400 líneas de lógica de dominio que se DUPLICAN por cada R concreto
+    }
+}</code></pre>
+
+<p>Ahora la parte que casi nadie hace: medir en vez de discutir. Poné las dos variantes detrás de features de Cargo y corré esto:</p>
+
+<pre><code class="lang-bash"># Cargo.toml
+# [features]
+# dispatch-dyn = []
+# dispatch-gen = []
+
+# 1) Tiempo de compilación limpio, tres corridas por variante
+for v in dispatch-dyn dispatch-gen; do
+  for i in 1 2 3; do
+    cargo clean
+    /usr/bin/time -f "$v corrida $i: %e s" cargo build --release --features $v
+  done
+done
+
+# 2) Rebuild incremental: tocar un archivo y recompilar (el número que sentís todo el día)
+touch src/servicio.rs &amp;&amp; /usr/bin/time -f "incremental: %e s" cargo build --release --features dispatch-gen
+
+# 3) Cuánta IR genera la monomorfización — el proxy más directo del costo
+cargo install cargo-llvm-lines
+cargo llvm-lines --release --features dispatch-gen | head -20
+
+# 4) Qué ocupa el binario, por crate y por función
+cargo install cargo-bloat
+cargo bloat --release --features dispatch-gen --crates -n 15
+
+# 5) Tamaño final comparable (sin símbolos de debug)
+strip -s target/release/app &amp;&amp; ls -l target/release/app</code></pre>
+
+<h3>Paso 4 — Los números de una corrida real</h3>
+
+<p>Esta es una corrida concreta: 12 tipos concretos de repositorio (5 backends reales × entidades), ~400 líneas de lógica genérica en el servicio, <code>rustc 1.95</code>, perfil <code>release</code> con <code>lto = "thin"</code>, en una máquina de 8 núcleos.</p>
+
+<table>
+<thead><tr><th>Métrica</th><th><code>Box&lt;dyn&gt;</code></th><th>Genérico (12 instanciaciones)</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Build limpio (mediana de 3)</td><td>18,4 s</td><td>47,9 s</td><td><strong>+160%</strong></td></tr>
+<tr><td>Rebuild incremental</td><td>2,1 s</td><td>9,6 s</td><td><strong>+357%</strong></td></tr>
+<tr><td>Binario stripped</td><td>4,62 MB</td><td>6,98 MB</td><td>+51%</td></tr>
+<tr><td><code>cargo llvm-lines</code> (total)</td><td>312 k</td><td>1,41 M</td><td>+352%</td></tr>
+<tr><td>Latencia p50 de <code>cancelar()</code></td><td>3,81 ms</td><td>3,79 ms</td><td><strong>−0,5% (ruido)</strong></td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Estos números son de UNA máquina y UNA forma del código. Reproducilos antes de citarlos.</strong> Lo que se transfiere no es la tabla: es la <strong>forma</strong> de la tabla. El costo del dispatch estático escala con <em>(cantidad de instanciaciones) × (tamaño del código genérico)</em>, y ese producto es lo que tenés que estimar en tu caso. Con 2 impls y 30 líneas genéricas la diferencia es literalmente inmedible. Con 12 impls y 400 líneas, el rebuild incremental pasó de 2 a 10 segundos — y eso se paga <em>cada vez que guardás un archivo</em>, todos los días.
+</div>
+
+<div class="rule">
+  <strong>📌 Fijate en la última fila.</strong> La latencia es idéntica. Toda la discusión "dyn es más lento" se evaporó frente a un round-trip de 3,8 ms a la base de datos: la llamada indirecta aporta nanosegundos sobre milisegundos. <strong>El costo real del dispatch estático acá no fue de runtime, fue de tiempo de compilación</strong> — que es el recurso que el equipo gasta todos los días. Elegir por la intuición equivocada ("estático es más rápido") habría optimizado la métrica que no importaba y degradado la que sí.
+</div>
+
+<h3>Paso 5 — El híbrido: fachada genérica, núcleo monomórfico</h3>
+
+<p>No hay que elegir globalmente. El patrón que usa la propia <code>std</code> mantiene la ergonomía del genérico y acota la monomorfización a una función mínima:</p>
+
+<pre><code class="lang-rust">use std::path::Path;
+
+// Así está escrito std::fs::read_to_string, casi literal:
+pub fn read_to_string&lt;P: AsRef&lt;Path&gt;&gt;(path: P) -&gt; std::io::Result&lt;String&gt; {
+    fn inner(path: &amp;Path) -&gt; std::io::Result&lt;String&gt; {
+        // TODO el trabajo vive acá: UNA sola copia en el binario,
+        // sin importar cuántos tipos distintos pasen por la fachada.
+        let mut f = std::fs::File::open(path)?;
+        let mut s = String::new();
+        std::io::Read::read_to_string(&amp;mut f, &amp;mut s)?;
+        Ok(s)
+    }
+    inner(path.as_ref())     // la parte genérica es esta línea, y nada más
+}</code></pre>
+
+<p>Aplicado al servicio: la API pública sigue siendo genérica y cómoda; el cuerpo largo se llama una sola vez con el tipo ya borrado.</p>
+
+<pre><code class="lang-rust">impl Servicio {
+    // Fachada genérica: ergonómica, se monomorfiza, pero es de tres líneas.
+    pub async fn cancelar&lt;R&gt;(&amp;self, repo: &amp;R, id: u64) -&gt; Result&lt;(), ServicioError&gt;
+    where
+        R: Repositorio&lt;Entidad = Pedido&gt;,
+    {
+        self.cancelar_dyn(repo, id).await
+    }
+
+    // Núcleo: una sola instanciación en todo el binario.
+    async fn cancelar_dyn(
+        &amp;self,
+        repo: &amp;dyn Repositorio&lt;Entidad = Pedido&gt;,
+        id: u64,
+    ) -&gt; Result&lt;(), ServicioError&gt; {
+        // las ~400 líneas, compiladas UNA vez
+        todo!()
+    }
+}</code></pre>
+
+<div class="tip">
+  Con esta forma, la tabla del Paso 4 vuelve prácticamente a la columna de <code>dyn</code> en build y binario, y el usuario de la API ni se entera. Es el mejor default para librerías: firma genérica hacia afuera, <code>dyn</code> o tipo concreto hacia adentro.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Cómo decidís entre un tipo asociado y un parámetro de tipo genérico?</summary>
+<p>Con una sola pregunta: <em>¿tiene sentido que un mismo tipo implemente el trait más de una vez, con tipos distintos?</em> Si sí, va como parámetro (<code>From&lt;T&gt;</code>: un tipo se construye desde muchos otros; <code>Add&lt;Rhs&gt;</code>: se suma con varios). Si no, va como asociado (<code>Iterator::Item</code>: un iterador itera sobre una sola cosa; <code>TryFrom::Error</code>: una conversión falla de una sola manera). El marco mental es entrada/salida: el <strong>parámetro lo elige quien llama</strong>, el <strong>tipo asociado lo decide quien implementa</strong>. Equivocarse hacia el parámetro cuesta anotaciones y errores de inferencia en cada uso, y contamina las firmas de toda la cadena de llamadas con un genérico extra; equivocarse hacia el asociado cuesta romper la API el día que necesitás la segunda implementación.</p></details>
+
+<details><summary>Agregaste un <code>async fn</code> a un trait que funcionaba y ahora <code>Box&lt;dyn Trait&gt;</code> dejó de compilar. ¿Qué pasó y qué opciones tenés?</summary>
+<p><code>async fn</code> en un trait es azúcar de RPITIT: desazucara a <code>fn f(&amp;self) -&gt; impl Future&lt;Output = T&gt; + '_</code>. Y <code>impl Trait</code> en posición de retorno hace que el trait deje de ser dyn-compatible, porque cada impl devuelve un tipo opaco distinto y de tamaño distinto — no hay una firma única que poner en la vtable. Tres salidas: <strong>(1)</strong> <code>#[async_trait]</code>, que reescribe el retorno como <code>Pin&lt;Box&lt;dyn Future + Send + 'a&gt;&gt;</code> — tipo concreto, <code>Sized</code>, dyn-compatible, a costa de una asignación por llamada; <strong>(2)</strong> escribir esa firma a mano con <code>BoxFuture</code>, mismo costo pero sin macro y con la firma visible en el código; <strong>(3)</strong> si en realidad no necesitabas <code>dyn</code>, quedarte con <code>async fn</code> nativo y agregar <code>#[trait_variant::make(.. : Send)]</code> para poder hacer <code>spawn</code>. La decisión es si el trait vive en un borde (necesita <code>dyn</code>) o en el núcleo genérico (no lo necesita).</p></details>
+
+<details><summary>Querés implementar <code>Display</code> para <code>Vec&lt;String&gt;</code> y el compilador te lo prohíbe. ¿Por qué, y cuál es la salida?</summary>
+<p>Es la <strong>orphan rule</strong>: <code>Display</code> es de <code>std</code> y <code>Vec</code> también, así que ninguno de los dos es local a tu crate (error <code>E0117</code>). Existe para garantizar <strong>coherencia</strong>: como máximo un impl de un trait para un tipo en todo el binario. Sin la regla, dos crates podrían implementar <code>Display for Vec&lt;String&gt;</code>, cada una compilaría bien por separado, y el programa que dependa de ambas no linkearía — rompiendo a un tercero que no hizo nada. Peor: cualquier dependencia podría romperte el build agregando un impl en una versión de parche. La salida estándar es el <strong>newtype</strong>: <code>#[repr(transparent)] struct Csv(Vec&lt;String&gt;);</code> e implementar <code>Display for Csv</code>. Es gratis en runtime (mismo layout, cero overhead) y cuesta ergonomía: perdés los métodos del tipo interno y hay que delegarlos o exponer <code>into_inner()</code>. Si lo que querías no era cumplir <code>Display</code> sino agregar métodos, ni siquiera hace falta el newtype: definí un trait local y hacele impl para <code>Vec&lt;String&gt;</code> (extension trait), que es legal porque el trait es tuyo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Tipo asociado vs parámetro genérico</strong> se decide con una pregunta: ¿puede un tipo implementar el trait más de una vez? Sí → parámetro. No → asociado. El parámetro es entrada (lo elige quien llama), el asociado es salida (lo decide quien implementa).</li>
+  <li><strong>Monomorfización</strong> da costo cero en runtime y cobra en tiempo de compilación y tamaño de binario, escalando con instanciaciones × tamaño del código genérico. <strong><code>dyn Trait</code></strong> cobra una indirección (y, sobre todo, la pérdida de inlining) y no escala con la cantidad de tipos. Un <code>enum</code> es la tercera opción cuando el conjunto es cerrado.</li>
+  <li><strong>Dyn compatibility</strong> (antes "object safety", renombrada en 1.83) prohíbe métodos genéricos, <code>Self</code> por valor, constantes asociadas, GATs y <code>impl Trait</code> en retorno. Se rediseña con <code>&amp;mut dyn</code> en parámetros, <code>where Self: Sized</code>, o partiendo el trait en núcleo + extensión con blanket impl <code>?Sized</code>.</li>
+  <li><strong>GATs</strong> (estables desde 1.65) permiten un tipo asociado parametrizado por lifetime — el <code>LendingIterator</code> que devuelve ítems que toman prestado del iterador, imposible de expresar antes. Precio: el trait deja de ser dyn-compatible y no compone con los adaptadores de <code>Iterator</code>.</li>
+  <li><strong>RPITIT</strong> (1.75) permite <code>-&gt; impl Trait</code> dentro de traits y elimina el tipo asociado ceremonial. Precio: mata la dyn compatibility.</li>
+  <li><strong><code>async fn</code> en traits</strong> (1.75) <em>es</em> RPITIT: hereda sus tres límites — sin <code>dyn</code>, sin bounds <code>Send</code> desde afuera, futuro no nombrable. <code>trait-variant</code> resuelve el <code>Send</code>; <code>async-trait</code> resuelve los tres a cambio de una asignación por llamada, y por eso sigue siendo la herramienta correcta cuando necesitás <code>dyn</code>.</li>
+  <li><strong>Coherencia</strong> garantiza un solo impl por (trait, tipo) en todo el binario. La <strong>orphan rule</strong> la hace cumplir; el <strong>newtype</strong> (gratis en runtime, caro en ergonomía) es la salida estándar, y el <strong>extension trait</strong> lo es cuando solo querés agregar métodos.</li>
+  <li><strong>Blanket impls</strong> son potentes y bloquean impls específicos, porque la coherencia no razona en negativo. Agregar uno a un trait público es un <strong>cambio incompatible</strong>. La salida limpia es blanquear sobre un marcador propio con opt-in explícito.</li>
+  <li><strong><code>Send</code>/<code>Sync</code></strong> son auto traits derivados estructuralmente: de ahí sale toda la seguridad de concurrencia sin una sola regla especial. <strong><code>Sized</code></strong> es un bound implícito en genéricos y, al revés, <code>Self</code> en un trait es <code>?Sized</code> por defecto.</li>
+  <li><strong><code>Deref</code> es para punteros inteligentes</strong>, no para simular herencia: no da subtipado, sombrea métodos en silencio y empeora los errores. Para reutilizar un campo, delegá o usá <code>AsRef</code>.</li>
+  <li><strong><code>From</code>/<code>Into</code></strong> (implementá solo <code>From</code>) y <strong><code>TryFrom</code></strong> son la base de <code>?</code>, que literalmente llama a <code>From::from</code> sobre el error. <strong><code>AsRef</code></strong> es ergonomía; <strong><code>Borrow</code></strong> tiene un contrato semántico fuerte (<code>Hash</code>/<code>Eq</code>/<code>Ord</code> equivalentes) y romperlo produce búsquedas fallidas silenciosas.</li>
+  <li><strong>Un trait con una sola implementación es una indirección, no una abstracción.</strong> Antes de crearlo, evaluá una closure, un <code>enum</code>, un test de integración o <code>#[cfg(test)]</code>.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un trait de un proyecto tuyo (o de una crate que uses) que tenga un parámetro de tipo y aplicale el test de RuS2.1. Si el tipo debería ser asociado, reescribilo y contá cuántas firmas de funciones dejaron de necesitar un genérico. Documentá el delta.</li>
+  <li>Escribí un trait con un método genérico y comprobá el <code>E0038</code> pidiendo un <code>Box&lt;dyn&gt;</code>. Después arreglalo de las tres maneras de RuS2.3 (<code>&amp;mut dyn</code> en el parámetro, <code>where Self: Sized</code>, y núcleo + extension trait). Escribí en dos líneas por qué elegirías cada una.</li>
+  <li>Implementá <code>LendingIterator</code> para un tipo propio que recorra un buffer reusándolo — por ejemplo, un lector de líneas que devuelve <code>&amp;str</code> apuntando a un <code>String</code> interno, sin asignar por línea. Compará con <code>BufRead::lines()</code> usando <code>criterion</code> sobre un archivo de 100 MB y reportá asignaciones y tiempo.</li>
+  <li>Definí un trait con <code>async fn</code> nativo y probá las cuatro cosas que no compilan: <code>Box&lt;dyn Trait&gt;</code>, un <code>tokio::spawn</code> del futuro devuelto, guardar el futuro en un campo de struct, y nombrar su tipo. Después resolvelo con <code>#[async_trait]</code> y con <code>#[trait_variant::make]</code>, y anotá qué resuelve cada uno.</li>
+  <li>Reproducí el conflicto de blanket impl de RuS2.8 con un tipo local que <em>no</em> implemente <code>Display</code>. Leé el error completo del compilador y explicá con tus palabras por qué la coherencia no puede razonar en negativo. Después arreglalo con el marcador opt-in.</li>
+  <li>Escribí un tipo con <code>Deref</code> apuntando a un campo, y comprobá los dos síntomas del antipatrón: que un <code>fn f&lt;T: MiTrait&gt;</code> lo rechaza, y que agregar un método inherente con el mismo nombre que uno del <code>Target</code> lo sombrea sin ningún warning. Reescribilo con delegación explícita.</li>
+  <li>Implementá <code>Borrow&lt;str&gt;</code> para un newtype de <code>String</code> que normalice (por ejemplo, pase a minúsculas) e insertá claves en un <code>HashMap</code>. Encontrá un caso concreto donde <code>get</code> no encuentre una clave que sí está guardada, y explicá por qué el compilador no te avisó.</li>
+  <li>Armá la comparación del Worked Example en un proyecto de juguete: la misma lógica detrás de <code>Box&lt;dyn&gt;</code> y de un genérico, con al menos 6 tipos concretos. Medí con <code>cargo llvm-lines</code>, <code>cargo bloat</code> y tres builds limpios cronometrados. Después aplicá el patrón fachada-genérica/núcleo-<code>dyn</code> y volvé a medir. Presentá <strong>tus</strong> números en una tabla.</li>
+</ol>
+
+<section class="quiz" id="quizRuS2">
+  <style>
+    #quizRuS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS2 .q{margin-bottom:1.5rem}
+    #quizRuS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS2 .opt:hover{border-color:var(--accent)}
+    #quizRuS2 .opt:disabled{cursor:default}
+    #quizRuS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS2 .exp.show{display:block}
+    #quizRuS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tenés <code>trait Politica { fn clonar(&amp;self) -&gt; Self; }</code> y el compilador rechaza <code>Box&lt;dyn Politica&gt;</code> con <code>E0038</code>. ¿Cuál es la causa exacta?</p>
+    <button class="opt">Falta que el trait declare <code>Self: Sized</code>, que es lo que habilita <code>dyn</code></button>
+    <button class="opt">El método devuelve <code>Self</code> por valor, y detrás de <code>dyn</code> el <code>Self</code> es unsized: no hay tamaño que devolver</button>
+    <button class="opt"><code>Clone</code> no está en el prelude, hay que importarlo con <code>use std::clone::Clone</code></button>
+    <div class="exp">Detrás de <code>dyn Politica</code>, el tipo concreto se borró: <code>Self</code> pasa a ser unsized y no se puede devolver por valor ni pasar por valor. Por eso <code>Clone</code> —cuya firma es <code>fn clone(&amp;self) -&gt; Self</code>— nunca es dyn-compatible. La salida estándar es devolver el puntero ya construido: <code>fn clonar(&amp;self) -&gt; Box&lt;dyn Politica&gt;</code>, que sí es <code>Sized</code>, y después <code>impl Clone for Box&lt;dyn Politica&gt;</code> delegando en él. Ojo con la opción 1: agregar <code>Self: Sized</code> al trait hace exactamente lo contrario — <em>prohíbe</em> <code>dyn</code> para siempre.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tenés <code>impl&lt;T: Display&gt; MiTrait for T</code> y agregás <code>impl MiTrait for MiStruct</code>. <code>MiStruct</code> <strong>no</strong> implementa <code>Display</code>. ¿Qué pasa?</p>
+    <button class="opt">Compila: el compilador ve que <code>MiStruct</code> no es <code>Display</code>, así que no hay solapamiento</button>
+    <button class="opt">Compila, pero el impl específico queda sombreado por el blanket en tiempo de ejecución</button>
+    <button class="opt">Falla con <code>E0119</code>: el chequeo de solapamiento no razona en negativo, porque <code>MiStruct</code> podría implementar <code>Display</code> más adelante</button>
+    <div class="exp">La coherencia no puede apoyarse en la <em>ausencia</em> de un impl. Si lo hiciera, agregar un <code>impl Display for MiStruct</code> —un cambio aparentemente aditivo, y que hasta podría venir de una dependencia— rompería el programa retroactivamente. Rust prefiere el error temprano. Las salidas son: blanquear sobre un marcador propio con opt-in explícito (<code>trait MiMarcador: Display {}</code>), usar un wrapper (<code>struct PorDisplay&lt;T&gt;(T)</code>), o directamente no usar blanket impl y generar los impls con un <code>derive</code>. Y recordá el corolario de semver: agregar un blanket impl a un trait público es un cambio incompatible.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Un servicio hace un query a Postgres de ~4 ms por operación. Tenés que elegir entre <code>Box&lt;dyn Repositorio&gt;</code> y un servicio genérico sobre <code>R: Repositorio</code>, con 12 tipos concretos y ~400 líneas de lógica. ¿Cuál es el criterio correcto?</p>
+    <button class="opt">Elegir <code>dyn</code>: la indirección es ruido frente a los 4 ms de I/O, y el genérico paga tiempo de compilación y binario que sí se sienten todos los días</button>
+    <button class="opt">Elegir el genérico: el dispatch estático siempre es más rápido y en un servicio la latencia es lo único que importa</button>
+    <button class="opt">Da igual, son equivalentes: el compilador desvirtualiza los <code>dyn</code> automáticamente en release</button>
+    <div class="exp">La llamada indirecta aporta nanosegundos sobre milisegundos: en el perfil no se ve. Lo que sí se ve es el otro lado del intercambio — con 12 instanciaciones × 400 líneas, el build limpio y sobre todo el <strong>rebuild incremental</strong> se multiplican, y eso lo paga el equipo cada vez que guarda un archivo. La opción 3 es un mito frecuente: LLVM puede desvirtualizar en casos muy acotados donde ve el tipo concreto, pero no es algo con lo que se pueda contar a través de un límite de crate. Y el mejor de los dos mundos existe: fachada genérica de tres líneas + núcleo <code>dyn</code>, el patrón de <code>std::fs::read_to_string</code>.</div>
+  </div>
+
+  <div class="score" id="scoreRuS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RuS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus1-ownership/lecture.html">← RuS1: Ownership por dentro</a>
+  <a href="../rus3-async-interno/lecture.html">RuS3: Async por dentro →</a>
+</nav>
+
+</div>
+</body>
+</html>

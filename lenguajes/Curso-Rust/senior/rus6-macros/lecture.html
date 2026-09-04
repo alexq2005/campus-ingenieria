@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS6 — Macros: declarativas, procedurales y su costo · Rust Senior</title>
+  <meta name="description" content="macro_rules! y sus fragment specifiers, higiene, los tres tipos de macros procedurales, el trío syn+quote+proc-macro2, un derive(Builder) completo, cargo expand y trybuild, el costo real en tiempo de compilación y cuándo NO escribir una macro.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS6</span>
+  <span class="badge">⏱ 45–150 min</span>
+  <span class="badge">🎯 Pre-req: RuS2</span>
+  <span class="badge">🔮 Metaprogramación</span>
+</div>
+
+<article>
+
+<h1>RuS6 — Macros: declarativas, procedurales y su costo</h1>
+
+<h2>RuS6.0 Por qué las macros de Rust no son las de C</h2>
+
+<p>Si venís de C, la palabra <em>macro</em> te trae malos recuerdos: sustitución de texto ciega, paréntesis defensivos por todos lados, variables que se pisan, y errores de compilación que hablan de código que vos nunca escribiste. Las macros de Rust arreglan casi todo eso, y lo hacen por una razón estructural: <strong>operan sobre árboles de tokens y fragmentos del AST, no sobre caracteres</strong>.</p>
+
+<p>El ejemplo canónico. En C, el preprocesador reemplaza texto antes de que el compilador vea nada:</p>
+
+<pre><code class="lang-text">#define CUADRADO(x) x * x
+
+int main(void) {
+    int r = CUADRADO(1 + 2);   // se expande a:  1 + 2 * 1 + 2
+    return r;                  // r == 5, no 9
+}</code></pre>
+
+<p>La solución en C es escribir <code>((x) * (x))</code> y no olvidarse nunca. En Rust el problema no existe, porque <code>$x:expr</code> no captura texto: captura <strong>una expresión completa como un solo nodo</strong>. Cuando la macro la vuelve a emitir, sigue siendo esa expresión, indivisible.</p>
+
+<pre><code class="lang-rust">macro_rules! cuadrado {
+    ($x:expr) =&gt; { $x * $x };
+}
+
+fn main() {
+    let r = cuadrado!(1 + 2);   // (1 + 2) * (1 + 2)
+    assert_eq!(r, 9);           // ✅ sin paréntesis defensivos
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Una macro de Rust es <strong>una función que corre en tiempo de compilación y cuya entrada y salida son tokens de Rust</strong>. De ahí se deducen sus dos superpoderes y su gran limitación. Superpoderes: puede generar código que vos no podrías escribir a mano sin repetirte, y puede validar cosas antes de que el programa exista. Limitación: corre <strong>antes</strong> de la resolución de tipos, así que <em>no sabe qué tipo tiene nada</em>. Todo lo que sigue en este módulo es una consecuencia de esas tres frases.
+</div>
+
+<p>Esa limitación no es un detalle menor: es <em>la</em> restricción. Una macro ve el token <code>Option</code> y no sabe si es el <code>Option</code> de la biblioteca estándar, un alias tuyo, o un enum propio que se llama igual. Ve <code>Vec&lt;T&gt;</code> y no sabe si <code>T</code> implementa <code>Clone</code>. Volvemos a esto varias veces, porque es el origen del 80% de las macros mal diseñadas.</p>
+
+<p>Rust tiene dos familias, y conviene tenerlas separadas desde el arranque:</p>
+
+<table>
+<thead><tr><th>Familia</th><th>Cómo se define</th><th>Qué ve</th><th>Dónde vive</th></tr></thead>
+<tbody>
+<tr><td><strong>Declarativas</strong> (<code>macro_rules!</code>)</td><td>Patrones y sustituciones, dentro de tu propio crate</td><td>Árboles de tokens que matchean un patrón</td><td>Cualquier módulo</td></tr>
+<tr><td><strong>Procedurales</strong></td><td>Código Rust arbitrario que transforma un <code>TokenStream</code></td><td>Todos los tokens del ítem, sin restricciones</td><td>Un crate aparte, marcado <code>proc-macro = true</code></td></tr>
+</tbody>
+</table>
+
+<p>La regla de oro del módulo, adelantada: <strong>empezá siempre por lo más simple que funcione</strong>, y en el orden función → trait → <code>macro_rules!</code> → proc-macro. Cada escalón te cuesta legibilidad, herramientas y tiempo de compilación.</p>
+
+<h2>RuS6.1 <code>macro_rules!</code>: patrones, repetición y fragment specifiers</h2>
+
+<p>Una macro declarativa es una lista de reglas <code>(patrón) =&gt; { expansión }</code> separadas por punto y coma. Se prueban <strong>en orden, de arriba hacia abajo, y gana la primera que matchea</strong>:</p>
+
+<pre><code class="lang-rust">macro_rules! saludar {
+    // regla 1: sin argumentos
+    () =&gt; {
+        println!("hola")
+    };
+    // regla 2: un identificador
+    ($quien:ident) =&gt; {
+        println!("hola, {}", stringify!($quien))
+    };
+    // regla 3: una expresión que produce algo Display
+    ($quien:expr) =&gt; {
+        println!("hola, {}", $quien)
+    };
+}
+
+fn main() {
+    saludar!();              // hola
+    saludar!(mundo);         // hola, mundo     (regla 2: 'mundo' es un ident)
+    saludar!("Ada".trim());  // hola, Ada       (regla 3)
+}</code></pre>
+
+<p>Fijate que la regla 2 y la 3 se pisan parcialmente: <code>mundo</code> también sería una expresión válida. Como la 2 va primero, gana la 2. <strong>Si las intercambiaras, la regla del <code>ident</code> quedaría muerta para siempre</strong> — y no habría warning que te avise.</p>
+
+<h3>Los fragment specifiers</h3>
+
+<p>El <code>:algo</code> después de la metavariable le dice al compilador <em>con qué parser</em> leer ese fragmento. Elegir mal es la primera fuente de macros frustrantes.</p>
+
+<table>
+<thead><tr><th>Specifier</th><th>Captura</th><th>Qué puede seguirlo en el patrón</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><code>expr</code></td><td>Una expresión completa</td><td>solo <code>=&gt;</code>, <code>,</code>, <code>;</code></td><td>Valores. Es el default mental correcto.</td></tr>
+<tr><td><code>ident</code></td><td>Un identificador o keyword</td><td>cualquier cosa</td><td>Nombres de variables, campos, tipos simples.</td></tr>
+<tr><td><code>ty</code></td><td>Un tipo</td><td><code>=&gt;</code> <code>,</code> <code>=</code> <code>|</code> <code>;</code> <code>:</code> <code>&gt;</code> <code>&gt;&gt;</code> <code>[</code> <code>{</code> <code>as</code> <code>where</code></td><td>Anotaciones de tipo, parámetros genéricos.</td></tr>
+<tr><td><code>pat</code></td><td>Un patrón (incluye <code>a | b</code> desde 2021)</td><td><code>=&gt;</code> <code>,</code> <code>=</code> <code>if</code> <code>in</code></td><td>Brazos de <code>match</code> generados.</td></tr>
+<tr><td><code>pat_param</code></td><td>Patrón sin <code>|</code> de nivel superior</td><td>lo anterior, más <code>|</code></td><td>Cuando necesitás separar alternativas vos mismo.</td></tr>
+<tr><td><code>block</code></td><td>Un bloque <code>{ ... }</code></td><td>cualquier cosa</td><td>Cuerpos de código que el usuario pasa.</td></tr>
+<tr><td><code>stmt</code></td><td>Una sentencia, sin el <code>;</code> final</td><td><code>=&gt;</code>, <code>,</code>, <code>;</code></td><td>Raro. Casi siempre querés <code>block</code>.</td></tr>
+<tr><td><code>item</code></td><td>Un ítem entero (<code>fn</code>, <code>struct</code>, <code>impl</code>…)</td><td>cualquier cosa</td><td>Macros que envuelven definiciones.</td></tr>
+<tr><td><code>path</code></td><td>Una ruta tipo <code>std::io::Read</code></td><td>igual que <code>ty</code></td><td>Traits y tipos calificados.</td></tr>
+<tr><td><code>lifetime</code></td><td><code>'a</code></td><td>cualquier cosa</td><td>Genéricos con lifetimes.</td></tr>
+<tr><td><code>vis</code></td><td>Visibilidad, <em>puede estar vacía</em></td><td>conjunto restringido</td><td>Generar ítems respetando el <code>pub</code> del usuario.</td></tr>
+<tr><td><code>meta</code></td><td>El contenido de un atributo</td><td>cualquier cosa</td><td>Reenviar <code>#[...]</code> al código generado.</td></tr>
+<tr><td><code>tt</code></td><td><strong>Un solo árbol de tokens</strong></td><td>cualquier cosa</td><td>El comodín. Para DSLs y para reenviar sin interpretar.</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Por qué existe la columna "qué puede seguirlo".</strong> No es capricho. Después de <code>$e:expr</code> el compilador solo acepta <code>=&gt;</code>, <code>,</code> o <code>;</code> porque son los únicos tokens que <em>hoy y siempre</em> van a ser imposibles de confundir con la continuación de una expresión. Si mañana Rust agrega sintaxis nueva de expresiones, tu macro tiene que seguir compilando igual. Es una <strong>garantía de compatibilidad hacia adelante</strong> pagada con una restricción hoy.
+</div>
+
+<div class="mistake">
+  <strong>El error que te va a costar una tarde.</strong> Una vez que capturaste algo como <code>$e:expr</code>, ese fragmento se vuelve <strong>opaco</strong>: internamente es un solo token con delimitadores invisibles. Si se lo pasás a otra macro que espera <code>$($t:tt)*</code>, no se va a re-descomponer. Por eso las macros que hacen recursión sobre su entrada capturan <code>tt</code> y no <code>expr</code>: <em>el <code>tt</code> es el único que conserva la estructura para el siguiente paso</em>.
+</div>
+
+<h3>Repetición: <code>$()*</code>, <code>$()+</code> y <code>$()?</code></h3>
+
+<p>La sintaxis es <code>$( ... ) sep rep</code>, donde <code>sep</code> es un separador opcional y <code>rep</code> es <code>*</code> (cero o más), <code>+</code> (uno o más) o <code>?</code> (cero o uno, sin separador). El mismo grupo se usa en el patrón para <em>capturar</em> y en la expansión para <em>emitir</em>:</p>
+
+<pre><code class="lang-rust">macro_rules! mapa {
+    // caso vacío: mapa!()
+    () =&gt; {
+        ::std::collections::HashMap::new()
+    };
+    // caso general: mapa!{ "a" =&gt; 1, "b" =&gt; 2, }   ← coma final opcional
+    ($($clave:expr =&gt; $valor:expr),+ $(,)?) =&gt; {{
+        let mut m = ::std::collections::HashMap::new();
+        $( m.insert($clave, $valor); )+
+        m
+    }};
+}
+
+fn main() {
+    let edades = mapa! {
+        "ada"   =&gt; 36,
+        "grace" =&gt; 45,     // la coma final compila gracias a $(,)?
+    };
+    assert_eq!(edades["ada"], 36);
+}</code></pre>
+
+<p>Tres detalles de artesanía en esas ocho líneas:</p>
+
+<div class="step"><strong>1. Las llaves dobles <code>{{ }}</code>.</strong> Las externas delimitan la expansión; las internas crean un <strong>bloque</strong>, que es una expresión. Sin ellas, la macro emitiría tres sentencias sueltas y no podrías escribir <code>let m = mapa!{...};</code>.</div>
+
+<div class="step"><strong>2. <code>$(,)?</code> al final del patrón.</strong> Acepta la coma final que todo el mundo escribe. Omitirlo es la queja número uno de los usuarios de tu macro.</div>
+
+<div class="step"><strong>3. La ruta absoluta <code>::std::collections::HashMap</code>.</strong> Los <em>caminos</em> no son higiénicos: se resuelven en el ámbito de quien llama. Si el usuario tiene un <code>struct HashMap</code> propio, tu macro se rompe. Con <code>::</code> adelante, apuntás a la raíz y no hay ambigüedad posible.</div>
+
+<p>Las repeticiones anidan. El patrón clásico de una matriz literal, donde el nivel externo son filas y el interno columnas:</p>
+
+<pre><code class="lang-rust">macro_rules! matriz {
+    ( $( [ $($celda:expr),* $(,)? ] ),* $(,)? ) =&gt; {
+        vec![ $( vec![ $($celda),* ] ),* ]
+    };
+}
+
+fn main() {
+    let m: Vec&lt;Vec&lt;i32&gt;&gt; = matriz![
+        [1, 2, 3],
+        [4, 5, 6],
+    ];
+    assert_eq!(m[1][2], 6);
+}</code></pre>
+
+<div class="tip">
+  Regla de oro de las repeticiones anidadas: <strong>la estructura de <code>$()</code> en la expansión tiene que reflejar la del patrón</strong>. Si capturaste dos niveles, emitís dos niveles. Si intentás emitir <code>$celda</code> con un solo <code>$()*</code>, el compilador te dice <em>"variable 'celda' is still repeating at this depth"</em>, que es raro la primera vez pero literal: te quedó un nivel sin desplegar.
+</div>
+
+<h3>Munching de <code>tt</code> y reglas internas</h3>
+
+<p>Para procesar entradas arbitrarias existe el patrón <em>tt munching</em>: consumir un token tree por vez y recurrir. También la convención de <strong>reglas internas</strong> marcadas con <code>@</code>, que no son parte de la API pública de la macro:</p>
+
+<pre><code class="lang-rust">macro_rules! contar {
+    // regla interna: cada tt vale 1
+    (@uno $_x:tt) =&gt; { 1usize };
+    // regla pública: suma un 1 por cada token tree
+    ($($x:tt)*) =&gt; { 0usize $( + contar!(@uno $x) )* };
+}
+
+const N: usize = contar!(a b "c" 4 (5 + 6));
+// N == 5, y se evalúa en tiempo de compilación</code></pre>
+
+<div class="warn">
+  La recursión de macros tiene límite: <strong>128 niveles por defecto</strong>. Se sube con <code>#![recursion_limit = "256"]</code> en la raíz del crate, pero si necesitás subirlo mucho es señal de que tu macro es cuadrática en tiempo de compilación y hay que rediseñarla. La versión de arriba es lineal justamente porque expande un <code>+ 1</code> por token en vez de re-invocarse sobre la cola.
+</div>
+
+<h3>Exportar la macro: <code>#[macro_export]</code> y <code>$crate</code></h3>
+
+<p>Una macro declarativa solo es visible <em>después</em> de su definición en el orden textual del archivo, salvo que la exportes. <code>#[macro_export]</code> la publica en la raíz del crate. Y ahí aparece el problema de las rutas: dentro de tu macro no sabés cómo se llama tu crate en el proyecto del usuario.</p>
+
+<pre><code class="lang-rust">// en tu crate `bitacora`
+pub fn escribir(nivel: u8, msg: &amp;str) { /* ... */ }
+
+#[macro_export]
+macro_rules! aviso {
+    ($($arg:tt)*) =&gt; {
+        // $crate se expande a ::bitacora — o al nombre real, si el usuario
+        // hizo  bitacora = { package = "bitacora", version = "1" }  con alias
+        $crate::escribir(2, &amp;::std::format!($($arg)*))
+    };
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>$crate</code> es obligatorio en toda macro exportada.</strong> Sin él, tu macro compila en tu crate y falla en el de tu usuario con "cannot find function <code>escribir</code>". Es el bug más frecuente de las macros publicadas en crates.io, y solo aparece cuando alguien más la usa — nunca en tus propios tests.
+</div>
+
+<h2>RuS6.2 Higiene: por qué tu variable no pisa la del llamador</h2>
+
+<p>Este es el punto donde Rust se separa de C de manera más visible. Mirá el clásico <code>SWAP</code>:</p>
+
+<pre><code class="lang-text">#define SWAP(a, b) { int tmp = (a); (a) = (b); (b) = tmp; }
+
+int main(void) {
+    int tmp = 1, x = 2;
+    SWAP(tmp, x);      // se expande a: { int tmp = tmp; tmp = x; x = tmp; }
+    // tmp y x quedan ambos en basura: la variable de la macro pisó la del llamador
+}</code></pre>
+
+<p>La macro no tiene forma de saber que el usuario ya tenía un <code>tmp</code>. La convención histórica en C es llamar a las variables internas <code>__tmp_swap_line_37</code> y rezar. En Rust el problema simplemente no ocurre:</p>
+
+<pre><code class="lang-rust">macro_rules! con_temporal {
+    ($e:expr) =&gt; {{
+        let tmp = 40;
+        $e + tmp
+    }};
+}
+
+fn main() {
+    let tmp = 2;
+    // El `tmp` de adentro y el `tmp` de afuera son DOS bindings distintos.
+    assert_eq!(con_temporal!(tmp), 42);   // 2 + 40, no 40 + 40
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Cómo funciona la higiene.</strong> Cada identificador que Rust ve lleva pegado un <strong><code>SyntaxContext</code></strong>: una marca invisible que dice "este nombre nació acá". El <code>tmp</code> escrito en el cuerpo de la macro y el <code>tmp</code> escrito en <code>main</code> son textualmente iguales pero tienen contextos distintos, así que la resolución de nombres los trata como variables diferentes. No hay renombre mágico ni prefijos: hay un sistema de identidad de identificadores.
+</div>
+
+<h3>Qué es higiénico y qué no</h3>
+
+<p>Acá está el matiz que separa a quien leyó el libro de quien escribió macros de verdad. <strong>La higiene de <code>macro_rules!</code> es parcial</strong>: cubre variables locales, labels y lifetimes. No cubre nada más.</p>
+
+<table>
+<thead><tr><th>Elemento</th><th>¿Higiénico?</th><th>Consecuencia práctica</th></tr></thead>
+<tbody>
+<tr><td>Variables locales (<code>let</code>)</td><td>✅ Sí</td><td>Podés usar cualquier nombre sin miedo.</td></tr>
+<tr><td>Labels de loop (<code>'salir:</code>)</td><td>✅ Sí</td><td>Ídem.</td></tr>
+<tr><td>Lifetimes</td><td>✅ Sí</td><td>Ídem.</td></tr>
+<tr><td>Rutas y tipos (<code>HashMap</code>, <code>Result</code>)</td><td>❌ No</td><td>Se resuelven en el sitio de llamada. Usá <code>::std::…</code> y <code>$crate::…</code>.</td></tr>
+<tr><td>Nombres de ítems generados (<code>fn</code>, <code>struct</code>)</td><td>❌ No</td><td>Van al ámbito del llamador y pueden colisionar.</td></tr>
+<tr><td>Campos y métodos</td><td>❌ No</td><td>Se resuelven por tipo, después de la expansión.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">macro_rules! frágil {
+    () =&gt; {{
+        // ❌ 'Result' NO es higiénico: si el usuario tiene su propio Result
+        //    (¡y muchos crates lo definen!), esto compila distinto o no compila.
+        let r: Result&lt;u8, ()&gt; = Ok(1);
+        r
+    }};
+}
+
+macro_rules! robusta {
+    () =&gt; {{
+        // ✅ Ruta absoluta: no hay ambigüedad posible
+        let r: ::core::result::Result&lt;u8, ()&gt; = ::core::result::Result::Ok(1);
+        r
+    }};
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ En macros procedurales la higiene es una decisión tuya.</strong> <code>quote!</code> genera tokens con <code>Span::call_site()</code>, que es <strong>no higiénico</strong>: todo se resuelve como si lo hubiera escrito el usuario. Si tu proc-macro emite <code>let tmp = ...</code>, ese <code>tmp</code> <em>sí</em> puede colisionar. Para el comportamiento tipo <code>macro_rules!</code> existe <code>Span::mixed_site()</code>, disponible en <code>quote::quote_spanned!</code>. Es un tema del que casi nadie habla y que produce bugs muy difíciles de reproducir.
+</div>
+
+<h2>RuS6.3 Los límites de <code>macro_rules!</code></h2>
+
+<p>Las macros declarativas cubren muchísimo terreno con muy poco costo. Pero se chocan contra cuatro paredes duras, y reconocerlas rápido te ahorra días.</p>
+
+<div class="step"><strong>Pared 1 — No puede fabricar identificadores nuevos.</strong> Dado <code>Usuario</code>, no hay forma en <code>macro_rules!</code> de producir <code>UsuarioBuilder</code>, <code>USUARIO_ID</code> o <code>fn crear_usuario</code>. <code>concat_idents!</code> existe pero es inestable y ni siquiera sirve para declarar cosas. La única salida en estable es el crate <code>paste</code>… que es una proc-macro. O sea: la pared ya te empujó al otro lado.</div>
+
+<div class="step"><strong>Pared 2 — No inspecciona tipos ni semántica.</strong> <code>$t:ty</code> te da tokens que <em>parsean</em> como un tipo. No sabés si es <code>Copy</code>, si es un enum, cuántas variantes tiene, ni si <code>Option</code> es el de <code>std</code>. Cualquier decisión que dependa de eso es imposible.</div>
+
+<div class="step"><strong>Pared 3 — No se puede enganchar a una definición real.</strong> Podés escribir <code>mi_struct!{ Usuario { nombre: String } }</code> con tu propia sintaxis, pero no podés poner <code>#[derive(MiCosa)]</code> arriba de un <code>struct</code> normal. Los <code>derive</code> son territorio exclusivo de las procedurales.</div>
+
+<div class="step"><strong>Pared 4 — Los errores son crípticos.</strong> Cuando ninguna regla matchea, el compilador dice <em>"no rules expected this token in macro invocation"</em> y señala un token cualquiera. No hay forma de explicar qué esperabas… salvo un truco.</div>
+
+<p>Ese truco es una <strong>regla catch-all con <code>compile_error!</code></strong>, y es lo mínimo que le debés a quien use tu macro:</p>
+
+<pre><code class="lang-rust">macro_rules! configurar {
+    (modo = debug)   =&gt; { Config::debug() };
+    (modo = release) =&gt; { Config::release() };
+    // 👇 catch-all: convierte un error incomprensible en una instrucción
+    ($($otro:tt)*) =&gt; {
+        ::core::compile_error!(
+            "uso: configurar!(modo = debug) o configurar!(modo = release)"
+        )
+    };
+}
+
+// configurar!(modo = prod);
+// error: uso: configurar!(modo = debug) o configurar!(modo = release)</code></pre>
+
+<div class="rule">
+  <strong>📌 El test de "¿me tengo que ir a procedural?"</strong> Respondé estas cuatro: ¿necesito <strong>fabricar nombres</strong>? ¿necesito <strong>leer una definición existente</strong> (struct/enum/fn) sin cambiar cómo se escribe? ¿necesito <strong>leer atributos</strong> tipo <code>#[builder(each = "arg")]</code>? ¿necesito <strong>errores con span propio</strong> apuntando al campo culpable? Un solo "sí" y <code>macro_rules!</code> no alcanza. Cuatro "no" y una proc-macro es sobreingeniería.
+</div>
+
+<h2>RuS6.4 Macros procedurales: los tres tipos</h2>
+
+<p>Una macro procedural es <strong>una función Rust normal que corre dentro del compilador</strong>. Recibe tokens, hace lo que se le antoja —parsear, consultar una base de datos, leer un archivo— y devuelve tokens. Hay exactamente tres formas, distinguidas por dónde se invocan y qué reemplazan:</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Firma</th><th>Se invoca</th><th>Qué hace con el ítem original</th></tr></thead>
+<tbody>
+<tr><td><strong>derive</strong></td><td><code>fn(TokenStream) -&gt; TokenStream</code></td><td><code>#[derive(Builder)]</code> sobre <code>struct</code>/<code>enum</code>/<code>union</code></td><td>Lo <strong>deja intacto</strong> y <em>agrega</em> ítems nuevos</td></tr>
+<tr><td><strong>atributo</strong></td><td><code>fn(TokenStream, TokenStream) -&gt; TokenStream</code></td><td><code>#[medir(nivel = "info")]</code> sobre casi cualquier ítem</td><td>Lo <strong>reemplaza</strong> por completo</td></tr>
+<tr><td><strong>function-like</strong></td><td><code>fn(TokenStream) -&gt; TokenStream</code></td><td><code>sql!( SELECT … )</code></td><td>Reemplaza la invocación</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">use proc_macro::TokenStream;
+
+// 1. derive — solo agrega. El primer TokenStream es el struct completo.
+#[proc_macro_derive(Builder, attributes(builder))]
+pub fn derive_builder(entrada: TokenStream) -&gt; TokenStream { /* … */ }
+
+// 2. atributo — reemplaza. args = lo de adentro de los paréntesis del atributo,
+//    item = el ítem entero al que está pegado.
+#[proc_macro_attribute]
+pub fn medir(args: TokenStream, item: TokenStream) -&gt; TokenStream { /* … */ }
+
+// 3. function-like — reemplaza la llamada.
+#[proc_macro]
+pub fn sql(entrada: TokenStream) -&gt; TokenStream { /* … */ }</code></pre>
+
+<div class="info">
+  El <code>attributes(builder)</code> del <code>derive</code> declara <strong>helper attributes</strong>: le avisa al compilador que <code>#[builder(...)]</code> sobre los campos es legal y que se lo tiene que pasar a tu macro en vez de rechazarlo. Sin esa declaración, cualquier atributo desconocido es un error de compilación. Es exactamente el mecanismo por el que funciona <code>#[serde(rename = "…")]</code>.
+</div>
+
+<h3>Por qué van en su propio crate</h3>
+
+<p>Un crate de proc-macros se declara así, y esa marca cambia todo:</p>
+
+<pre><code class="lang-toml"># mi-crate-macros/Cargo.toml
+[package]
+name = "mi-crate-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true          # 👈 la línea que lo cambia todo
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"</code></pre>
+
+<p>Con <code>proc-macro = true</code>, Cargo compila ese crate <strong>como una biblioteca dinámica para la máquina que compila</strong>, no para la máquina destino, y <code>rustc</code> la carga como un plugin mientras compila tu código. De ahí salen tres consecuencias que hay que tener presentes:</p>
+
+<ul>
+  <li><strong>No podés mezclar.</strong> Un crate proc-macro solo puede exportar macros procedurales. Nada de structs, funciones o traits públicos.</li>
+  <li><strong>Compila para el host.</strong> Si hacés cross-compilation a ARM, el crate de macros igual se compila para tu x86. Es correcto, pero explica por qué a veces aparece dos veces en el árbol de dependencias.</li>
+  <li><strong>Necesita una fachada.</strong> Nadie quiere depender de dos crates. La convención es <code>mi-crate</code> (con los traits y tipos) que re-exporta la macro:</li>
+</ul>
+
+<pre><code class="lang-rust">// mi-crate/src/lib.rs
+pub use mi_crate_macros::Builder;   // el usuario solo escribe: mi-crate = "1"
+
+pub trait Construible { /* … */ }</code></pre>
+
+<div class="mistake">
+  <strong>Dentro de una proc-macro no existe <code>$crate</code>.</strong> Es la trampa gemela de la de <code>macro_rules!</code>. Si tu derive genera <code>::mi_crate::Construible</code> y el usuario renombró la dependencia en su <code>Cargo.toml</code>, no compila. Las dos salidas reales: el crate <code>proc-macro-crate</code>, que lee el <code>Cargo.toml</code> del consumidor y te dice el nombre efectivo; o la técnica de <code>serde</code>, que envuelve todo en un <code>const _: () = { extern crate serde as _serde; … };</code> para tener un alias garantizado.
+</div>
+
+<h2>RuS6.5 El trío estándar: <code>syn</code> + <code>quote</code> + <code>proc-macro2</code></h2>
+
+<p>El <code>TokenStream</code> que te da el compilador es una lista plana e incómoda. Nadie escribe proc-macros a mano sobre eso. El ecosistema convergió hace años en tres crates que hacen falta juntos:</p>
+
+<table>
+<thead><tr><th>Crate</th><th>Rol</th><th>Por qué no se puede evitar</th></tr></thead>
+<tbody>
+<tr><td><code>proc-macro2</code></td><td>Un <code>TokenStream</code> que funciona <strong>fuera</strong> del compilador</td><td>Los tipos de <code>proc_macro</code> solo existen durante una expansión: sin esto no podés escribir un solo <code>#[test]</code> unitario de tu lógica.</td></tr>
+<tr><td><code>syn</code></td><td><strong>Parsea</strong> tokens a un AST tipado (<code>DeriveInput</code>, <code>ItemFn</code>, <code>Type</code>, <code>Expr</code>…)</td><td>Reimplementar el parser de Rust no es una opción razonable.</td></tr>
+<tr><td><code>quote</code></td><td><strong>Genera</strong> tokens con plantillas (<em>quasi-quoting</em>)</td><td>Construir tokens a mano es ilegible y propenso a errores de span.</td></tr>
+</tbody>
+</table>
+
+<p>El flujo siempre es el mismo: <em>parsear con <code>syn</code> → decidir en Rust normal → emitir con <code>quote</code></em>.</p>
+
+<pre><code class="lang-rust">use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::Ident;
+
+fn ejemplo(nombre: &amp;Ident, campos: &amp;[Ident]) -&gt; TokenStream2 {
+    // #var  interpola cualquier cosa que implemente ToTokens
+    // #(#xs),*  repite sobre un iterador, con separador
+    quote! {
+        impl #nombre {
+            pub fn campos() -&gt; &amp;'static [&amp;'static str] {
+                &amp;[ #( ::core::stringify!(#campos) ),* ]
+            }
+        }
+    }
+}</code></pre>
+
+<div class="tip">
+  Las <em>features</em> de <code>syn</code> importan para tu tiempo de compilación. Por defecto trae <code>derive</code> (suficiente para parsear un <code>struct</code>). <code>full</code> agrega el parser de expresiones, sentencias y cuerpos de función — es lo que necesitás para macros de atributo tipo <code>#[tokio::main]</code>, y es la parte cara. <code>extra-traits</code> agrega <code>Debug</code> a todo el AST: <strong>ponela solo mientras depurás</strong> y sacala antes de publicar.
+</div>
+
+<h3>Lo que separa una macro usable de una odiada: los errores</h3>
+
+<p>Acá está el 90% de la diferencia de calidad. Una proc-macro que hace <code>unwrap()</code> produce esto:</p>
+
+<pre><code class="lang-bash">error: proc-macro derive panicked
+ --&gt; src/modelo.rs:8:10
+  |
+8 | #[derive(Builder)]
+  |          ^^^^^^^
+  |
+  = help: message: called `Option::unwrap()` on a `None` value</code></pre>
+
+<p>El usuario no tiene la menor idea de qué hizo mal. La alternativa cuesta cinco líneas y cambia la experiencia por completo:</p>
+
+<pre><code class="lang-rust">use syn::spanned::Spanned;
+
+// ❌ mal: revienta el compilador, span inútil
+let campos = match datos { Data::Struct(s) =&gt; s.fields, _ =&gt; panic!("solo structs") };
+
+// ✅ bien: error de compilación normal, apuntando al token exacto
+fn revisar(campo: &amp;syn::Field) -&gt; syn::Result&lt;()&gt; {
+    if campo.ident.is_none() {
+        return Err(syn::Error::new(
+            campo.span(),                       // 👈 el span del CAMPO culpable
+            "Builder no soporta structs de tupla; usá campos nombrados",
+        ));
+    }
+    Ok(())
+}
+
+// Acumular todos los errores en vez de mostrar uno por build:
+fn revisar_todos(campos: &amp;[syn::Field]) -&gt; syn::Result&lt;()&gt; {
+    let mut acumulado: Option&lt;syn::Error&gt; = None;
+    for c in campos {
+        if let Err(e) = revisar(c) {
+            match &amp;mut acumulado {
+                Some(previo) =&gt; previo.combine(e),   // 👈 combine, no return
+                None =&gt; acumulado = Some(e),
+            }
+        }
+    }
+    match acumulado { Some(e) =&gt; Err(e), None =&gt; Ok(()) }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El patrón de entrada canónico de todo derive.</strong> La función pública nunca hace trabajo: parsea, delega a una función que devuelve <code>syn::Result</code>, y convierte el error en <code>compile_error!</code>. Así <em>nunca</em> hay un panic y <em>siempre</em> hay un span.
+</div>
+
+<pre><code class="lang-rust">#[proc_macro_derive(Builder, attributes(builder))]
+pub fn derive_builder(entrada: TokenStream) -&gt; TokenStream {
+    let ast = syn::parse_macro_input!(entrada as syn::DeriveInput);
+    expandir(ast)
+        .unwrap_or_else(syn::Error::into_compile_error)   // 👈 la línea clave
+        .into()
+}</code></pre>
+
+<p>Y el segundo truco de spans, el que casi nadie aplica: <code>quote_spanned!</code>. Cuando generás código que le pone un <em>bound</em> a un tipo del usuario, ese código debe llevar el span <strong>del tipo</strong>, no el de tu macro. Así, cuando falta el <code>Clone</code>, el error subraya el campo:</p>
+
+<pre><code class="lang-rust">use quote::quote_spanned;
+use syn::spanned::Spanned;
+
+// El error "the trait `Clone` is not implemented" va a apuntar
+// a la línea del CAMPO en el struct del usuario, no al #[derive(Builder)].
+let asercion = quote_spanned! { campo.ty.span() =&gt;
+    const _: fn() = || {
+        fn exige_clone&lt;T: ::core::clone::Clone&gt;() {}
+        exige_clone::&lt;#tipo&gt;();
+    };
+};</code></pre>
+
+<h2>RuS6.6 Un <code>#[derive(Builder)]</code> completo, de punta a punta</h2>
+
+<p>Vamos a escribir el derive entero. El objetivo: dado un struct del usuario, generar un builder que exija los campos obligatorios y deje opcionales los <code>Option&lt;T&gt;</code>.</p>
+
+<pre><code class="lang-rust">// Lo que el usuario escribe:
+use mi_crate::Builder;
+
+#[derive(Builder)]
+pub struct Conexion {
+    host: String,
+    puerto: u16,
+    usuario: Option&lt;String&gt;,     // opcional: no hace falta setearlo
+}
+
+fn main() -&gt; Result&lt;(), String&gt; {
+    let c = Conexion::builder()
+        .host("db.interno".into())
+        .puerto(5432)
+        .build()?;               // ← Err("falta el campo `host`") si te olvidás
+    Ok(())
+}</code></pre>
+
+<h3>Paso 1 — El esqueleto y la validación de entrada</h3>
+
+<pre><code class="lang-rust">use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{format_ident, quote, quote_spanned};
+use syn::{
+    parse_macro_input, punctuated::Punctuated, spanned::Spanned, token::Comma,
+    Data, DeriveInput, Field, Fields, GenericArgument, PathArguments, Type,
+};
+
+#[proc_macro_derive(Builder)]
+pub fn derive_builder(entrada: TokenStream) -&gt; TokenStream {
+    let ast = parse_macro_input!(entrada as DeriveInput);
+    expandir(&amp;ast)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn campos_nombrados(ast: &amp;DeriveInput) -&gt; syn::Result&lt;&amp;Punctuated&lt;Field, Comma&gt;&gt; {
+    match &amp;ast.data {
+        Data::Struct(s) =&gt; match &amp;s.fields {
+            Fields::Named(f) =&gt; Ok(&amp;f.named),
+            otros =&gt; Err(syn::Error::new(
+                otros.span(),
+                "Builder necesita campos nombrados: `struct X { a: T }`",
+            )),
+        },
+        Data::Enum(e) =&gt; Err(syn::Error::new(
+            e.enum_token.span(),
+            "Builder no se puede derivar en enums",
+        )),
+        Data::Union(u) =&gt; Err(syn::Error::new(
+            u.union_token.span(),
+            "Builder no se puede derivar en unions",
+        )),
+    }
+}</code></pre>
+
+<h3>Paso 2 — Detectar <code>Option&lt;T&gt;</code> (y ver la limitación en vivo)</h3>
+
+<pre><code class="lang-rust">/// Si `ty` es `Option&lt;T&gt;`, devuelve `T`.
+fn tipo_interno_de_option(ty: &amp;Type) -&gt; Option&lt;&amp;Type&gt; {
+    let Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &amp;seg.arguments else { return None };
+    match args.args.first()? {
+        GenericArgument::Type(t) =&gt; Some(t),
+        _ =&gt; None,
+    }
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Leé esa función otra vez: es puramente sintáctica.</strong> Acepta <code>Option&lt;T&gt;</code>, <code>std::option::Option&lt;T&gt;</code> y también el <code>enum Option</code> que definió el usuario en su propio módulo. Y <strong>rechaza</strong> un <code>type Quizas = Option&lt;String&gt;;</code>, porque ve el token <code>Quizas</code> y no sabe que es un alias. No hay forma de arreglarlo: la macro corre antes de que exista información de tipos. Todas las macros del ecosistema —serde incluido— tienen exactamente esta limitación. Documentala en tu README en vez de fingir que no existe.
+</div>
+
+<h3>Paso 3 — Generar las tres piezas</h3>
+
+<pre><code class="lang-rust">fn expandir(ast: &amp;DeriveInput) -&gt; syn::Result&lt;TokenStream2&gt; {
+    let nombre = &amp;ast.ident;
+    let nombre_builder = format_ident!("{}Builder", nombre);   // 👈 fabricar un ident
+    let campos = campos_nombrados(ast)?;
+
+    // (a) los campos del builder: todo envuelto en Option
+    let declaraciones = campos.iter().map(|c| {
+        let id = &amp;c.ident;
+        let ty = &amp;c.ty;
+        if tipo_interno_de_option(ty).is_some() {
+            quote! { #id: #ty }                                  // ya era Option
+        } else {
+            quote! { #id: ::core::option::Option&lt;#ty&gt; }
+        }
+    });
+
+    // (b) un setter por campo, con el span del tipo original
+    let setters = campos.iter().map(|c| {
+        let id = &amp;c.ident;
+        let ty = tipo_interno_de_option(&amp;c.ty).unwrap_or(&amp;c.ty);
+        quote_spanned! { c.ty.span() =&gt;
+            pub fn #id(&amp;mut self, valor: #ty) -&gt; &amp;mut Self {
+                self.#id = ::core::option::Option::Some(valor);
+                self
+            }
+        }
+    });
+
+    // (c) el build(): los obligatorios fallan con un mensaje que nombra el campo
+    let construccion = campos.iter().map(|c| {
+        let id = &amp;c.ident;
+        if tipo_interno_de_option(&amp;c.ty).is_some() {
+            quote! { #id: self.#id.take() }
+        } else {
+            let msg = format!("falta el campo `{}`", id.as_ref().unwrap());
+            quote_spanned! { c.span() =&gt;
+                #id: self.#id.take().ok_or_else(
+                    || ::std::string::String::from(#msg)
+                )?
+            }
+        }
+    });
+
+    let inicial = campos.iter().map(|c| {
+        let id = &amp;c.ident;
+        quote! { #id: ::core::option::Option::None }
+    });
+
+    Ok(quote! {
+        impl #nombre {
+            pub fn builder() -&gt; #nombre_builder {
+                #nombre_builder { #(#inicial),* }
+            }
+        }
+
+        pub struct #nombre_builder {
+            #(#declaraciones),*
+        }
+
+        impl #nombre_builder {
+            #(#setters)*
+
+            pub fn build(&amp;mut self)
+                -&gt; ::core::result::Result&lt;#nombre, ::std::string::String&gt;
+            {
+                ::core::result::Result::Ok(#nombre {
+                    #(#construccion),*
+                })
+            }
+        }
+    })
+}</code></pre>
+
+<div class="info">
+  Tres decisiones de diseño escondidas ahí. <strong>(1)</strong> <code>format_ident!</code> es lo que <code>macro_rules!</code> no puede hacer — fabricar <code>ConexionBuilder</code> a partir de <code>Conexion</code>; es <em>la</em> razón por la que este derive tiene que ser procedural. <strong>(2)</strong> Uso <code>take()</code> y no <code>clone()</code>: no le impongo <code>Clone</code> al usuario, a costa de que <code>build()</code> consuma los valores. <strong>(3)</strong> Todas las rutas son absolutas y con <code>::core::</code> cuando se puede, para que el derive funcione también en crates <code>#![no_std]</code>.
+</div>
+
+<h3>Paso 4 — Verificar qué generó de verdad</h3>
+
+<pre><code class="lang-rust">// $ cargo expand --bin demo   (recortado)
+pub struct Conexion {
+    host: String,
+    puerto: u16,
+    usuario: Option&lt;String&gt;,
+}
+impl Conexion {
+    pub fn builder() -&gt; ConexionBuilder {
+        ConexionBuilder { host: None, puerto: None, usuario: None }
+    }
+}
+pub struct ConexionBuilder {
+    host: Option&lt;String&gt;,
+    puerto: Option&lt;u16&gt;,
+    usuario: Option&lt;String&gt;,      // 👈 NO quedó Option&lt;Option&lt;String&gt;&gt;
+}
+impl ConexionBuilder {
+    pub fn host(&amp;mut self, valor: String) -&gt; &amp;mut Self { /* … */ }
+    pub fn puerto(&amp;mut self, valor: u16) -&gt; &amp;mut Self { /* … */ }
+    pub fn usuario(&amp;mut self, valor: String) -&gt; &amp;mut Self { /* … */ }
+    pub fn build(&amp;mut self) -&gt; Result&lt;Conexion, String&gt; { /* … */ }
+}</code></pre>
+
+<h2>RuS6.7 Depurar macros: <code>cargo expand</code> y <code>trybuild</code></h2>
+
+<p>Escribir macros sin estas dos herramientas es programar a ciegas. Con ellas, es programación normal.</p>
+
+<h3><code>cargo expand</code>: ver el código real</h3>
+
+<pre><code class="lang-bash"># Necesita nightly por dentro (usa -Zunpretty=expanded); él solo lo invoca.
+rustup toolchain install nightly
+cargo install cargo-expand
+
+cargo expand                      # todo el crate, ya formateado
+cargo expand modelo::conexion     # solo un módulo — imprescindible en crates grandes
+cargo expand --bin demo           # un binario puntual
+cargo expand --test integracion   # también expande los tests
+cargo expand --lib | wc -l        # ¿cuánto código estoy generando realmente?</code></pre>
+
+<div class="tip">
+  <strong>Usalo también sobre macros ajenas.</strong> Es la forma más rápida de contestar "¿qué runtime me está armando <code>#[tokio::main]</code>?", "¿qué <code>Display</code> me generó <code>thiserror</code>?" o "¿por qué este <code>Deserialize</code> tarda tanto en compilar?". Deja de ser magia y pasa a ser código que podés leer.
+</div>
+
+<p>Para <code>macro_rules!</code> hay además dos ayudas de nightly: <code>trace_macros!(true)</code>, que imprime cada expansión a medida que ocurre, y <code>log_syntax!(...)</code>, que imprime tokens durante la compilación. En proc-macros el equivalente es más simple: un <code>eprintln!</code> dentro de tu función sale por la salida de error de <code>cargo build</code>.</p>
+
+<pre><code class="lang-rust">// dentro de la proc-macro: se imprime mientras compila el crate cliente
+eprintln!("[builder] campos = {:#?}", campos.iter().map(|c| &amp;c.ident).collect::&lt;Vec&lt;_&gt;&gt;());
+eprintln!("[builder] salida =\n{}", salida);   // el TokenStream como texto</code></pre>
+
+<h3><code>trybuild</code>: testear que los errores sigan siendo buenos</h3>
+
+<p>Los tests normales prueban que el código correcto compile. <code>trybuild</code> prueba lo otro: que el código incorrecto <strong>falle con el mensaje que vos escribiste</strong>. Es la única defensa contra que un refactor te degrade los errores sin que nadie se entere.</p>
+
+<pre><code class="lang-toml">[dev-dependencies]
+trybuild = "1"</code></pre>
+
+<pre><code class="lang-rust">// tests/ui.rs
+#[test]
+fn ui() {
+    let t = trybuild::TestCases::new();
+    t.pass("tests/ui/01-struct-simple.rs");
+    t.pass("tests/ui/02-campos-opcionales.rs");
+    t.compile_fail("tests/ui/10-en-un-enum.rs");
+    t.compile_fail("tests/ui/11-struct-de-tupla.rs");
+}</code></pre>
+
+<pre><code class="lang-bash">tests/ui/
+├── 01-struct-simple.rs
+├── 02-campos-opcionales.rs
+├── 10-en-un-enum.rs
+├── 10-en-un-enum.stderr        # ← el error EXACTO que esperás, versionado en git
+├── 11-struct-de-tupla.rs
+└── 11-struct-de-tupla.stderr
+
+# Regenerar los .stderr después de mejorar un mensaje a propósito:
+TRYBUILD=overwrite cargo test --test ui
+git diff tests/ui/            # 👈 y acá REVISÁS que el cambio sea una mejora</code></pre>
+
+<pre><code class="lang-bash"># tests/ui/11-struct-de-tupla.stderr — así queda el snapshot
+error: Builder necesita campos nombrados: `struct X { a: T }`
+ --&gt; tests/ui/11-struct-de-tupla.rs:4:18
+  |
+4 | struct Punto(f64, f64);
+  |             ^^^^^^^^^^</code></pre>
+
+<div class="rule">
+  <strong>📌 El span en el <code>.stderr</code> es parte del test.</strong> Si el <code>^^^^</code> se corre del campo culpable al <code>#[derive(...)]</code>, el test falla aunque el texto sea idéntico. Eso es exactamente lo que querés: la calidad de un error es <em>mensaje + ubicación</em>, y las dos cosas se regresan solas si nadie las mide.
+</div>
+
+<h2>RuS6.8 El costo, con datos</h2>
+
+<p>Las macros no son gratis, y el precio no se paga donde uno cree. Vamos por partes.</p>
+
+<h3>1. Las proc-macros se ejecutan en cada compilación</h3>
+
+<p>El crate de macros se compila una vez y queda cacheado. Pero <strong>la expansión corre cada vez que se compila el crate que la usa</strong>, incluso en <code>cargo check</code>. Con compilación incremental el resultado se cachea por ítem, pero cualquier cambio en el crate de macros invalida todo lo que está río abajo. Y hay un detalle de arquitectura que duele: rustc habla con la proc-macro por un canal serializado, de a un crate por vez, así que esa parte no se paraleliza como el resto de la compilación.</p>
+
+<h3>2. <code>syn</code> pesa, y está en el camino crítico</h3>
+
+<pre><code class="lang-bash"># ¿Quién me está trayendo syn, y con qué features?
+cargo tree -e normal -i syn
+cargo tree --duplicates              # ¿tengo syn 1 y syn 2 conviviendo?
+
+# ¿Dónde se va el tiempo del build limpio?
+cargo clean &amp;&amp; cargo build --timings
+# genera target/cargo-timings/cargo-timing.html — ordenalo por duración
+
+# Medición honesta, con varias corridas
+cargo install hyperfine
+hyperfine --warmup 1 --prepare 'cargo clean' 'cargo build'</code></pre>
+
+<div class="warn">
+  Órdenes de magnitud típicos en una máquina de escritorio de 2026, <strong>que tenés que reproducir en la tuya antes de citarlos</strong>: <code>proc-macro2</code> + <code>quote</code> ≈ 1–2 s; <code>syn</code> con features por defecto ≈ 3–5 s; <code>syn</code> con <code>full</code> ≈ 8–15 s. Se paga una sola vez por build limpio, pero <strong>bloquea</strong>: nada que dependa de tu derive puede empezar hasta que el <em>dylib</em> de la macro esté linkeado. Por eso una macro chiquita puede empeorar el <em>wall clock</em> mucho más de lo que sugiere su tamaño.
+</div>
+
+<p>Hay una optimización poco conocida y muy efectiva. Por defecto Cargo compila los build scripts y las proc-macros con el perfil de desarrollo, o sea sin optimizar — y después las <em>ejecuta</em> miles de veces:</p>
+
+<pre><code class="lang-toml"># Cargo.toml — compila las proc-macros optimizadas aunque el resto sea debug
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3</code></pre>
+
+<p>Se paga un poco más al compilar <code>syn</code> una sola vez y se gana en cada expansión. En proyectos con muchos derives la diferencia es medible; en proyectos chicos es ruido. Es exactamente el tipo de cambio que hay que <em>medir</em> con <code>hyperfine</code> antes y después, no adoptar por fe.</p>
+
+<h3>3. Qué hace por dentro un <code>#[derive(Serialize)]</code></h3>
+
+<p>La fama de <code>serde</code> como "el que hace lento el build" es merecida, pero la causa no es la que se dice. El <code>Serialize</code> de un struct de 20 campos genera algo así:</p>
+
+<pre><code class="lang-rust">// cargo expand, muy recortado
+const _: () = {
+    extern crate serde as _serde;              // 👈 alias, por si renombraste el crate
+    impl _serde::Serialize for Conexion {
+        fn serialize&lt;S&gt;(&amp;self, ser: S) -&gt; _serde::__private::Result&lt;S::Ok, S::Error&gt;
+        where S: _serde::Serializer {
+            let mut st = _serde::Serializer::serialize_struct(ser, "Conexion", 3)?;
+            _serde::ser::SerializeStruct::serialize_field(&amp;mut st, "host", &amp;self.host)?;
+            _serde::ser::SerializeStruct::serialize_field(&amp;mut st, "puerto", &amp;self.puerto)?;
+            _serde::ser::SerializeStruct::serialize_field(&amp;mut st, "usuario", &amp;self.usuario)?;
+            _serde::ser::SerializeStruct::end(st)
+        }
+    }
+};</code></pre>
+
+<p>Eso es barato. El caro es <code>Deserialize</code>: genera un <code>enum __Field</code> con una variante por campo, un <code>__FieldVisitor</code> con <code>visit_str</code>, <code>visit_bytes</code> y <code>visit_u64</code>, un <code>__Visitor</code> con <code>visit_seq</code> y <code>visit_map</code>, arrays de nombres constantes y el manejo de duplicados. Fácilmente <strong>200–400 líneas por struct</strong>. Y todo eso es genérico sobre <code>D: Deserializer</code>, así que se <strong>monomorfiza</strong> por cada formato que uses.</p>
+
+<div class="concept">
+  <strong>💡 El costo real de los derives no está en expandir: está en lo que le dan de comer a LLVM.</strong> Generar 300 líneas de Rust tarda milisegundos. Monomorfizar y optimizar esas 300 líneas por cada uno de tus 80 structs y por cada formato es lo que hace que el build tarde minutos. La herramienta para verlo es <code>cargo llvm-lines</code>, no <code>--timings</code>.
+</div>
+
+<pre><code class="lang-bash">cargo install cargo-llvm-lines
+cargo llvm-lines -p mi-crate | head -25
+# Ordena las funciones por líneas de IR generadas. Si arriba de todo hay
+# 'serde::de::…' o tu propio derive, ahí está tu tiempo de compilación.
+
+# Nightly: cuánto expandió cada macro, en tokens y bytes
+cargo +nightly rustc -- -Zmacro-stats</code></pre>
+
+<p>Mitigaciones reales, en orden de esfuerzo: apagar features que no usás (<code>serde</code> sin <code>derive</code> donde escribís el impl a mano), aplicar el derive solo a los tipos que cruzan un límite de serialización en vez de a todo el modelo de dominio, partir el crate para que un cambio no recompile todo, y —en el extremo— escribir el <code>impl</code> a mano para los cinco tipos más grandes. No hay bala de plata; hay medición.</p>
+
+<h2>RuS6.9 Cuándo NO escribir una macro</h2>
+
+<div class="danger">
+  <strong>⚠️ Esta es la sección más importante del módulo.</strong> Todo lo anterior te enseñó a construir el martillo. Esto te enseña a no ver clavos por todos lados. La mayoría de las macros que se escriben en la industria <strong>no deberían existir</strong>: resuelven con metaprogramación algo que el sistema de tipos ya resolvía.
+</div>
+
+<p>Antes de escribir una macro, recorré esta tabla de arriba hacia abajo y frená en la primera fila que sirva:</p>
+
+<table>
+<thead><tr><th>Lo que querés</th><th>Alternativa sin macro</th><th>Por qué gana</th></tr></thead>
+<tbody>
+<tr><td>La misma lógica para varios tipos</td><td><strong>Genéricos</strong> + trait bounds</td><td>El IDE la entiende, el compilador la chequea, el error apunta bien.</td></tr>
+<tr><td>El mismo <code>impl</code> para muchos tipos</td><td><strong>Blanket impl</strong>: <code>impl&lt;T: Base&gt; Extra for T</code></td><td>Cero código repetido y cero costo de compilación.</td></tr>
+<tr><td>Constructores con muchos parámetros</td><td>Struct de config + <code>Default</code> + <code>..Default::default()</code></td><td>Un builder a mano son 20 líneas legibles.</td></tr>
+<tr><td>Comportamiento configurable por tipo</td><td><strong>Constantes asociadas</strong> y tipos asociados en el trait</td><td>Se resuelve en tiempo de compilación igual, pero con tipos.</td></tr>
+<tr><td>Variar comportamiento en runtime</td><td>Un <code>enum</code> o <code>dyn Trait</code></td><td>Es un problema de datos, no de código.</td></tr>
+<tr><td><code>Display</code>/<code>Error</code>/<code>From</code> repetidos</td><td><code>thiserror</code>, <code>derive_more</code></td><td>La macro ya está escrita y testeada por otro.</td></tr>
+<tr><td>Una tabla de datos repetida</td><td>Un array <code>const</code> y un <code>for</code></td><td>Los datos van en datos.</td></tr>
+<tr><td>Generar desde un schema/IDL/CSV</td><td><strong><code>build.rs</code></strong> (RuS6.10)</td><td>La entrada es un archivo, no código Rust.</td></tr>
+<tr><td>Evitar repetir tres líneas</td><td><strong>Escribilas tres veces</strong></td><td>Duplicación &lt; abstracción equivocada.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">// ❌ Macro innecesaria: esto es un blanket impl disfrazado
+macro_rules! impl_resumen {
+    ($($t:ty),*) =&gt; { $(
+        impl Resumen for $t {
+            fn resumen(&amp;self) -&gt; String { format!("{}", self) }
+        }
+    )* };
+}
+impl_resumen!(u8, u16, u32, i8, i16, i32, String);
+
+// ✅ Sin macro, y además cubre todos los tipos futuros
+impl&lt;T: ::core::fmt::Display&gt; Resumen for T {
+    fn resumen(&amp;self) -&gt; String { format!("{}", self) }
+}</code></pre>
+
+<h3>Lo que te cuesta una macro, en concreto</h3>
+
+<ul>
+  <li><strong>Tu IDE la entiende peor.</strong> rust-analyzer expande proc-macros, pero es más lento, a veces falla, y una macro que lee archivos o variables de entorno puede no funcionar dentro del editor. <code>goto-definition</code> sobre un método generado te lleva al cuerpo de la macro, no al método.</li>
+  <li><strong>Tu equipo la debuggea peor.</strong> Un breakpoint en código generado es un ejercicio de paciencia. Los stack traces mencionan funciones que nadie escribió.</li>
+  <li><strong>El code review pierde.</strong> El <code>git diff</code> muestra la macro, no lo que hace. Nadie revisa 300 líneas invisibles.</li>
+  <li><strong>Los errores empeoran.</strong> Cualquier error de tipos dentro de la expansión sale en el sitio de llamada, con un mensaje sobre código que el usuario no ve — salvo que hayas hecho el trabajo de spans de RuS6.5.</li>
+  <li><strong>El build tarda más.</strong> RuS6.8 completo.</li>
+  <li><strong>El aparato de tests crece.</strong> <code>trybuild</code>, <code>cargo expand</code>, casos <code>.stderr</code> versionados.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Cuándo sí, sin duda.</strong> Una macro es la respuesta correcta cuando el problema es <em>genuinamente sintáctico</em> y el sistema de tipos no puede expresarlo: enumerar los campos de un struct (<code>serde</code>), validar SQL contra una base real en tiempo de compilación (<code>sqlx::query!</code>), chequear un string de formato (<code>format!</code>), reescribir una <code>async fn main</code> (<code>#[tokio::main]</code>). Todas comparten una firma: <strong>hacen algo que ninguna feature del lenguaje puede hacer</strong>, no algo que da un poco de fiaca escribir.
+</div>
+
+<div class="mistake">
+  <strong>El corolario incómodo: las macros deberían morirse.</strong> Una macro suele existir para tapar un agujero del lenguaje. Cuando el agujero se cierra, la macro sobra. <code>lazy_static!</code> fue reemplazado por <code>OnceLock</code> y <code>LazyLock</code>; <code>#[async_trait]</code> dejó de ser necesario en la mayoría de los casos cuando llegaron las <em>async fn en traits</em>; <code>maplit</code> sigue vivo porque el agujero sigue abierto. Si escribís una macro, dejá anotado en el README <strong>qué feature del lenguaje la volvería innecesaria</strong>. Es la mejor forma de que alguien la borre a tiempo.
+</div>
+
+<h2>RuS6.10 <code>build.rs</code>: generar código sin macros</h2>
+
+<p>Hay una tercera vía que se olvida seguido. Si tu entrada es <strong>un archivo</strong> —un <code>.proto</code>, un schema SQL, un CSV de códigos de país, una gramática— la herramienta no es una macro: es un <em>build script</em> que escribe Rust en <code>OUT_DIR</code> y después se incluye.</p>
+
+<pre><code class="lang-rust">// build.rs — corre antes de compilar el crate
+use std::{env, fmt::Write as _, fs, path::PathBuf};
+
+fn main() {
+    // Sintaxis moderna con `::` (Cargo 1.77+); la vieja `cargo:` sigue andando
+    println!("cargo::rerun-if-changed=datos/paises.csv");
+
+    let salida = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let csv = fs::read_to_string("datos/paises.csv").expect("falta datos/paises.csv");
+
+    let mut codigo = String::from("pub static PAISES: &amp;[(&amp;str, &amp;str)] = &amp;[\n");
+    for (n, linea) in csv.lines().skip(1).enumerate() {
+        let (iso, nombre) = linea
+            .split_once(',')
+            .unwrap_or_else(|| panic!("linea {} mal formada: {linea:?}", n + 2));
+        // {:?} escapa el string por nosotros — nada de concatenar comillas a mano
+        writeln!(codigo, "    ({iso:?}, {nombre:?}),").unwrap();
+    }
+    codigo.push_str("];\n");
+
+    fs::write(salida.join("paises.rs"), codigo).unwrap();
+}</code></pre>
+
+<pre><code class="lang-rust">// src/paises.rs — el consumo
+include!(concat!(env!("OUT_DIR"), "/paises.rs"));
+
+pub fn nombre(iso: &amp;str) -&gt; Option&lt;&amp;'static str&gt; {
+    PAISES.iter().find(|(c, _)| *c == iso).map(|(_, n)| *n)
+}</code></pre>
+
+<table>
+<thead><tr><th>Criterio</th><th><code>macro_rules!</code></th><th>proc-macro</th><th><code>build.rs</code></th></tr></thead>
+<tbody>
+<tr><td>Entrada</td><td>Tokens de Rust</td><td>Tokens de Rust</td><td><strong>Archivos, red, cualquier cosa</strong></td></tr>
+<tr><td>Costo de compilación</td><td>Casi nulo</td><td>Alto (<code>syn</code>)</td><td>Medio (solo en build limpio)</td></tr>
+<tr><td>Necesita crate aparte</td><td>No</td><td>Sí</td><td>No</td></tr>
+<tr><td>El resultado es legible</td><td>Con <code>cargo expand</code></td><td>Con <code>cargo expand</code></td><td><strong>Sí: es un .rs en <code>target/</code></strong></td></tr>
+<tr><td>Se ejecuta un programa externo</td><td>No</td><td>Sí, pero incómodo</td><td><strong>Sí, es lo natural</strong> (protoc, bindgen)</td></tr>
+<tr><td>Ve tipos de Rust</td><td>No</td><td>No</td><td>No</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Es la elección de <code>prost-build</code>/<code>tonic-build</code> para gRPC y de <code>bindgen</code> para FFI, y por buenas razones: el código generado se puede abrir y leer en <code>target/</code>, no hay que arrastrar <code>syn</code>, y el paso pesado corre una sola vez. La contra es que <code>OUT_DIR</code> no está versionado y el <code>include!</code> le complica la vida a algunas herramientas. Cuando la entrada es un archivo, empezá siempre por acá.
+</div>
+
+<h2>RuS6.11 Leer las macros del ecosistema</h2>
+
+<p>No vas a escribir muchas macros. Vas a <em>diagnosticar</em> las de otros todas las semanas. Estas cuatro cubren casi todo lo que te vas a encontrar.</p>
+
+<h3><code>#[tokio::main]</code> — una macro de atributo que reescribe tu <code>main</code></h3>
+
+<pre><code class="lang-rust">// Lo que escribís
+#[tokio::main(flavor = "current_thread")]
+async fn main() { trabajo().await; }
+
+// Lo que existe realmente (cargo expand)
+fn main() {
+    let cuerpo = async { trabajo().await; };
+    return tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(cuerpo);
+}</code></pre>
+
+<div class="info">
+  Esto explica de un saque tres preguntas frecuentes: por qué <code>#[tokio::main]</code> necesita la feature <code>macros</code> <em>y</em> <code>rt-multi-thread</code>; por qué el error "there is no reactor running" aparece cuando alguien saca el atributo; y por qué <code>#[tokio::test]</code> crea un runtime <strong>por test</strong> — lo ves en la expansión, no en la documentación. Cada vez que dudes de qué runtime estás usando, <code>cargo expand</code> te lo dice literalmente.
+</div>
+
+<h3><code>thiserror</code> — un derive puramente de compilación</h3>
+
+<pre><code class="lang-rust">use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ErrorCarga {
+    #[error("no se pudo leer {ruta}")]
+    Io { ruta: String, #[source] causa: std::io::Error },
+    #[error("JSON invalido en la linea {0}")]
+    Json(usize),
+    #[error(transparent)]                    // delega Display al de adentro
+    Otro(#[from] anyhow::Error),
+}
+// Genera: impl Display (con el formato de cada #[error]),
+//         impl Error::source() (de los campos #[source]/#[from]),
+//         impl From&lt;anyhow::Error&gt; (del #[from]).</code></pre>
+
+<p>Detalle que se pregunta en entrevistas: <code>thiserror</code> <strong>no deja dependencia en tiempo de ejecución</strong> — genera <code>impl</code>s de traits de <code>std</code> y nada más. <code>anyhow</code> es al revés: es una biblioteca de runtime, y sus <code>anyhow!</code>/<code>bail!</code> son <code>macro_rules!</code> triviales. Por eso la regla habitual: <code>thiserror</code> en bibliotecas, <code>anyhow</code> en aplicaciones.</p>
+
+<h3><code>clap</code> — un derive que es una fachada del builder</h3>
+
+<p><code>#[derive(Parser)]</code> no inventa nada: traduce tu struct a llamadas de la API de builder que existía antes. Por eso cada atributo del derive tiene un equivalente en el builder, y por eso algunos errores hablan de conceptos ("arg", "command", "group") que no aparecen en tu código. Cuando un atributo de <code>clap</code> no hace lo que esperás, expandí y mirá a qué llamada se tradujo.</p>
+
+<h3><code>sqlx::query!</code> — la macro que hace lo imposible</h3>
+
+<pre><code class="lang-rust">// Se conecta a la base EN TIEMPO DE COMPILACIÓN (o lee .sqlx/ en modo offline),
+// valida el SQL contra el schema real e infiere los tipos de las columnas.
+let fila = sqlx::query!("SELECT id, email FROM usuarios WHERE id = $1", id)
+    .fetch_one(&amp;pool)
+    .await?;
+
+// fila.email es String o Option&lt;String&gt; según la nullability REAL de la columna.
+// Un typo en el nombre de la tabla es un error de compilación, no un panic a las 3 AM.</code></pre>
+
+<div class="concept">
+  <strong>💡 Este es el argumento definitivo a favor de las macros procedurales.</strong> Ningún genérico, ningún trait, ninguna feature futura del lenguaje puede validar un string de SQL contra un schema en PostgreSQL. Requiere ejecutar código arbitrario durante la compilación, que es <em>exactamente</em> lo que una proc-macro es. Cuando alguien te diga "las macros son un antipatrón", <code>sqlx::query!</code> es la respuesta: cuando el problema justifica el costo, el costo se paga contento.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el patrón que aparece 12 veces</h2>
+
+<blockquote>Un servicio de facturación tiene 12 tipos de evento (<code>CrearFactura</code>, <code>AnularFactura</code>, <code>RegistrarPago</code>…). Los 12 necesitan lo mismo: convertirse en una <code>FilaAuditoria</code> con un nombre de evento en <em>snake_case</em>, un timestamp y el payload en JSON. Hoy están las 12 implementaciones copiadas a mano y ya hubo dos bugs por copiar y no cambiar el nombre. Alguien propone un <code>#[derive(Auditable)]</code>. ¿Es la respuesta?</blockquote>
+
+<p><strong>Paso 0 — Escribir la restricción antes que la solución.</strong> El requisito real es: un solo lugar donde se define el mapeo, imposible de desincronizar, y el nombre del evento derivado del nombre del tipo. Los 12 tipos ya derivan <code>Serialize</code>. Con eso escrito, evaluamos <strong>las cuatro salidas en orden de simplicidad</strong>.</p>
+
+<h3>Salida 1 — Una función</h3>
+
+<pre><code class="lang-rust">fn a_fila(nombre: &amp;str, payload: &amp;impl Serialize) -&gt; FilaAuditoria { /* … */ }
+
+// En cada uno de los 12 lugares:
+a_fila("crear_factura", &amp;evento)</code></pre>
+
+<p><strong>Veredicto: no alcanza.</strong> Resuelve la lógica, pero el string sigue escrito a mano 12 veces. Es literalmente el bug que queremos eliminar. Descartada — <em>y descartada por la razón correcta, no por "es poco elegante"</em>.</p>
+
+<h3>Salida 2 — Trait con blanket impl</h3>
+
+<pre><code class="lang-rust">pub trait Evento: Serialize {
+    /// Por defecto: el nombre del tipo, en snake_case, calculado una sola vez.
+    fn nombre_evento() -&gt; &amp;'static str where Self: Sized {
+        static CACHE: OnceLock&lt;String&gt; = OnceLock::new();
+        CACHE.get_or_init(|| a_snake_case(::core::any::type_name::&lt;Self&gt;())).as_str()
+    }
+}
+
+// Blanket impl: TODO lo que sea Evento es Auditable, gratis.
+impl&lt;T: Evento&gt; Auditable for T {
+    fn a_fila(&amp;self) -&gt; FilaAuditoria {
+        FilaAuditoria {
+            evento: T::nombre_evento(),
+            momento: OffsetDateTime::now_utc(),
+            payload: serde_json::to_value(self).unwrap_or(Value::Null),
+        }
+    }
+}
+
+// Y en cada tipo, una línea:
+impl Evento for CrearFactura {}</code></pre>
+
+<p><strong>Veredicto: funciona.</strong> 12 líneas de <code>impl Evento for X {}</code>, cero macros, el nombre se deriva solo. Dos objeciones legítimas: <code>type_name</code> no está garantizado por el estándar como estable entre versiones, y dos tipos necesitan un nombre distinto al del struct. La segunda se resuelve sin tocar nada, sobrescribiendo el método por defecto en esos dos casos. La primera se resuelve con un test:</p>
+
+<pre><code class="lang-rust">// Un test barato clava el contrato y avisa si una versión futura lo cambia.
+#[test]
+fn nombres_de_evento_estables() {
+    assert_eq!(CrearFactura::nombre_evento(), "crear_factura");
+    assert_eq!(RegistrarPago::nombre_evento(), "registrar_pago");
+}</code></pre>
+
+<h3>Salida 3 — <code>macro_rules!</code></h3>
+
+<pre><code class="lang-rust">macro_rules! impl_evento {
+    ($($tipo:ty =&gt; $nombre:literal),+ $(,)?) =&gt; { $(
+        impl Evento for $tipo {
+            fn nombre_evento() -&gt; &amp;'static str { $nombre }
+        }
+    )+ };
+}
+
+impl_evento! {
+    CrearFactura   =&gt; "crear_factura",
+    AnularFactura  =&gt; "anular_factura",
+    RegistrarPago  =&gt; "registrar_pago",
+    // … 9 más
+}</code></pre>
+
+<p><strong>Veredicto: correcta pero innecesaria acá.</strong> Es de hecho más explícita que la salida 2 (el nombre está escrito, no inferido) y sigue costando ~0 en compilación. Sería la ganadora si los nombres <em>no</em> se pudieran derivar del tipo. Pero no puede fabricar el snake_case sola: eso es la Pared 1 de RuS6.3.</p>
+
+<h3>Salida 4 — proc-macro <code>#[derive(Auditable)]</code></h3>
+
+<pre><code class="lang-rust">#[derive(Serialize, Auditable)]
+#[auditable(nombre = "factura_anulada")]   // override opcional
+pub struct AnularFactura { /* … */ }</code></pre>
+
+<p><strong>Veredicto: es lo más lindo y lo más caro.</strong> Requiere un crate nuevo, <code>syn</code>, <code>quote</code>, <code>heck</code> para el snake_case, manejo de atributos, tests de <code>trybuild</code>… para reemplazar 12 líneas triviales. Pero no lo descartamos por intuición: <strong>lo medimos</strong>.</p>
+
+<h3>La medición, que es el punto del ejercicio</h3>
+
+<pre><code class="lang-bash"># Rama A: blanket impl.  Rama B: proc-macro derive.
+git switch salida-2-blanket
+cargo clean &amp;&amp; hyperfine --warmup 1 --prepare 'cargo clean' 'cargo build'
+cargo build --timings     # guardá el HTML
+
+git switch salida-4-derive
+cargo clean &amp;&amp; hyperfine --warmup 1 --prepare 'cargo clean' 'cargo build'
+
+# Build incremental: tocar un archivo y recompilar es lo que hacés 200 veces por día
+hyperfine --warmup 3 --prepare 'touch src/dominio/factura.rs' 'cargo check'
+
+cargo tree -e normal -i syn      # ¿entró syn al árbol por primera vez?
+cargo llvm-lines -p facturacion | head</code></pre>
+
+<table>
+<thead><tr><th>Opción</th><th>Líneas nuevas</th><th>Δ build limpio</th><th>Δ <code>cargo check</code> incremental</th><th>IDE</th></tr></thead>
+<tbody>
+<tr><td>2 · Blanket impl</td><td>~25 (12 son <code>impl X {}</code>)</td><td><strong>+0.0 s</strong></td><td>+0.0 s</td><td>✅ perfecto</td></tr>
+<tr><td>3 · <code>macro_rules!</code></td><td>~8 + 12 líneas</td><td>+0.1 s</td><td>≈ 0</td><td>⚠️ parcial</td></tr>
+<tr><td>4 · proc-macro derive</td><td>~180 + crate nuevo</td><td><strong>+11.4 s</strong> (syn <code>full</code> entra al árbol)</td><td>+0.3 s</td><td>⚠️ depende del IDE</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Decisión: salida 2.</strong> Cero dependencias nuevas, cero segundos de build, cero pérdida de <code>goto-definition</code>, y el bug original —el string copiado a mano— queda estructuralmente imposible. La salida 4 costaba <strong>once segundos y medio en cada build limpio</strong> para ahorrar 12 líneas. Los 11,4 s no son una intuición: salen del <code>cargo-timing.html</code> de una rama que se escribió, se midió y se tiró a la basura. <em>Tirar una rama que funciona es parte del trabajo.</em>
+</div>
+
+<div class="tip">
+  <strong>Y se deja escrito.</strong> Un comentario de cinco líneas arriba del <code>trait Evento</code> —"se evaluó un derive procedural en 2026-09; costaba +11,4 s de build limpio por traer <code>syn</code>; se revisa si superamos los ~40 tipos o si aparecen reglas por campo"— vale más que cualquier documento de arquitectura. Sin eso, dentro de seis meses alguien reabre exactamente la misma discusión sin los datos.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>CUADRADO(1 + 2)</code> da 5 en C y <code>cuadrado!(1 + 2)</code> da 9 en Rust?</summary>
+<p>Porque el preprocesador de C hace <strong>sustitución de texto</strong> antes de que el compilador parsee: <code>x * x</code> se convierte literalmente en <code>1 + 2 * 1 + 2</code>, y ahí las reglas de precedencia se aplican sobre el texto ya mezclado. En Rust, <code>$x:expr</code> captura la expresión <code>1 + 2</code> como <strong>un nodo del árbol sintáctico</strong>, con delimitadores invisibles que la mantienen indivisible. Cuando la macro emite <code>$x * $x</code>, cada <code>$x</code> sigue siendo esa expresión completa, así que el resultado es <code>(1 + 2) * (1 + 2)</code>. Esa diferencia —tokens estructurados versus caracteres— es la que también da higiene, mejores errores y la imposibilidad de generar código sintácticamente inválido.</p></details>
+
+<details><summary>Tu <code>macro_rules!</code> tiene que generar <code>FooBuilder</code> a partir de <code>Foo</code>. ¿Qué hacés?</summary>
+<p>No se puede, y hay que reconocerlo rápido en vez de pelearla: <code>macro_rules!</code> <strong>no puede fabricar identificadores nuevos</strong> (<code>concat_idents!</code> es inestable y ni siquiera sirve para declarar ítems). Hay tres salidas. <strong>(a)</strong> Pedirle el nombre al usuario: <code>builder!(Foo, FooBuilder);</code> — feo pero honesto, y cuesta cero. <strong>(b)</strong> El crate <code>paste</code>, que resuelve exactamente esto… pero es una proc-macro, así que ya pagaste el costo sin ganar el control. <strong>(c)</strong> Escribir una proc-macro de verdad y usar <code>format_ident!("{}Builder", nombre)</code>. Si además necesitás leer atributos o dar errores con span propio, la (c) es la única que sirve; si es solo el nombre, la (a) suele ser la decisión sensata.</p></details>
+
+<details><summary>Tu derive funciona, pero cuando el usuario se equivoca el error apunta a <code>#[derive(Builder)]</code> y dice "proc-macro derive panicked". ¿Qué le falta?</summary>
+<p>Dos cosas, y las dos son baratas. <strong>Primero</strong>, sacar todos los <code>panic!</code> y <code>unwrap()</code>: la función pública tiene que parsear, delegar en una que devuelva <code>syn::Result</code>, y cerrar con <code>.unwrap_or_else(syn::Error::into_compile_error)</code>. Eso convierte el pánico en un error de compilación normal. <strong>Segundo</strong>, darle un span útil: <code>syn::Error::new(campo.span(), "…")</code> o <code>Error::new_spanned(&amp;campo.ty, "…")</code> para que el subrayado caiga sobre el campo culpable y no sobre el atributo. Si además el error es de <em>trait bounds</em> del código generado, se arregla emitiendo esa parte con <code>quote_spanned!</code> usando el span del tipo. Y para que no se degrade con el próximo refactor, se congela en un <code>.stderr</code> de <code>trybuild</code>: el test compara mensaje <em>y</em> ubicación.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Las macros de Rust operan sobre <strong>tokens y fragmentos del AST</strong>, no sobre texto. De ahí salen la higiene, los buenos errores y la imposibilidad del bug clásico de <code>CUADRADO(1+2)</code>.</li>
+  <li>Corren <strong>antes de la resolución de tipos</strong>. Una macro nunca sabe si algo implementa <code>Clone</code>, ni si <code>Option</code> es el de <code>std</code>. Toda decisión es sintáctica, siempre.</li>
+  <li><code>macro_rules!</code> cuesta casi nada y cubre muchísimo: patrones, repetición <code>$()*</code>, <code>$(,)?</code> para la coma final, <code>$crate</code> obligatorio al exportar, y un catch-all con <code>compile_error!</code> como mínimo de cortesía.</li>
+  <li>La <strong>higiene es parcial</strong>: protege variables locales, labels y lifetimes. <em>No</em> protege rutas, tipos ni nombres de ítems — por eso <code>::std::</code> y <code>$crate::</code> en todo lo que emitas.</li>
+  <li>Se sube a <strong>procedural</strong> por cuatro razones y solo esas: fabricar identificadores, engancharse a una definición real, leer atributos, o dar errores con span propio.</li>
+  <li>El trío es <code>syn</code> + <code>quote</code> + <code>proc-macro2</code>, en un crate con <code>proc-macro = true</code>. Nunca <code>panic!</code>: <code>syn::Result</code>, <code>Error::new_spanned</code>, <code>combine</code> y <code>into_compile_error</code>.</li>
+  <li><code>cargo expand</code> para ver qué generaste (propio o ajeno) y <code>trybuild</code> para que los errores no se degraden. Sin las dos, es programar a ciegas.</li>
+  <li>El costo real no es expandir: es <strong><code>syn</code> en el camino crítico</strong> del build limpio y la <strong>monomorfización</strong> del código generado. Se mide con <code>--timings</code>, <code>cargo tree -i syn</code> y <code>cargo llvm-lines</code>, no se estima.</li>
+  <li><strong>Si un trait, un genérico o una función alcanzan, ganan.</strong> Una macro es código que tu IDE entiende peor, que tu equipo debuggea peor, que rompe <code>goto-definition</code> y que nadie revisa en el diff.</li>
+  <li>Si la entrada es un archivo, la herramienta es <code>build.rs</code>, no una macro. Y si una feature del lenguaje vuelve tu macro innecesaria, anotalo: <code>lazy_static!</code> y <code>#[async_trait]</code> ya murieron así.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí <code>vecdeque!</code> con la misma API que <code>vec!</code>: caso vacío, caso <code>[elem; n]</code> y caso lista con coma final opcional. Después comprobá con <code>cargo expand</code> que las tres reglas expanden a lo que creés, y agregá una regla catch-all con <code>compile_error!</code> y un mensaje útil.</li>
+  <li>Escribí una <code>macro_rules!</code> con las reglas <code>($x:ident)</code> y <code>($x:expr)</code> <em>en ese orden</em> y después invertidas. Documentá con un ejemplo concreto qué invocación cambia de comportamiento y por qué el compilador no te avisa nada.</li>
+  <li>Demostrá la higiene: escribí una macro que declare internamente una variable <code>i</code> y usala en un contexto donde el llamador también tiene una <code>i</code>. Después demostrá lo contrario: hacé que tu macro se rompa porque el llamador definió un <code>struct Result</code> propio, y arreglala con rutas absolutas.</li>
+  <li>Completá el <code>#[derive(Builder)]</code> de RuS6.6 con un helper attribute <code>#[builder(each = "arg")]</code> que genere un setter que empuja de a un elemento a un <code>Vec</code>. Emití un error con <code>Error::new_spanned</code> si el atributo está mal escrito, y verificá el span con <code>trybuild</code>.</li>
+  <li>Agarrá un struct tuyo con <code>#[derive(Serialize, Deserialize)]</code> y corré <code>cargo expand</code>. Contá las líneas que genera cada uno de los dos derives por separado. Después corré <code>cargo llvm-lines</code> y explicá por qué el <code>Deserialize</code> pesa varias veces más.</li>
+  <li>Medí con <code>hyperfine --prepare 'cargo clean'</code> el build de un proyecto tuyo, agregá una dependencia que traiga <code>syn</code> con feature <code>full</code>, y volvé a medir. Después probá <code>[profile.dev.build-override] opt-level = 3</code> y medí las tres configuraciones. Armá la tabla con <em>tus</em> números.</li>
+  <li>Tomá cualquier <code>macro_rules!</code> de un proyecto tuyo (o de un crate que uses) y reescribila sin macro: genéricos, blanket impl, <code>enum</code> o simple duplicación. Compará las dos versiones en líneas, legibilidad y tiempo de compilación, y escribí en tres renglones cuál elegirías y por qué.</li>
+</ol>
+
+<section class="quiz" id="quizRuS6">
+  <style>
+    #quizRuS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS6 .q{margin-bottom:1.5rem}
+    #quizRuS6 .q p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS6 .opt:hover{border-color:var(--accent)}
+    #quizRuS6 .opt:disabled{cursor:default}
+    #quizRuS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0;font-weight:400}
+    #quizRuS6 .exp.show{display:block}
+    #quizRuS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu <code>macro_rules!</code> necesita generar, a partir de <code>Pedido</code>, un tipo llamado <code>PedidoBuilder</code>. ¿Qué te dice eso?</p>
+    <button class="opt">Que te falta agregar <code>#![recursion_limit = "256"]</code> en la raíz del crate</button>
+    <button class="opt">Que tenés que capturar el nombre con <code>$t:ty</code> en vez de <code>$t:ident</code></button>
+    <button class="opt">Que chocaste con un límite duro de <code>macro_rules!</code>: no puede fabricar identificadores nuevos</button>
+    <div class="exp">Es la Pared 1. Las macros declarativas pueden reordenar y repetir tokens que ya existen, pero no pueden <em>construir</em> un identificador nuevo a partir de otro. <code>concat_idents!</code> es inestable y ni siquiera sirve para declarar ítems. Las salidas reales son pedirle el nombre al usuario (<code>builder!(Pedido, PedidoBuilder)</code>), usar el crate <code>paste</code> —que ya es una proc-macro—, o escribir una proc-macro y usar <code>format_ident!</code>. Ni el <code>recursion_limit</code> ni el fragment specifier tienen nada que ver.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu <code>#[derive(Config)]</code> hace <code>unwrap()</code> cuando el usuario lo aplica a un enum, y el error dice "proc-macro derive panicked" apuntando al atributo. ¿Cuál es el arreglo correcto?</p>
+    <button class="opt">Devolver <code>syn::Result</code> desde la lógica y cerrar con <code>.unwrap_or_else(syn::Error::into_compile_error)</code>, construyendo el error con el span del ítem culpable</button>
+    <button class="opt">Reemplazar el <code>unwrap()</code> por <code>expect("solo structs")</code> para que el mensaje se lea mejor</button>
+    <button class="opt">Documentar en el README que el derive solo funciona sobre structs</button>
+    <div class="exp">Un pánico en una proc-macro siempre produce el mismo error inútil, con el span del <code>#[derive(...)]</code> y el mensaje escondido en un <code>= help:</code>. Cambiar <code>unwrap</code> por <code>expect</code> mejora el texto pero sigue siendo un pánico con span equivocado. El patrón correcto es el canónico: la función pública parsea y delega, la lógica devuelve <code>syn::Result</code>, los errores se crean con <code>syn::Error::new(span, msg)</code> apuntando al token culpable, y el cierre convierte todo en un <code>compile_error!</code> normal. Y después se congela con un <code>.stderr</code> de <code>trybuild</code>, porque un buen mensaje sin test se degrada solo.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Tenés que implementar el mismo método en 12 tipos que ya comparten un trait. Un compañero propone un <code>#[derive(...)]</code> propio. ¿Qué evaluás primero?</p>
+    <button class="opt">Cuál de <code>syn</code> 1 o <code>syn</code> 2 conviene para que el derive compile más rápido</button>
+    <button class="opt">Si un blanket impl <code>impl&lt;T: Base&gt; Extra for T</code> lo resuelve: cero dependencias, cero segundos de build y el IDE lo entiende</button>
+    <button class="opt">Si conviene un <code>build.rs</code> que escriba los 12 <code>impl</code> en <code>OUT_DIR</code></button>
+    <div class="exp">El orden es función → trait → <code>macro_rules!</code> → proc-macro, y hay que frenar en el primer escalón que sirva. Un blanket impl cubre exactamente este caso —"todos los que ya son X también son Y"— sin agregar una línea de metaprogramación, sin traer <code>syn</code> al árbol de dependencias (que en un build limpio son varios segundos en el camino crítico) y sin romper <code>goto-definition</code>. El <code>build.rs</code> es la herramienta para cuando la entrada es un <em>archivo</em>, no código Rust. Y elegir versión de <code>syn</code> es optimizar una decisión que todavía no deberías haber tomado.</div>
+  </div>
+
+  <div class="score" id="scoreRuS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RuS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus5-unsafe/lecture.html">← RuS5: Unsafe correcto</a>
+  <a href="../rus7-performance/lecture.html">RuS7: Performance →</a>
+</nav>
+
+</div>
+</body>
+</html>

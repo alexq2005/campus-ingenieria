@@ -1,0 +1,1235 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS1 — Ownership por dentro: borrow checker, lifetimes y varianza · Rust Senior</title>
+  <meta name="description" content="Qué verifica realmente el borrow checker: aliasing XOR mutabilidad, NLL, lifetimes como restricciones, elisión, HRTB, varianza, interior mutability, ciclos de Rc y los patrones para dejar de pelear. Rust 1.95, edición 2024.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS1</span>
+  <span class="badge">⏱ 50–155 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Rust M00–M12</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>RuS1 — Ownership por dentro: borrow checker, lifetimes y varianza</h1>
+
+<h2>RuS1.0 Por qué este módulo</h2>
+
+<p>El curso base te enseñó a <strong>pelear</strong> con el borrow checker. Aprendiste el repertorio de golpes: cloná esto, poné un <code>&amp;</code> allá, sacá la variable del <code>for</code>, envolvelo en <code>Rc</code>. Funciona. Y a la vez es agotador, porque cada error se siente como una regla arbitraria nueva en vez de una consecuencia de algo que ya sabías.</p>
+
+<p>Este módulo es para que dejes de pelear. No agregando trucos, sino al revés: mostrándote que <strong>casi todo el borrow checker se deduce de un solo invariante</strong>. Cuando lo tenés internalizado, los errores dejan de ser sorpresas y pasan a ser confirmaciones — «claro, si permitiera esto, se rompería aquello».</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El compilador de Rust hace cumplir <strong>una</strong> regla: en cualquier instante, un dato puede tener <em>muchos lectores</em> o <em>un escritor</em>, nunca las dos cosas. <em>Aliasing</em> XOR <em>mutabilidad</em>. Los lifetimes son la contabilidad de <em>cuándo</em> está vigente cada préstamo. La varianza es la regla de <em>cómo</em> se pueden convertir esos lifetimes entre sí sin romper el invariante. Todo lo demás —NLL, <code>RefCell</code>, <code>Rc</code>, <code>Pin</code>— son consecuencias o escapes explícitos de esa regla.
+</div>
+
+<p>Trabajamos con <strong>Rust 1.95</strong> y la <strong>edición 2024</strong>, que ya es la que vas a encontrar en cualquier proyecto nuevo. La edición importa acá más que en otros temas: cambió cuándo se liberan ciertos préstamos temporales y cambió qué lifetimes captura un <code>impl Trait</code>. Lo vemos en RuS1.13.</p>
+
+<pre><code class="lang-bash">rustc --version           # rustc 1.95.0
+cargo new grafo --edition 2024
+
+# Herramientas que vamos a usar en el módulo:
+rustup +nightly component add miri     # detecta UB real corriendo tus tests
+cargo +nightly miri test
+
+# Ver las "regiones" que el borrow checker calcula (nightly, para curiosear)
+cargo +nightly rustc -- -Z dump-mir=nll</code></pre>
+
+<h2>RuS1.1 El modelo: ownership, move, Copy y Drop</h2>
+
+<p>Arrancamos por lo que ya sabés, pero mirándolo desde la implementación. Un valor tiene exactamente <strong>un dueño</strong>. Cuando el dueño sale de scope, el valor se destruye. Asignar o pasar por valor <strong>mueve</strong> la propiedad.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let a = String::from("hola");   // a es dueño del buffer del heap
+    let b = a;                      // MOVE: b pasa a ser dueño, a queda inválido
+    // println!("{a}");             // error[E0382]: borrow of moved value: `a`
+    println!("{b}");
+}                                   // se libera una sola vez, cuando muere b</code></pre>
+
+<div class="rule">
+  <strong>📌 Un <em>move</em> en Rust es un <code>memcpy</code> de los bits del valor y nada más.</strong> No hay constructor de movimiento como en C++, no hay hook que puedas interceptar. Lo único que agrega Rust es que, <em>estáticamente</em>, marca el origen como inutilizable para que nadie libere dos veces. Guardate esta frase: en RuS1.12 explica por qué los structs auto-referenciales son imposibles.
+</div>
+
+<h3><code>Copy</code> vs <code>Clone</code>: no son dos niveles de lo mismo</h3>
+
+<p>Mucha gente los aprende como «<code>Copy</code> es la versión barata de <code>Clone</code>». Es más preciso decir que <strong><code>Copy</code> es un permiso y <code>Clone</code> es una operación</strong>.</p>
+
+<table>
+<thead><tr><th></th><th><code>Copy</code></th><th><code>Clone</code></th></tr></thead>
+<tbody>
+<tr><td>Qué es</td><td>Marker trait, sin métodos propios</td><td>Trait con método <code>clone()</code></td></tr>
+<tr><td>Cuándo actúa</td><td><strong>Implícito</strong>: en cada asignación o paso por valor</td><td><strong>Explícito</strong>: solo si lo escribís</td></tr>
+<tr><td>Qué hace</td><td>Duplicar los bits, y el original <em>sigue válido</em></td><td>Lo que vos programes (puede alocar, abrir recursos, etc.)</td></tr>
+<tr><td>Costo</td><td>Obligatoriamente trivial</td><td>Arbitrario</td></tr>
+<tr><td>Convive con <code>Drop</code></td><td><strong>Nunca</strong></td><td>Sí, sin problema</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">#[derive(Clone, Copy, Debug)]
+struct Punto { x: f64, y: f64 }
+
+#[derive(Clone, Debug)]              // Clone sí, Copy no: hay heap adentro
+struct Etiqueta { texto: String }
+
+fn main() {
+    let p = Punto { x: 1.0, y: 2.0 };
+    let q = p;                       // COPY: p sigue usable
+    println!("{p:?} {q:?}");         // ambos válidos
+
+    let e = Etiqueta { texto: "hola".into() };
+    let f = e.clone();               // explícito: aloca otro String
+    println!("{e:?} {f:?}");
+}</code></pre>
+
+<h3>Por qué <code>Drop</code> y <code>Copy</code> son mutuamente excluyentes</h3>
+
+<p>Esta pregunta cae en entrevistas y separa a quien memorizó de quien entendió. El compilador te frena de entrada:</p>
+
+<pre><code class="lang-rust">#[derive(Clone, Copy)]
+struct Handle(u32);
+
+impl Drop for Handle {
+    fn drop(&amp;mut self) {
+        println!("cerrando fd {}", self.0);
+    }
+}
+// error[E0184]: the trait `Copy` cannot be implemented for this type;
+//               the type has a destructor</code></pre>
+
+<div class="concept">
+  <strong>💡 El razonamiento.</strong> <code>Copy</code> significa: «duplicar los bits produce un valor independiente y válido, y el original <strong>no se invalida</strong>». <code>Drop</code> significa: «este valor es responsable de liberar un recurso <strong>exactamente una vez</strong>». Si un tipo tuviera los dos, cada asignación crearía un dueño extra del mismo recurso, y <em>cada</em> copia correría <code>drop</code> al morir. Un <code>fd</code> cerrado tres veces, un <code>free()</code> doble. Rust no puede permitirlo, así que lo prohíbe en la definición del tipo, no en el uso.
+</div>
+
+<p>Y hay una consecuencia práctica que sí te va a morder: agregar un <code>impl Drop</code> a un tipo que hoy es <code>Copy</code> es un <strong>cambio incompatible</strong> para todos tus usuarios, porque de golpe sus asignaciones pasan a ser moves.</p>
+
+<h3>El orden de destrucción</h3>
+
+<p>Las variables locales se destruyen en <strong>orden inverso de declaración</strong>; los campos de un struct, en orden de declaración. Es determinista y sin recolector: por eso Rust puede tener RAII sin sorpresas de latencia.</p>
+
+<pre><code class="lang-rust">struct Ruidoso(&amp;'static str);
+impl Drop for Ruidoso {
+    fn drop(&amp;mut self) { println!("drop {}", self.0); }
+}
+
+struct Par { primero: Ruidoso, segundo: Ruidoso }
+
+fn main() {
+    let _a = Ruidoso("a");
+    let _b = Ruidoso("b");
+    let _p = Par { primero: Ruidoso("p.1"), segundo: Ruidoso("p.2") };
+}
+// drop p.1      &lt;- campos: orden de declaración
+// drop p.2
+// drop b        &lt;- locales: orden INVERSO
+// drop a</code></pre>
+
+<div class="tip">
+  <strong>Truco de diagnóstico.</strong> Cuando no entendés por qué algo «sigue prestado», metele un tipo con <code>Drop</code> ruidoso y mirá el orden real de destrucción. Los errores de borrow casi siempre son errores de <em>cuándo muere</em> algo, y esta técnica los hace visibles sin leer una línea de MIR.
+</div>
+
+<h2>RuS1.2 El invariante: aliasing XOR mutabilidad</h2>
+
+<p>Acá está el corazón. Las dos reglas que memorizaste en M03 —«muchas <code>&amp;T</code> o una sola <code>&amp;mut T</code>»— no son dos reglas: son una sola formulación de la misma cosa.</p>
+
+<div class="rule">
+  <strong>📌 El invariante único.</strong> Mientras exista una referencia <strong>mutable</strong> a un valor, esa referencia es el <strong>único</strong> camino de acceso a ese valor en todo el programa. Mientras existan referencias <strong>compartidas</strong>, nadie puede escribir a través de ninguna de ellas. Traducido: <em>aliasing</em> (varios caminos al mismo dato) y <em>mutabilidad</em> son mutuamente excluyentes.
+</div>
+
+<pre><code class="lang-rust">fn main() {
+    let mut v = vec![1, 2, 3];
+    let r = &amp;v[0];        // préstamo compartido
+    v.push(4);            // error[E0502]: cannot borrow `v` as mutable
+    println!("{r}");      // porque también está prestado como inmutable
+}</code></pre>
+
+<p>El ejemplo se ve pedante hasta que pensás qué hace <code>push</code>: si el <code>Vec</code> se queda sin capacidad, <strong>realoca</strong> el buffer y libera el viejo. Tu <code>r</code> quedaría apuntando a memoria liberada. En C++ eso es <em>iterator invalidation</em>, la fuente clásica de <em>use-after-free</em> silencioso. En Rust es un error de compilación, y sale del mismo invariante.</p>
+
+<h3>De un invariante salen tres garantías</h3>
+
+<table>
+<thead><tr><th>Clase de bug</th><th>Por qué el invariante lo mata</th></tr></thead>
+<tbody>
+<tr><td><strong>Use-after-free</strong></td><td>Liberar exige propiedad exclusiva; si alguien tiene un préstamo vivo, no podés ser exclusivo</td></tr>
+<tr><td><strong>Iterator invalidation</strong></td><td>Mutar la colección exige <code>&amp;mut</code>; el iterador ya sostiene un <code>&amp;</code></td></tr>
+<tr><td><strong>Data race</strong></td><td>Una carrera necesita dos hilos, uno escribiendo, sobre el mismo dato. Escribir exige exclusividad: no hay dos</td></tr>
+</tbody>
+</table>
+
+<div class="analogy">
+  <strong>🔗 Analogía.</strong> Es una pizarra en una sala de reuniones. Pueden entrar diez personas a <em>leer</em> al mismo tiempo. Pero si alguien va a <em>borrar y reescribir</em>, la sala se cierra: entra solo esa persona. No porque escribir sea peligroso, sino porque leer <em>mientras</em> alguien reescribe te deja con media frase vieja y media nueva. La regla no protege al que escribe: protege a los que leen.
+</div>
+
+<h3>El invariante también es una optimización</h3>
+
+<p>Esto casi nadie lo cuenta: aliasing XOR mutabilidad no es solo seguridad, es <strong>información que el optimizador de C no tiene</strong>. Rust emite el atributo <code>noalias</code> de LLVM en sus referencias, que en C es el opt-in manual llamado <code>restrict</code>.</p>
+
+<pre><code class="lang-rust">pub fn acumular(destino: &amp;mut i32, sumando: &amp;i32) {
+    *destino += *sumando;
+    *destino += *sumando;
+}
+// LLVM sabe que `destino` y `sumando` NO pueden apuntar al mismo i32
+// (uno es &amp;mut, el otro &amp;: el invariante lo prohíbe).
+// Entonces puede leer *sumando UNA sola vez y hacer *destino += 2 * s.</code></pre>
+
+<pre><code class="lang-c">// El equivalente en C: el compilador DEBE releer *sumando la segunda vez,
+// porque nada le prohíbe que destino == sumando.
+void acumular(int *destino, const int *sumando) {
+    *destino += *sumando;
+    *destino += *sumando;   // recarga obligatoria
+}
+// Para conseguir lo mismo hay que jurarlo a mano — y si mentís, es UB:
+void acumular_rapido(int *restrict destino, const int *restrict sumando);</code></pre>
+
+<div class="info">
+  Esta es la respuesta corta a «¿por qué Rust puede ser tan rápido como C si hace más chequeos?». Los chequeos son en compilación y cuestan cero en runtime; la información que producen <em>habilita</em> optimizaciones que en C hay que pedir a mano y con riesgo. El invariante es simultáneamente la restricción más molesta y el activo más valioso del lenguaje.
+</div>
+
+<h2>RuS1.3 NLL: por qué el préstamo termina en el último uso</h2>
+
+<p>Hasta Rust 2015 el borrow checker era <strong>léxico</strong>: un préstamo vivía desde donde se creaba hasta que se cerraba la llave del bloque. Simple de implementar, y rechazaba montañas de código correcto. Desde la edición 2018 rige <strong>NLL</strong> (<em>Non-Lexical Lifetimes</em>): un préstamo vive hasta su <strong>último uso</strong>, calculado sobre el grafo de flujo de control del MIR.</p>
+
+<pre><code class="lang-rust">fn main() {
+    let mut v = vec![1, 2, 3];
+
+    let primero = &amp;v[0];       // el préstamo NACE acá
+    println!("{primero}");     // ...y MUERE acá: último uso de `primero`
+
+    v.push(4);                 // OK desde NLL. Con el checker léxico: E0502
+    println!("{v:?}");
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 El cambio mental que importa.</strong> Un lifetime <strong>no es un scope</strong>. Es un conjunto de puntos del grafo de control donde el préstamo tiene que seguir siendo válido — lo que el compilador llama una <em>región</em>. Por eso dos préstamos «del mismo bloque» pueden no solaparse, y por eso un <code>return</code> temprano puede alargar un préstamo mucho más de lo que sugiere la indentación.
+</div>
+
+<p>NLL también resuelve el caso clásico del <code>match</code> que devolvía por dos ramas:</p>
+
+<pre><code class="lang-rust">fn primero_o_default(v: &amp;mut Vec&lt;String&gt;) -&gt; &amp;str {
+    if v.is_empty() {
+        v.push(String::from("vacío"));   // muta: necesita &amp;mut
+    }
+    &amp;v[0]                                // presta: y acá el &amp;mut ya murió
+}</code></pre>
+
+<h3>Dónde NLL todavía dice que no (y no es tu culpa)</h3>
+
+<p>Hay un caso famoso que sigue sin compilar en la edición 2024, conocido como <em>NLL problem case #3</em>: cuando un préstamo se devuelve <strong>condicionalmente</strong>, el compilador lo considera vivo en <strong>toda</strong> la función, incluso en la rama donde no se devolvió.</p>
+
+<pre><code class="lang-rust">use std::collections::HashMap;
+
+fn obtener_o_crear&lt;'m&gt;(m: &amp;'m mut HashMap&lt;String, String&gt;, k: &amp;str) -&gt; &amp;'m String {
+    if let Some(v) = m.get(k) {
+        return v;              // este préstamo se ata a 'm ...
+    }
+    m.insert(k.to_string(), String::from("default"));  // error[E0499]
+    m.get(k).unwrap()          // ... y por eso `m` sigue prestado acá
+}</code></pre>
+
+<p>El compilador no se equivoca <em>en la seguridad</em> — el programa es correcto, pero el análisis actual no puede probarlo. Las dos salidas prácticas:</p>
+
+<pre><code class="lang-rust">use std::collections::HashMap;
+
+// Opción A — la idiomática: la API `entry` fue diseñada exactamente para esto.
+fn obtener_o_crear_a&lt;'m&gt;(m: &amp;'m mut HashMap&lt;String, String&gt;, k: &amp;str) -&gt; &amp;'m String {
+    m.entry(k.to_string()).or_insert_with(|| String::from("default"))
+}
+
+// Opción B — cuando no hay `entry`: chequear sin quedarte con el préstamo.
+fn obtener_o_crear_b&lt;'m&gt;(m: &amp;'m mut HashMap&lt;String, String&gt;, k: &amp;str) -&gt; &amp;'m String {
+    if !m.contains_key(k) {                      // contains_key no retiene nada
+        m.insert(k.to_string(), String::from("default"));
+    }
+    m.get(k).unwrap()                            // un único préstamo, al final
+}</code></pre>
+
+<div class="info">
+  El sucesor de NLL se llama <strong>Polonius</strong>: reformula el análisis en términos de «qué préstamos están vivos en cada punto» en vez de «qué regiones contienen qué puntos», y acepta este caso. Al momento de escribir esto sigue en nightly (<code>-Z polonius=next</code>) y no cambia nada de lo que aprendés acá — los mismos programas seguros seguirán siendo seguros; solo se van a aceptar <em>más</em> programas que ya eran correctos.
+</div>
+
+<h2>RuS1.4 Lifetimes de verdad: no son «cuánto vive el dato»</h2>
+
+<p>La definición de manual —«un lifetime es cuánto vive una referencia»— sirve para el M09 y se rompe en cuanto llegás a firmas genéricas. La definición útil es otra.</p>
+
+<div class="rule">
+  <strong>📌 Un lifetime es una <em>restricción de relación</em> entre referencias, no una duración.</strong> Escribir <code>&amp;'a str</code> no dice «esto vive 40 milisegundos». Dice: «existe una región <code>'a</code>, y esta referencia es válida en toda ella». Y las anotaciones que ponés en una firma no <em>crean</em> duraciones: <strong>relacionan</strong> las de los parámetros con las del resultado.
+</div>
+
+<pre><code class="lang-rust">// Esto NO dice "a y b viven lo mismo".
+// Dice: "existe una región 'a en la que AMBOS son válidos, y el resultado
+//        también lo es". El compilador elige la MÁS CHICA que funcione.
+fn mas_larga&lt;'a&gt;(a: &amp;'a str, b: &amp;'a str) -&gt; &amp;'a str {
+    if a.len() &gt;= b.len() { a } else { b }
+}
+
+fn main() {
+    let larga = String::from("una cadena larga");
+    let elegida;
+    {
+        let corta = String::from("corta");
+        elegida = mas_larga(&amp;larga, &amp;corta);   // 'a se achica al scope de `corta`
+        println!("{elegida}");                 // OK: acá 'a todavía vale
+    }
+    // println!("{elegida}");                  // error: 'a terminó con `corta`
+}</code></pre>
+
+<h3>Los lifetimes tienen subtipado</h3>
+
+<p>Un lifetime más largo puede usarse donde se espera uno más corto. Se escribe <code>'largo: 'corto</code> y se lee «<code>'largo</code> sobrevive a <code>'corto</code>» (<em>outlives</em>). Esto es <strong>subtipado</strong>: <code>&amp;'static str</code> es un subtipo de <code>&amp;'a str</code> para cualquier <code>'a</code>.</p>
+
+<pre><code class="lang-rust">fn usar&lt;'corto&gt;(s: &amp;'corto str) -&gt; usize { s.len() }
+
+fn main() {
+    let estatica: &amp;'static str = "vivo todo el programa";
+    let local = String::from("vivo poquito");
+
+    usar(estatica);      // 'static se "achica" a 'corto: coerción implícita
+    usar(&amp;local);        // el lifetime de `local` también sirve
+}
+
+// Y podés exigir la relación explícitamente:
+fn guardar&lt;'largo, 'corto&gt;(destino: &amp;mut Vec&lt;&amp;'corto str&gt;, s: &amp;'largo str)
+where
+    'largo: 'corto,      // "'largo dura al menos lo que 'corto"
+{
+    destino.push(s);     // meter algo más longevo en un contenedor más efímero: OK
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error mental más común:</strong> creer que si anotás <code>'a</code> en una firma le estás <em>diciendo</em> al compilador cuánto tiene que vivir el dato. No. Las anotaciones son <strong>promesas que el llamador tiene que poder cumplir</strong>. Si prometés algo imposible, el error no aparece en tu función: aparece en cada lugar que la llama, y por eso se siente lejano e inexplicable. Cuando un error de lifetime te apunta a una llamada, leé la <em>firma</em>, no el cuerpo.
+</div>
+
+<h2>RuS1.5 Elisión: las tres reglas que evitan que escribas <code>'a</code></h2>
+
+<p>El 95% de las funciones con referencias no llevan anotaciones porque el compilador aplica tres reglas mecánicas. No son inteligencia artificial ni inferencia: son tres pasos, en orden, y si después de los tres queda algún lifetime de salida sin asignar, es error.</p>
+
+<div class="step"><strong>Regla 1.</strong> A cada parámetro que sea una referencia se le asigna <strong>su propio</strong> lifetime fresco. Dos parámetros por referencia dan <code>'a</code> y <code>'b</code>, distintos.</div>
+
+<div class="step"><strong>Regla 2.</strong> Si hay <strong>exactamente un</strong> lifetime de entrada, ese se le asigna a <strong>todos</strong> los lifetimes de salida.</div>
+
+<div class="step"><strong>Regla 3.</strong> Si hay varios lifetimes de entrada pero uno de los parámetros es <code>&amp;self</code> o <code>&amp;mut self</code>, el lifetime de <code>self</code> se le asigna a todos los de salida.</div>
+
+<pre><code class="lang-rust">// Escribís esto:
+fn primera_palabra(s: &amp;str) -&gt; &amp;str { s.split(' ').next().unwrap_or("") }
+
+// El compilador lee esto (regla 1 + regla 2):
+fn primera_palabra&lt;'a&gt;(s: &amp;'a str) -&gt; &amp;'a str { /* ... */ }</code></pre>
+
+<pre><code class="lang-rust">// Acá la elisión FALLA y por eso te pide la anotación:
+fn mas_larga(a: &amp;str, b: &amp;str) -&gt; &amp;str { if a.len() &gt;= b.len() { a } else { b } }
+// error[E0106]: missing lifetime specifier
+//   regla 1 -&gt; 'a y 'b;  regla 2 -&gt; no aplica (hay dos);  regla 3 -&gt; no hay self.
+//   El compilador NO adivina: si eligiera mal, te dejaría una referencia colgada.</code></pre>
+
+<pre><code class="lang-rust">struct Parser&lt;'texto&gt; { fuente: &amp;'texto str, pos: usize }
+
+impl&lt;'texto&gt; Parser&lt;'texto&gt; {
+    // Regla 3: la salida se ata a &amp;self, NO a `patron`.
+    fn resto(&amp;self, patron: &amp;str) -&gt; &amp;str {
+        &amp;self.fuente[self.pos..]
+    }
+}
+// Y ojo, es una regla, no una adivinanza correcta: si de verdad quisieras
+// devolver una tajada de `patron`, la regla 3 te da la firma EQUIVOCADA
+// y tenés que anotar a mano:
+//   fn tajada&lt;'p&gt;(&amp;self, patron: &amp;'p str) -&gt; &amp;'p str { &amp;patron[1..] }</code></pre>
+
+<div class="tip">
+  <strong>Bonus poco conocido:</strong> el lifetime del parser de arriba se llama <code>'texto</code>, no <code>'a</code>. Los nombres de lifetime son identificadores comunes y ponerles nombres con significado (<code>'buf</code>, <code>'conn</code>, <code>'arena</code>) mejora los mensajes de error muchísimo. Cuando un struct tiene dos lifetimes, <code>'a</code> y <code>'b</code> son una crueldad para tu yo del futuro.
+</div>
+
+<h2>RuS1.6 <code>'static</code>: casi nunca significa lo que la gente cree</h2>
+
+<p><code>'static</code> tiene <strong>dos significados distintos</strong> según dónde aparezca, y confundirlos es el origen de la mitad de las peleas con <code>thread::spawn</code>, <code>Box&lt;dyn Error&gt;</code> y los runtimes async.</p>
+
+<table>
+<thead><tr><th>Forma</th><th>Qué dice</th><th>Ejemplos que la cumplen</th></tr></thead>
+<tbody>
+<tr><td><code>&amp;'static T</code></td><td>Esta <strong>referencia</strong> apunta a datos que viven todo el programa</td><td>Literales de string, <code>static</code>, <code>Box::leak</code></td></tr>
+<tr><td><code>T: 'static</code></td><td>Este <strong>tipo</strong> no contiene ninguna referencia que pueda expirar</td><td><code>String</code>, <code>Vec&lt;u8&gt;</code>, <code>i32</code>, <code>&amp;'static str</code></td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ <code>T: 'static</code> NO significa «vive para siempre».</strong> Significa «es <em>dueño</em> de todo lo que contiene, así que <em>podría</em> vivir para siempre si quisieras». Un <code>String</code> cumple <code>T: 'static</code> y se destruye tres líneas después. Esta confusión es la número uno de todo el tema.
+</div>
+
+<pre><code class="lang-rust">fn exige_static&lt;T: 'static&gt;(_t: T) {}
+
+fn main() {
+    // 1) &amp;'static T — el dato está en el binario
+    let literal: &amp;'static str = "esto vive todo el programa";
+    exige_static(literal);
+
+    // 2) T: 'static — el TIPO no tiene préstamos adentro
+    let efimera = String::from("me muero en dos líneas");
+    exige_static(efimera);     // compila: String no contiene referencias
+                               // y se destruye acá nomás, no "para siempre"
+
+    // Lo que NO cumple T: 'static es esto:
+    let local = String::from("local");
+    let prestada: &amp;str = &amp;local;
+    // exige_static(prestada);  // error: `local` no vive lo suficiente
+}</code></pre>
+
+<h3>Dónde te lo vas a cruzar</h3>
+
+<pre><code class="lang-rust">use std::thread;
+
+fn main() {
+    let datos = vec![1, 2, 3];
+
+    // thread::spawn exige F: 'static porque el hilo puede sobrevivir
+    // a esta función. Por eso hay que MOVER, no prestar.
+    let h = thread::spawn(move || println!("{datos:?}"));
+    h.join().unwrap();
+}</code></pre>
+
+<pre><code class="lang-rust">fn main() {
+    let datos = vec![1, 2, 3];
+
+    // La salida moderna: scoped threads (estable desde 1.63).
+    // El scope GARANTIZA que los hilos terminan antes de salir,
+    // así que NO hace falta 'static y podés prestar.
+    std::thread::scope(|s| {
+        s.spawn(|| println!("leo prestado: {:?}", &amp;datos));
+        s.spawn(|| println!("y yo también: {}", datos.len()));
+    });
+
+    println!("sigo siendo dueño: {datos:?}");   // datos nunca se movió
+}</code></pre>
+
+<div class="mistake">
+  <strong>El antipatrón: <code>Box::leak</code> para «arreglar» un error de lifetime.</strong> Convierte cualquier valor en <code>&amp;'static</code>… filtrando la memoria a propósito. Es legítimo <em>una vez</em>, al arrancar, para una config que va a vivir todo el proceso. Es una fuga si lo hacés por request, por conexión o dentro de un loop. Si tu solución a un error de lifetime fue <code>Box::leak</code>, casi seguro la respuesta correcta era <code>Arc</code>, un scope, o replantear quién es el dueño.
+</div>
+
+<pre><code class="lang-rust">// Aceptable: UNA vez, al arranque, config que vive todo el proceso.
+fn cargar_config() -&gt; &amp;'static Config {
+    let c = Box::new(Config::leer_de_disco());
+    Box::leak(c)
+}
+
+// Fuga garantizada: se llama por request y nunca se libera nada.
+fn nombre_de_usuario(id: u64) -&gt; &amp;'static str {
+    Box::leak(consultar_nombre(id).into_boxed_str())   // NO HAGAS ESTO
+}</code></pre>
+
+<h2>RuS1.7 HRTB: <code>for&lt;'a&gt;</code>, o «para todo lifetime»</h2>
+
+<p>Un <em>Higher-Ranked Trait Bound</em> aparece cuando necesitás que algo funcione para <strong>cualquier</strong> lifetime, elegido por el <em>llamado</em>, no por el <em>llamador</em>. Es la diferencia entre «yo elijo un <code>'a</code> y vos cumplís» y «vos tenés que cumplir para todos los <code>'a</code> posibles».</p>
+
+<pre><code class="lang-rust">// Lo que querés decir: "f funciona con CUALQUIER lifetime que yo le pase"
+fn aplicar&lt;F&gt;(f: F) -&gt; String
+where
+    F: for&lt;'a&gt; Fn(&amp;'a str) -&gt; &amp;'a str,
+{
+    let temporal = String::from("hola mundo");
+    f(&amp;temporal).to_string()          // el 'a acá es local: nadie afuera lo conoce
+}
+
+fn main() {
+    println!("{}", aplicar(|s| s.split(' ').next().unwrap()));
+}</code></pre>
+
+<p>Compará con la versión sin HRTB, que <em>parece</em> lo mismo y no sirve:</p>
+
+<pre><code class="lang-rust">// Acá 'a lo elige el LLAMADOR, antes de entrar a la función.
+fn aplicar_mal&lt;'a, F&gt;(f: F) -&gt; String
+where
+    F: Fn(&amp;'a str) -&gt; &amp;'a str,
+{
+    let temporal = String::from("hola mundo");
+    f(&amp;temporal).to_string()
+    // error[E0597]: `temporal` does not live long enough
+    // Claro: 'a ya estaba fijado desde afuera y `temporal` no llega.
+}</code></pre>
+
+<div class="info">
+  <strong>Casi nunca vas a escribir <code>for&lt;'a&gt;</code> a mano</strong>, porque los bounds de closures lo aplican solos por elisión. Se vuelve visible en tres lugares: (1) cuando guardás un closure en un campo, tipo <code>Box&lt;dyn for&lt;'a&gt; Fn(&amp;'a str)&gt;</code>; (2) en los mensajes de error de <code>serde</code>, donde <code>DeserializeOwned</code> es literalmente <code>for&lt;'de&gt; Deserialize&lt;'de&gt;</code>; (3) cuando escribís un trait genérico sobre préstamos. Si te aparece en un error, ahora sabés leerlo: <em>«para todo lifetime»</em>.
+</div>
+
+<h2>RuS1.8 Varianza: la sección que casi nadie enseña</h2>
+
+<p>Ya vimos que <code>&amp;'static str</code> se puede usar donde se pide <code>&amp;'a str</code>: hay subtipado entre lifetimes. La <strong>varianza</strong> responde la pregunta siguiente, que es la que de verdad importa: si <code>Largo</code> es subtipo de <code>Corto</code>, ¿es <code>Contenedor&lt;Largo&gt;</code> subtipo de <code>Contenedor&lt;Corto&gt;</code>?</p>
+
+<table>
+<thead><tr><th>Varianza</th><th>Si <code>L</code> es subtipo de <code>C</code>, entonces…</th><th>Intuición</th></tr></thead>
+<tbody>
+<tr><td><strong>Covariante</strong></td><td><code>F&lt;L&gt;</code> es subtipo de <code>F&lt;C&gt;</code></td><td>Va «para el mismo lado». Lectura</td></tr>
+<tr><td><strong>Contravariante</strong></td><td><code>F&lt;C&gt;</code> es subtipo de <code>F&lt;L&gt;</code></td><td>Va «al revés». Parámetros de función</td></tr>
+<tr><td><strong>Invariante</strong></td><td>No hay relación en ningún sentido</td><td>Se lee <em>y</em> se escribe: no se puede aflojar</td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>Tipo</th><th>en <code>'a</code></th><th>en <code>T</code></th></tr></thead>
+<tbody>
+<tr><td><code>&amp;'a T</code></td><td>covariante</td><td>covariante</td></tr>
+<tr><td><code>&amp;'a mut T</code></td><td>covariante</td><td><strong>invariante</strong></td></tr>
+<tr><td><code>Box&lt;T&gt;</code>, <code>Vec&lt;T&gt;</code></td><td>—</td><td>covariante</td></tr>
+<tr><td><code>Cell&lt;T&gt;</code>, <code>RefCell&lt;T&gt;</code>, <code>UnsafeCell&lt;T&gt;</code></td><td>—</td><td><strong>invariante</strong></td></tr>
+<tr><td><code>fn(T) -&gt; U</code></td><td>—</td><td><strong>contravariante</strong> en <code>T</code>, covariante en <code>U</code></td></tr>
+<tr><td><code>*const T</code></td><td>—</td><td>covariante</td></tr>
+<tr><td><code>*mut T</code></td><td>—</td><td><strong>invariante</strong></td></tr>
+</tbody>
+</table>
+
+<h3>Por qué <code>&amp;'a T</code> es covariante en <code>'a</code></h3>
+
+<p>Porque solo podés <strong>leer</strong>. Si tengo una referencia válida por mucho tiempo y me la pedís por poco tiempo, no puede pasar nada malo: durante ese ratito el dato existe seguro. Achicar el lifetime siempre es seguro.</p>
+
+<h3>Por qué <code>&amp;'a mut T</code> es <em>invariante</em> en <code>T</code></h3>
+
+<p>Acá está el ejemplo que justifica toda la sección. Una referencia mutable no solo lee: <strong>escribe</strong>. Y escribir con el tipo aflojado te deja meter un dato efímero en un lugar donde alguien prometió que había un dato longevo.</p>
+
+<pre><code class="lang-rust">// Supongamos, POR ABSURDO, que &amp;mut T fuera covariante en T.
+// Entonces &amp;mut &amp;'static str podría usarse como &amp;mut &amp;'corto str.
+
+fn asignar&lt;'corto&gt;(destino: &amp;mut &amp;'corto str, origen: &amp;'corto str) {
+    *destino = origen;
+}
+
+fn main() {
+    let mut r: &amp;'static str = "vivo para siempre";
+
+    {
+        let efimera = String::from("me muero en la llave");
+        asignar(&amp;mut r, &amp;efimera);   // error[E0597] — y MENOS MAL
+        //      ^^^^^^ acá haría falta la covarianza que Rust prohíbe
+    }                                 // `efimera` se libera acá
+
+    println!("{r}");   // si hubiera compilado: LECTURA DE MEMORIA LIBERADA
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Ese es el agujero exacto que la invarianza previene.</strong> Si <code>&amp;mut T</code> fuera covariante en <code>T</code>, el compilador aceptaría degradar <code>&amp;mut &amp;'static str</code> a <code>&amp;mut &amp;'corto str</code>, escribir por ahí una referencia corta, y devolverte una variable que <em>declara</em> ser <code>&amp;'static</code> apuntando a un <code>String</code> ya destruido. Java tiene exactamente este agujero con los arrays (covariantes) y lo tapa con un chequeo en runtime, <code>ArrayStoreException</code>. Rust lo tapa en el sistema de tipos y no paga nada en runtime.
+</div>
+
+<h3>Contravarianza: los parámetros van al revés</h3>
+
+<pre><code class="lang-rust">fn ejecutar(f: fn(&amp;'static str)) { f("literal en el binario") }
+
+fn imprime_cualquiera&lt;'a&gt;(s: &amp;'a str) { println!("{s}"); }
+
+fn main() {
+    // `imprime_cualquiera` acepta CUALQUIER lifetime -&gt; es MÁS general
+    // que lo pedido (que solo tiene que aceptar 'static). Sirve.
+    ejecutar(imprime_cualquiera);
+}
+
+// Al revés NO funciona, y es la definición de contravarianza:
+fn ejecutar_corto&lt;'a&gt;(f: fn(&amp;'a str), s: &amp;'a str) { f(s) }
+fn solo_static(s: &amp;'static str) { println!("{s}"); }
+// ejecutar_corto(solo_static, &amp;local);   // error: solo_static exige 'static</code></pre>
+
+<div class="analogy">
+  <strong>🔗 Analogía para no olvidarla.</strong> Un contrato de trabajo dice «te doy un ingrediente y me devolvés un plato». Podés reemplazar al cocinero por uno que acepte <strong>más</strong> ingredientes (contravarianza en la entrada: más general está bien) y que devuelva un plato <strong>más específico</strong> (covarianza en la salida). Lo que no podés es contratar a uno que exija ingredientes más raros que los del contrato.
+</div>
+
+<h3><code>PhantomData</code>: elegir la varianza a mano</h3>
+
+<p>Cuando escribís tipos con punteros crudos o FFI, el compilador no puede deducir la varianza correcta porque el parámetro no aparece en ningún campo real. <code>PhantomData</code> es cómo se lo decís.</p>
+
+<pre><code class="lang-rust">use std::marker::PhantomData;
+
+// Un slice propio sobre memoria cruda. Sin PhantomData, T no aparece en
+// ningún campo "de verdad" y el compilador no sabe qué varianza darle
+// ni que este tipo es "dueño" de valores T (importante para drop check).
+struct MiSlice&lt;'a, T&gt; {
+    ptr: *const T,
+    largo: usize,
+    _marca: PhantomData&lt;&amp;'a T&gt;,   // covariante en 'a y en T, y sin Send/Sync gratis
+}
+
+// Recetario de varianza con PhantomData:
+//   PhantomData&lt;T&gt;            -&gt; covariante en T
+//   PhantomData&lt;&amp;'a T&gt;        -&gt; covariante en 'a y en T
+//   PhantomData&lt;&amp;'a mut T&gt;    -&gt; covariante en 'a, INVARIANTE en T
+//   PhantomData&lt;fn(T)&gt;        -&gt; contravariante en T
+//   PhantomData&lt;fn(T) -&gt; T&gt;   -&gt; invariante en T
+//   PhantomData&lt;*const T&gt;     -&gt; covariante, y quita Send/Sync automáticos</code></pre>
+
+<div class="warn">
+  <strong>Cuándo NO tocar varianza.</strong> Si estás escribiendo código seguro normal —structs con campos comunes, genéricos sobre <code>Vec</code> y <code>HashMap</code>— la varianza que infiere el compilador es la correcta y no tenés que pensar en esto jamás. La sección existe para dos momentos: cuando un error de lifetime «imposible» no cede con ningún <code>'a</code> que pruebes (casi siempre hay un tipo invariante en el medio, típicamente un <code>&amp;mut</code> o una <code>Cell</code>), y cuando escribís estructuras de datos con <code>unsafe</code> (RuS5).
+</div>
+
+<h2>RuS1.9 Interior mutability: mutar a través de <code>&amp;T</code></h2>
+
+<p>El invariante dice que no podés escribir a través de una referencia compartida. Y sin embargo <code>RefCell</code>, <code>Mutex</code> y los atómicos lo hacen todo el tiempo. No es una excepción mágica: es que el chequeo se <strong>corre de compilación a runtime</strong>, y la puerta por la que se hace es una sola.</p>
+
+<pre><code class="lang-rust">// core/src/cell.rs, simplificado. Este es el ÚNICO tipo del lenguaje
+// por el que es legal obtener un *mut T a partir de un &amp;T.
+#[repr(transparent)]
+pub struct UnsafeCell&lt;T: ?Sized&gt; { value: T }
+
+impl&lt;T: ?Sized&gt; UnsafeCell&lt;T&gt; {
+    pub const fn get(&amp;self) -&gt; *mut T { self as *const Self as *mut T }
+}
+// El compilador lo trata especial: NO emite `noalias` para lo que hay
+// adentro. Por eso las optimizaciones de RuS1.2 no rompen a RefCell.</code></pre>
+
+<p>Todo lo demás está construido encima. Una <code>Cell</code> mínima entra en seis líneas:</p>
+
+<pre><code class="lang-rust">use std::cell::UnsafeCell;
+
+pub struct MiCell&lt;T&gt; { valor: UnsafeCell&lt;T&gt; }
+
+impl&lt;T: Copy&gt; MiCell&lt;T&gt; {
+    pub fn nueva(v: T) -&gt; Self { MiCell { valor: UnsafeCell::new(v) } }
+    pub fn get(&amp;self) -&gt; T { unsafe { *self.valor.get() } }
+    pub fn set(&amp;self, v: T) { unsafe { *self.valor.get() = v } }
+}
+// Es seguro porque NUNCA entrega una referencia al interior: solo copias.
+// Sin referencias al interior, no hay aliasing que romper.
+// Y es !Sync automáticamente, porque UnsafeCell&lt;T&gt; es !Sync.</code></pre>
+
+<table>
+<thead><tr><th>Tipo</th><th>Cuándo chequea</th><th>Costo</th><th>Multi-hilo</th><th>Cómo falla</th></tr></thead>
+<tbody>
+<tr><td><code>Cell&lt;T&gt;</code></td><td>Nunca (no da referencias)</td><td>Cero</td><td>No (<code>!Sync</code>)</td><td>No puede fallar</td></tr>
+<tr><td><code>RefCell&lt;T&gt;</code></td><td>Runtime, contador de préstamos</td><td>Un <code>usize</code> + una rama</td><td>No (<code>!Sync</code>)</td><td><strong>Panic</strong> <code>BorrowMutError</code></td></tr>
+<tr><td><code>OnceCell&lt;T&gt;</code></td><td>Runtime, una sola escritura</td><td>Mínimo</td><td>No (usar <code>OnceLock</code>)</td><td>Devuelve <code>Err</code></td></tr>
+<tr><td><code>Mutex&lt;T&gt;</code></td><td>Runtime, bloqueante</td><td>Atómico; syscall si hay contención</td><td>Sí</td><td>Deadlock / <em>poisoning</em></td></tr>
+<tr><td><code>RwLock&lt;T&gt;</code></td><td>Runtime, N lectores o 1 escritor</td><td>Mayor que <code>Mutex</code></td><td>Sí</td><td>Deadlock / inanición</td></tr>
+<tr><td><code>AtomicUsize</code> y cía.</td><td>Hardware</td><td>Una instrucción</td><td>Sí</td><td>No falla (pero es fácil usarlo mal)</td></tr>
+<tr><td><code>UnsafeCell&lt;T&gt;</code></td><td><strong>Vos</strong></td><td>Cero</td><td>Depende</td><td><strong>UB</strong> si te equivocás</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">use std::cell::RefCell;
+
+fn main() {
+    let c = RefCell::new(vec![1, 2, 3]);
+
+    {
+        let lectura = c.borrow();            // contador de préstamos: 1 compartido
+        println!("{:?}", *lectura);
+    }                                        // se libera acá
+
+    c.borrow_mut().push(4);                  // ahora sí: exclusivo
+
+    let _a = c.borrow();
+    let _b = c.borrow_mut();
+    // thread 'main' panicked: already borrowed: BorrowMutError
+}</code></pre>
+
+<div class="mistake">
+  <strong>La trampa de <code>RefCell</code> es que mueve el error de compilación a producción.</strong> El mismo bug que el borrow checker te habría marcado en dos segundos ahora es un panic que aparece a las tres semanas, en la rama que nadie testeó. Si tenés que usarlo, usá <code>try_borrow_mut()</code> en los caminos donde el conflicto es concebible, y mantené los préstamos <strong>lo más cortos posible</strong>: nunca sostengas un <code>Ref</code> mientras llamás a código que no controlás.
+</div>
+
+<pre><code class="lang-rust">// Patrón defensivo: préstamo mínimo + manejo explícito del conflicto
+match cache.try_borrow_mut() {
+    Ok(mut c) =&gt; { c.insert(clave, valor); }
+    Err(_) =&gt; {
+        // Alguien de arriba en el stack ya tiene el RefCell prestado.
+        // No paniquear: registrar y seguir, o reencolar el trabajo.
+        tracing::warn!("cache ocupada, salteando escritura");
+    }
+}
+
+// Antipatrón: el Ref vive durante la llamada al callback.
+// Si el callback vuelve a tocar la cache -&gt; panic garantizado.
+let datos = cache.borrow();
+callback_del_usuario(&amp;datos);      // ← acá adentro puede pasar cualquier cosa</code></pre>
+
+<h2>RuS1.10 <code>Rc</code>, <code>Arc</code> y sí, Rust también filtra memoria</h2>
+
+<p><code>Rc&lt;T&gt;</code> es propiedad compartida por conteo de referencias, sin sincronización. <code>Arc&lt;T&gt;</code> es lo mismo con contadores atómicos, para cruzar hilos. Por dentro son casi triviales:</p>
+
+<pre><code class="lang-rust">// alloc/src/rc.rs, simplificado
+struct RcInner&lt;T: ?Sized&gt; {
+    strong: Cell&lt;usize&gt;,   // cuántos Rc apuntan acá; a 0 se destruye el valor
+    weak: Cell&lt;usize&gt;,     // cuántos Weak (+1 mientras quede algún strong)
+    value: T,              // el dato, en el MISMO bloque del heap
+}
+// Rc&lt;T&gt; es un puntero a esto. Por eso Rc::clone() es incrementar un usize:
+// NO copia el dato. Y por eso Rc&lt;T&gt; te da &amp;T, nunca &amp;mut T
+// (hay varios dueños: la exclusividad es imposible por construcción).</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>Rc</code> te da propiedad compartida, no mutabilidad compartida.</strong> Para mutar necesitás combinarlo con interior mutability: <code>Rc&lt;RefCell&lt;T&gt;&gt;</code> en un hilo, <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> entre hilos. Esa combinación es la que hace que Rust «se parezca a un lenguaje con GC», y también la que trae los dos problemas de esta sección: el panic de <code>RefCell</code> y los ciclos.
+</div>
+
+<h3>El ciclo que filtra</h3>
+
+<p>El conteo de referencias no tiene forma de descubrir que dos objetos se sostienen mutuamente. Si <code>a</code> apunta a <code>b</code> y <code>b</code> apunta a <code>a</code>, sus contadores nunca llegan a cero, aunque nadie más los alcance. Es una fuga real, en Rust seguro, sin un solo <code>unsafe</code>:</p>
+
+<pre><code class="lang-rust">use std::cell::RefCell;
+use std::rc::Rc;
+
+struct Nodo { nombre: &amp;'static str, vecino: RefCell&lt;Option&lt;Rc&lt;Nodo&gt;&gt;&gt; }
+
+impl Drop for Nodo {
+    fn drop(&amp;mut self) { println!("drop {}", self.nombre); }
+}
+
+fn main() {
+    let a = Rc::new(Nodo { nombre: "a", vecino: RefCell::new(None) });
+    let b = Rc::new(Nodo { nombre: "b", vecino: RefCell::new(None) });
+
+    *a.vecino.borrow_mut() = Some(Rc::clone(&amp;b));
+    *b.vecino.borrow_mut() = Some(Rc::clone(&amp;a));   // ← el ciclo se cierra
+
+    println!("strong(a) = {}", Rc::strong_count(&amp;a));   // 2
+    println!("strong(b) = {}", Rc::strong_count(&amp;b));   // 2
+}
+// No se imprime NINGÚN "drop". Los dos nodos quedaron en el heap
+// hasta que el proceso termine. Memory leak, en safe Rust.</code></pre>
+
+<div class="info">
+  Esto no es un bug de Rust: es una decisión de diseño explícita. Filtrar memoria <strong>no es <em>unsafe</em></strong> — no causa comportamiento indefinido, no corrompe nada, no es un agujero de seguridad de memoria. Por eso <code>std::mem::forget</code> es una función segura. Rust promete <em>memory safety</em>, no <em>ausencia de fugas</em>. Confundir las dos cosas es el error de marketing más común sobre el lenguaje.
+</div>
+
+<h3><code>Weak</code>: la solución</h3>
+
+<p>Un <code>Weak&lt;T&gt;</code> apunta al mismo bloque pero <strong>no cuenta como dueño</strong>. Para usarlo hay que hacer <code>upgrade()</code>, que devuelve <code>Option&lt;Rc&lt;T&gt;&gt;</code>: <code>None</code> si el valor ya se destruyó.</p>
+
+<pre><code class="lang-rust">use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+struct Nodo {
+    nombre: &amp;'static str,
+    padre: RefCell&lt;Weak&lt;Nodo&gt;&gt;,        // hacia ARRIBA: débil, no es dueño
+    hijos: RefCell&lt;Vec&lt;Rc&lt;Nodo&gt;&gt;&gt;,     // hacia ABAJO: fuerte, sí es dueño
+}
+
+impl Drop for Nodo {
+    fn drop(&amp;mut self) { println!("drop {}", self.nombre); }
+}
+
+fn main() {
+    let raiz = Rc::new(Nodo {
+        nombre: "raiz",
+        padre: RefCell::new(Weak::new()),
+        hijos: RefCell::new(vec![]),
+    });
+    let hijo = Rc::new(Nodo {
+        nombre: "hijo",
+        padre: RefCell::new(Rc::downgrade(&amp;raiz)),   // Weak
+        hijos: RefCell::new(vec![]),
+    });
+    raiz.hijos.borrow_mut().push(Rc::clone(&amp;hijo));  // Rc
+
+    // Subir al padre: siempre puede fallar, y el tipo te obliga a decidir.
+    if let Some(p) = hijo.padre.borrow().upgrade() {
+        println!("el padre de {} es {}", hijo.nombre, p.nombre);
+    }
+}
+// drop raiz
+// drop hijo      ← los dos se liberan. Sin ciclo.</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla mecánica para cualquier estructura enlazada:</strong> las aristas que van <em>hacia abajo</em> en la jerarquía (padre → hijo, dueño → poseído, observado → nada) son <code>Rc</code>/<code>Arc</code>. Las que van <em>hacia arriba</em> o <em>hacia el costado</em> (hijo → padre, observador → sujeto, caché → entrada) son <code>Weak</code>. Si alguna vez podés recorrer un ciclo siguiendo solo <code>Rc</code>, tenés una fuga.
+</div>
+
+<h2>RuS1.11 Patrones para salir de las peleas más comunes</h2>
+
+<h3>Pelea 1 — «no puedo llamar a un método de <code>self</code> dentro de un loop sobre <code>self</code>»</h3>
+
+<pre><code class="lang-rust">struct Servidor { conexiones: Vec&lt;String&gt;, atendidas: usize }
+
+impl Servidor {
+    fn registrar(&amp;mut self, _c: &amp;str) { self.atendidas += 1; }
+
+    fn tick(&amp;mut self) {
+        for c in &amp;self.conexiones {   // presta self.conexiones (compartido)
+            self.registrar(c);        // error[E0502]: registrar pide &amp;mut *self
+        }                             //   ENTERO, no solo el campo `atendidas`
+    }
+}</code></pre>
+
+<p>La causa exacta: el borrow checker <strong>sí</strong> distingue campos distintos dentro de un cuerpo de función, pero una <strong>llamada a método</strong> presta <code>self</code> completo. Tres salidas, en orden de preferencia:</p>
+
+<pre><code class="lang-rust">// Salida A — no llamar al método: tocar el campo directo.
+// Los préstamos a campos DISJUNTOS del mismo struct sí conviven.
+fn tick_a(&amp;mut self) {
+    for _c in &amp;self.conexiones {
+        self.atendidas += 1;          // compila: campos distintos
+    }
+}</code></pre>
+
+<pre><code class="lang-rust">// Salida B — dividir el struct según lo que se presta junto.
+// Es la que casi siempre indica un diseño mejor.
+struct Metricas { atendidas: usize }
+impl Metricas {
+    fn registrar(&amp;mut self, _c: &amp;str) { self.atendidas += 1; }
+}
+
+struct Servidor { conexiones: Vec&lt;String&gt;, metricas: Metricas }
+
+impl Servidor {
+    fn tick(&amp;mut self) {
+        for c in &amp;self.conexiones {       // &amp;self.conexiones
+            self.metricas.registrar(c);   // &amp;mut self.metricas -&gt; disjuntos: OK
+        }
+    }
+}</code></pre>
+
+<pre><code class="lang-rust">// Salida C — mem::take: sacar el dato, trabajar libre, devolverlo.
+// Útil cuando de verdad necesitás &amp;mut self adentro del loop.
+impl Servidor {
+    fn tick_c(&amp;mut self) {
+        let conexiones = std::mem::take(&amp;mut self.conexiones);  // deja un Vec vacío
+        for c in &amp;conexiones {
+            self.registrar(c);        // self ya no está prestado por el loop
+        }
+        self.conexiones = conexiones; // devolver (ojo si hay early return)
+    }
+}</code></pre>
+
+<div class="warn">
+  <strong>Cuándo NO usar <code>mem::take</code>:</strong> si adentro del loop podés hacer <code>return</code> o <code>?</code>, el campo se queda vacío para siempre y acabás de crear un bug de estado silencioso. Si hay caminos de salida tempranos, usá la salida B (dividir el struct) o un guard con <code>Drop</code> que restaure. <code>mem::take</code> es una herramienta afilada, no un comodín.
+</div>
+
+<h3>Pelea 2 — «tengo que devolver a veces prestado y a veces propio»</h3>
+
+<pre><code class="lang-rust">use std::borrow::Cow;
+
+// Cow = Clone On Write: presta si puede, aloca solo si tuvo que cambiar algo.
+fn normalizar(s: &amp;str) -&gt; Cow&lt;'_, str&gt; {
+    if s.contains(' ') {
+        Cow::Owned(s.replace(' ', "_"))   // hubo cambio: alocamos
+    } else {
+        Cow::Borrowed(s)                  // sin cambios: CERO alocaciones
+    }
+}
+
+fn main() {
+    let a = normalizar("ya_estaba_bien");   // Borrowed: no alocó nada
+    let b = normalizar("con espacios");     // Owned: alocó una vez
+    println!("{a} {b}");
+}</code></pre>
+
+<div class="tip">
+  <code>Cow</code> brilla en el caso «el 95% de las entradas ya están bien». Un parser de configuración, un sanitizador de rutas, un normalizador de headers HTTP: alocás solo en el 5% raro. En cambio, si casi siempre transformás, <code>Cow</code> agrega un <code>enum</code> y una rama a cambio de nada — ahí devolvé <code>String</code> y listo.
+</div>
+
+<h3>Pelea 3 — cuándo clonar es la respuesta correcta</h3>
+
+<div class="concept">
+  <strong>💡 Clonar no es una derrota.</strong> Es una decisión de ingeniería con un costo medible. La pregunta correcta no es «¿puedo evitar este clone?» sino «¿este clone está en un camino caliente?». Un <code>String</code> de 30 bytes clonado una vez por request, en un servicio que hace una consulta a Postgres por request, es literalmente inmedible al lado de la latencia de red.
+</div>
+
+<table>
+<thead><tr><th>Situación</th><th>Clonar es…</th></tr></thead>
+<tbody>
+<tr><td>Configuración, al arrancar</td><td>✅ Correcto. Simplifica y corre una vez</td></tr>
+<tr><td>Clave para un <code>HashMap</code> que se guarda</td><td>✅ Correcto. Igual necesitás propiedad</td></tr>
+<tr><td>Prototipo hasta que el diseño se estabilice</td><td>✅ Correcto. Refactorizás después, con perfil en mano</td></tr>
+<tr><td>Adentro de un loop de millones de iteraciones</td><td>❌ Ahí sí importa: medí y sacalo</td></tr>
+<tr><td>Un <code>Vec</code> grande, por request</td><td>❌ Usá <code>Arc</code> y compartilo</td></tr>
+<tr><td>Para «hacer callar» un error que no entendés</td><td>⚠️ Peligroso: suele tapar un problema de diseño de propiedad</td></tr>
+</tbody>
+</table>
+
+<h3>Pelea 4 — índices en vez de referencias</h3>
+
+<p>El patrón que resuelve el 90% de las estructuras enlazadas, y el que desarrollamos en el Worked Example: si guardar referencias es imposible, guardá <strong>índices a un <code>Vec</code></strong>. Las «referencias» pasan a ser datos comunes (<code>usize</code>), el borrow checker deja de tener opinión, y de yapa los datos quedan contiguos en memoria.</p>
+
+<h2>RuS1.12 Cuándo el borrow checker tiene razón y vos no</h2>
+
+<p>Hay una familia de errores donde no hay truco, ni anotación, ni <code>Cow</code> que valga: los <strong>structs auto-referenciales</strong>, esos donde un campo apunta a otro campo del mismo struct.</p>
+
+<pre><code class="lang-rust">struct Parser {
+    texto: String,
+    actual: &amp;str,     // quisiera apuntar DENTRO de self.texto
+}
+// error[E0106]: missing lifetime specifier
+// Y si le ponés un lifetime... ¿cuál? No existe un 'a que signifique
+// "el lifetime de mi propio campo de al lado".</code></pre>
+
+<p>Podrías pensar que es una limitación de la sintaxis. No lo es. El problema es más profundo, y lo anticipamos en RuS1.1:</p>
+
+<div class="danger">
+  <strong>⚠️ Un move en Rust es un <code>memcpy</code>, y no hay forma de interceptarlo.</strong> Aunque el compilador te dejara construir el struct, en cuanto lo devolvieras de una función, lo metieras en un <code>Vec</code> o lo mandaras a otro hilo, los bits se copiarían a otra dirección — y el puntero interno seguiría apuntando a la dirección <strong>vieja</strong>. C++ tapa esto con constructores de movimiento; Rust no los tiene por diseño, porque son justamente lo que hace que mover sea caro e impredecible.
+</div>
+
+<pre><code class="lang-rust">// El experimento mental, si compilara:
+let p = armar_parser();   // los bits del struct se copian del stack de la
+                          // función al del llamador...
+                          // ...y `p.actual` sigue apuntando a la vieja dirección.
+// No hay lifetime que arregle esto: el problema no es CUÁNTO vive, es DÓNDE está.</code></pre>
+
+<p>La respuesta del lenguaje se llama <strong><code>Pin</code></strong>: un envoltorio que promete a nivel de tipos que el valor <strong>no se va a mover</strong> de su dirección. Es la pieza que hace posibles los <code>async fn</code>, porque un bloque <code>async</code> compilado es exactamente esto — una máquina de estados donde una variable local viva a través de un <code>.await</code> es un campo que apunta a otro campo.</p>
+
+<div class="info">
+  <strong>Lo desarrollamos en <a href="../rus3-async-interno/lecture.html">RuS3 — Async por dentro</a>.</strong> Por ahora quedate con el diagnóstico: si tu error de lifetime describe un struct que se apunta a sí mismo, dejá de buscar la anotación mágica. Las salidas reales son tres, en orden de preferencia: <strong>(1)</strong> guardar índices/offsets en vez de referencias (un <code>usize</code> no se invalida al mover), <strong>(2)</strong> separar el dueño del prestatario en dos tipos, o <strong>(3)</strong> <code>Pin</code> con <code>Box::pin</code>, o crates como <code>ouroboros</code>/<code>self_cell</code> que encapsulan el <code>unsafe</code>.
+</div>
+
+<pre><code class="lang-rust">// Salida (1), la que casi siempre alcanza: offsets en vez de punteros.
+struct Parser {
+    texto: String,
+    pos: usize,        // un índice NO se invalida cuando el struct se mueve
+}
+
+impl Parser {
+    fn actual(&amp;self) -&gt; &amp;str { &amp;self.texto[self.pos..] }   // se calcula al pedir
+}</code></pre>
+
+<h2>RuS1.13 Lo que cambió en la edición 2024</h2>
+
+<p>La edición 2024 tocó tres cosas que caen justo en este módulo. Si venís de código 2021, conviene tenerlas presentes porque explican errores que aparecen (o desaparecen) al migrar.</p>
+
+<h3>1. Los temporales del <code>if let</code> mueren antes del <code>else</code></h3>
+
+<pre><code class="lang-rust">use std::cell::RefCell;
+use std::collections::HashMap;
+
+fn main() {
+    let cache: RefCell&lt;HashMap&lt;u32, u32&gt;&gt; = RefCell::new(HashMap::new());
+    let k = 7;
+
+    if let Some(v) = cache.borrow().get(&amp;k).copied() {
+        println!("hit: {v}");
+    } else {
+        // Edición 2021: el `Ref` de borrow() vivía hasta el final del if/else
+        //               -&gt; esta línea PANIQUEA en runtime.
+        // Edición 2024: el temporal se libera antes de entrar acá -&gt; funciona.
+        cache.borrow_mut().insert(k, 42);
+    }
+}</code></pre>
+
+<h3>2. <code>impl Trait</code> captura todos los lifetimes en scope</h3>
+
+<pre><code class="lang-rust">// Edición 2024: el impl Trait de retorno captura TODOS los lifetimes
+// en scope por defecto. Antes había que repetir + 'a a mano.
+fn nombres&lt;'a&gt;(v: &amp;'a [String]) -&gt; impl Iterator&lt;Item = &amp;'a str&gt; {
+    v.iter().map(|s| s.as_str())
+}
+
+// Y si NO querés capturar nada (para poder devolverlo más allá del préstamo),
+// lo decís explícito con la sintaxis `use&lt;&gt;`:
+fn longitudes(v: &amp;[String]) -&gt; impl Iterator&lt;Item = usize&gt; + use&lt;&gt; {
+    v.iter().map(|s| s.len()).collect::&lt;Vec&lt;_&gt;&gt;().into_iter()
+}</code></pre>
+
+<h3>3. Referencias a <code>static mut</code> son error duro</h3>
+
+<pre><code class="lang-rust">static mut CONTADOR: u32 = 0;
+
+fn main() {
+    unsafe {
+        // Edición 2021: warning. Edición 2024: error[E0796].
+        // let r = &amp;mut CONTADOR;
+        //
+        // Motivo: es trivialmente fácil crear dos &amp;mut al mismo static
+        // desde dos lugares -&gt; UB inmediato. La alternativa correcta:
+    }
+}
+
+use std::sync::atomic::{AtomicU32, Ordering};
+static CONTADOR_OK: AtomicU32 = AtomicU32::new(0);
+
+fn incrementar() { CONTADOR_OK.fetch_add(1, Ordering::Relaxed); }</code></pre>
+
+<h2>🧑‍🎓 Worked Example — el grafo que no compila de ninguna forma</h2>
+
+<blockquote>Necesitás representar un grafo no dirigido: nodos con nombre, y cada nodo conoce a sus vecinos. La primera idea es obvia y no compila. Vamos a recorrer las tres soluciones reales, medir qué cuesta cada una, y terminar con una recomendación por caso.</blockquote>
+
+<p><strong>Paso 1 — El intento natural, y por qué está muerto.</strong></p>
+
+<pre><code class="lang-rust">struct Nodo&lt;'a&gt; {
+    nombre: String,
+    vecinos: Vec&lt;&amp;'a Nodo&lt;'a&gt;&gt;,
+}
+
+fn main() {
+    let mut a = Nodo { nombre: "a".into(), vecinos: vec![] };
+    let mut b = Nodo { nombre: "b".into(), vecinos: vec![] };
+
+    a.vecinos.push(&amp;b);      // a toma prestado b (compartido)
+    b.vecinos.push(&amp;a);      // error[E0502]: b ya está prestado por a,
+                             // y para mutar b hace falta &amp;mut b
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 No es un problema de sintaxis: es el invariante de RuS1.2 aplicado.</strong> Un grafo con ciclos exige que <strong>dos</strong> caminos lleguen al mismo nodo <em>mientras</em> ese nodo todavía se puede modificar. Aliasing + mutabilidad. No hay lifetime que lo permita, y no debería haberlo: si <code>b</code> se realocara o se destruyera, el vecino de <code>a</code> quedaría colgado.
+</div>
+
+<p><strong>Paso 2 — Solución 1: <code>Rc&lt;RefCell&lt;Nodo&gt;&gt;</code>.</strong> Mover ambos chequeos a runtime.</p>
+
+<pre><code class="lang-rust">use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+struct Nodo {
+    nombre: String,
+    vecinos: Vec&lt;Weak&lt;RefCell&lt;Nodo&gt;&gt;&gt;,   // Weak: si fueran Rc, TODO ciclo filtra
+}
+
+type Ref = Rc&lt;RefCell&lt;Nodo&gt;&gt;;
+
+fn nuevo(nombre: &amp;str) -&gt; Ref {
+    Rc::new(RefCell::new(Nodo { nombre: nombre.into(), vecinos: vec![] }))
+}
+
+fn conectar(a: &amp;Ref, b: &amp;Ref) {
+    a.borrow_mut().vecinos.push(Rc::downgrade(b));
+    b.borrow_mut().vecinos.push(Rc::downgrade(a));
+}
+
+fn vecinos_de(n: &amp;Ref) -&gt; Vec&lt;String&gt; {
+    n.borrow()
+        .vecinos
+        .iter()
+        .filter_map(|w| w.upgrade())               // el vecino puede haber muerto
+        .map(|v| v.borrow().nombre.clone())
+        .collect()
+}
+
+fn main() {
+    let a = nuevo("a");
+    let b = nuevo("b");
+    let c = nuevo("c");
+    conectar(&amp;a, &amp;b);
+    conectar(&amp;b, &amp;c);
+    println!("{:?}", vecinos_de(&amp;b));   // ["a", "c"]
+}</code></pre>
+
+<div class="warn">
+  <strong>Lo que estás pagando.</strong> Cada nodo es una alocación separada del heap, con dos contadores de encabezado, y recorrer una arista es seguir un puntero a una dirección arbitraria — pésima localidad de caché. Cada acceso hace un chequeo de préstamo con una rama. Y hay <strong>dos</strong> formas de romperlo en producción: un <code>borrow()</code> vivo mientras alguien hace <code>borrow_mut()</code> (panic), y —si te olvidás del <code>Weak</code>— un ciclo que filtra. Nota que <code>vecinos_de</code> tuvo que clonar los nombres: devolver <code>&amp;str</code> desde adentro de un <code>RefCell</code> es imposible, porque el <code>Ref</code> muere al salir.
+</div>
+
+<p><strong>Paso 3 — Solución 2: índices en un <code>Vec</code> (arena a mano).</strong> El grafo es dueño de todo; las aristas son números.</p>
+
+<pre><code class="lang-rust">type NodoId = usize;
+
+struct Nodo { nombre: String, vecinos: Vec&lt;NodoId&gt; }
+
+#[derive(Default)]
+struct Grafo { nodos: Vec&lt;Nodo&gt; }
+
+impl Grafo {
+    fn agregar(&amp;mut self, nombre: &amp;str) -&gt; NodoId {
+        self.nodos.push(Nodo { nombre: nombre.into(), vecinos: vec![] });
+        self.nodos.len() - 1
+    }
+
+    fn conectar(&amp;mut self, a: NodoId, b: NodoId) {
+        self.nodos[a].vecinos.push(b);
+        self.nodos[b].vecinos.push(a);     // ningún problema: son usize
+    }
+
+    fn bfs(&amp;self, desde: NodoId) -&gt; Vec&lt;&amp;str&gt; {
+        let mut visto = vec![false; self.nodos.len()];
+        let mut cola = std::collections::VecDeque::from([desde]);
+        let mut orden = Vec::new();
+        visto[desde] = true;
+
+        while let Some(id) = cola.pop_front() {
+            orden.push(self.nodos[id].nombre.as_str());   // devolver &amp;str: gratis
+            for &amp;v in &amp;self.nodos[id].vecinos {
+                if !visto[v] { visto[v] = true; cola.push_back(v); }
+            }
+        }
+        orden
+    }
+}
+
+fn main() {
+    let mut g = Grafo::default();
+    let (a, b, c) = (g.agregar("a"), g.agregar("b"), g.agregar("c"));
+    g.conectar(a, b);
+    g.conectar(b, c);
+    println!("{:?}", g.bfs(a));   // ["a", "b", "c"]
+}</code></pre>
+
+<div class="tip">
+  <strong>Por qué esta suele ser la correcta.</strong> Cero contadores, cero chequeos en runtime, todos los nodos contiguos en memoria (el BFS recorre caché amigable), y <code>bfs</code> puede devolver <code>&amp;str</code> prestado del grafo sin clonar nada. Además, serializar y testear se vuelve trivial: es un <code>Vec</code>. Es exactamente lo que hacen por dentro <code>rustc</code>, los motores de juego con ECS y casi cualquier compilador.
+</div>
+
+<div class="mistake">
+  <strong>El costo escondido de los índices:</strong> un <code>NodoId</code> es un puntero <em>sin</em> chequeo de tipo. Nada te impide usar un id del grafo A para indexar el grafo B, ni conservar un id de un nodo borrado y leer el nodo que ocupó su lugar. El compilador te ayudaba con las referencias y acá renunciaste a esa ayuda. Mitigación barata: un <em>newtype</em> (<code>struct NodoId(usize);</code>) para que al menos no se mezcle con otros índices. Mitigación completa: la solución 3.
+</div>
+
+<p><strong>Paso 4 — Solución 3: una crate de arena.</strong> Alguien ya resolvió esto mejor que vos.</p>
+
+<pre><code class="lang-rust">// slotmap: índices con GENERACIÓN. Un id de un nodo borrado no vuelve
+// a indexar nada, aunque el slot se recicle.
+use slotmap::{DefaultKey, SlotMap};
+
+let mut sm: SlotMap&lt;DefaultKey, String&gt; = SlotMap::new();
+let k = sm.insert("a".to_string());
+sm.remove(k);
+assert!(sm.get(k).is_none());        // el id caducó: no leyó basura ajena</code></pre>
+
+<pre><code class="lang-rust">// petgraph: si además querés algoritmos, no reimplementes Dijkstra.
+use petgraph::graph::UnGraph;
+use petgraph::algo::dijkstra;
+
+let mut g: UnGraph&lt;&amp;str, u32&gt; = UnGraph::new_undirected();
+let a = g.add_node("a");
+let b = g.add_node("b");
+let c = g.add_node("c");
+g.add_edge(a, b, 1);
+g.add_edge(b, c, 4);
+
+let distancias = dijkstra(&amp;g, a, None, |e| *e.weight());
+println!("{:?}", distancias[&amp;c]);    // 5</code></pre>
+
+<pre><code class="lang-rust">// typed-arena / bumpalo: TODO muere junto. Con esto SÍ podés usar
+// referencias de verdad entre nodos, porque la arena garantiza que
+// nada se libera antes que el resto.
+use typed_arena::Arena;
+
+struct Nodo&lt;'a&gt; { nombre: &amp;'a str, vecinos: std::cell::RefCell&lt;Vec&lt;&amp;'a Nodo&lt;'a&gt;&gt;&gt; }
+
+let arena: Arena&lt;Nodo&gt; = Arena::new();
+let a = arena.alloc(Nodo { nombre: "a", vecinos: Default::default() });
+let b = arena.alloc(Nodo { nombre: "b", vecinos: Default::default() });
+a.vecinos.borrow_mut().push(b);
+b.vecinos.borrow_mut().push(a);      // ciclo permitido: nadie se libera solo</code></pre>
+
+<p><strong>Paso 5 — La tabla de decisión.</strong></p>
+
+<table>
+<thead><tr><th>Solución</th><th>Costo en runtime</th><th>Riesgo</th><th>Ergonomía</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><code>Rc&lt;RefCell&lt;T&gt;&gt;</code></td><td>2 contadores/nodo, alocación por nodo, chequeo de borrow, sin localidad</td><td>Panic por doble préstamo; fuga si olvidás <code>Weak</code></td><td>Alta al empezar, baja al crecer</td><td>Grafo chico, mutación puntual, prototipo, GUI con observadores</td></tr>
+<tr><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></td><td>Lo anterior + atómicos + lock</td><td>Deadlock, contención</td><td>Media</td><td>Solo si de verdad lo comparten varios hilos</td></tr>
+<tr><td>Índices en <code>Vec</code></td><td><strong>Cero.</strong> Contiguo, cache-friendly</td><td>Id inválido o de otro grafo, silencioso</td><td>Media</td><td><strong>El default.</strong> Grafos, árboles, ECS, compiladores</td></tr>
+<tr><td><code>slotmap</code></td><td>Casi igual a <code>Vec</code> + chequeo de generación</td><td>Prácticamente nulo</td><td>Alta</td><td>Como el anterior, pero con borrados frecuentes</td></tr>
+<tr><td><code>petgraph</code></td><td>Optimizado, comparable a índices</td><td>Una dependencia más</td><td>Muy alta</td><td>Cuando además querés Dijkstra, ciclos, topo-sort</td></tr>
+<tr><td><code>typed-arena</code></td><td>Cero (bump allocator); todo se libera junto</td><td>No podés liberar un nodo suelto</td><td>Alta</td><td>AST/IR de un compilador: se construye, se usa, se tira entero</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La recomendación, en una línea cada una.</strong> Empezá con <strong>índices en un <code>Vec</code></strong>: es lo más rápido, lo más simple de testear y lo que usan los proyectos serios. Pasá a <strong><code>slotmap</code></strong> apenas necesites borrar nodos. Usá <strong><code>petgraph</code></strong> si además querés algoritmos de grafos. Reservá <strong><code>Rc&lt;RefCell&lt;&gt;&gt;</code></strong> para cuando la topología cambia de forma impredecible desde muchos lugares y el grafo es chico — y ahí sí, poné <code>Weak</code> desde el minuto uno. Elegí <strong><code>typed-arena</code></strong> solo si el ciclo de vida es «construyo todo, lo uso, lo tiro entero».
+</div>
+
+<div class="mistake">
+  <strong>Y la lección real del ejercicio no es «usá índices».</strong> Es que cuando el borrow checker rechaza <em>toda</em> variante de tu diseño, no está pidiéndote una anotación: te está diciendo que <strong>tu modelo de propiedad no existe</strong>. Un nodo no puede ser dueño de sus vecinos si los vecinos también son dueños de él. Alguien tiene que ser el dueño único —el grafo— y el resto tiene que ser una referencia débil, un índice, o una arena. Ese replanteo es el trabajo; la sintaxis es la consecuencia.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>&amp;'a mut T</code> es covariante en <code>'a</code> pero invariante en <code>T</code>?</summary>
+<p>Son dos posiciones distintas. Sobre <code>'a</code> solo podés <em>acortar</em> el préstamo, y acortarlo siempre es seguro: si la referencia era válida por diez segundos, usarla durante dos no rompe nada. Sobre <code>T</code>, en cambio, la referencia mutable <strong>lee y escribe</strong>. Si fuera covariante podrías tratar un <code>&amp;mut &amp;'static str</code> como un <code>&amp;mut &amp;'corto str</code>, escribirle adentro una referencia efímera, y quedarte con una variable declarada <code>&amp;'static str</code> que apunta a memoria ya liberada. Si fuera contravariante pasaría el problema espejo del lado de la lectura. Cuando podés leer y escribir con el mismo tipo, la única opción segura es que el tipo no se pueda aflojar en ningún sentido: invariante. Ese es también el motivo de que <code>Cell&lt;T&gt;</code> y <code>*mut T</code> sean invariantes.</p></details>
+
+<details><summary>Tu programa Rust consume memoria sin parar. ¿Es un bug de <em>memory safety</em>?</summary>
+<p>No, y la distinción importa. Rust garantiza <em>memory safety</em> —nada de use-after-free, doble liberación, data races ni lecturas fuera de rango— pero <strong>no</strong> garantiza ausencia de fugas. Filtrar es seguro: por eso <code>std::mem::forget</code> y <code>Box::leak</code> son funciones normales, sin <code>unsafe</code>. La causa típica en safe Rust es un ciclo de <code>Rc</code> o <code>Arc</code>: dos objetos que se sostienen mutuamente nunca llegan a contador cero. Se diagnostica con <code>Rc::strong_count</code> en los puntos sospechosos, o con un <code>impl Drop</code> ruidoso que nunca se imprime, y se arregla convirtiendo en <code>Weak</code> las aristas que van «hacia arriba» en la jerarquía. Las otras causas frecuentes son cachés sin política de expiración y colas que crecen más rápido de lo que se consumen — ninguna es un problema del lenguaje.</p></details>
+
+<details><summary>Escribís <code>fn f&lt;T: 'static&gt;(t: T)</code>. ¿Qué le estás exigiendo realmente a <code>T</code>?</summary>
+<p>Que el <strong>tipo</strong> no contenga ninguna referencia con un lifetime más corto que <code>'static</code>. Es decir: que sea dueño de todo lo que lleva adentro, o que lo que preste viva todo el programa. <strong>No</strong> le estás exigiendo que el valor viva para siempre: un <code>String</code> cumple <code>T: 'static</code> y se destruye al salir del scope. Un <code>Vec&lt;u8&gt;</code>, un <code>i32</code> y un <code>&amp;'static str</code> también cumplen. Lo que <em>no</em> cumple es un <code>&amp;'a str</code> con <code>'a</code> corto, o un struct que contenga uno. Este bound aparece en <code>thread::spawn</code> (el hilo puede sobrevivir al que lo creó), en <code>Box&lt;dyn Error&gt;</code> —que en realidad es <code>Box&lt;dyn Error + 'static&gt;</code>— y en <code>Any</code>, que necesita que el tipo sea estable para poder hacer downcast. Si te choca con <code>spawn</code>, la salida moderna casi nunca es <code>Box::leak</code>: es mover los datos con <code>move</code>, compartirlos con <code>Arc</code>, o usar <code>thread::scope</code>, que garantiza el join y por eso te deja prestar.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El borrow checker hace cumplir <strong>un</strong> invariante: <em>aliasing</em> XOR mutabilidad. Use-after-free, invalidación de iteradores y data races son tres consecuencias de la misma regla — y de yapa habilita el <code>noalias</code> que en C hay que jurar a mano.</li>
+  <li>Un <em>move</em> es un <code>memcpy</code> sin hooks. De ahí sale que <code>Copy</code> y <code>Drop</code> sean incompatibles (cada copia correría el destructor) y que los structs auto-referenciales sean imposibles sin <code>Pin</code>.</li>
+  <li><strong>NLL</strong>: el préstamo muere en su último uso, no al cerrar la llave. Todavía falla en el retorno condicional de un préstamo (<em>problem case #3</em>); la salida idiomática es <code>entry</code> o un <code>contains_key</code> previo.</li>
+  <li>Un lifetime <strong>no es una duración</strong>: es una restricción de relación entre referencias. Las anotaciones no crean vida, imponen promesas que el llamador debe poder cumplir. Tres reglas de elisión te ahorran escribirlas casi siempre.</li>
+  <li><code>&amp;'static T</code> (el dato vive todo el programa) y <code>T: 'static</code> (el tipo no contiene préstamos que expiren) son cosas <strong>distintas</strong>. <code>Box::leak</code> casi nunca es la solución; <code>thread::scope</code> y <code>Arc</code> casi siempre sí.</li>
+  <li><strong>Varianza</strong>: <code>&amp;'a T</code> es covariante en todo; <code>&amp;'a mut T</code> es covariante en <code>'a</code> pero <strong>invariante en <code>T</code></strong>, y eso tapa un agujero real de use-after-free. <code>Cell</code>, <code>RefCell</code> y <code>*mut T</code> también son invariantes; <code>PhantomData</code> es cómo se elige a mano.</li>
+  <li><strong>Interior mutability</strong> mueve el chequeo a runtime. <code>UnsafeCell</code> es la raíz de todo; <code>Cell</code> no puede fallar, <code>RefCell</code> paniquea, <code>Mutex</code> bloquea. Un panic de <code>RefCell</code> es un error de compilación que se te escapó a producción.</li>
+  <li><strong>Rust filtra memoria</strong> y eso es seguro por diseño: un ciclo de <code>Rc</code> nunca llega a cero. Regla mecánica: aristas hacia abajo con <code>Rc</code>, hacia arriba con <code>Weak</code>.</li>
+  <li>Para estructuras enlazadas, el default profesional son <strong>índices en un <code>Vec</code></strong> (o <code>slotmap</code> si borrás nodos). <code>Rc&lt;RefCell&lt;&gt;&gt;</code> se reserva para topologías chicas e impredecibles.</li>
+  <li>Cuando el checker rechaza todas las variantes de tu diseño, el problema no es la sintaxis: <strong>tu modelo de propiedad no existe</strong>. Definí quién es el dueño único y todo lo demás se ordena.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí un tipo con <code>#[derive(Clone, Copy)]</code> y agregale un <code>impl Drop</code>. Leé el error completo (E0184) y después escribí en tres líneas, con tus palabras, qué corrupción de memoria concreta ocurriría si el compilador lo aceptara.</li>
+  <li>Reproducí el ejemplo de invarianza de RuS1.8. Después, modificalo para que <code>asignar</code> reciba <code>&amp;'static str</code> en vez de <code>&amp;'corto str</code> y explicá por qué ahora compila. Terminá describiendo qué habría pasado en runtime con la versión que no compila.</li>
+  <li>Armá el ciclo de <code>Rc</code> del ejemplo y verificá con <code>Rc::strong_count</code> y un <code>Drop</code> ruidoso que la memoria efectivamente se filtra. Convertí una de las dos aristas a <code>Weak</code> y comprobá que ahora sí se imprimen los dos <code>drop</code>.</li>
+  <li>Tomá una función que hoy devuelve <code>String</code> siempre y convertila a <code>Cow&lt;'_, str&gt;</code>. Medí con <code>cargo bench</code> (o <code>Instant::now</code> sobre un millón de llamadas) la diferencia con entradas que <em>no</em> necesitan transformación. Anotá el número real, no el esperado.</li>
+  <li>Implementá el grafo con índices del Worked Example y agregale un DFS iterativo y una detección de ciclos. Después implementá <em>el mismo</em> grafo con <code>Rc&lt;RefCell&lt;&gt;&gt;</code> y compará: líneas de código, cantidad de <code>clone()</code>, y tiempo de un recorrido completo sobre 100.000 nodos.</li>
+  <li>Escribí a propósito un panic de <code>RefCell</code> (un <code>borrow()</code> vivo mientras hacés <code>borrow_mut()</code>) y arreglalo de dos formas distintas: acortando el préstamo con un bloque, y usando <code>try_borrow_mut()</code>. Explicá en qué situación real preferirías cada una.</li>
+  <li>Escribí un struct auto-referencial <code>{ texto: String, actual: &amp;str }</code> y coleccioná los errores del compilador. Reescribilo con un <code>usize</code> como offset. Escribí un párrafo explicando por qué ningún lifetime podía arreglar la primera versión: el problema no era cuánto vive el dato, sino dónde está.</li>
+</ol>
+
+<section class="quiz" id="quizRuS1">
+  <style>
+    #quizRuS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS1 .q{margin-bottom:1.5rem}
+    #quizRuS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS1 .opt:hover{border-color:var(--accent)}
+    #quizRuS1 .opt:disabled{cursor:default}
+    #quizRuS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS1 .exp.show{display:block}
+    #quizRuS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. ¿Por qué <code>&amp;'a mut T</code> es <strong>invariante</strong> en <code>T</code>?</p>
+    <button class="opt">Por una limitación del inferidor de tipos que Polonius va a resolver</button>
+    <button class="opt">Porque permite escribir: si se pudiera aflojar el tipo, se podría guardar una referencia efímera donde alguien prometió una longeva, y leerla después de liberada</button>
+    <button class="opt">Porque las referencias mutables no participan del subtipado de ningún modo</button>
+    <div class="exp">Una referencia mutable lee <em>y</em> escribe. Si fuera covariante en <code>T</code>, un <code>&amp;mut &amp;'static str</code> podría pasarse donde se pide <code>&amp;mut &amp;'corto str</code>; ahí adentro se le escribe una referencia corta, y al salir del scope quedás con una variable declarada <code>&amp;'static str</code> apuntando a memoria liberada. Es exactamente el agujero que Java tiene con los arrays covariantes y tapa en runtime con <code>ArrayStoreException</code>. Ojo con la tercera opción: <code>&amp;'a mut T</code> <strong>sí</strong> es covariante en <code>'a</code> — la invarianza es solo en <code>T</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu servicio en Rust seguro consume memoria sin parar. Usa <code>Rc</code> en varias estructuras y no hay un solo bloque <code>unsafe</code>. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">Imposible: si compila y no hay <code>unsafe</code>, Rust garantiza que no puede filtrar memoria</button>
+    <button class="opt">Un <em>use-after-free</em> que el borrow checker dejó pasar por un bug del compilador</button>
+    <button class="opt">Un ciclo de <code>Rc</code>: dos objetos que se referencian mutuamente nunca llegan a contador cero y nadie los libera</button>
+    <div class="exp">Rust garantiza <em>memory safety</em>, no ausencia de fugas — filtrar no es UB, por eso <code>mem::forget</code> y <code>Box::leak</code> son funciones seguras. El conteo de referencias no detecta ciclos por construcción. Se diagnostica con <code>Rc::strong_count</code> o con un <code>impl Drop</code> ruidoso que nunca se imprime, y se arregla convirtiendo a <code>Weak</code> las aristas que van «hacia arriba» en la jerarquía. Las otras causas típicas son cachés sin expiración y colas que crecen más rápido de lo que se drenan.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. <code>thread::spawn</code> te rechaza el closure pidiendo <code>'static</code>, pero los datos que querés leer son un <code>Vec</code> local y el hilo termina antes que la función. ¿Cuál es la salida correcta?</p>
+    <button class="opt"><code>std::thread::scope</code>: garantiza el join antes de salir del scope, así que no exige <code>'static</code> y podés prestar sin mover ni clonar</button>
+    <button class="opt"><code>Box::leak</code> sobre el <code>Vec</code> para convertirlo en <code>&amp;'static</code></button>
+    <button class="opt">Anotar el closure con <code>for&lt;'a&gt;</code> para que acepte cualquier lifetime</button>
+    <div class="exp"><code>spawn</code> exige <code>F: 'static</code> porque el hilo <em>podría</em> sobrevivir al que lo creó — el compilador no tiene forma de saber que vos vas a hacer el <code>join</code>. <code>thread::scope</code> (estable desde 1.63) sí lo garantiza estructuralmente, y por eso levanta el requisito: prestás el <code>Vec</code> y seguís siendo dueño después. <code>Box::leak</code> «funciona» filtrando la memoria a propósito, algo aceptable una vez al arrancar y desastroso por request. Y el <code>for&lt;'a&gt;</code> no aplica: no es un problema de cuantificación sobre lifetimes, es un requisito de propiedad.</div>
+  </div>
+
+  <div class="score" id="scoreRuS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🦀 Seguí con RuS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../rus2-traits/lecture.html">RuS2: Traits avanzados →</a>
+</nav>
+
+</div>
+</body>
+</html>

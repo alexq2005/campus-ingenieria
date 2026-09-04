@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS7 — Performance: medir el zero-cost · Rust Senior</title>
+  <meta name="description" content="Verificar la promesa del zero-cost: perfiles de compilación, benchmarks con criterion y black_box, perfilado con flamegraphs, allocaciones medidas con dhat, lectura de asm, bounds checking, layout de datos, rayon, SIMD y tiempo de compilación.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS7</span>
+  <span class="badge">⏱ 50–165 min</span>
+  <span class="badge">🎯 Pre-req: RuS1, RuS2</span>
+  <span class="badge">📊 Performance</span>
+</div>
+
+<article>
+
+<h1>RuS7 — Performance: medir el zero-cost</h1>
+
+<h2>RuS7.0 Por qué este módulo</h2>
+
+<p>“Zero-cost abstractions” es la frase que más se repite sobre Rust y la que menos se verifica. La formulación original de Bjarne Stroustrup —que Rust heredó— dice dos cosas, y la segunda se olvida siempre: <em>lo que no usás no lo pagás</em>, y <em>lo que sí usás no lo podrías haber escrito mejor a mano</em>. Fijate que ninguna de las dos afirma “es gratis”. Afirman “no es peor que la versión manual”. Y eso es una <strong>hipótesis comprobable</strong>, no un axioma.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un iterador de Rust normalmente compila al mismo código máquina que el bucle escrito a mano. <em>Normalmente.</em> Cuando no lo hace —y pasa— la única forma de enterarte es mirando. Este módulo es el equipamiento para mirar: perfiles de compilación, benchmarks estadísticos, flamegraphs, contadores de allocaciones y, cuando hace falta, el asm generado. Sin ese equipamiento, tus decisiones de rendimiento son folclore.
+</div>
+
+<p>Y hay una razón práctica para tomarlo en serio: en Rust la mayoría de las discusiones de performance que ves en foros son <strong>falsas</strong>. No porque la gente mienta, sino porque midió mal. Midió en <code>debug</code>. Midió un <code>for</code> que el optimizador borró entero porque el resultado no se usaba. Midió con un cronómetro manual y una sola corrida. Comparó dos programas donde uno leía de la caché del sistema de archivos y el otro no. El 80% del trabajo de este módulo es <strong>no cometer esos errores</strong>; el 20% restante es saber qué hacer con un número honesto.</p>
+
+<blockquote class="author">“Los programadores gastan enormes cantidades de tiempo pensando en la velocidad de partes no críticas de sus programas. Deberíamos olvidarnos de las pequeñas eficiencias el 97% del tiempo.” — Donald Knuth, 1974. La cita que todos truncan sigue: “...pero no deberíamos dejar pasar nuestras oportunidades en ese 3% crítico”. El módulo trata de <em>encontrar</em> ese 3%.</blockquote>
+
+<h2>RuS7.1 Lo primero, y lo que más veces resuelve todo: <code>--release</code></h2>
+
+<p>Antes que cualquier otra técnica de este módulo: si medís sin <code>--release</code>, tu número no significa nada. No es “un poco más lento”. Un build de desarrollo puede ser <strong>10× a 100×</strong> más lento que uno optimizado, y el factor no es uniforme: castiga desproporcionadamente justo lo que Rust hace bien, porque las abstracciones (iteradores, <code>Option</code>, envoltorios de tipos, operadores de índice) son montones de funciones chiquitas que en <code>debug</code> <strong>no se inlinean</strong>.</p>
+
+<pre><code class="lang-bash"># El error más común del planeta
+cargo run                  # perfil dev:     opt-level = 0
+cargo run --release        # perfil release: opt-level = 3
+
+# Lo mismo para tests y benchmarks
+cargo test --release
+cargo bench                # bench ya usa el perfil `bench`, que hereda de release</code></pre>
+
+<p>Qué cambia exactamente entre los dos perfiles por defecto en la edición 2024:</p>
+
+<table>
+<thead><tr><th>Ajuste</th><th><code>dev</code></th><th><code>release</code></th><th>Consecuencia</th></tr></thead>
+<tbody>
+<tr><td><code>opt-level</code></td><td><code>0</code></td><td><code>3</code></td><td>Sin inlining ni vectorización en dev</td></tr>
+<tr><td><code>debug</code></td><td><code>true</code></td><td><code>false</code></td><td>Sin símbolos en release: el profiler no sabe qué mirar</td></tr>
+<tr><td><code>debug-assertions</code></td><td><code>true</code></td><td><code>false</code></td><td><code>debug_assert!</code> desaparece en release</td></tr>
+<tr><td><code>overflow-checks</code></td><td><code>true</code></td><td><code>false</code></td><td>En release, el overflow de enteros <em>envuelve</em> (wrapping), no hace panic</td></tr>
+<tr><td><code>codegen-units</code></td><td><code>256</code></td><td><code>16</code></td><td>Más unidades = compila más rápido, optimiza peor</td></tr>
+<tr><td><code>incremental</code></td><td><code>true</code></td><td><code>false</code></td><td>Recompilación rápida en dev</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Ojo con <code>overflow-checks</code>.</strong> Que la aritmética haga panic en <code>dev</code> y envuelva en <code>release</code> es una diferencia de <em>comportamiento</em>, no de velocidad. Un bug de overflow puede pasar todos tus tests en debug y producir números silenciosamente erróneos en producción. Si tu dominio no tolera eso (contabilidad, criptografía, índices), activá <code>overflow-checks = true</code> también en release: cuesta unos pocos puntos porcentuales y compra corrección. Y usá <code>checked_add</code>/<code>saturating_add</code>/<code>wrapping_add</code> cuando la semántica importe de verdad.
+</div>
+
+<pre><code class="lang-rust">// Explicitar la intención vale más que confiar en el perfil
+let total = a.checked_add(b).ok_or(Error::Overflow)?;   // falla explícito
+let clamp = a.saturating_add(b);                        // topea en MAX
+let hash  = a.wrapping_mul(31).wrapping_add(b);         // quiero envolver</code></pre>
+
+<div class="mistake">
+  <strong>El bug de medición clásico.</strong> Alguien escribe un micro-benchmark, lo corre con <code>cargo run</code>, ve que Rust “es más lento que Python” y publica. Cambiar a <code>--release</code> lo pone 60× más rápido. Antes de investigar cualquier anomalía de rendimiento, la primera pregunta —siempre— es: <em>¿esto está en release?</em>
+</div>
+
+<h2>RuS7.2 Perfiles de compilación: qué gana cada opción y qué cuesta</h2>
+
+<p><code>release</code> es un punto de partida razonable, no el techo. Los ajustes finos van en <code>Cargo.toml</code> y cada uno intercambia tiempo de build por tiempo de ejecución (o por tamaño del binario).</p>
+
+<pre><code class="lang-toml"># Cargo.toml — perfil de release afinado para un binario de servidor
+[profile.release]
+opt-level     = 3          # 0,1,2,3 | "s" (size) | "z" (size, sin loop vectorization)
+lto           = "fat"      # false | "thin" | "fat" (alias: true)
+codegen-units = 1          # menos unidades = mejor optimización global
+panic         = "abort"    # sin unwinding: binario más chico y algo más rápido
+strip         = "symbols"  # saca símbolos del binario final
+debug         = false
+
+# Perfil derivado: release CON símbolos, exclusivo para perfilar
+[profile.profiling]
+inherits = "release"
+debug    = true            # línea+función en el flamegraph
+strip    = "none"</code></pre>
+
+<p>Ese <code>[profile.profiling]</code> es la pieza que más gente se pierde: perfilar el build de release <em>sin</em> símbolos te da un flamegraph lleno de direcciones hexadecimales. Un perfil heredado te da el mismo código máquina con nombres legibles.</p>
+
+<pre><code class="lang-bash">cargo build --profile profiling
+./target/profiling/mi-app</code></pre>
+
+<h3>La tabla de intercambios</h3>
+
+<table>
+<thead><tr><th>Opción</th><th>Qué gana</th><th>Qué cuesta</th><th>¿Vale la pena?</th></tr></thead>
+<tbody>
+<tr><td><code>opt-level = 3</code></td><td>Base. Inlining agresivo, vectorización</td><td>Nada frente a release por defecto (ya es 3)</td><td>Siempre</td></tr>
+<tr><td><code>opt-level = "s"</code> / <code>"z"</code></td><td>Binario 20–40% más chico</td><td>Típicamente 5–20% más lento</td><td>Solo en embebido o WASM</td></tr>
+<tr><td><code>lto = "thin"</code></td><td>2–10% más rápido; inlining entre crates</td><td>+20–50% de tiempo de link</td><td>Casi siempre sí</td></tr>
+<tr><td><code>lto = "fat"</code></td><td>0–5% adicional sobre thin</td><td>Link 2–5× más lento; picos de RAM altos</td><td>Solo en el build de producción</td></tr>
+<tr><td><code>codegen-units = 1</code></td><td>1–10%; habilita optimizaciones globales</td><td>Se pierde el paralelismo del codegen: build notablemente más lento</td><td>Producción sí, desarrollo no</td></tr>
+<tr><td><code>panic = "abort"</code></td><td>Binario más chico, menos tablas de unwinding, algo de inlining extra</td><td>Perdés <code>catch_unwind</code> y los tests <code>#[should_panic]</code> del perfil</td><td>Servicios y CLIs sí; librerías, cuidado</td></tr>
+<tr><td><code>target-cpu=native</code></td><td>5–30% en código numérico (AVX2/AVX-512)</td><td>El binario <strong>no corre</strong> en CPUs más viejas</td><td>Solo si compilás en la misma máquina donde corre</td></tr>
+<tr><td><code>strip = "symbols"</code></td><td>Binario mucho más chico</td><td>Backtraces inútiles</td><td>Sí, si guardás los símbolos aparte</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-toml"># .cargo/config.toml — flags del compilador por proyecto
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# Alternativa portable: pedir un piso de instrucciones, no "native"
+# rustflags = ["-C", "target-cpu=x86-64-v3"]   # AVX2 + BMI, CPUs de 2015 en adelante</code></pre>
+
+<div class="warn">
+  <strong>⚠️ <code>target-cpu=native</code> es una bomba de tiempo en CI.</strong> Compilás en un runner con AVX-512, deployás a una máquina sin él y el proceso muere con <em>illegal instruction</em> en el primer request. Si necesitás las instrucciones modernas pero también portabilidad, elegí un nivel de arquitectura (<code>x86-64-v2</code>, <code>v3</code>, <code>v4</code>) y documentalo, o hacé despacho en runtime con <code>is_x86_feature_detected!</code> (RuS7.11).
+</div>
+
+<div class="tip">
+  <strong>💡 El perfil de dependencias es un truco aparte.</strong> En desarrollo querés compilar rápido <em>tu</em> crate, pero las dependencias (parsers, criptografía, <code>image</code>) las recompilás casi nunca y en <code>opt-level = 0</code> hacen que el programa vuele como un ladrillo. Optimizá solo las dependencias:
+</div>
+
+<pre><code class="lang-toml">[profile.dev]
+opt-level = 0              # tu código: compila rápido
+
+[profile.dev.package."*"]
+opt-level = 3              # las dependencias: optimizadas una vez y listo</code></pre>
+
+<h2>RuS7.3 Benchmarks: por qué el cronómetro a mano miente</h2>
+
+<p>El primer instinto es medir con <code>Instant::now()</code>. Ese instinto produce números que parecen datos y son ruido.</p>
+
+<pre><code class="lang-rust">use std::time::Instant;
+
+fn main() {
+    let datos: Vec&lt;u64&gt; = (0..1_000_000).collect();
+    let t0 = Instant::now();
+    let suma: u64 = datos.iter().sum();
+    println!("{:?} — {suma}", t0.elapsed());   // "42ns" 🤔
+}</code></pre>
+
+<p>42 nanosegundos para sumar un millón de enteros son unos 200 terabytes por segundo. No pasó. Lo que pasó es que <strong>LLVM evaluó la suma en tiempo de compilación</strong> —los datos son una constante conocida— y dejó el resultado hardcodeado. Estás midiendo un <code>println!</code>.</p>
+
+<p>Los cinco pecados del cronómetro manual:</p>
+
+<div class="step"><strong>1. El optimizador borra tu benchmark.</strong> Si el resultado no se usa, la operación se elimina; si la entrada es constante, se precalcula.</div>
+<div class="step"><strong>2. No hay warmup.</strong> La primera corrida paga fallos de caché de instrucciones, page faults del heap y, en CPUs modernas, frecuencias todavía bajas por gobernadores de energía.</div>
+<div class="step"><strong>3. Una sola muestra no tiene varianza.</strong> Sin distribución no sabés si la diferencia entre 1,20 ms y 1,25 ms es una mejora o el vecino de al lado moviendo el mouse.</div>
+<div class="step"><strong>4. La resolución del reloj.</strong> Medir algo de 40 ns con un reloj cuya llamada cuesta ~20 ns es medir el reloj.</div>
+<div class="step"><strong>5. No detectás regresiones.</strong> Un número suelto en la consola de hoy no se compara con el de hace tres semanas.</div>
+
+<h3><code>criterion</code>: estadística en vez de fe</h3>
+
+<pre><code class="lang-toml">[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name    = "parseo"
+harness = false            # criterion trae su propio main; hay que apagar el de libtest</code></pre>
+
+<pre><code class="lang-rust">// benches/parseo.rs
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use std::hint::black_box;
+
+fn parsear(linea: &amp;str) -&gt; Option&lt;u64&gt; {
+    linea.split(' ').nth(2)?.parse().ok()
+}
+
+fn bench_parseo(c: &amp;mut Criterion) {
+    let linea = "2026-09-03 INFO 4821 request completado";
+
+    c.bench_function("parsear_linea", |b| {
+        b.iter(|| parsear(black_box(linea)))
+    });
+
+    // Barrido de tamaños: ¿la función es O(n) o algo peor?
+    let mut grupo = c.benchmark_group("parseo_lote");
+    for n in [100usize, 1_000, 10_000, 100_000] {
+        let lote: Vec&lt;String&gt; = (0..n).map(|i| format!("2026-09-03 INFO {i} ok")).collect();
+        grupo.throughput(criterion::Throughput::Elements(n as u64));
+        grupo.bench_with_input(BenchmarkId::from_parameter(n), &amp;lote, |b, lote| {
+            b.iter(|| {
+                let mut acc = 0u64;
+                for l in lote {
+                    acc += parsear(black_box(l)).unwrap_or(0);
+                }
+                acc
+            })
+        });
+    }
+    grupo.finish();
+}
+
+criterion_group!(benches, bench_parseo);
+criterion_main!(benches);</code></pre>
+
+<pre><code class="lang-bash">cargo bench                                    # corre y compara contra la última corrida
+cargo bench -- --save-baseline antes           # guardá el estado actual
+# ...hacés el cambio...
+cargo bench -- --baseline antes                # comparás contra ese punto fijo
+open target/criterion/report/index.html        # gráficos de distribución y regresión</code></pre>
+
+<p>Criterion hace, sin que se lo pidas: warmup de 3 segundos, cientos o miles de iteraciones, ajuste de la cantidad de iteraciones al costo de la función, resta del overhead del propio reloj, análisis de outliers y un <strong>test estadístico</strong> que reporta “mejoró un 12,4% (p = 0,00)” o “sin cambio detectable”.</p>
+
+<pre><code class="lang-bash">parsear_linea           time:   [18.204 ns 18.291 ns 18.392 ns]
+                        change: [-31.442% -30.887% -30.301%] (p = 0.00 &lt; 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  4 (4.00%) high mild
+  2 (2.00%) high severe</code></pre>
+
+<div class="rule">
+  <strong>📌 Cómo se lee ese bloque.</strong> El intervalo <code>[18.204 ns 18.291 ns 18.392 ns]</code> es <em>[límite inferior, estimación, límite superior]</em> con 95% de confianza. Si los intervalos de dos versiones se solapan, <strong>no hay diferencia demostrada</strong>, por más que las medias difieran. Y los outliers importan: si tenés 30% de outliers severos, la máquina está haciendo otra cosa y el benchmark no sirve.
+</div>
+
+<h3><code>black_box</code>: la barrera que salva el experimento</h3>
+
+<p><code>std::hint::black_box</code> (estable desde Rust 1.66; usalo en vez del re-export deprecado de criterion) es una función identidad que el compilador trata como opaca: no puede asumir nada sobre el valor que entra ni sobre el que sale, así que no puede constant-foldear ni eliminar el cálculo.</p>
+
+<pre><code class="lang-rust">use std::hint::black_box;
+
+// ❌ SIN black_box: el compilador ve que `n` es constante y que nadie usa el
+//    resultado. La función entera se convierte en `ret`. Medís 0,4 ns.
+fn mal(b: &amp;mut criterion::Bencher) {
+    b.iter(|| fibonacci(30));
+}
+
+// ✅ CON black_box en LOS DOS lados: la entrada es opaca (no se precalcula)
+//    y el resultado se "consume" (no se elimina).
+fn bien(b: &amp;mut criterion::Bencher) {
+    b.iter(|| black_box(fibonacci(black_box(30))));
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error de poner <code>black_box</code> solo afuera.</strong> <code>black_box(fibonacci(30))</code> impide que se borre el resultado, pero <em>no</em> impide que LLVM calcule <code>fibonacci(30)</code> en tiempo de compilación y meta la constante. Necesitás la barrera en la <strong>entrada</strong> para que el argumento sea desconocido. Regla mnemotécnica: <em>opaco lo que entra, opaco lo que sale</em>.
+</div>
+
+<div class="info">
+  <code>black_box</code> no es gratis ni preciso: es una <em>pista</em>, implementada con un bloque de ensamblador vacío que “toca” el valor. Puede forzar un valor a memoria que de otro modo viviría en un registro, lo que agrega unos nanosegundos. En funciones de microsegundos es irrelevante; en funciones de 2 ns, la barrera puede ser la mitad de lo que medís. Para esos casos, medí un lote (mil llamadas dentro del <code>iter</code>) y dividí.
+</div>
+
+<div class="tip">
+  <strong>💡 Alternativa moderna:</strong> <code>divan</code> es un harness de benchmarks más nuevo, con menos ceremonia (macros <code>#[divan::bench]</code> tipo <code>#[test]</code>) y medición de allocaciones incorporada. Criterion sigue siendo el estándar para regresiones en CI porque su análisis estadístico y sus baselines son más maduros. Los dos son mejores que <code>Instant</code>.
+</div>
+
+<h2>RuS7.4 Perfilado: encontrar el 3% que importa</h2>
+
+<p>El benchmark te dice <em>cuánto</em> tarda. El profiler te dice <em>dónde</em>. Nunca optimices sin haber mirado un perfil: la intuición sobre dónde se va el tiempo acierta, según cualquiera que haya hecho esto muchas veces, alrededor de un tercio de las veces.</p>
+
+<h3><code>samply</code> — el más fácil, y multiplataforma</h3>
+
+<pre><code class="lang-bash">cargo install samply
+
+# Compilá con símbolos (el perfil `profiling` de RuS7.2)
+cargo build --profile profiling
+
+# Grabá: abre el Firefox Profiler en el navegador con el resultado
+samply record ./target/profiling/mi-app datos/entrada.log
+
+# También podés adjuntarte a un proceso ya corriendo
+samply record --pid 48213</code></pre>
+
+<p>Es un <em>sampling profiler</em>: interrumpe el proceso ~1000 veces por segundo y anota la pila de llamadas. No instrumenta nada, así que el overhead es de 1–3% y los números que ves son los del programa real, no los de una versión con sondas.</p>
+
+<h3><code>perf</code> + flamegraph — el estándar en Linux</h3>
+
+<pre><code class="lang-bash"># Permiso para leer contadores de rendimiento (temporal)
+sudo sysctl kernel.perf_event_paranoid=1
+
+perf record -g --call-graph=dwarf ./target/profiling/mi-app
+perf report --sort=overhead                     # vista de texto, interactiva
+
+# Flamegraph directo desde cargo
+cargo install flamegraph
+cargo flamegraph --profile profiling -- datos/entrada.log
+cargo flamegraph --bench parseo -- --bench      # perfilar el benchmark mismo</code></pre>
+
+<div class="analogy">
+  <strong>🔍 Cómo se lee un flamegraph.</strong> El <strong>ancho</strong> es tiempo: una caja que ocupa el 40% del ancho es el 40% de las muestras. La <strong>altura</strong> es profundidad de pila, no tiempo — una torre alta y finita es irrelevante. Los colores son aleatorios, no significan nada. Buscá <em>mesetas anchas</em>: una caja ancha cuyos hijos son angostos es una función que hace el trabajo ella misma; una caja ancha con un hijo igual de ancho es solo un intermediario. Y el eje X está <strong>ordenado alfabéticamente</strong>, no cronológicamente: no leas un flamegraph como una línea de tiempo.
+</div>
+
+<p>Lo que vas a ver una y otra vez en un flamegraph de Rust, y qué significa:</p>
+
+<table>
+<thead><tr><th>Meseta ancha en...</th><th>Diagnóstico probable</th><th>Sección</th></tr></thead>
+<tbody>
+<tr><td><code>malloc</code>, <code>free</code>, <code>__rust_alloc</code></td><td>Demasiadas allocaciones chicas</td><td>RuS7.5</td></tr>
+<tr><td><code>memcpy</code>, <code>memmove</code></td><td>Clones innecesarios o <code>Vec</code> que crece sin <code>with_capacity</code></td><td>RuS7.5</td></tr>
+<tr><td><code>core::panicking::panic_bounds_check</code></td><td>Bounds check que no se eliminó (raro que domine, pero pasa)</td><td>RuS7.7</td></tr>
+<tr><td>Una función tuya, sin hijos anchos</td><td>Trabajo real: candidato a algoritmo mejor o SIMD</td><td>RuS7.11</td></tr>
+<tr><td><code>read</code>, <code>write</code>, <code>epoll_wait</code></td><td>I/O: la CPU no es tu problema</td><td>RuS7.13</td></tr>
+<tr><td><code>std::sync::Mutex</code>, <code>futex_wait</code></td><td>Contención de locks: paralelizar más va a empeorarlo</td><td>RuS7.10</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>⚠️ Con <code>lto</code> y <code>codegen-units = 1</code>, el perfil miente un poco.</strong> El inlining agresivo hace que funciones enteras desaparezcan dentro de sus llamadores, y el flamegraph te atribuye el tiempo al llamador. Es correcto (ese <em>es</em> el código que corre) pero desorienta. Si necesitás atribución fina, perfilá con <code>lto = false</code> y confirmá la mejora final con el perfil de producción.
+</div>
+
+<h2>RuS7.5 Allocaciones: el costo que casi nunca aparece en el código</h2>
+
+<p>En un programa de Rust bien escrito y bien perfilado, la causa número uno de lentitud no es el algoritmo: es que se pide memoria al sistema demasiadas veces. Una allocación cuesta entre 15 y 100 ns según el allocador y la fragmentación, no se vectoriza, no se paraleliza bien (el allocador global tiene sus propios locks) y ensucia la caché.</p>
+
+<h3>Medir antes de creer: <code>dhat</code></h3>
+
+<pre><code class="lang-toml">[dependencies]
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dep:dhat"]</code></pre>
+
+<pre><code class="lang-rust">// main.rs
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _perfil = dhat::Profiler::new_heap();   // al hacer drop escribe dhat-heap.json
+
+    trabajo_pesado();
+}</code></pre>
+
+<pre><code class="lang-bash">cargo run --release --features dhat-heap
+# dhat: Total:     1,847,392,110 bytes in 24,183,004 blocks
+# dhat: At t-gmax: 8,412,096 bytes in 3 blocks
+# dhat: At t-end:  0 bytes in 0 blocks
+# Subí dhat-heap.json a https://nnethercote.github.io/dh_view/dh_view.html</code></pre>
+
+<div class="rule">
+  <strong>📌 Los tres números que importan en la salida de dhat.</strong> <strong>Total</strong> = cuánto pediste en toda la corrida (si son millones de bloques para procesar miles de ítems, tenés una allocación por ítem escondida). <strong>t-gmax</strong> = el pico simultáneo, que es lo que determina si el proceso entra en el contenedor. <strong>t-end</strong> = lo que quedó al final; distinto de cero en Rust suele ser un <code>Box::leak</code>, un ciclo de <code>Rc</code> o un <code>static</code> inicializado perezosamente, no un “memory leak” en el sentido de C.
+</div>
+
+<h3><code>Vec::with_capacity</code>: lo más barato que vas a hacer hoy</h3>
+
+<p>Un <code>Vec</code> que crece duplica su capacidad: para llegar a un millón de elementos hace ~20 reallocaciones y copia, en total, cerca de dos millones de elementos. Si sabés el tamaño, decilo.</p>
+
+<pre><code class="lang-rust">// ❌ 20 reallocaciones + ~2M de elementos copiados
+let mut v = Vec::new();
+for i in 0..1_000_000 { v.push(i); }
+
+// ✅ una allocación, cero copias
+let mut v = Vec::with_capacity(1_000_000);
+for i in 0..1_000_000 { v.push(i); }
+
+// ✅✅ mejor todavía: el iterador conoce su tamaño (ExactSizeIterator)
+//     y `collect` llama a with_capacity solo
+let v: Vec&lt;i32&gt; = (0..1_000_000).collect();</code></pre>
+
+<div class="info">
+  Ese último caso es zero-cost real y verificable: <code>collect</code> consulta <code>Iterator::size_hint</code>, y para un <code>Range</code> el hint es exacto, así que reserva una vez. Con un <code>filter</code> en el medio el hint pasa a ser <code>(0, Some(n))</code> y <code>collect</code> reserva el mínimo: ahí sí conviene <code>Vec::with_capacity</code> + <code>extend</code> si tenés una estimación mejor.
+</div>
+
+<h3><code>collect()</code> intermedios: el desperdicio más común</h3>
+
+<pre><code class="lang-rust">// ❌ tres Vec completos en memoria, dos de ellos tirados enseguida
+let r: Vec&lt;String&gt; = lineas
+    .iter()
+    .map(|l| l.trim().to_string())          // Vec&lt;String&gt; #1 — N allocaciones
+    .collect::&lt;Vec&lt;_&gt;&gt;()
+    .into_iter()
+    .filter(|l| !l.is_empty())              // Vec&lt;String&gt; #2
+    .collect::&lt;Vec&lt;_&gt;&gt;()
+    .into_iter()
+    .map(|l| l.to_uppercase())              // Vec&lt;String&gt; #3 — otras N allocaciones
+    .collect();
+
+// ✅ una sola pasada, una sola allocación de salida, cero intermedios
+let r: Vec&lt;String&gt; = lineas
+    .iter()
+    .map(|l| l.trim())
+    .filter(|l| !l.is_empty())
+    .map(|l| l.to_uppercase())
+    .collect();</code></pre>
+
+<p>Esta es la primera verificación empírica del zero-cost: la versión de abajo, con tres adaptadores encadenados, compila a un único bucle. Los adaptadores de iterador son structs sin estado extra cuyos <code>next()</code> se inlinean unos dentro de otros hasta desaparecer. La versión de arriba <em>no</em> puede fusionarse: cada <code>collect</code> es una barrera de materialización.</p>
+
+<h3><code>String</code> vs <code>&amp;str</code> es una decisión de rendimiento</h3>
+
+<p>Se enseña como una cuestión de ownership, y lo es, pero la consecuencia práctica es de allocaciones. <code>String</code> es dueño de un buffer en el heap: crearlo cuesta una allocación, clonarlo cuesta otra más una copia. <code>&amp;str</code> es un puntero y un largo: 16 bytes en el stack, cero allocaciones.</p>
+
+<pre><code class="lang-rust">// ❌ una allocación por línea, por campo: millones en un log grande
+fn campos_lentos(linea: &amp;str) -&gt; Vec&lt;String&gt; {
+    linea.split(' ').map(|s| s.to_string()).collect()
+}
+
+// ✅ cero allocaciones: los &amp;str apuntan dentro de la línea original
+fn campos_rapidos(linea: &amp;str) -&gt; Vec&lt;&amp;str&gt; {
+    linea.split(' ').collect()
+}
+
+// ✅✅ ni siquiera el Vec: si solo consumís, devolvé el iterador
+fn campos_cero&lt;'a&gt;(linea: &amp;'a str) -&gt; impl Iterator&lt;Item = &amp;'a str&gt; + 'a {
+    linea.split(' ')
+}</code></pre>
+
+<p>Cuando una función “a veces” necesita ser dueña, la respuesta no es <code>String</code> por las dudas: es <code>Cow</code>, que alloca solo en la rama que lo necesita.</p>
+
+<pre><code class="lang-rust">use std::borrow::Cow;
+
+/// Devuelve la línea sin comentario. Si no hay comentario (el caso frecuente),
+/// no alloca nada: devuelve una vista de la entrada.
+fn sin_comentario(l: &amp;str) -&gt; Cow&lt;'_, str&gt; {
+    match l.find('#') {
+        None    =&gt; Cow::Borrowed(l),
+        Some(i) =&gt; Cow::Owned(l[..i].trim_end().to_owned()),
+    }
+}</code></pre>
+
+<h3>Buffers reusados, <code>SmallVec</code> y arenas</h3>
+
+<pre><code class="lang-rust">use std::io::{self, BufRead, Write};
+
+// Patrón "leer sin allocar por línea": un solo String reusado.
+// `lines()` devuelve io::Result&lt;String&gt; y alloca UNA VEZ POR LÍNEA.
+fn procesar&lt;R: BufRead, W: Write&gt;(mut e: R, mut s: W) -&gt; io::Result&lt;()&gt; {
+    let mut buf = String::with_capacity(256);
+    loop {
+        buf.clear();                       // conserva la capacidad, tira el contenido
+        if e.read_line(&amp;mut buf)? == 0 { break; }
+        if let Some(campo) = buf.split(' ').nth(2) {
+            writeln!(s, "{campo}")?;
+        }
+    }
+    Ok(())
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>clear()</code> no libera: reusa.</strong> <code>Vec::clear</code> y <code>String::clear</code> dejan el largo en 0 pero <em>mantienen la capacidad</em>. Ese es el mecanismo del patrón de arriba: la allocación se paga una vez y las 20 millones de líneas siguientes escriben en el mismo buffer. Si querés devolver la memoria, <code>shrink_to_fit</code>.
+</div>
+
+<pre><code class="lang-rust">use smallvec::{SmallVec, smallvec};
+
+// Los primeros 8 elementos viven EN EL STACK, dentro del propio struct.
+// Recién si aparece el noveno se pasa al heap.
+// Sirve cuando el caso típico es chico pero el máximo es ilimitado.
+type Campos&lt;'a&gt; = SmallVec&lt;[&amp;'a str; 8]&gt;;
+
+fn campos(l: &amp;str) -&gt; Campos&lt;'_&gt; {
+    l.split(' ').collect()
+}</code></pre>
+
+<pre><code class="lang-rust">use bumpalo::Bump;
+
+// Arena: miles de nodos, UNA allocación grande, y se liberan todos juntos
+// cuando la arena hace drop. Ideal para árboles de sintaxis, grafos temporales
+// y cualquier estructura con vida "de fase".
+struct Nodo&lt;'a&gt; { nombre: &amp;'a str, hijos: bumpalo::collections::Vec&lt;'a, &amp;'a Nodo&lt;'a&gt;&gt; }
+
+fn construir(arena: &amp;Bump) -&gt; &amp;Nodo&lt;'_&gt; {
+    let hoja = arena.alloc(Nodo { nombre: "hoja", hijos: bumpalo::collections::Vec::new_in(arena) });
+    let mut hijos = bumpalo::collections::Vec::new_in(arena);
+    hijos.push(&amp;*hoja);
+    arena.alloc(Nodo { nombre: "raiz", hijos })
+}</code></pre>
+
+<div class="tip">
+  <strong>💡 Cambiar el allocador global es una línea y a veces da 5–20%.</strong> <code>mimalloc</code> o <code>jemalloc</code> suelen superar al allocador del sistema en cargas con muchas allocaciones chicas y multihilo. Es lo más barato de probar y lo primero que hay que <em>medir</em>, porque no siempre gana.
+</div>
+
+<pre><code class="lang-rust">use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;</code></pre>
+
+<h2>RuS7.6 Verificar el zero-cost: mirar el asm</h2>
+
+<p>Acá está el corazón del módulo. La promesa dice que el iterador compila igual que el bucle a mano. Comprobémoslo en vez de creerlo.</p>
+
+<pre><code class="lang-bash">cargo install cargo-show-asm
+
+cargo asm --release --lib mi_crate::suma_iter        # asm de una función
+cargo asm --release --lib mi_crate::suma_iter --rust # asm intercalado con el fuente
+cargo asm --release --lib --llvm mi_crate::suma_iter # IR de LLVM, más legible
+
+# Para una exploración rápida sin proyecto: https://godbolt.org (Compiler Explorer)</code></pre>
+
+<h3>Caso 1: donde el zero-cost SÍ se cumple</h3>
+
+<pre><code class="lang-rust">#[inline(never)]
+pub fn suma_manual(v: &amp;[u64]) -&gt; u64 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i &lt; v.len() { acc += v[i]; i += 1; }
+    acc
+}
+
+#[inline(never)]
+pub fn suma_iter(v: &amp;[u64]) -&gt; u64 {
+    v.iter().sum()
+}
+
+#[inline(never)]
+pub fn suma_compleja(v: &amp;[u64]) -&gt; u64 {
+    v.iter().copied().filter(|x| x % 2 == 0).map(|x| x * 3).sum()
+}</code></pre>
+
+<pre><code class="lang-bash"># Ambas producen el MISMO núcleo: un bucle vectorizado con paddq (SIMD de 128/256 bits)
+# procesando 4 u64 por iteración, más un epílogo escalar para el resto.
+suma_iter:
+        test    rsi, rsi
+        je      .LBB_vacio
+        ...
+        vpaddq  ymm0, ymm0, ymmword ptr [rdi + 8*rax]
+        vpaddq  ymm1, ymm1, ymmword ptr [rdi + 8*rax + 32]
+        ...</code></pre>
+
+<div class="tip">
+  <strong>✅ Verificado.</strong> <code>suma_iter</code> y <code>suma_manual</code> generan instrucción por instrucción el mismo bucle, y <code>suma_compleja</code> —tres adaptadores encadenados— genera <em>un solo</em> bucle sin allocaciones ni closures materializadas. Los adaptadores son structs de tamaño cero o casi, sus <code>next()</code> están marcados <code>#[inline]</code> y LLVM los funde. Esto es el zero-cost funcionando, y ahora lo sabés porque lo miraste.
+</div>
+
+<h3>Caso 2: donde el zero-cost NO se cumple</h3>
+
+<pre><code class="lang-rust">// El compilador NO puede vectorizar esto, aunque parezca idéntico al caso 1
+#[inline(never)]
+pub fn suma_f32(v: &amp;[f32]) -&gt; f32 {
+    v.iter().sum()
+}</code></pre>
+
+<p>La suma de <code>f32</code> <strong>no es asociativa</strong>: <code>(a+b)+c</code> puede dar un resultado distinto de <code>a+(b+c)</code> por redondeo. Vectorizar implica reasociar (sumar en cuatro acumuladores paralelos y combinarlos al final), lo que cambiaría el resultado. Rust y LLVM se niegan a hacerlo sin permiso explícito, así que el bucle queda escalar y corre 4–8× más lento que el equivalente entero.</p>
+
+<pre><code class="lang-rust">// Solución 1: reasociar VOS, explícitamente. Aceptás el cambio de redondeo.
+pub fn suma_f32_rapida(v: &amp;[f32]) -&gt; f32 {
+    let mut acc = [0.0f32; 8];
+    let mut trozos = v.chunks_exact(8);
+    for c in &amp;mut trozos {
+        for i in 0..8 { acc[i] += c[i]; }     // 8 acumuladores independientes
+    }
+    let resto: f32 = trozos.remainder().iter().sum();
+    acc.iter().sum::&lt;f32&gt;() + resto
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Otros lugares donde la abstracción SÍ cuesta.</strong> <code>collect::&lt;Vec&lt;_&gt;&gt;()</code> alloca (es su trabajo, pero no es gratis). <code>chars()</code> decodifica UTF-8 y no puede saltar de a bytes: si buscás un byte ASCII, <code>as_bytes()</code> es varias veces más rápido. <code>flat_map</code> e <code>iter().rev()</code> sobre estructuras no contiguas rompen la vectorización. Los closures que capturan por <code>move</code> valores grandes se copian. Y <code>impl Trait</code> en posición de retorno se monomorfiza, pero un <code>Box&lt;dyn Fn&gt;</code> no (RuS7.8). El zero-cost es la norma, no una ley.
+</div>
+
+<h2>RuS7.7 Bounds checking: cuándo desaparece y cómo ayudarlo</h2>
+
+<p>Cada <code>v[i]</code> en Rust es, en principio, una comparación y un salto condicional a <code>panic_bounds_check</code>. En la práctica, LLVM elimina la mayoría de esos chequeos porque puede probar que el índice está en rango. La pregunta útil es cuándo <em>no</em> puede.</p>
+
+<pre><code class="lang-rust">// ✅ Sin bounds check: el iterador es dueño del rango, no hay índice
+pub fn dobla_iter(v: &amp;mut [i32]) {
+    for x in v.iter_mut() { *x *= 2; }
+}
+
+// ✅ Sin bounds check: LLVM prueba que i &lt; v.len() por la condición del bucle
+pub fn dobla_indice(v: &amp;mut [i32]) {
+    for i in 0..v.len() { v[i] *= 2; }
+}
+
+// ❌ CON bounds check en cada iteración: `n` es independiente del largo
+pub fn dobla_n(v: &amp;mut [i32], n: usize) {
+    for i in 0..n { v[i] *= 2; }
+}
+
+// ✅ Arreglado sin unsafe: un solo chequeo al principio, y adentro nada
+pub fn dobla_n_bien(v: &amp;mut [i32], n: usize) {
+    let v = &amp;mut v[..n];                  // panic acá si n &gt; len, UNA vez
+    for x in v.iter_mut() { *x *= 2; }
+}</code></pre>
+
+<p>El truco general se llama <em>slicing defensivo</em>: en vez de pelear con el optimizador dentro del bucle, recortá el slice antes y dejá que la prueba sea trivial.</p>
+
+<pre><code class="lang-rust">// ❌ dos bounds checks por iteración: a[i] y b[i] con largos no relacionados
+pub fn producto_mal(a: &amp;[f64], b: &amp;[f64], out: &amp;mut [f64]) {
+    for i in 0..out.len() { out[i] = a[i] * b[i]; }
+}
+
+// ✅ los tres largos se igualan una vez; adentro no queda ningún chequeo
+//    y además esto SÍ se vectoriza
+pub fn producto_bien(a: &amp;[f64], b: &amp;[f64], out: &amp;mut [f64]) {
+    let n = out.len().min(a.len()).min(b.len());
+    let (a, b, out) = (&amp;a[..n], &amp;b[..n], &amp;mut out[..n]);
+    for i in 0..n { out[i] = a[i] * b[i]; }
+}
+
+// ✅✅ la versión idiomática, sin índices y sin chequeos: zip
+pub fn producto_zip(a: &amp;[f64], b: &amp;[f64], out: &amp;mut [f64]) {
+    for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b)) { *o = x * y; }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla operativa.</strong> En Rust, <strong>los iteradores son la optimización</strong>, no un lujo de estilo. <code>iter()</code>, <code>zip</code>, <code>chunks_exact</code>, <code>windows</code> y <code>array_windows</code> le dan al compilador información que la indexación manual esconde. Cuando alguien te diga “uso índices porque es más rápido”, pedile el asm.
+</div>
+
+<div class="warn">
+  <strong>⚠️ <code>get_unchecked</code> es la última opción, no la primera.</strong> Existe <code>unsafe { *v.get_unchecked(i) }</code> y sí, saca el chequeo. También convierte un panic determinista en corrupción de memoria silenciosa el día que alguien cambie un largo. Antes de llegar ahí: probá el slicing defensivo, medí si el bounds check aparece siquiera en el perfil (casi nunca aparece: el predictor de saltos acierta el 100% de las veces y el costo real ronda el 1–3%), y si igual necesitás <code>unsafe</code>, leé <a href="../rus5-unsafe/lecture.html">RuS5</a> y encapsulalo detrás de una API segura con un <code>// SAFETY:</code> que explique el invariante.
+</div>
+
+<h2>RuS7.8 <code>Box&lt;dyn Trait&gt;</code> vs genéricos: el costo real del dispatch</h2>
+
+<p>En <a href="../rus2-traits/lecture.html">RuS2</a> viste la diferencia semántica entre despacho estático (genéricos, monomorfización) y dinámico (objetos de trait, vtable). Acá va la parte medida, que suele sorprender.</p>
+
+<pre><code class="lang-rust">pub trait Filtro { fn aplica(&amp;self, x: f64) -&gt; f64; }
+
+pub struct Ganancia(pub f64);
+impl Filtro for Ganancia {
+    #[inline] fn aplica(&amp;self, x: f64) -&gt; f64 { x * self.0 }
+}
+
+// Estático: se genera una copia de `procesar` por cada tipo concreto.
+// `aplica` se inlinea y desaparece; el bucle se vectoriza.
+pub fn procesar_estatico&lt;F: Filtro&gt;(f: &amp;F, v: &amp;mut [f64]) {
+    for x in v.iter_mut() { *x = f.aplica(*x); }
+}
+
+// Dinámico: una sola copia. Cada llamada es un salto indirecto por vtable.
+// No se inlinea, no se vectoriza.
+pub fn procesar_dinamico(f: &amp;dyn Filtro, v: &amp;mut [f64]) {
+    for x in v.iter_mut() { *x = f.aplica(*x); }
+}</code></pre>
+
+<table>
+<thead><tr><th>Escenario</th><th>Estático</th><th>Dinámico</th><th>Diferencia</th></tr></thead>
+<tbody>
+<tr><td>Llamada trivial (<code>x * k</code>), 10M iteraciones</td><td>2,1 ms</td><td>14,7 ms</td><td><strong>7×</strong> — el inlining y la vectorización son todo</td></tr>
+<tr><td>Llamada mediana (~50 ns de trabajo)</td><td>512 ms</td><td>521 ms</td><td>1,8%</td></tr>
+<tr><td>Llamada que toca memoria dispersa (cache miss)</td><td>1,84 s</td><td>1,85 s</td><td>&lt; 1% — invisible</td></tr>
+<tr><td>Tiempo de compilación del crate</td><td>18,4 s</td><td>11,2 s</td><td>El dinámico compila 40% más rápido</td></tr>
+<tr><td>Tamaño del binario</td><td>4,8 MB</td><td>3,1 MB</td><td>Monomorfizar duplica código</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El costo del despacho dinámico es real y es chico.</strong> Un salto indirecto bien predicho cuesta 1–3 ciclos (~1 ns). Un fallo de caché L3 cuesta 200–300 ciclos (~100 ns). Si tu función hace <em>cualquier</em> trabajo sustancial, el dispatch se pierde en el ruido. Lo que <strong>sí</strong> duele no es el salto: es que <code>dyn</code> <strong>bloquea el inlining</strong>, y sin inlining se caen la vectorización, el constant folding y la eliminación de código muerto. Por eso la penalidad es enorme en funciones de una línea y despreciable en todo lo demás.
+</div>
+
+<div class="tip">
+  <strong>💡 La tercera vía que la gente olvida: despacho por enum.</strong> Si el conjunto de implementaciones es cerrado y conocido, un <code>enum</code> con un <code>match</code> te da despacho estático, una sola copia del código, sin allocación y sin vtable. Es el patrón que usan casi todos los intérpretes rápidos escritos en Rust.
+</div>
+
+<pre><code class="lang-rust">pub enum FiltroConcreto { Ganancia(f64), Offset(f64), Clip { lo: f64, hi: f64 } }
+
+impl FiltroConcreto {
+    #[inline]
+    pub fn aplica(&amp;self, x: f64) -&gt; f64 {
+        match self {
+            FiltroConcreto::Ganancia(k)   =&gt; x * k,
+            FiltroConcreto::Offset(k)     =&gt; x + k,
+            FiltroConcreto::Clip { lo, hi } =&gt; x.clamp(*lo, *hi),
+        }
+    }
+}
+// Un `match` predecible dentro de un bucle se convierte en un salto que el
+// predictor acierta siempre; y como no hay indirección, LLVM puede sacar el
+// match FUERA del bucle (loop unswitching) y vectorizar cada rama.</code></pre>
+
+<h2>RuS7.9 Layout de datos y caché: la optimización que le gana a todas</h2>
+
+<p>Una CPU moderna hace ~4 operaciones por ciclo y tarda ~300 ciclos en traer un dato de RAM. La aritmética es esencialmente gratis; la memoria es lo caro. Por eso el layout de los datos suele importar más que cualquier micro-optimización aritmética.</p>
+
+<pre><code class="lang-rust">use std::mem::{size_of, align_of};
+
+struct Malo  { a: u8, b: u64, c: u8, d: u32 }   // como lo escribiste
+#[repr(C)]
+struct MaloC { a: u8, b: u64, c: u8, d: u32 }   // orden garantizado, con padding
+
+fn main() {
+    // repr(Rust) REORDENA los campos para minimizar padding
+    println!("{} {}", size_of::&lt;Malo&gt;(),  align_of::&lt;Malo&gt;());   // 16 8
+    // repr(C) respeta tu orden y paga el padding: 1+7+8+1+3+4 = 24
+    println!("{} {}", size_of::&lt;MaloC&gt;(), align_of::&lt;MaloC&gt;());  // 24 8
+}</code></pre>
+
+<div class="info">
+  <strong><code>repr(Rust)</code> es el default y es tu amigo:</strong> el compilador puede reordenar campos y lo hace para achicar el struct. <code>#[repr(C)]</code> desactiva ese reordenamiento y solo se usa cuando el layout tiene que ser estable: FFI, mapeo de estructuras binarias, o cuando lo exige un formato externo. Usarlo “por prolijidad” es una pesimización.
+</div>
+
+<div class="danger">
+  <strong>⚠️ <code>#[repr(packed)]</code> es peligroso, no solo lento.</strong> Elimina todo el padding, pero entonces tomar una referencia a un campo desalineado es <strong>comportamiento indefinido</strong>, y en algunas arquitecturas es directamente un fallo de hardware. En x86 “funciona” pero cada acceso desalineado cuesta ciclos extra. Si necesitás layout compacto para serializar, leé y escribé los campos con <code>read_unaligned</code>/<code>to_le_bytes</code>, o usá un crate de serialización.
+</div>
+
+<h3>AoS vs SoA: el cambio que multiplica</h3>
+
+<pre><code class="lang-rust">// Array of Structs (AoS) — lo natural de escribir
+struct Particula { x: f32, y: f32, z: f32, vx: f32, vy: f32, vz: f32, masa: f32, id: u64 }
+// 40 bytes por partícula. Para actualizar solo X, la CPU trae líneas de caché
+// de 64 bytes de las cuales usás 4. Desperdiciás el 90% del ancho de banda.
+
+fn avanzar_aos(ps: &amp;mut [Particula], dt: f32) {
+    for p in ps.iter_mut() { p.x += p.vx * dt; }
+}
+
+// Structure of Arrays (SoA) — lo que le gusta a la CPU
+struct Particulas {
+    x:  Vec&lt;f32&gt;, y:  Vec&lt;f32&gt;, z:  Vec&lt;f32&gt;,
+    vx: Vec&lt;f32&gt;, vy: Vec&lt;f32&gt;, vz: Vec&lt;f32&gt;,
+    masa: Vec&lt;f32&gt;, id: Vec&lt;u64&gt;,
+}
+
+fn avanzar_soa(ps: &amp;mut Particulas, dt: f32) {
+    // Dos slices contiguos: cada línea de caché se usa entera y LLVM vectoriza
+    for (x, vx) in ps.x.iter_mut().zip(&amp;ps.vx) { *x += vx * dt; }
+}</code></pre>
+
+<table>
+<thead><tr><th>Layout</th><th>1M partículas, actualizar X</th><th>Líneas de caché tocadas</th><th>Vectorizable</th></tr></thead>
+<tbody>
+<tr><td>AoS</td><td>4,10 ms</td><td>625.000</td><td>No (los datos están salteados)</td></tr>
+<tr><td>SoA</td><td>0,52 ms</td><td>125.000</td><td>Sí (8 f32 por instrucción AVX)</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Casi 8× sin cambiar ni una operación aritmética.</strong> No hay ninguna micro-optimización de este módulo que dé eso. Por eso el orden correcto de trabajo es: primero algoritmo, después layout de datos, después allocaciones, y recién al final las opciones del compilador y SIMD. La contra de SoA es que la ergonomía empeora (perdés “la partícula” como entidad) y que si tu acceso típico usa <em>todos</em> los campos de un solo elemento, AoS gana. Medí tu patrón de acceso real.
+</div>
+
+<div class="tip">
+  <strong>💡 Otros efectos de caché que valen oro:</strong> ordenar los datos por la clave con la que los recorrés (transforma accesos aleatorios en secuenciales); usar índices <code>u32</code> en vez de punteros de 64 bits para grafos grandes; poner los campos “calientes” juntos y los fríos en un struct aparte; y para estructuras compartidas entre hilos, separar los datos de cada hilo por al menos una línea de caché para evitar <em>false sharing</em> (el crate <code>crossbeam-utils</code> tiene <code>CachePadded</code>).
+</div>
+
+<h2>RuS7.10 Paralelismo con <code>rayon</code>: cuándo una línea alcanza</h2>
+
+<p><code>rayon</code> es la mejor relación esfuerzo/resultado del ecosistema: convertís <code>iter()</code> en <code>par_iter()</code> y tu bucle usa todos los núcleos, con work-stealing y sin que puedas introducir data races —el sistema de tipos lo impide.</p>
+
+<pre><code class="lang-rust">use rayon::prelude::*;
+
+// Secuencial
+let total: u64 = datos.iter().map(|d| costoso(d)).sum();
+
+// Paralelo. Sí, es literalmente eso.
+let total: u64 = datos.par_iter().map(|d| costoso(d)).sum();
+
+// Con control del grano: si cada ítem es barato, agrupá para amortizar
+let total: u64 = datos.par_chunks(4096)
+    .map(|c| c.iter().map(|d| barato(d)).sum::&lt;u64&gt;())
+    .sum();</code></pre>
+
+<p>Y ahora la parte que casi nunca se cuenta: <strong>cuándo no sirve</strong>.</p>
+
+<table>
+<thead><tr><th>Situación</th><th>Resultado con <code>par_iter</code></th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Trabajo por ítem &gt; ~10 µs, CPU puro</td><td>Escala casi lineal</td><td>El overhead de tarea (~1 µs) se amortiza</td></tr>
+<tr><td>Trabajo por ítem &lt; ~1 µs</td><td>Igual o <strong>peor</strong></td><td>El scheduler cuesta más que el trabajo → usá <code>par_chunks</code></td></tr>
+<tr><td>Colección chica (&lt; 1000 ítems baratos)</td><td>Peor</td><td>Ni siquiera se amortiza el arranque</td></tr>
+<tr><td>El cuello es I/O de disco o red</td><td>Sin cambio</td><td>Los núcleos esperan al mismo dispositivo</td></tr>
+<tr><td>El cuello es ancho de banda de memoria</td><td>Mejora 1,5–2× y se planta</td><td>Un solo bus de memoria; más hilos no traen más bytes</td></tr>
+<tr><td>Hay un <code>Mutex</code> compartido adentro</td><td>Puede ser 5× peor</td><td>Serializás con contención encima</td></tr>
+<tr><td>Necesitás orden de salida</td><td>Funciona (<code>collect</code> preserva orden)</td><td>Pero <code>for_each</code> no garantiza orden de ejecución</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El antipatrón del acumulador con lock.</strong> <code>par_iter().for_each(|x| resultados.lock().unwrap().push(f(x)))</code> paraleliza el <code>f(x)</code> y serializa todo lo demás, con el costo extra del lock. La forma correcta es <code>map</code> + <code>collect</code>, o <code>fold</code>/<code>reduce</code>, que acumulan por hilo y combinan al final sin ninguna sincronización explícita.
+</div>
+
+<pre><code class="lang-rust">use rayon::prelude::*;
+use std::collections::HashMap;
+
+// ✅ fold local por hilo, reduce al final: cero locks
+let conteo: HashMap&lt;&amp;str, usize&gt; = palabras
+    .par_iter()
+    .fold(HashMap::new, |mut acc, p| { *acc.entry(*p).or_insert(0) += 1; acc })
+    .reduce(HashMap::new, |mut a, b| {
+        for (k, v) in b { *a.entry(k).or_insert(0) += v; }
+        a
+    });</code></pre>
+
+<div class="warn">
+  <strong>⚠️ Nunca mezcles <code>rayon</code> con <code>async</code> a lo bruto.</strong> Un <code>par_iter</code> pesado dentro de una tarea de Tokio bloquea el worker del runtime. Si necesitás las dos cosas, mandá el trabajo con <code>tokio::task::spawn_blocking</code> o hacé un puente con un canal. Volvemos sobre esto en <a href="../rus4-tokio/lecture.html">RuS4</a>.
+</div>
+
+<h2>RuS7.11 SIMD: cuándo vale la pena escribirlo a mano</h2>
+
+<p>Primera regla del SIMD manual: <strong>lo más probable es que ya lo tengas</strong>. LLVM autovectoriza bucles simples sobre slices contiguos si no hay dependencias entre iteraciones ni operaciones no asociativas. Verificá con <code>cargo asm</code> antes de escribir intrinsics: si ves <code>vpaddd</code>, <code>vmulps</code> o <code>vfmadd</code>, ya estás vectorizado.</p>
+
+<pre><code class="lang-rust">// Nightly: portable SIMD, la opción legible y multi-arquitectura
+#![feature(portable_simd)]
+use std::simd::{f32x8, num::SimdFloat};
+
+pub fn suma_simd(v: &amp;[f32]) -&gt; f32 {
+    let (pre, medio, post) = v.as_simd::&lt;8&gt;();   // alinea y parte el slice
+    let acumulado: f32x8 = medio.iter().copied().sum();
+    pre.iter().sum::&lt;f32&gt;() + acumulado.reduce_sum() + post.iter().sum::&lt;f32&gt;()
+}</code></pre>
+
+<pre><code class="lang-rust">// Estable: intrinsics + detección en runtime.
+// Desde Rust 1.86, `#[target_feature]` puede ir en funciones SEGURAS: solo se
+// las puede llamar desde contextos que ya garantizan la feature.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn suma_avx2(v: &amp;[f32]) -&gt; f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        let trozos = v.chunks_exact(8);
+        let resto  = trozos.remainder();
+        for c in trozos { acc = _mm256_add_ps(acc, _mm256_loadu_ps(c.as_ptr())); }
+        let mut buf = [0f32; 8];
+        _mm256_storeu_ps(buf.as_mut_ptr(), acc);
+        buf.iter().sum::&lt;f32&gt;() + resto.iter().sum::&lt;f32&gt;()
+    }
+}
+
+pub fn suma(v: &amp;[f32]) -&gt; f32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") { return suma_avx2(v); }
+    v.iter().sum()                       // camino portable de respaldo
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Cuándo SÍ escribir SIMD a mano.</strong> (1) El perfil dice que un bucle numérico es &gt; 20% del tiempo total. (2) Miraste el asm y <em>no</em> está vectorizado. (3) Sabés por qué no lo está (float no asociativo, control de flujo adentro, accesos no contiguos, posible aliasing). (4) La ganancia teórica justifica el código: 4–8× en el bucle, que sobre un 20% del total son 17% de mejora global — hacé la cuenta de Amdahl <em>antes</em> de escribir. Si alguna de las cuatro falla, no lo escribas: hay crates (<code>wide</code>, <code>pulp</code>, <code>faster</code>, o directamente <code>ndarray</code>/<code>polars</code>) que ya resolvieron tu caso mejor.
+</div>
+
+<h2>RuS7.12 Tiempo de compilación: la performance del equipo</h2>
+
+<p>Un build de 4 minutos que ocurre 40 veces por día son 2,7 horas de espera diarias por desarrollador. Eso es un problema de rendimiento tan legítimo como una latencia p99, y en Rust es el reclamo número uno. Como todo lo demás en este módulo: primero medí.</p>
+
+<pre><code class="lang-bash">cargo build --timings --release
+# Genera target/cargo-timings/cargo-timing.html:
+#   - una barra por crate, con tiempo total y tiempo de codegen
+#   - el "camino crítico" de dependencias que no se puede paralelizar
+#   - cuántas unidades corrieron en paralelo a lo largo del build
+
+cargo install cargo-llvm-lines
+cargo llvm-lines --release | head -20
+#   Ranking de funciones por cantidad de líneas de IR generadas.
+#   El tope de esa lista suele ser una función genérica monomorfizada 200 veces.</code></pre>
+
+<p>Los cuatro sospechosos habituales, en orden de frecuencia:</p>
+
+<div class="step"><strong>1. Genéricos monomorfizados de más.</strong> Una función genérica grande instanciada con 30 tipos genera 30 copias que LLVM tiene que optimizar por separado. La cura es el patrón <em>thin wrapper</em>: una capa genérica mínima que convierte a un tipo concreto y llama a una función no genérica grande.</div>
+
+<pre><code class="lang-rust">// ❌ toda la lógica se duplica por cada P que uses
+pub fn abrir&lt;P: AsRef&lt;std::path::Path&gt;&gt;(p: P) -&gt; std::io::Result&lt;Config&gt; {
+    /* 200 líneas de parseo, validación y errores */
+    # unimplemented!()
+}
+
+// ✅ la parte genérica es de una línea; el cuerpo pesado se compila UNA vez
+pub fn abrir&lt;P: AsRef&lt;std::path::Path&gt;&gt;(p: P) -&gt; std::io::Result&lt;Config&gt; {
+    abrir_impl(p.as_ref())
+}
+fn abrir_impl(p: &amp;std::path::Path) -&gt; std::io::Result&lt;Config&gt; {
+    /* las mismas 200 líneas, no genéricas */
+    # unimplemented!()
+}</code></pre>
+
+<div class="step"><strong>2. Proc-macros.</strong> Cada derive corre código en tiempo de compilación y genera fuente que hay que parsear y chequear. <code>serde</code> con <code>derive</code> sobre 300 structs, o el árbol de <code>syn</code>/<code>quote</code>, aparecen siempre alto en <code>--timings</code>. Ver <a href="../rus6-macros/lecture.html">RuS6</a>: a veces una macro declarativa <code>macro_rules!</code> hace el mismo trabajo por una fracción del costo, y <code>cargo expand</code> te muestra cuánto código está generando realmente cada derive.</div>
+
+<div class="step"><strong>3. El linker.</strong> En proyectos grandes, linkear puede ser la mitad del build incremental. Cambiar a <code>lld</code> o <code>mold</code> suele dar 2–5× en ese paso, y es una línea de configuración.</div>
+
+<pre><code class="lang-toml"># .cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/DEBUG:NONE"]     # sin PDB gigante en dev</code></pre>
+
+<div class="step"><strong>4. Configuración del perfil dev.</strong> <code>debug = "line-tables-only"</code> conserva backtraces útiles y recorta mucho tiempo y tamaño frente a <code>debug = true</code>. Y para iterar de verdad rápido, <code>cargo check</code> hace el chequeo de tipos y el borrow checker sin generar código: es el bucle correcto mientras estás escribiendo.</div>
+
+<pre><code class="lang-toml">[profile.dev]
+debug = "line-tables-only"      # backtraces sí, DWARF completo no
+split-debuginfo = "unpacked"    # en macOS/Linux, saca el debug info del binario</code></pre>
+
+<div class="tip">
+  <strong>💡 Otras palancas.</strong> Partir el crate monolítico en un workspace: Cargo paraleliza crates independientes y solo recompila el que tocaste. <code>sccache</code> para compartir artefactos entre ramas y CI. Poner las dependencias pesadas detrás de <em>features</em> opcionales. Y correr <code>cargo tree --duplicates</code> para encontrar dos versiones de la misma crate compilándose por partida doble.
+</div>
+
+<h2>RuS7.13 Cuándo NO optimizar</h2>
+
+<p>La habilidad más cara de este módulo no es optimizar: es decidir que no hace falta. Cada optimización tiene un costo permanente en legibilidad, en superficie de bugs y en tiempo de la gente que va a mantener eso.</p>
+
+<div class="rule">
+  <strong>📌 No optimices si...</strong>
+  <ul>
+    <li><strong>No medisté.</strong> Regla cero, sin excepciones.</li>
+    <li><strong>Ya cumplís el objetivo.</strong> Si el requisito es p99 &lt; 100 ms y estás en 40 ms, terminaste. “Más rápido” no es un requisito.</li>
+    <li><strong>El componente no está en el camino crítico.</strong> Amdahl: acelerar 10× algo que es el 5% del tiempo total te da 4,5% global. Hacé la cuenta antes.</li>
+    <li><strong>El cuello está afuera.</strong> Base de datos, red, disco, otro servicio. Optimizar tu CPU cuando esperás 200 ms a Postgres es teatro.</li>
+    <li><strong>La ganancia es menor que la varianza de tu medición.</strong> Si el intervalo de confianza de criterion se solapa, no mejoraste nada demostrable.</li>
+    <li><strong>El código se ejecuta una vez por día.</strong> Un job nocturno que tarda 8 minutos en vez de 3 no es un problema.</li>
+    <li><strong>Vas a necesitar <code>unsafe</code> para ganar 3%.</strong> Ese intercambio casi nunca cierra.</li>
+  </ul>
+</div>
+
+<div class="concept">
+  <strong>💡 El orden que sí funciona.</strong> 1) Definí el objetivo en números. 2) Medí el estado actual con <code>--release</code>. 3) Perfilá. 4) Atacá la meseta más ancha, no la que más te intriga. 5) Medí de nuevo con criterion contra un baseline. 6) Si no mejoró, <strong>revertí</strong> —no dejes complejidad que no compró nada. 7) Escribí un benchmark de regresión para que la mejora no se pierda sola en tres meses.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el procesador de logs de 8 segundos</h2>
+
+<blockquote>Un CLI interno agrega logs de acceso: lee un archivo de 2,1 GB con 24 millones de líneas, extrae el código de estado y el tiempo de respuesta, y emite un resumen por endpoint. Tarda <strong>8,1 s</strong> y el equipo quiere bajarlo. Alguien ya propuso “usemos rayon”. Vamos a hacerlo bien.</blockquote>
+
+<h3>Paso 0 — Confirmar que estamos midiendo algo real</h3>
+
+<pre><code class="lang-bash">cargo build           &amp;&amp; time ./target/debug/logagg acceso.log      # 94,7 s
+cargo build --release &amp;&amp; time ./target/release/logagg acceso.log   # 8,10 s</code></pre>
+
+<p>Bien: ya estábamos en release, los 8,1 s son el número honesto. (Si el reporte original hubiera sido de 94 s, el módulo terminaba acá.) Antes de seguir, fijamos el piso teórico: leer 2,1 GB de un NVMe a ~1,8 GB/s son <strong>~1,17 s</strong>. Ese es el objetivo alcanzable; menos que eso requeriría cambiar de estrategia de I/O.</p>
+
+<h3>Paso 1 — El código original</h3>
+
+<pre><code class="lang-rust">use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+fn resumir(ruta: &amp;str) -&gt; std::io::Result&lt;HashMap&lt;String, (u64, u64)&gt;&gt; {
+    let f = BufReader::new(File::open(ruta)?);
+    let mut acc: HashMap&lt;String, (u64, u64)&gt; = HashMap::new();
+
+    for linea in f.lines() {
+        let linea = linea?;                                    // ① String por línea
+        let campos: Vec&lt;String&gt; = linea.split(' ')
+            .map(|s| s.to_string())                            // ② String por campo
+            .collect();                                        // ③ Vec por línea
+        if campos.len() &lt; 9 { continue; }
+
+        let endpoint = campos[6].to_lowercase();               // ④ otra String
+        let estado: u64 = campos[8].parse().unwrap_or(0);
+        let e = acc.entry(endpoint).or_insert((0, 0));         // ⑤ String clonada al insertar
+        e.0 += 1;
+        if estado &gt;= 500 { e.1 += 1; }
+    }
+    Ok(acc)
+}</code></pre>
+
+<h3>Paso 2 — Perfilar, no adivinar</h3>
+
+<pre><code class="lang-bash">cargo build --profile profiling
+samply record ./target/profiling/logagg acceso.log</code></pre>
+
+<pre><code class="lang-bash"># Lectura del flamegraph, agrupada:
+#   61,4 %  __rust_alloc / __rust_dealloc / memcpy      ← allocaciones
+#   14,2 %  core::str::to_lowercase + Utf8 decoding
+#    9,8 %  hashbrown::raw::find + SipHash
+#    8,1 %  std::io::BufRead::read_until (I/O real)
+#    6,5 %  parsing y aritmética propia</code></pre>
+
+<p>Y el contador de allocaciones confirma el diagnóstico:</p>
+
+<pre><code class="lang-bash">cargo run --release --features dhat-heap -- acceso.log
+# dhat: Total: 1,932,551,884 bytes in 241,830,041 blocks
+#       ~10 allocaciones por línea × 24M líneas</code></pre>
+
+<div class="rule">
+  <strong>📌 Nadie habría adivinado esto.</strong> La propuesta inicial era paralelizar, es decir, atacar el <strong>6,5%</strong> de trabajo propio con 8 núcleos: el techo de esa mejora es 5,7% del total. El perfil dice que el enemigo es el <strong>61,4%</strong> en allocaciones, y esa parte no se arregla con más hilos: se arregla no allocando.
+</div>
+
+<h3>Paso 3 — Los intentos, uno por uno y todos medidos</h3>
+
+<pre><code class="lang-rust">// Intento C — la reescritura principal: buffer reusado + &amp;str en vez de String
+fn resumir_v2(ruta: &amp;str) -&gt; std::io::Result&lt;HashMap&lt;Box&lt;str&gt;, (u64, u64)&gt;&gt; {
+    let mut f = BufReader::with_capacity(1 &lt;&lt; 20, File::open(ruta)?);   // buffer de 1 MB
+    let mut acc: HashMap&lt;Box&lt;str&gt;, (u64, u64)&gt; = HashMap::new();
+    let mut buf = String::with_capacity(512);
+
+    loop {
+        buf.clear();                                     // reusa la capacidad
+        if f.read_line(&amp;mut buf)? == 0 { break; }
+
+        // SmallVec: hasta 12 campos sin tocar el heap. Cero Strings.
+        let campos: smallvec::SmallVec&lt;[&amp;str; 12]&gt; = buf.trim_end().split(' ').collect();
+        if campos.len() &lt; 9 { continue; }
+
+        let endpoint = campos[6];
+        let estado: u64 = campos[8].parse().unwrap_or(0);
+
+        // Solo allocamos la clave la PRIMERA vez que vemos el endpoint
+        match acc.get_mut(endpoint) {
+            Some(e) =&gt; { e.0 += 1; if estado &gt;= 500 { e.1 += 1; } }
+            None =&gt; { acc.insert(endpoint.into(), (1, u64::from(estado &gt;= 500))); }
+        }
+    }
+    Ok(acc)
+}</code></pre>
+
+<pre><code class="lang-rust">// Intento D — matar el to_lowercase(): comparar sin allocar
+// (to_lowercase alloca SIEMPRE, incluso si el texto ya está en minúsculas)
+// En vez de normalizar la clave, normalizamos solo al comparar:
+use std::collections::HashMap;
+fn clave_normalizada&lt;'a&gt;(acc: &amp;'a HashMap&lt;Box&lt;str&gt;, (u64, u64)&gt;, s: &amp;str) -&gt; Option&lt;&amp;'a str&gt; {
+    acc.keys().find(|k| k.eq_ignore_ascii_case(s)).map(|k| &amp;**k)
+}
+// ⚠️ ojo: esto es O(claves) por línea. Solo sirve porque hay ~40 endpoints.
+// Con 100.000 claves sería catastrófico: ahí conviene un hash case-insensitive.</code></pre>
+
+<pre><code class="lang-rust">// Intento F — hash más barato. SipHash resiste ataques de colisión (correcto
+// para claves que vienen de la red), pero acá las claves son internas.
+// FxHash es ~4× más rápido y no criptográfico.
+use rustc_hash::FxHashMap;
+let mut acc: FxHashMap&lt;Box&lt;str&gt;, (u64, u64)&gt; = FxHashMap::default();</code></pre>
+
+<pre><code class="lang-rust">// Intento G — el que propuso el equipo: rayon
+use rayon::prelude::*;
+use rayon::iter::ParallelBridge;
+
+fn resumir_par(ruta: &amp;str) -&gt; std::io::Result&lt;FxHashMap&lt;Box&lt;str&gt;, (u64, u64)&gt;&gt; {
+    let f = BufReader::with_capacity(1 &lt;&lt; 20, File::open(ruta)?);
+    Ok(f.lines()
+        .par_bridge()                                  // ⚠️ vuelve a allocar String/línea
+        .filter_map(|l| l.ok())
+        .fold(FxHashMap::default, |mut acc, linea| { acumular(&amp;mut acc, &amp;linea); acc })
+        .reduce(FxHashMap::default, fusionar))
+}</code></pre>
+
+<h3>Paso 4 — La tabla completa, incluidos los fracasos</h3>
+
+<table>
+<thead><tr><th>#</th><th>Cambio</th><th>Tiempo</th><th>Δ vs anterior</th><th>Allocaciones</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>Base (release)</td><td>8,10 s</td><td>—</td><td>241,8 M</td><td>Punto de partida</td></tr>
+<tr><td>B</td><td><code>HashMap::with_capacity(64)</code></td><td>8,04 s</td><td>−0,7%</td><td>241,8 M</td><td>🔴 Ruido. Revertido</td></tr>
+<tr><td>C</td><td>Buffer reusado + <code>&amp;str</code> + <code>SmallVec</code></td><td>2,31 s</td><td><strong>−71%</strong></td><td>1.284</td><td>🟢 El cambio que importaba</td></tr>
+<tr><td>D</td><td>Sacar <code>to_lowercase()</code></td><td>1,55 s</td><td>−33%</td><td>1.284</td><td>🟢 Grande y barato</td></tr>
+<tr><td>E</td><td>Sin <code>collect</code> intermedio (parseo directo por índice)</td><td>1,42 s</td><td>−8,4%</td><td>312</td><td>🟢 Vale</td></tr>
+<tr><td>F</td><td><code>FxHashMap</code> en vez de <code>HashMap</code></td><td>1,21 s</td><td>−15%</td><td>312</td><td>🟢 Vale (claves internas)</td></tr>
+<tr><td>G</td><td><strong><code>rayon</code> con <code>par_bridge</code></strong></td><td><strong>1,26 s</strong></td><td><strong>+4,1%</strong></td><td>24,1 M</td><td>🔴 <strong>Empeora.</strong> Revertido</td></tr>
+<tr><td>H</td><td><code>lto = "fat"</code> + <code>codegen-units = 1</code></td><td>1,14 s</td><td>−5,8%</td><td>312</td><td>🟢 Gratis en runtime; build 3× más lento</td></tr>
+<tr><td>I</td><td><code>target-cpu=native</code></td><td>1,13 s</td><td>−0,9%</td><td>312</td><td>🔴 No compensa el riesgo de portabilidad</td></tr>
+<tr><td>J</td><td><code>mmap</code> + partición por chunks + rayon</td><td>0,64 s</td><td>−44%</td><td>296</td><td>🟡 Funciona, pero +180 líneas y <code>unsafe</code></td></tr>
+</tbody>
+</table>
+
+<p><strong>Resultado entregado: 8,10 s → 1,14 s (7,1×)</strong>, con el intento J documentado pero no mergeado.</p>
+
+<h3>Paso 5 — Por qué rayon no sirvió</h3>
+
+<p>Después del intento F, el perfil cambió por completo:</p>
+
+<pre><code class="lang-bash"># Perfil DESPUÉS de las optimizaciones de allocación:
+#   79,2 %  read / __memmove_avx_unaligned_erms   ← I/O y copia del kernel
+#   11,4 %  parsing propio
+#    6,1 %  FxHashMap
+#    3,3 %  otros</code></pre>
+
+<div class="rule">
+  <strong>📌 El cuello se mudó.</strong> Al principio el 61% era CPU gastada en allocaciones — paralelizable en teoría. Después de arreglarla, el 79% es esperar al disco, que es un recurso único: ocho hilos leen el mismo archivo por el mismo controlador. Peor todavía, <code>par_bridge</code> tiene que producir un <code>String</code> por línea para poder mandarla a otro hilo, así que <strong>reintrodujo las 24 millones de allocaciones</strong> que acabábamos de eliminar, y encima le sumó el costo del scheduler. Por eso G empeora un 4%: no es que “rayon sea malo”, es que se aplicó a la etapa equivocada del problema.
+</div>
+
+<div class="mistake">
+  <strong>La trampa a la que le ganamos.</strong> Si el equipo hubiera implementado rayon <em>primero</em> (sobre el código base A), habría medido 8,10 s → 3,4 s y declarado victoria: una mejora de 2,4× real y visible. Y se habría quedado con un programa que sigue haciendo 24 millones de allocaciones, con 8 hilos, tres veces más complejo, y <strong>tres veces más lento que la solución de un hilo bien escrita</strong>. Paralelizar código ineficiente esconde la ineficiencia detrás de núcleos: la primera regla es hacer menos trabajo, no repartir el mismo trabajo.
+</div>
+
+<h3>Paso 6 — Que la mejora no se pierda sola</h3>
+
+<pre><code class="lang-rust">// benches/logagg.rs — benchmark de regresión sobre una muestra fija
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+fn bench(c: &amp;mut Criterion) {
+    let muestra = include_str!("../testdata/acceso_100k.log");   // 100k líneas, ~9 MB
+    let mut g = c.benchmark_group("logagg");
+    g.throughput(Throughput::Bytes(muestra.len() as u64));
+    g.bench_function("resumir_v2", |b| b.iter(|| resumir_str(black_box(muestra))));
+    g.finish();
+}
+criterion_group!(benches, bench);
+criterion_main!(benches);</code></pre>
+
+<pre><code class="lang-bash"># En CI: guardar el baseline en main y comparar en cada PR
+cargo bench -- --save-baseline main            # en la rama principal
+cargo bench -- --baseline main                 # en el PR; falla si regresa &gt; X%</code></pre>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu benchmark de una función que suma un millón de elementos reporta 3 nanosegundos. ¿Qué pasó y cómo lo arreglás?</summary>
+<p>El optimizador borró el trabajo. Con datos conocidos en tiempo de compilación y un resultado que nadie usa, LLVM constant-foldea la suma o elimina el bucle entero por <em>dead code elimination</em>; lo que medís es el overhead del harness. Se arregla con <code>std::hint::black_box</code> <strong>en los dos lados</strong>: <code>black_box(f(black_box(entrada)))</code>. La barrera de entrada hace que el argumento sea opaco (no se puede precalcular) y la de salida hace que el resultado se considere usado (no se puede eliminar). Verificación adicional: si duplicás el tamaño de la entrada y el tiempo no cambia, seguís midiendo nada.</p></details>
+
+<details><summary>El perfil dice que el 40% del tiempo está en <code>__rust_alloc</code>. Enumerá, en orden, qué revisás.</summary>
+<p>(1) <code>Vec</code>/<code>String</code> que crecen sin <code>with_capacity</code> cuando el tamaño es conocido o estimable. (2) <code>to_string()</code>/<code>to_owned()</code>/<code>clone()</code> dentro de bucles calientes: ¿se puede trabajar con <code>&amp;str</code>/<code>&amp;[T]</code>, o con <code>Cow</code> si a veces hace falta ser dueño? (3) <code>collect::&lt;Vec&lt;_&gt;&gt;()</code> intermedios que se descartan enseguida: encadenar los adaptadores en una sola pasada. (4) Buffers que se recrean por iteración en vez de reusarse con <code>clear()</code>. (5) Colecciones chicas y frecuentes → <code>SmallVec</code>; muchas allocaciones con la misma vida → arena (<code>bumpalo</code>). (6) Recién ahí, cambiar el allocador global a <code>mimalloc</code>. Y todo el tiempo, medir con <code>dhat</code>: el contador de bloques totales te dice si bajaste de “una por ítem” a “constante”, que es el salto que importa.</p></details>
+
+<details><summary>¿Cómo demostrarías que un <code>filter().map().sum()</code> compila al mismo código que un bucle manual — y en qué caso concreto sabés de antemano que no lo va a hacer?</summary>
+<p>Se demuestra con <code>cargo asm --release --lib crate::funcion</code> sobre las dos versiones (marcadas <code>#[inline(never)]</code> para que no desaparezcan dentro del llamador) y comparando el asm; o en godbolt.org para una exploración rápida. Deberías ver un único bucle, sin llamadas a <code>next()</code> y sin allocaciones. El caso donde <strong>no</strong> se cumple, y se sabe de antemano, es con punto flotante: <code>v.iter().sum::&lt;f32&gt;()</code> no se vectoriza porque la suma de floats no es asociativa, y reasociar cambiaría el resultado por redondeo. LLVM no toma esa libertad sin permiso. Si querés la vectorización, tenés que reasociar vos —acumuladores múltiples con <code>chunks_exact</code>— y aceptar explícitamente la diferencia numérica. Otros casos previsibles: cualquier <code>collect</code> intermedio (alloca por definición), <code>chars()</code> sobre UTF-8 cuando alcanzaba con bytes, e iteración sobre estructuras no contiguas.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Zero-cost es una hipótesis verificable</strong>, no un axioma. Se verifica leyendo el asm con <code>cargo asm</code> o Compiler Explorer. Se cumple casi siempre con iteradores sobre slices; se rompe de forma predecible con floats no asociativos, <code>collect</code> intermedios y <code>dyn</code> en funciones triviales.</li>
+  <li><strong><code>--release</code> primero.</strong> Un número medido en <code>debug</code> no significa nada. Ojo con <code>overflow-checks</code>: es una diferencia de comportamiento, no solo de velocidad.</li>
+  <li><strong>Perfiles:</strong> <code>lto = "thin"</code> casi siempre; <code>fat</code> + <code>codegen-units = 1</code> solo en el build de producción; <code>panic = "abort"</code> en binarios; <code>target-cpu=native</code> solo si compilás donde corre; y un <code>[profile.profiling]</code> heredado de release con <code>debug = true</code> para poder perfilar.</li>
+  <li><strong>Benchmarks con <code>criterion</code>, no con <code>Instant</code>:</strong> warmup, cientos de muestras, intervalos de confianza y baselines para detectar regresiones. Si los intervalos se solapan, no hubo mejora.</li>
+  <li><strong><code>std::hint::black_box</code> en los dos lados</strong> o el compilador borra tu benchmark.</li>
+  <li><strong>Perfilá antes de tocar nada:</strong> <code>samply</code> (fácil, multiplataforma) o <code>perf</code> + flamegraph. El ancho es tiempo, la altura no; buscá mesetas anchas con hijos angostos.</li>
+  <li><strong>Las allocaciones son el sospechoso número uno.</strong> <code>with_capacity</code>, buffers reusados con <code>clear()</code>, <code>&amp;str</code> en vez de <code>String</code>, <code>Cow</code> para el caso mixto, <code>SmallVec</code> para colecciones chicas, arenas para vidas de fase. Medí con <code>dhat</code>: mirá <em>bloques totales</em>, no solo bytes.</li>
+  <li><strong>Los iteradores eliminan bounds checks</strong> que los índices no. Cuando necesites índices, recortá los slices antes del bucle. <code>get_unchecked</code> es la última opción, no la primera.</li>
+  <li><strong><code>dyn</code> cuesta poco por el salto y mucho por el inlining perdido:</strong> 7× en funciones de una línea, invisible en cualquier cosa que toque memoria. El despacho por <code>enum</code> es la tercera vía cuando el conjunto es cerrado.</li>
+  <li><strong>El layout le gana a la micro-optimización:</strong> AoS → SoA dio 8× sin cambiar una sola operación aritmética. <code>repr(Rust)</code> por defecto; <code>repr(C)</code> solo para FFI; <code>repr(packed)</code> casi nunca.</li>
+  <li><strong><code>rayon</code> es una línea, y a veces esa línea empeora todo:</strong> trabajo por ítem chico, colecciones chicas, cuello de I/O o de ancho de banda, o locks compartidos. Paralelizar código ineficiente esconde la ineficiencia.</li>
+  <li><strong>SIMD manual solo con las cuatro condiciones:</strong> es &gt; 20% del perfil, no está autovectorizado, sabés por qué, y Amdahl justifica el código.</li>
+  <li><strong>El tiempo de compilación es performance del equipo:</strong> medilo con <code>cargo build --timings</code> y <code>cargo llvm-lines</code>; atacá monomorfización (thin wrappers), proc-macros, linker y perfil dev.</li>
+  <li><strong>Saber no optimizar es la habilidad cara:</strong> si ya cumplís el objetivo, si no está en el camino crítico, si el cuello está afuera, o si la ganancia cabe dentro de tu barra de error — no toques nada.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li><strong>El benchmark que se borra.</strong> Escribí una función que sume los cuadrados de <code>0..n</code>. Medila con criterion sin <code>black_box</code>, con <code>black_box</code> solo en la salida, y con <code>black_box</code> en entrada y salida. Anotá los tres tiempos y explicá cada uno. Después duplicá <code>n</code> y verificá cuál de las tres versiones responde proporcionalmente.</li>
+  <li><strong>La matriz de perfiles.</strong> Tomá cualquier programa tuyo con carga real y armá una tabla con: <code>dev</code>, <code>release</code>, <code>release + lto="thin"</code>, <code>release + lto="fat" + codegen-units=1</code>, y <code>+ target-cpu=native</code>. Registrá para cada uno tiempo de ejecución, tiempo de build limpio y tamaño del binario. Decidí cuál mergearías y escribí por qué en dos renglones.</li>
+  <li><strong>Verificar el zero-cost, las dos caras.</strong> Con <code>cargo asm</code>, compará el asm de <code>v.iter().filter(|x| **x &gt; 0).map(|x| x * 2).sum::&lt;i64&gt;()</code> contra el bucle equivalente escrito a mano. Confirmá que son iguales. Después hacé lo mismo con <code>f32</code> y documentá exactamente dónde aparece la diferencia y por qué.</li>
+  <li><strong>Cazar allocaciones.</strong> Instrumentá con <code>dhat</code> un programa tuyo que procese un archivo. Anotá bloques totales y pico. Aplicá el patrón de buffer reusado + <code>&amp;str</code> y volvé a medir. El objetivo es pasar de O(líneas) a O(1) allocaciones: reportá los dos números y el tiempo antes/después con criterion.</li>
+  <li><strong>El costo real de <code>dyn</code>.</strong> Reproducí la tabla de RuS7.8 en tu máquina: mismo trait con una implementación trivial y una que hace ~100 ns de trabajo, cada una en versión genérica y <code>&amp;dyn</code>. Agregá una tercera variante con despacho por <code>enum</code>. Reportá los seis números y decí en qué punto la diferencia deja de importar.</li>
+  <li><strong>AoS vs SoA.</strong> Implementá una simulación de 1M de partículas con los dos layouts y un paso de integración que use solo posición y velocidad. Medí con criterion, mirá el asm de los dos bucles y confirmá cuál se vectorizó. Después agregá un segundo bucle que use <em>todos</em> los campos de cada partícula y verificá si el ganador cambia.</li>
+  <li><strong>Rayon que no sirve.</strong> Construí a propósito dos casos: uno donde <code>par_iter</code> escale casi linealmente y otro donde empeore. Medí ambos con 1, 2, 4 y 8 hilos (<code>RAYON_NUM_THREADS</code>) y graficá. Explicá el segundo caso con el flamegraph, no con la intuición.</li>
+</ol>
+
+<section class="quiz" id="quizRuS7">
+  <style>
+    #quizRuS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS7 .q{margin-bottom:1.5rem}
+    #quizRuS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS7 .opt:hover{border-color:var(--accent)}
+    #quizRuS7 .opt:disabled{cursor:default}
+    #quizRuS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRuS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRuS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS7 .exp.show{display:block}
+    #quizRuS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un benchmark de <code>fibonacci(30)</code> reporta 0,4 ns. Escribís <code>b.iter(|| black_box(fibonacci(30)))</code> y sigue dando lo mismo. ¿Qué falta?</p>
+    <button class="opt">Falta compilar con <code>--release</code>: en debug los benchmarks no se optimizan</button>
+    <button class="opt">Falta subir el warmup de criterion; 3 segundos no alcanzan para esa función</button>
+    <button class="opt">Falta <code>black_box</code> en la <strong>entrada</strong>: <code>fibonacci(black_box(30))</code>, si no LLVM precalcula el resultado</button>
+    <div class="exp">La barrera de salida impide que se elimine el resultado, pero con el argumento constante LLVM evalúa <code>fibonacci(30)</code> en tiempo de compilación y mete la constante. Hay que hacer opaca la <strong>entrada</strong> también. Regla: opaco lo que entra, opaco lo que sale.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu perfil muestra 61% en <code>__rust_alloc</code> y 8% en I/O. Alguien propone <code>par_iter()</code>. ¿Cuál es la objeción técnica correcta?</p>
+    <button class="opt">Que las allocaciones no se arreglan repartiendo el mismo trabajo: hay que hacer menos, y el allocador global además tiene contención propia entre hilos</button>
+    <button class="opt">Que <code>rayon</code> no es compatible con código que allocá memoria en el heap</button>
+    <button class="opt">Que <code>par_iter()</code> solo funciona sobre <code>Vec</code>, y un lector de archivo no es un <code>Vec</code></button>
+    <div class="exp">Paralelizar código que allocá de más esconde la ineficiencia detrás de núcleos: seguís haciendo millones de allocaciones, ahora peleándose por el allocador global. Primero se elimina el trabajo innecesario (buffers reusados, <code>&amp;str</code>, sin <code>collect</code> intermedios); recién después se evalúa si queda algo que valga la pena paralelizar — y muchas veces, como en el Worked Example, ya no queda.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. <code>v.iter().sum::&lt;i64&gt;()</code> se vectoriza pero <code>v.iter().sum::&lt;f32&gt;()</code> no, sobre datos del mismo tamaño. ¿Por qué?</p>
+    <button class="opt">Porque <code>f32</code> ocupa 4 bytes y las instrucciones SIMD solo operan sobre tipos de 8 bytes</button>
+    <button class="opt">Porque la suma de floats no es asociativa: vectorizar exige reasociar, lo que cambiaría el resultado por redondeo, y LLVM no lo hace sin permiso explícito</button>
+    <button class="opt">Porque el trait <code>Sum</code> no está implementado de forma inlineable para <code>f32</code> en la librería estándar</button>
+    <div class="exp">Vectorizar una suma significa usar varios acumuladores en paralelo y combinarlos al final, es decir, reasociar. Con enteros el resultado es idéntico; con floats puede diferir por redondeo, así que el compilador se niega salvo que uses <code>-ffast-math</code> (que Rust no expone) o reasocies vos mismo con <code>chunks_exact</code> y acumuladores múltiples, aceptando explícitamente la diferencia numérica.</div>
+  </div>
+
+  <div class="score" id="scoreRuS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para RuS8.' : '  — repasá las que fallaste antes de seguir.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus6-macros/lecture.html">← RuS6: Macros</a>
+  <a href="../rus8-produccion/lecture.html">RuS8: Embebido y producción →</a>
+</nav>
+
+</div>
+</body>
+</html>

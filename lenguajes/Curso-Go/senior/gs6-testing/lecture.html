@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS6 — Testing serio: fuzzing, integración y tests que sirven · Go Senior</title>
+  <meta name="description" content="Table-driven a nivel senior, t.Parallel y t.Cleanup, fuzzing nativo con testing.F, property-based, fakes contra mocks, httptest, testcontainers, build tags, goleak, coverage que no miente y cómo matar los tests flaky de raíz. Go 1.26.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS6</span>
+  <span class="badge">⏱ 45–145 min</span>
+  <span class="badge">🎯 Pre-req: GS3</span>
+  <span class="badge">🧪 Testing</span>
+</div>
+
+<article>
+
+<h1>GS6 — Testing serio: fuzzing, integración y tests que sirven</h1>
+
+<h2>GS6.0 Por qué este módulo</h2>
+
+<p>Go trae testing en la biblioteca estándar. No hay que elegir framework, no hay que configurar nada, no hay <code>describe</code> ni <code>beforeEach</code>: escribís una función que empieza con <code>Test</code>, corrés <code>go test</code> y listo. Esa decisión de diseño es una de las mejores del lenguaje y también su trampa más común, porque como la barrera de entrada es cero, la mayoría de los equipos se queda para siempre en el primer escalón: <code>if got != want { t.Errorf(...) }</code>, tablas de casos y un número de coverage que se mira una vez por trimestre.</p>
+
+<p>Este módulo es el resto del camino. No vamos a repetir lo que ya viste en <strong>M10</strong> —qué es un archivo <code>_test.go</code>, cómo se arma una tabla— sino a responder las preguntas que aparecen cuando el código pasa a producción y empieza a romperse de maneras que tus tests no anticiparon: <em>¿por qué el 95% de coverage no me salvó del panic?</em>, <em>¿por qué este test falla uno de cada treinta corridas en CI?</em>, <em>¿este mock está probando algo o está probando al mock?</em>, <em>¿cómo pruebo la query de verdad sin montar una base entera a mano?</em></p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un test tiene valor solo si <strong>puede fallar por una razón que te importe</strong>. Las tablas prueban los casos que ya se te ocurrieron; el fuzzing prueba los que no. Los mocks prueban que tu código llama a lo que vos creés que llama; los contenedores prueban que el sistema real acepta eso. El coverage mide líneas ejecutadas, no afirmaciones hechas. Todo lo que sigue es aplicar esa distinción, herramienta por herramienta.
+</div>
+
+<p>Trabajamos con <strong>Go 1.26</strong>. Varias de las herramientas centrales acá son relativamente recientes: el fuzzing nativo llegó en 1.18, el coverage de binarios con <code>GOCOVERDIR</code> en 1.20, la semántica por iteración de la variable de <code>for</code> en 1.22, <code>t.Context()</code> y <code>t.Chdir()</code> en 1.24 y <code>testing/synctest</code> se estabilizó en 1.25. Si venís de tutoriales viejos, buena parte de los <em>workarounds</em> que aprendiste ya no hacen falta —y alguno directamente empeora el test.</p>
+
+<h2>GS6.1 Table-driven a nivel senior</h2>
+
+<p>La tabla básica ya la conocés. Lo que separa una tabla de juguete de una tabla de producción son cuatro cosas: cómo se nombra cada caso, cómo se paraleliza, cómo se limpia y qué se compara.</p>
+
+<h3>Nombres que dicen algo cuando fallan</h3>
+
+<p>El nombre del subtest no es decoración: es lo único que vas a ver en el log de CI a las tres de la mañana. <code>caso 3</code> no sirve. El nombre tiene que describir <em>la regla de negocio que se rompió</em>, no la entrada.</p>
+
+<pre><code class="lang-go">func TestNormalizarTelefono(t *testing.T) {
+    casos := []struct {
+        nombre  string
+        entrada string
+        quiero  string
+        errWant bool
+    }{
+        {"prefijo internacional se conserva", "+54 9 11 5555-1234", "+5491155551234", false},
+        {"cero y quince locales se descartan", "011 15 5555-1234", "+5491155551234", false},
+        {"menos de diez digitos es invalido", "1234", "", true},
+        {"letras en el medio es invalido", "11 5555 ABCD", "", true},
+    }
+
+    for _, c := range casos {
+        t.Run(c.nombre, func(t *testing.T) {
+            got, err := NormalizarTelefono(c.entrada)
+            if (err != nil) != c.errWant {
+                t.Fatalf("error = %v, esperaba error = %v", err, c.errWant)
+            }
+            if got != c.quiero {
+                t.Errorf("NormalizarTelefono(%q) = %q, quiero %q", c.entrada, got, c.quiero)
+            }
+        })
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>t.Run</code> no es cosmética: crea un espacio de nombres direccionable.</strong> Los espacios pasan a guiones bajos y las barras arman jerarquía, así que podés correr un caso solo: <code>go test -run 'TestNormalizarTelefono/cero_y_quince_locales_se_descartan'</code>. Sin <code>t.Run</code>, si el caso 17 falla no tenés forma de correr <em>solo</em> el 17, y una tabla sin subtests corta en el primer <code>t.Fatal</code>: perdés la información de los 23 casos que venían después.
+</div>
+
+<h3><code>t.Parallel()</code> y la trampa que ya no es la que creías</h3>
+
+<p>Durante años, el consejo repetido fue <em>«acordate del <code>tc := tc</code>»</em>, porque la variable del <code>for</code> se compartía entre iteraciones y todos los subtests paralelos terminaban viendo el último caso. Desde <strong>Go 1.22</strong>, si tu <code>go.mod</code> declara <code>go 1.22</code> o superior, la variable del <code>for</code> es <strong>nueva en cada iteración</strong> y ese <em>shadow</em> sobra.</p>
+
+<pre><code class="lang-go">// go.mod dice: go 1.26
+for _, c := range casos {
+    // c := c  ← ya NO hace falta desde Go 1.22
+    t.Run(c.nombre, func(t *testing.T) {
+        t.Parallel()          // este subtest se suspende y sigue cuando el padre retorne
+        got := Normalizar(c.entrada)
+        if got != c.quiero {
+            t.Errorf("got %q, quiero %q", got, c.quiero)
+        }
+    })
+}</code></pre>
+
+<div class="warn">
+  <strong>Cuidado con los módulos viejos.</strong> La semántica nueva está atada a la versión declarada en <code>go.mod</code>, no a la versión del compilador. Un repo que todavía dice <code>go 1.21</code> compilado con Go 1.26 sigue con la semántica vieja y necesita el <code>c := c</code>. Por eso <code>go vet</code> mantiene el chequeo <code>loopclosure</code>: no lo apagues.
+</div>
+
+<p>La trampa que <strong>sí</strong> sigue viva es otra, y es más sutil: <code>t.Parallel()</code> <em>pausa</em> el subtest hasta que la función padre retorna. Todo lo que el padre difiera con <code>defer</code> se ejecuta <strong>antes</strong> de que los subtests paralelos siquiera arranquen.</p>
+
+<pre><code class="lang-go">func TestConBaseTemporal(t *testing.T) {
+    db := abrirDB(t)
+    defer db.Close()          // 💣 corre ANTES que los subtests paralelos
+
+    for _, c := range casos {
+        t.Run(c.nombre, func(t *testing.T) {
+            t.Parallel()
+            usar(db)          // db ya está cerrada: "sql: database is closed"
+        })
+    }
+}</code></pre>
+
+<pre><code class="lang-go">func TestConBaseTemporal(t *testing.T) {
+    db := abrirDB(t)
+    t.Cleanup(func() { db.Close() })   // ✅ corre cuando terminan TODOS los subtests
+
+    for _, c := range casos {
+        t.Run(c.nombre, func(t *testing.T) {
+            t.Parallel()
+            usar(db)
+        })
+    }
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> agregar <code>t.Parallel()</code> a una suite que funcionaba y ver fallas erráticas de «recurso cerrado» o «archivo no existe». No es una carrera de datos en tu código: es que los <code>defer</code> del padre se dispararon antes de tiempo. La regla es simple y no admite excepciones: <strong>en un test que tiene subtests paralelos, la limpieza va en <code>t.Cleanup</code>, nunca en <code>defer</code>.</strong>
+</div>
+
+<h3>Slice o map: elegí a conciencia</h3>
+
+<p>Una tabla como <code>map[string]caso</code> tiene una propiedad interesante: Go aleatoriza el orden de iteración de los mapas <em>a propósito</em>, así que si tus casos dependen del orden entre sí, el mapa lo va a delatar. El costo es que la reproducción de una falla ya no es determinista en cuanto al orden. Para tablas puras (sin estado compartido) da lo mismo; para tablas que tocan estado, el mapa es un detector de dependencias ocultas gratis.</p>
+
+<h2>GS6.2 Helpers: que el error apunte a la línea correcta</h2>
+
+<p>Apenas la suite crece aparecen los helpers, y con ellos el problema: cuando un assert falla dentro de <code>compararUsuario()</code>, el reporte dice <code>helpers_test.go:42</code> para los 60 casos que lo usan. Inútil. La solución es una línea:</p>
+
+<pre><code class="lang-go">func requiereSinError(t *testing.T, err error) {
+    t.Helper()                 // ← primera línea, siempre
+    if err != nil {
+        t.Fatalf("error inesperado: %v", err)
+    }
+}
+
+func compararUsuario(t *testing.T, got, want Usuario) {
+    t.Helper()
+    if got.ID != want.ID {
+        t.Errorf("ID = %d, quiero %d", got.ID, want.ID)
+    }
+    if got.Email != want.Email {
+        t.Errorf("Email = %q, quiero %q", got.Email, want.Email)
+    }
+}</code></pre>
+
+<p><code>t.Helper()</code> marca el frame como «de infraestructura» y hace que el reporte de fallas suba en el stack hasta el primer frame que no sea helper. Funciona de forma transitiva: si un helper llama a otro y ambos declaran <code>t.Helper()</code>, el archivo y la línea reportados son los del test real.</p>
+
+<div class="danger">
+  <strong>Lo que <code>t.Helper()</code> NO arregla: llamar a <code>t.Fatal</code> desde otra goroutine.</strong> <code>t.Fatalf</code> internamente hace <code>FailNow()</code>, y <code>FailNow</code> termina la goroutine con <code>runtime.Goexit()</code>. Si lo llamás desde una goroutine que vos lanzaste, matás <em>esa</em> goroutine y el test principal sigue corriendo como si nada, muchas veces hasta pasar. Desde una goroutine solo podés usar <code>t.Errorf</code> (que marca la falla sin cortar) o —mejor— mandar el error por un canal y hacer el <code>t.Fatal</code> en la goroutine del test.
+</div>
+
+<pre><code class="lang-go">func TestServidorAceptaConexion(t *testing.T) {
+    errc := make(chan error, 1)
+
+    go func() {
+        conn, err := net.Dial("tcp", addr)
+        if err != nil {
+            errc &lt;- fmt.Errorf("dial: %w", err)   // NO t.Fatal acá adentro
+            return
+        }
+        conn.Close()
+        errc &lt;- nil
+    }()
+
+    select {
+    case err := &lt;-errc:
+        if err != nil {
+            t.Fatal(err)          // ✅ en la goroutine del test
+        }
+    case &lt;-t.Context().Done():    // Go 1.24+: contexto cancelado antes del Cleanup
+        t.Fatal("timeout esperando la conexión")
+    }
+}</code></pre>
+
+<h3>El helper que se limpia solo</h3>
+
+<p>El mejor uso de <code>t.Cleanup</code> es dentro del helper de setup. El que crea el recurso es el que sabe cómo destruirlo, y el test que lo usa escribe una sola línea:</p>
+
+<pre><code class="lang-go">func nuevoRepo(t *testing.T) *Repo {
+    t.Helper()
+    dir := t.TempDir()                     // se borra solo al terminar el test
+    r, err := AbrirRepo(filepath.Join(dir, "datos.db"))
+    if err != nil {
+        t.Fatalf("abrir repo: %v", err)
+    }
+    t.Cleanup(func() {
+        if err := r.Close(); err != nil {
+            t.Errorf("cerrar repo: %v", err)   // un cierre que falla ES un bug
+        }
+    })
+    return r
+}
+
+func TestGuardarYLeer(t *testing.T) {
+    r := nuevoRepo(t)                      // una línea, cero teardown a la vista
+    // ...
+}</code></pre>
+
+<div class="tip">
+  Los <code>t.Cleanup</code> se ejecutan en orden <strong>LIFO</strong>, como los <code>defer</code>, y se disparan también si el test falló con <code>t.Fatal</code>. Un helper puede registrar varios. Y <code>t.TempDir()</code> ya trae su propia limpieza: nunca escribas <code>os.MkdirTemp</code> a mano en un test.
+</div>
+
+<h2>GS6.3 Fuzzing nativo: la sección estrella</h2>
+
+<p>Las tablas prueban los casos que se te ocurrieron. El problema es que los bugs que llegan a producción son, casi por definición, los que <em>no</em> se te ocurrieron. El fuzzing ataca exactamente ese hueco: en vez de que vos escribas las entradas, el motor las genera, las muta y usa la <strong>cobertura del código</strong> como brújula para encontrar caminos que ninguna de tus entradas alcanzó.</p>
+
+<h3>Anatomía de un fuzz target</h3>
+
+<pre><code class="lang-go">func FuzzNormalizarTelefono(f *testing.F) {
+    // 1. Corpus semilla: entradas conocidas, buenas y malas
+    f.Add("+54 9 11 5555-1234")
+    f.Add("011 15 5555-1234")
+    f.Add("")
+    f.Add("+")
+
+    // 2. La propiedad que tiene que valer SIEMPRE
+    f.Fuzz(func(t *testing.T, entrada string) {
+        got, err := NormalizarTelefono(entrada)
+        if err != nil {
+            return                 // rechazar entradas inválidas es correcto
+        }
+        // Si dijo que sí, el resultado tiene que cumplir el contrato:
+        if !strings.HasPrefix(got, "+") {
+            t.Fatalf("normalizó %q a %q, sin prefijo +", entrada, got)
+        }
+        // Y tiene que ser idempotente:
+        otra, err := NormalizarTelefono(got)
+        if err != nil || otra != got {
+            t.Fatalf("no es idempotente: %q → %q → (%q, %v)", entrada, got, otra, err)
+        }
+    })
+}</code></pre>
+
+<p>Fijate el cambio de mentalidad. Una tabla afirma <em>«esta entrada da esta salida»</em>. Un fuzz target afirma <em>«pase lo que pase, esta propiedad se cumple»</em>. No sabés qué te va a mandar el motor, así que no podés predecir la salida: solo podés declarar invariantes. Los tres invariantes más productivos en la práctica son:</p>
+
+<ul>
+  <li><strong>No panic.</strong> Ni siquiera hace falta escribir un assert: si la función explota, el test falla. Es el invariante más barato y el que más bugs encuentra.</li>
+  <li><strong>Round-trip.</strong> <code>Parse(Render(x)) == x</code>, <code>Decode(Encode(x)) == x</code>, <code>Descomprimir(Comprimir(b)) == b</code>. Cualquier par codificador/decodificador tiene esta propiedad y es donde el fuzzing brilla.</li>
+  <li><strong>Diferencial.</strong> Tu implementación nueva y rápida tiene que dar exactamente lo mismo que la vieja y lenta, para toda entrada.</li>
+</ul>
+
+<h3>Cómo se corre (y por qué el comando importa)</h3>
+
+<pre><code class="lang-bash"># Sin -fuzz: el target corre como test normal, solo contra el corpus semilla
+# y contra testdata/. Esto es lo que corre en CI en cada commit.
+go test ./...
+
+# Con -fuzz: arranca el motor de mutación. Corre hasta que encuentra algo
+# o hasta que se acaba el tiempo. NUNCA lo pongas así en CI.
+go test -fuzz=FuzzNormalizarTelefono -fuzztime=60s ./telefono
+
+# Combinado con el detector de carreras (más lento, encuentra más)
+go test -fuzz=FuzzParse -fuzztime=5m -race ./parser</code></pre>
+
+<div class="rule">
+  <strong>📌 Un fuzz target tiene dos vidas.</strong> Sin <code>-fuzz</code> es un test determinista que corre el corpus semilla y todo lo que haya en <code>testdata/fuzz/&lt;Target&gt;/</code>: rapidísimo, apto para CI en cada push. Con <code>-fuzz</code> es una sesión de búsqueda que puede durar minutos u horas. La forma correcta de usarlo en un equipo es: CI corre la primera vida siempre, y un job nocturno (o una corrida manual antes de un release) corre la segunda.
+</div>
+
+<h3>El corpus: semilla, caché y <code>testdata</code></h3>
+
+<p>Hay dos corpus y confundirlos es la causa número uno de «me funcionó local y en CI no».</p>
+
+<table>
+<thead><tr><th>Corpus</th><th>Dónde vive</th><th>Va al repo</th><th>Para qué</th></tr></thead>
+<tbody>
+<tr><td><strong>Semilla</strong></td><td><code>f.Add(...)</code> + <code>testdata/fuzz/&lt;Target&gt;/</code></td><td>Sí</td><td>Punto de partida del motor y suite de regresión determinista</td></tr>
+<tr><td><strong>Generado</strong></td><td><code>$GOCACHE/fuzz</code> (caché de build)</td><td>No</td><td>Entradas interesantes que el motor descubrió; se pierde al limpiar la caché</td></tr>
+</tbody>
+</table>
+
+<p>Cuando el motor encuentra una entrada que rompe algo, hace dos cosas valiosas: la <strong>minimiza</strong> (recorta bytes mientras siga fallando, así te queda el caso mínimo y no un blob de 4 KB) y la <strong>escribe en <code>testdata/</code></strong>. Ese archivo es texto plano y se commitea:</p>
+
+<pre><code class="lang-bash">$ cat testdata/fuzz/FuzzParse/8f2a1c7d3b9e04f1
+go test fuzz v1
+string("clave=valor\\")</code></pre>
+
+<div class="concept">
+  <strong>💡 Acá está el círculo virtuoso.</strong> El bug encontrado por fuzzing se convierte, automáticamente y sin que escribas una línea, en un test de regresión determinista que va a correr en cada <code>go test</code> para siempre. No tenés que acordarte de agregar el caso a la tabla: el motor ya lo hizo. Un repo maduro tiene <code>testdata/fuzz/</code> lleno de archivitos crípticos, y cada uno es un bug real que ya no puede volver.
+</div>
+
+<h3>Qué encuentra el fuzzing que las tablas no</h3>
+
+<p>Esta es la pregunta importante, y la respuesta no es «entradas raras» sino tres clases concretas de bug que las tablas sistemáticamente se pierden:</p>
+
+<p><strong>1. Índices fuera de rango en máquinas de estado sobre bytes.</strong> Cualquier parser que haga <code>i++</code> adentro de un loop y después lea <code>s[i]</code> tiene un agujero en el borde derecho de la entrada. Vos escribís casos «con escape» y «sin escape»; nunca escribís el caso «la entrada termina justo en el medio de un escape», porque no es un caso de negocio: es un caso de <em>implementación</em>. El motor lo encuentra en segundos porque es la mutación más obvia (truncar).</p>
+
+<p><strong>2. Round-trips que no cierran.</strong> Tu <code>Render</code> escribe un valor con espacios sin comillar, tu <code>Parse</code> lo lee y devuelve otra cosa. Con casos elegidos a mano el round-trip siempre cierra, porque elegís valores prolijos. El motor prueba con <code>"a=b=c"</code>, con <code>"\n"</code> adentro de un valor, con una clave vacía, con UTF-8 inválido.</p>
+
+<p><strong>3. Diferencias de unicode y bytes.</strong> Recorrer un <code>string</code> con <code>for i := 0; i &lt; len(s); i++</code> te da <strong>bytes</strong>; recorrerlo con <code>for _, r := range s</code> te da <strong>runas</strong>. Mezclar los dos en la misma función es un bug garantizado con entrada no-ASCII, y el motor genera basura no-ASCII todo el tiempo.</p>
+
+<h3>Límites: qué tipos acepta <code>f.Fuzz</code></h3>
+
+<p>El primer parámetro es siempre <code>*testing.T</code>. Los siguientes solo pueden ser: <code>[]byte</code>, <code>string</code>, cualquier entero con y sin signo, <code>float32</code>/<code>float64</code>, <code>bool</code>, <code>rune</code> y <code>byte</code>. <strong>No hay structs, ni slices de structs, ni maps, ni interfaces.</strong></p>
+
+<pre><code class="lang-go">// ✅ válido
+f.Fuzz(func(t *testing.T, datos []byte, limite int, activo bool) { ... })
+
+// ❌ no compila: "fuzzing arguments can only have the following types: ..."
+f.Fuzz(func(t *testing.T, u Usuario) { ... })</code></pre>
+
+<div class="warn">
+  <strong>Los tipos del <code>f.Add</code> tienen que coincidir exactamente con la firma del <code>f.Fuzz</code>.</strong> Si la función toma <code>[]byte</code> y hacés <code>f.Add("hola")</code>, el test hace panic al arrancar. Escribí <code>f.Add([]byte("hola"))</code>. Y si el target toma tres parámetros, cada <code>f.Add</code> tiene que pasar los tres.
+</div>
+
+<h2>GS6.4 Property-based testing en Go</h2>
+
+<p>El fuzzing nativo <em>es</em> property-based testing, pero de un sabor particular: guiado por cobertura, con minimización, con corpus persistente… y sin generadores de tipos estructurados. Esa es exactamente la línea que divide lo que podés hacer con la stdlib y lo que necesita librería.</p>
+
+<h3>Truco: derivar la estructura de los bytes</h3>
+
+<p>Si querés fuzzear una función que toma un struct, la salida idiomática es tomar <code>[]byte</code> y construir el struct de forma determinista a partir de esos bytes. Es lo mismo que hacen las librerías por debajo:</p>
+
+<pre><code class="lang-go">func FuzzAplicarDescuento(f *testing.F) {
+    f.Add([]byte{10, 0, 3})
+
+    f.Fuzz(func(t *testing.T, datos []byte) {
+        if len(datos) &lt; 3 {
+            t.Skip()          // entrada demasiado corta: no es un fallo
+        }
+        p := Pedido{
+            Items:     int(datos[0]),
+            Cupon:     string(datos[1:2]),
+            Categoria: Categoria(datos[2] % 4),
+        }
+
+        total := AplicarDescuento(p, 1000)
+
+        // Propiedad de negocio: el descuento nunca puede dar negativo
+        // ni superar el total original.
+        if total &lt; 0 || total &gt; 1000 {
+            t.Fatalf("descuento fuera de rango: pedido=%+v total=%d", p, total)
+        }
+    })
+}</code></pre>
+
+<div class="tip">
+  Usá <code>t.Skip()</code> —no <code>return</code> a secas y nunca <code>t.Fatal</code>— para descartar entradas que no cumplen la precondición. El motor entiende el skip como «esta entrada no aporta» y no la guarda en el corpus, con lo cual no ensucia la búsqueda.
+</div>
+
+<h3>Cuándo necesitás una librería</h3>
+
+<p>Cuando la propiedad involucra <em>estructuras generadas con forma</em> —un árbol balanceado, un slice de longitud entre 3 y 10 con elementos únicos, una secuencia de comandos válidos contra una máquina de estados— derivar de bytes se vuelve tan feo que oscurece la propiedad. Ahí entra <code>pgregory.net/rapid</code>, que sí tiene generadores composables y <em>shrinking</em> sobre los valores generados, no sobre los bytes:</p>
+
+<pre><code class="lang-go">import "pgregory.net/rapid"
+
+func TestColaMantieneOrdenFIFO(t *testing.T) {
+    rapid.Check(t, func(t *rapid.T) {
+        n := rapid.IntRange(1, 100).Draw(t, "n")
+        vals := rapid.SliceOfN(rapid.Int(), n, n).Draw(t, "vals")
+
+        q := NuevaCola[int]()
+        for _, v := range vals {
+            q.Push(v)
+        }
+        for i, quiero := range vals {
+            got, ok := q.Pop()
+            if !ok || got != quiero {
+                t.Fatalf("Pop #%d = (%v, %v), quiero %v", i, got, ok, quiero)
+            }
+        }
+    })
+}</code></pre>
+
+<div class="info">
+  <strong>Y no uses <code>testing/quick</code>.</strong> Está en la stdlib, tiene la forma de una librería property-based y está <em>congelado</em>: no recibe features nuevas, no minimiza y su generador es aleatorio puro, sin guía de cobertura. Si buscás en internet «property based testing golang» vas a encontrarlo en tutoriales viejos. Para casos sobre bytes/strings usá <code>testing.F</code>; para estructuras, <code>rapid</code>.
+</div>
+
+<h2>GS6.5 Interfaces para testear: definilas en el consumidor</h2>
+
+<p>En <strong>GS4</strong> vimos la regla estructural: en Go las interfaces se satisfacen implícitamente, así que quien define la interfaz no tiene que ser quien la implementa. La consecuencia para el testing es enorme y casi nadie la aprovecha.</p>
+
+<pre><code class="lang-go">// ❌ El patrón que viene de Java: interfaz gigante junto a la implementación
+package almacen
+
+type Almacen interface {
+    Guardar(context.Context, Usuario) error
+    Buscar(context.Context, int64) (Usuario, error)
+    Listar(context.Context, Filtro) ([]Usuario, error)
+    Borrar(context.Context, int64) error
+    Contar(context.Context) (int, error)
+    Migrar(context.Context) error
+    // ...11 métodos más
+}</code></pre>
+
+<p>Si tu servicio de notificaciones solo necesita <em>buscar</em>, con esa interfaz estás obligado a implementar dieciséis métodos para poder testear uno. De ahí nace la industria de los generadores de mocks: la interfaz es tan grande que a mano es inviable.</p>
+
+<pre><code class="lang-go">// ✅ El patrón Go: la interfaz la declara quien la consume, con lo mínimo
+package notificaciones
+
+type buscadorUsuarios interface {
+    Buscar(ctx context.Context, id int64) (Usuario, error)
+}
+
+type Servicio struct {
+    usuarios buscadorUsuarios          // acepta interfaces...
+}
+
+func NuevoServicio(u buscadorUsuarios) *Servicio {   // ...devuelve structs
+    return &amp;Servicio{usuarios: u}
+}</code></pre>
+
+<p>Ahora el doble de prueba es esto, completo:</p>
+
+<pre><code class="lang-go">type buscadorStub struct {
+    fn func(context.Context, int64) (Usuario, error)
+}
+
+func (b buscadorStub) Buscar(ctx context.Context, id int64) (Usuario, error) {
+    return b.fn(ctx, id)
+}
+
+func TestNotificaSoloAVerificados(t *testing.T) {
+    s := NuevoServicio(buscadorStub{
+        fn: func(_ context.Context, id int64) (Usuario, error) {
+            return Usuario{ID: id, Verificado: false}, nil
+        },
+    })
+    // ...
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Interfaz chica en el consumidor = el 80% de los mocks se vuelve innecesario.</strong> La interfaz de un método se implementa a mano en cuatro líneas, con un campo función que cada test define como quiera. No hay <code>go:generate</code>, no hay archivo generado de 400 líneas que hay que regenerar cuando cambia una firma, no hay dependencia nueva. Y como bonus: la interfaz chica documenta exactamente qué necesita ese paquete del mundo exterior.
+</div>
+
+<h2>GS6.6 Fakes contra mocks</h2>
+
+<p>Los términos se usan mal todo el tiempo, así que fijemos vocabulario porque la diferencia decide la calidad de la suite:</p>
+
+<table>
+<thead><tr><th>Doble</th><th>Qué hace</th><th>Contra qué verifica</th></tr></thead>
+<tbody>
+<tr><td><strong>Stub</strong></td><td>Devuelve valores fijos</td><td>El resultado de tu código</td></tr>
+<tr><td><strong>Fake</strong></td><td>Implementación real pero simplificada (un map en vez de Postgres)</td><td>El resultado de tu código, con estado coherente</td></tr>
+<tr><td><strong>Mock</strong></td><td>Registra llamadas y afirma sobre ellas</td><td><em>Cómo</em> tu código usó la dependencia</td></tr>
+</tbody>
+</table>
+
+<p>Go, culturalmente, prefiere el <strong>fake escrito a mano</strong>, y hay una razón técnica además de la cultural: un mock verifica interacción, y la interacción es un detalle de implementación. El día que refactorizás <code>Guardar</code> para que haga un <em>upsert</em> en vez de <code>Buscar</code> + <code>Insertar</code>, el comportamiento observable no cambió pero doscientos tests con mocks se ponen rojos. Eso no es una red de seguridad: es un impuesto.</p>
+
+<pre><code class="lang-go">// Fake con estado: se comporta como el almacén real, en memoria.
+type almacenFake struct {
+    mu     sync.Mutex
+    datos  map[int64]Usuario
+    fallar error            // para forzar el camino de error cuando hace falta
+}
+
+func nuevoAlmacenFake() *almacenFake {
+    return &amp;almacenFake{datos: make(map[int64]Usuario)}
+}
+
+func (a *almacenFake) Guardar(_ context.Context, u Usuario) error {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    if a.fallar != nil {
+        return a.fallar
+    }
+    if _, existe := a.datos[u.ID]; existe {
+        return ErrDuplicado          // el fake respeta las MISMAS reglas
+    }
+    a.datos[u.ID] = u
+    return nil
+}
+
+func (a *almacenFake) Buscar(_ context.Context, id int64) (Usuario, error) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    u, ok := a.datos[id]
+    if !ok {
+        return Usuario{}, ErrNoEncontrado
+    }
+    return u, nil
+}</code></pre>
+
+<div class="tip">
+  <strong>El mutex del fake no es paranoia.</strong> Si tus tests corren con <code>t.Parallel()</code> o si el código bajo prueba usa goroutines, un fake con un map desnudo dispara un fallo del detector de carreras y vas a perder media hora creyendo que el bug está en tu código. Poné el mutex desde el principio.
+</div>
+
+<h4>Cuándo sí vale generar mocks</h4>
+
+<ul>
+  <li><strong>Interfaces que no controlás y son enormes</strong>: el SDK de AWS, un cliente gRPC generado con 40 métodos. Escribir eso a mano no es disciplina, es masoquismo — <code>mockery</code> o <code>moq</code> ahí ganan.</li>
+  <li><strong>Cuando la interacción ES el requisito</strong>: «no se puede llamar al gateway de pagos dos veces con el mismo idempotency key» es una afirmación sobre llamadas, y verificarla necesita un espía.</li>
+  <li><strong>Contratos que hay que auditar</strong>: en sistemas regulados, demostrar que se emitió exactamente un evento de auditoría por operación es parte del requisito.</li>
+</ul>
+
+<p>Fuera de esos tres casos, el fake gana casi siempre. Y hay una prueba de olfato infalible: si borrás el código de producción y todos tus tests siguen pasando porque solo hablan con mocks, tus tests no prueban nada.</p>
+
+<h2>GS6.7 <code>httptest</code>: los dos modos y cuándo usar cada uno</h2>
+
+<p>El paquete <code>net/http/httptest</code> resuelve dos problemas distintos y la mayoría usa uno solo.</p>
+
+<h3>Modo 1 — <code>ResponseRecorder</code>: probar tu handler sin red</h3>
+
+<pre><code class="lang-go">func TestHandlerUsuario(t *testing.T) {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /usuarios/{id}", handlerUsuario)   // Go 1.22+: patrón con método
+
+    req := httptest.NewRequest(http.MethodGet, "/usuarios/42", nil)
+    rec := httptest.NewRecorder()
+
+    mux.ServeHTTP(rec, req)          // ← por el MUX, no el handler directo
+
+    res := rec.Result()
+    defer res.Body.Close()
+
+    if res.StatusCode != http.StatusOK {
+        t.Fatalf("status = %d, quiero 200", res.StatusCode)
+    }
+    var u Usuario
+    if err := json.NewDecoder(res.Body).Decode(&amp;u); err != nil {
+        t.Fatalf("decodificar respuesta: %v", err)
+    }
+    if u.ID != 42 {
+        t.Errorf("ID = %d, quiero 42", u.ID)
+    }
+}</code></pre>
+
+<div class="mistake">
+  <strong>La trampa de <code>r.PathValue</code>.</strong> Los <em>wildcards</em> del router de Go 1.22 (<code>{id}</code>) los completa el <code>ServeMux</code>, no el request. Si llamás <code>handlerUsuario(rec, req)</code> directo, <code>r.PathValue("id")</code> devuelve <code>""</code> y el test o falla misteriosamente o —peor— pasa por un camino de error que no querías probar. O pasás por el mux, o usás <code>req.SetPathValue("id", "42")</code> explícitamente.
+</div>
+
+<h3>Modo 2 — <code>NewServer</code>: probar tu cliente contra HTTP real</h3>
+
+<p>El recorder es un objeto en memoria: no hay TCP, no hay serialización de headers, no hay timeouts, no hay redirecciones, no hay compresión. Para probar el <em>otro lado</em> —tu cliente HTTP, el que consume una API ajena— necesitás un servidor de verdad:</p>
+
+<pre><code class="lang-go">func TestClienteReintentaEn503(t *testing.T) {
+    var intentos atomic.Int32
+
+    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if intentos.Add(1) &lt; 3 {
+            w.WriteHeader(http.StatusServiceUnavailable)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        fmt.Fprint(w, `{"estado":"ok"}`)
+    }))
+    t.Cleanup(srv.Close)
+
+    c := NuevoCliente(srv.URL, ConMaxReintentos(5))
+
+    estado, err := c.Estado(t.Context())
+    if err != nil {
+        t.Fatalf("Estado(): %v", err)
+    }
+    if estado != "ok" {
+        t.Errorf("estado = %q, quiero \"ok\"", estado)
+    }
+    if n := intentos.Load(); n != 3 {
+        t.Errorf("intentos = %d, quiero 3", n)
+    }
+}</code></pre>
+
+<div class="info">
+  Para HTTPS usá <code>httptest.NewTLSServer</code> y —clave— <code>srv.Client()</code>, que devuelve un <code>*http.Client</code> ya configurado para confiar en el certificado autofirmado del server de prueba. Es infinitamente mejor que la solución que aparece en Stack Overflow, que es poner <code>InsecureSkipVerify: true</code> y arriesgarse a que ese <em>flag</em> se filtre al código de producción por copiar y pegar.
+</div>
+
+<h2>GS6.8 Testcontainers: dejar de mentirle a la base de datos</h2>
+
+<p>Un fake en memoria del repositorio prueba tu lógica. Lo que <strong>no</strong> prueba es el SQL: ni que la query compile, ni que el índice único exista, ni que el <code>ON CONFLICT</code> haga lo que creés, ni cómo se comporta el driver con un <code>NULL</code> en una columna <code>time.Time</code>, ni si esa transacción entra en deadlock bajo concurrencia. Esos son, casualmente, la mayoría de los bugs reales de la capa de datos.</p>
+
+<p><strong>testcontainers-go</strong> levanta el Postgres, el Redis o el Kafka de verdad en un contenedor descartable, desde el propio test:</p>
+
+<pre><code class="lang-go">//go:build integration
+
+package repo_test
+
+import (
+    "context"
+    "database/sql"
+    "testing"
+
+    "github.com/testcontainers/testcontainers-go"
+    "github.com/testcontainers/testcontainers-go/modules/postgres"
+    "github.com/testcontainers/testcontainers-go/wait"
+)
+
+func nuevaDBReal(t *testing.T) *sql.DB {
+    t.Helper()
+    ctx := context.Background()
+
+    ctr, err := postgres.Run(ctx, "postgres:17-alpine",
+        postgres.WithDatabase("app"),
+        postgres.WithUsername("test"),
+        postgres.WithPassword("test"),
+        testcontainers.WithWaitStrategy(
+            wait.ForLog("database system is ready to accept connections").
+                WithOccurrence(2),
+        ),
+    )
+    if err != nil {
+        t.Fatalf("levantar postgres: %v", err)
+    }
+    testcontainers.CleanupContainer(t, ctr)   // registra el Terminate en t.Cleanup
+
+    dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+    if err != nil {
+        t.Fatalf("connection string: %v", err)
+    }
+    db, err := sql.Open("pgx", dsn)
+    if err != nil {
+        t.Fatalf("abrir db: %v", err)
+    }
+    t.Cleanup(func() { db.Close() })
+
+    if err := Migrar(ctx, db); err != nil {   // las MISMAS migraciones de producción
+        t.Fatalf("migrar: %v", err)
+    }
+    return db
+}</code></pre>
+
+<div class="danger">
+  <strong>El <code>WithOccurrence(2)</code> no es un detalle.</strong> La imagen oficial de Postgres arranca, corre los scripts de inicialización, <em>se apaga</em> y vuelve a arrancar. El log «ready to accept connections» aparece dos veces. Si esperás la primera, te conectás justo antes del reinicio y tenés un test flaky que falla el 5% de las veces con «connection refused». Este error específico es el rito de iniciación de todo el que usa testcontainers.
+</div>
+
+<h3>El costo, con números</h3>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Arranque</th><th>Por test</th><th>Qué valida</th></tr></thead>
+<tbody>
+<tr><td>Fake en memoria</td><td>0 ms</td><td>&lt; 1 ms</td><td>Tu lógica de negocio</td></tr>
+<tr><td>SQLite en memoria</td><td>~5 ms</td><td>~1 ms</td><td>SQL genérico (y te miente en el dialecto)</td></tr>
+<tr><td>Contenedor por test</td><td>2–5 s <em>cada uno</em></td><td>5–50 ms</td><td>Todo, pero la suite se vuelve inusable</td></tr>
+<tr><td>Contenedor por paquete (<code>TestMain</code>)</td><td>2–5 s una vez</td><td>5–50 ms</td><td>Todo, con costo amortizado ✅</td></tr>
+</tbody>
+</table>
+
+<p>La cuarta fila es la única viable. Un contenedor por paquete, compartido, y aislamiento entre tests por <strong>schema</strong> o por transacción que se revierte:</p>
+
+<pre><code class="lang-go">var dbCompartida *sql.DB
+
+func TestMain(m *testing.M) {
+    // Setup una sola vez para todo el paquete.
+    ctr, db, limpiar := levantarPostgres()
+    dbCompartida = db
+
+    codigo := m.Run()      // corre todos los tests del paquete
+
+    limpiar()              // ojo: os.Exit NO corre defers, por eso la llamada explícita
+    _ = ctr
+    os.Exit(codigo)
+}
+
+// Cada test corre adentro de una transacción que nunca se commitea.
+func conTx(t *testing.T) *sql.Tx {
+    t.Helper()
+    tx, err := dbCompartida.BeginTx(t.Context(), nil)
+    if err != nil {
+        t.Fatalf("begin: %v", err)
+    }
+    t.Cleanup(func() { tx.Rollback() })   // aislamiento perfecto y gratis
+    return tx
+}</code></pre>
+
+<div class="warn">
+  <strong>El costo de CI es real y hay que decidirlo, no descubrirlo.</strong> Testcontainers necesita un demonio Docker disponible en el runner, tira imágenes de la red (cacheálas o el CI paga 30 s por corrida) y levanta además un contenedor <em>reaper</em> (Ryuk) que limpia lo que quede huérfano. En runners sin Docker-in-Docker no funciona. Nada de esto lo hace mala idea: lo hace una decisión de infraestructura que tenés que tomar antes de escribir 80 tests que dependen de eso.
+</div>
+
+<h2>GS6.9 Build tags: separar la suite rápida de la lenta</h2>
+
+<p>Si los tests de integración corren con <code>go test ./...</code>, en dos meses nadie corre <code>go test</code> antes de commitear porque tarda cuatro minutos. Y una suite que no se corre no existe. La separación es obligatoria.</p>
+
+<pre><code class="lang-go">//go:build integration
+
+package repo_test</code></pre>
+
+<pre><code class="lang-bash"># Suite rápida: por defecto los archivos con el tag ni se compilan
+go test ./...                       # ~3 s
+
+# Suite de integración: explícita
+go test -tags=integration ./...     # ~90 s
+
+# En CI: la rápida en cada push, la lenta en el merge a main
+</code></pre>
+
+<div class="mistake">
+  <strong>El defecto del build tag: el código etiquetado se pudre en silencio.</strong> Como el compilador ni lo mira sin el tag, podés renombrar un método y romper 40 tests de integración sin que nada te avise: <code>go build ./...</code> pasa, <code>go vet ./...</code> pasa, el editor a veces ni resalta el archivo. La contramedida es obligatoria en CI: <code>go vet -tags=integration ./...</code> en cada push, aunque los tests en sí solo corran en el merge. Compilar es barato; ejecutar es lo caro.
+</div>
+
+<h3>La alternativa: <code>testing.Short()</code></h3>
+
+<pre><code class="lang-go">func TestGuardarUsuarioContraPostgres(t *testing.T) {
+    if testing.Short() {
+        t.Skip("requiere Docker; correr sin -short")
+    }
+    db := nuevaDBReal(t)
+    // ...
+}</code></pre>
+
+<pre><code class="lang-bash">go test -short ./...    # saltea los pesados, pero los COMPILA todos</code></pre>
+
+<table>
+<thead><tr><th></th><th>Build tag</th><th><code>testing.Short()</code></th></tr></thead>
+<tbody>
+<tr><td>Tiempo de compilación</td><td>No compila lo excluido (más rápido)</td><td>Compila todo</td></tr>
+<tr><td>Detección de código podrido</td><td>Solo con <code>vet -tags</code> explícito</td><td>Automática, siempre</td></tr>
+<tr><td>Dependencias pesadas</td><td>No entran al binario de test</td><td>Entran igual</td></tr>
+<tr><td>Granularidad</td><td>Por archivo</td><td>Por test</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla práctica:</strong> <code>testing.Short()</code> cuando la diferencia es solo de tiempo (un test que tarda 8 segundos); <strong>build tag</strong> cuando el archivo arrastra dependencias que no querés en el módulo principal (testcontainers se lleva puesto medio Docker SDK). Y si usás tags, el <code>vet -tags</code> en CI no es opcional.
+</div>
+
+<h2>GS6.10 Fugas de goroutines y <code>-race</code>: los dos chequeos innegociables</h2>
+
+<p>En <strong>GS1</strong> y <strong>GS3</strong> vimos que una goroutine bloqueada para siempre en un canal sin receptor no la limpia nadie: no hay GC de goroutines. En producción eso es una fuga que se ve recién a las seis horas, cuando la memoria del pod se dispara. En un test es invisible… salvo que lo mires.</p>
+
+<pre><code class="lang-go">import "go.uber.org/goleak"
+
+// Verifica el paquete entero: si al terminar TODOS los tests quedan
+// goroutines vivas que no estaban al inicio, falla.
+func TestMain(m *testing.M) {
+    goleak.VerifyTestMain(m)
+}</code></pre>
+
+<pre><code class="lang-go">// O por test, cuando querés precisión sobre quién filtra.
+func TestWorkerCierraAlCancelar(t *testing.T) {
+    defer goleak.VerifyNone(t)
+
+    ctx, cancel := context.WithCancel(t.Context())
+    w := NuevoWorker(ctx)
+    w.Encolar("tarea")
+    cancel()
+    w.Esperar()          // si Esperar() no espera de verdad, goleak lo delata
+}</code></pre>
+
+<div class="tip">
+  Librerías legítimas dejan goroutines de fondo (el <code>Transport</code> de <code>net/http</code>, clientes de base con pool, exportadores de métricas). Para eso están <code>goleak.IgnoreTopFunction("...")</code> y <code>goleak.IgnoreCurrent()</code> —esta última tomada <em>después</em> del setup, para ignorar lo que ya existía. Lo que no hay que hacer es borrar goleak porque «tira falsos positivos»: cada ignore es una decisión documentada.
+</div>
+
+<h3><code>-race</code>: siempre, sin excepciones</h3>
+
+<pre><code class="lang-bash"># Lo que corre CI, siempre:
+go test -race -shuffle=on ./...
+
+# Para cazar un flaky: repetir sin caché
+go test -race -count=20 -run TestSospechoso ./paquete</code></pre>
+
+<div class="danger">
+  <strong>El detector de carreras no encuentra carreras: encuentra carreras que <em>ocurrieron</em>.</strong> Es un análisis dinámico, no estático. Si el test nunca ejecuta las dos goroutines conflictivas al mismo tiempo, no reporta nada. Por eso <code>-race</code> tiene que combinarse con <code>t.Parallel()</code>, con <code>-count=N</code> y con fuzzing: hay que <em>generar</em> el concurrente para que el detector tenga qué observar. El costo es 2–20× en tiempo y 5–10× en memoria, y aun así vale cada centavo.
+</div>
+
+<h2>GS6.11 Coverage: por qué el porcentaje engaña</h2>
+
+<p>Go mide <strong>cobertura de sentencias</strong>: qué porcentaje de las líneas ejecutables corrió durante el test. Nada más. Concretamente, esto da 100%:</p>
+
+<pre><code class="lang-go">func TestCalcular(t *testing.T) {
+    Calcular(10, 3)     // se ejecutó todo el cuerpo. Cero afirmaciones.
+}</code></pre>
+
+<p>Y esto también, aunque la función tenga un bug obvio en una de las ramas de una condición compuesta:</p>
+
+<pre><code class="lang-go">func Permitir(u Usuario, r Recurso) bool {
+    // El test cubre la línea con un caso donde ambas son true.
+    // La rama "activo pero sin permiso" nunca se evaluó, y la línea
+    // figura como cubierta al 100%.
+    return u.Activo &amp;&amp; u.TienePermiso(r)
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Lo que el número mide y lo que vos querés saber son cosas distintas.</strong> El coverage responde <em>«¿esta línea se ejecutó?»</em>. Vos querés responder <em>«si rompo esta línea, ¿algún test se pone rojo?»</em>. La distancia entre esas dos preguntas es donde viven los bugs de producción de código con 95% de cobertura. Un 40% con asserts serios vale más que un 95% de tests que solo llaman funciones.
+</div>
+
+<h3>Los comandos que sí sirven</h3>
+
+<pre><code class="lang-bash"># El número global no dice nada. El reporte por función, sí.
+go test -coverprofile=cover.out ./...
+go tool cover -func=cover.out | sort -k3 -n | head -20   # lo MENOS cubierto primero
+
+# Visual: ver exactamente qué líneas quedaron rojas
+go tool cover -html=cover.out
+
+# Por defecto solo mide el paquete bajo test. Para medir lo que un test
+# de integración toca en OTROS paquetes:
+go test -coverpkg=./... -coverprofile=cover.out ./tests/integracion
+
+# Con -race o subtests paralelos hace falta modo atómico
+go test -race -covermode=atomic -coverprofile=cover.out ./...</code></pre>
+
+<h3>Coverage de integración con <code>GOCOVERDIR</code></h3>
+
+<p>Desde Go 1.20 podés instrumentar el <strong>binario</strong>, no el test. Eso te deja medir qué código toca realmente un test end-to-end que arranca tu servidor como proceso, o incluso una sesión de QA manual:</p>
+
+<pre><code class="lang-bash"># 1. Compilar el binario instrumentado
+go build -cover -o bin/api ./cmd/api
+
+# 2. Correrlo con un directorio donde volcar los datos
+mkdir -p /tmp/cov
+GOCOVERDIR=/tmp/cov ./bin/api &amp;
+#    ...correr la suite end-to-end, el k6, lo que sea...
+kill -INT $!          # el volcado se escribe al terminar limpiamente
+
+# 3. Leer los resultados
+go tool covdata percent -i=/tmp/cov
+go tool covdata textfmt -i=/tmp/cov -o=cover-e2e.out
+go tool cover -html=cover-e2e.out</code></pre>
+
+<div class="tip">
+  Este es el uso <em>honesto</em> del coverage: no como métrica de vanidad, sino como <strong>detector de código muerto</strong>. Si después de correr toda la suite end-to-end y una semana de staging hay un paquete entero en 0%, la pregunta correcta no es «¿le escribo tests?» sino «¿para qué existe?».
+</div>
+
+<h2>GS6.12 Golden files: cuándo son la herramienta correcta</h2>
+
+<p>Un <em>golden file</em> es una salida esperada guardada en disco: el test genera la salida real y la compara byte a byte contra el archivo. El patrón canónico incluye un flag para regenerarlos:</p>
+
+<pre><code class="lang-go">var actualizar = flag.Bool("update", false, "regenerar los golden files")
+
+func TestRenderizarFactura(t *testing.T) {
+    casos := []string{"minima", "con_descuento", "multi_moneda"}
+
+    for _, nombre := range casos {
+        t.Run(nombre, func(t *testing.T) {
+            entrada := cargarFixture(t, nombre+".json")
+            got := Renderizar(entrada)
+
+            golden := filepath.Join("testdata", nombre+".golden")
+            if *actualizar {
+                if err := os.WriteFile(golden, got, 0o644); err != nil {
+                    t.Fatalf("escribir golden: %v", err)
+                }
+            }
+            want, err := os.ReadFile(golden)
+            if err != nil {
+                t.Fatalf("leer golden: %v", err)
+            }
+            if diff := cmp.Diff(string(want), string(got)); diff != "" {
+                t.Errorf("salida distinta (-quiero +tengo):\n%s", diff)
+            }
+        })
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">go test ./render -update    # regenerar. Después: git diff, y REVISAR el diff.</code></pre>
+
+<table>
+<thead><tr><th>✅ Son la herramienta correcta cuando…</th><th>❌ Se vuelven un lastre cuando…</th></tr></thead>
+<tbody>
+<tr><td>La salida es grande y estructurada (HTML, SQL generado, código generado, un plan de query)</td><td>La salida tiene timestamps, UUIDs, orden de map o rutas absolutas: el test es flaky por diseño</td></tr>
+<tr><td>Escribir el <code>want</code> a mano sería ilegible</td><td>El diff es tan grande que nadie lo lee y <code>-update</code> se vuelve un reflejo</td></tr>
+<tr><td>Lo que importa es «esto no cambió sin querer»</td><td>Lo que importa es «esto cumple tal regla»: ahí querés un assert específico, no un diff</td></tr>
+<tr><td>El diff es la mejor explicación posible del fallo</td><td>Un cambio cosmético legítimo rompe 200 goldens y todos se aprueban a ciegas</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Si usás golden files, normalizá la salida antes de comparar.</strong> Reemplazá timestamps por <code>&lt;TS&gt;</code>, IDs generados por <code>&lt;ID&gt;</code>, ordená las claves del JSON. Un golden no determinista no es un test: es un generador de <em>merge conflicts</em>. Y regla de oro: el diff de un <code>-update</code> se revisa en el PR con la misma atención que el código, porque es literalmente la definición del comportamiento correcto.
+</div>
+
+<h2>GS6.13 Qué NO testear</h2>
+
+<p>La suite tiene un costo de mantenimiento permanente. Cada test que no puede fallar por una razón interesante es peso muerto que frena cada refactor futuro.</p>
+
+<ul>
+  <li><strong>La biblioteca estándar.</strong> <code>json.Marshal</code> funciona. <code>time.Parse</code> funciona. Testear que <code>strings.Split</code> parte por comas no es un test: es un homenaje.</li>
+  <li><strong>Getters, setters y constructores triviales.</strong> Si <code>func (u Usuario) Nombre() string { return u.nombre }</code> tiene un test propio, el test es una copia de la implementación. Se cubren solos cuando los usa un test real.</li>
+  <li><strong>El framework.</strong> No pruebes que <code>ServeMux</code> rutea, que el ORM genera SQL o que el driver se conecta. Probá <em>tu</em> handler, <em>tu</em> query, <em>tu</em> mapeo.</li>
+  <li><strong>El mock.</strong> Si un test configura un mock para que devuelva X y después verifica que el código recibió X, probaste el mock. Ese test pasa aunque borres la lógica del medio.</li>
+  <li><strong>Los detalles privados que cambian en cada refactor.</strong> Testeá contra la superficie exportada del paquete. La pista está en el nombre del archivo: preferí <code>package foo_test</code> (test externo) sobre <code>package foo</code>; te obliga a probar lo que ven los demás.</li>
+  <li><strong>El 100% de coverage.</strong> El tramo del 85% al 100% se paga casi entero en tests de ramas de error irreproducibles, y esos tests son los que más se rompen.</li>
+</ul>
+
+<h2>GS6.14 Flaky tests: causas típicas en Go y cómo se arreglan de raíz</h2>
+
+<p>Un test que falla una de cada treinta veces es peor que no tener test, porque entrena al equipo a ignorar el rojo. La reacción de reintentar (<code>--retries 3</code>) no arregla nada: esconde un bug que casi siempre <em>también existe en producción</em>. Estas son las cinco causas y su cura real.</p>
+
+<h4>1. Tiempo real</h4>
+
+<pre><code class="lang-go">// ❌ Flaky garantizado: en un CI cargado, 100ms no alcanzan.
+func TestCacheExpira(t *testing.T) {
+    c := NuevoCache(50 * time.Millisecond)
+    c.Set("k", "v")
+    time.Sleep(100 * time.Millisecond)
+    if _, ok := c.Get("k"); ok {
+        t.Error("debería haber expirado")
+    }
+}</code></pre>
+
+<p>La cura moderna es <code>testing/synctest</code>, estable desde <strong>Go 1.25</strong>: corre el código en una «burbuja» con reloj falso, donde <code>time.Sleep</code> es instantáneo y el tiempo solo avanza cuando todas las goroutines de la burbuja están bloqueadas.</p>
+
+<pre><code class="lang-go">import "testing/synctest"
+
+func TestCacheExpira(t *testing.T) {
+    synctest.Test(t, func(t *testing.T) {
+        c := NuevoCache(50 * time.Millisecond)
+        c.Set("k", "v")
+
+        time.Sleep(100 * time.Millisecond)   // instantáneo: reloj virtual
+        synctest.Wait()                      // esperar a que todo se estabilice
+
+        if _, ok := c.Get("k"); ok {
+            t.Error("debería haber expirado")
+        }
+    })
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>synctest</code> cambia el cálculo por completo.</strong> Un test de timeouts, reintentos con <em>backoff</em> exponencial o expiración de sesiones que antes tardaba 30 segundos reales (y era flaky) ahora tarda milisegundos y es determinista. Si tu suite tiene <code>time.Sleep</code> desparramados, esta es la única sección del módulo que te va a devolver el tiempo invertido esta misma semana.
+</div>
+
+<h4>2. Orden de iteración de los maps</h4>
+
+<pre><code class="lang-go">// ❌ El orden de un map es aleatorio POR DISEÑO en Go.
+got := clavesDe(m)
+if !reflect.DeepEqual(got, []string{"a", "b", "c"}) { ... }
+
+// ✅ Ordenar antes de comparar...
+slices.Sort(got)
+
+// ✅ ...o comparar sin importar el orden
+if diff := cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool {
+    return a &lt; b
+})); diff != "" {
+    t.Errorf("claves (-quiero +tengo):\n%s", diff)
+}</code></pre>
+
+<h4>3. Puertos y recursos fijos</h4>
+
+<pre><code class="lang-go">// ❌ Dos tests en paralelo (o un CI con otro job) chocan: "address already in use"
+ln, _ := net.Listen("tcp", "127.0.0.1:8080")
+
+// ✅ Puerto 0 = "dame cualquiera libre", y preguntás cuál te tocó
+ln, err := net.Listen("tcp", "127.0.0.1:0")
+if err != nil {
+    t.Fatalf("listen: %v", err)
+}
+t.Cleanup(func() { ln.Close() })
+addr := ln.Addr().String()      // ej: 127.0.0.1:54312</code></pre>
+
+<p>Lo mismo con archivos: <code>t.TempDir()</code> siempre, nunca <code>/tmp/test.db</code>. Y con variables de entorno: <code>t.Setenv()</code>, que restaura el valor al terminar —y que, ojo, hace <em>panic</em> a propósito si el test llamó a <code>t.Parallel()</code>, porque el entorno es global al proceso y no se puede aislar por test.</p>
+
+<h4>4. Estado global compartido entre tests</h4>
+
+<p>Un <code>var registroGlobal = map[string]Handler{}</code> a nivel de paquete, un singleton con <code>sync.Once</code>, una conexión reutilizada: el test A deja algo escrito y el test B pasa solo si corre después. La cura tiene dos partes. La primera es de diagnóstico:</p>
+
+<pre><code class="lang-bash">go test -shuffle=on ./...        # aleatoriza el orden y muestra la semilla
+go test -shuffle=1730000000 ./...  # reproducir exactamente esa corrida</code></pre>
+
+<p>La segunda es de diseño: si el orden importa, el problema no es el test sino el estado global. Pasá la dependencia por parámetro en vez de leerla de un <code>var</code> de paquete.</p>
+
+<h4>5. Paralelismo mal declarado</h4>
+
+<p>Ya lo vimos con los <code>defer</code>, pero hay una variante más: <code>t.Parallel()</code> en un subtest que escribe en una variable capturada del padre. El detector de carreras lo agarra, pero solo si corrés con <code>-race</code>. Sin él, el síntoma es un valor incorrecto una vez cada tanto.</p>
+
+<div class="danger">
+  <strong>Protocolo para un flaky, en orden.</strong> <strong>(1)</strong> Reproducilo: <code>go test -race -count=50 -run TestX ./pkg</code>. <strong>(2)</strong> Si no reproduce, agregá <code>-shuffle=on</code> y corré el paquete entero: es dependencia de orden. <strong>(3)</strong> Si aparece solo en CI, es tiempo o recursos: buscá <code>time.Sleep</code> y puertos fijos. <strong>(4)</strong> Arreglá la causa. <strong>Nunca</strong> pongas un <code>t.Skip</code> «temporal» ni subas el sleep de 100 ms a 500 ms: eso no elimina el flaky, lo vuelve más raro y por lo tanto más caro de encontrar.
+</div>
+
+<h2>GS6.15 Worked Example: 95% de coverage, 40 casos en tabla, y un panic en producción</h2>
+
+<p>Tenemos un paquete <code>kvconf</code> que parsea un formato de configuración propio. Es viejo, es central, y tiene una tabla de <strong>40 casos</strong> y <strong>95,2% de coverage</strong>. El equipo lo considera sólido. La semana pasada tiró un panic en producción.</p>
+
+<h3>Paso 1 — El código</h3>
+
+<pre><code class="lang-go">package kvconf
+
+type Entrada struct {
+    Seccion string
+    Clave   string
+    Valor   string
+}
+
+func Parse(src string) ([]Entrada, error) {
+    var out []Entrada
+    seccion := ""
+    for n, linea := range strings.Split(src, "\n") {
+        linea = strings.TrimSpace(linea)
+        if linea == "" || strings.HasPrefix(linea, "#") {
+            continue
+        }
+        if strings.HasPrefix(linea, "[") &amp;&amp; strings.HasSuffix(linea, "]") {
+            seccion = linea[1 : len(linea)-1]
+            continue
+        }
+        clave, valor, ok := strings.Cut(linea, "=")
+        if !ok {
+            return nil, fmt.Errorf("línea %d: falta '='", n+1)
+        }
+        out = append(out, Entrada{
+            Seccion: seccion,
+            Clave:   strings.TrimSpace(clave),
+            Valor:   desescapar(strings.TrimSpace(valor)),
+        })
+    }
+    return out, nil
+}
+
+func desescapar(s string) string {
+    var b strings.Builder
+    for i := 0; i &lt; len(s); i++ {
+        if s[i] == '\\' {
+            i++                    // avanzar al carácter escapado
+            switch s[i] {          // 💣 si '\' era el último byte: index out of range
+            case 'n':
+                b.WriteByte('\n')
+            case 't':
+                b.WriteByte('\t')
+            default:
+                b.WriteByte(s[i])
+            }
+            continue
+        }
+        b.WriteByte(s[i])
+    }
+    return b.String()
+}</code></pre>
+
+<p>El bug está a la vista una vez que sabés dónde mirar: <code>i++</code> seguido de <code>s[i]</code> sin comprobar que <code>i</code> siga dentro del slice. Los 40 casos de la tabla incluyen <code>"a=b\\nc"</code>, <code>"a=b\\tc"</code>, <code>"a=b\\\\c"</code>… todos con algo <em>después</em> de la barra, porque escribir un escape colgando al final no es algo que a nadie se le ocurra a mano. Y como la línea <code>switch s[i]</code> <strong>sí se ejecuta</strong> en los 40 casos, figura como cubierta. El 95,2% es real y es inútil.</p>
+
+<h3>Paso 2 — El fuzz target (9 líneas)</h3>
+
+<pre><code class="lang-go">func FuzzParse(f *testing.F) {
+    // Semillas: reusamos algunos casos de la tabla que ya existía.
+    f.Add("clave=valor")
+    f.Add("[seccion]\nclave=valor")
+    f.Add("# comentario\na=b\\nc")
+    f.Add("")
+
+    f.Fuzz(func(t *testing.T, src string) {
+        entradas, err := Parse(src)     // invariante 1: NO PANIC
+        if err != nil {
+            return
+        }
+        // invariante 2: round-trip
+        vuelta, err := Parse(Render(entradas))
+        if err != nil {
+            t.Fatalf("Render produjo algo que Parse rechaza: %v\nentrada: %q", err, src)
+        }
+        if !slices.Equal(entradas, vuelta) {
+            t.Fatalf("round-trip roto\nsrc:    %q\nprimera: %+v\nsegunda: %+v",
+                src, entradas, vuelta)
+        }
+    })
+}</code></pre>
+
+<h3>Paso 3 — Correrlo</h3>
+
+<pre><code class="lang-bash">$ go test -fuzz=FuzzParse -fuzztime=60s ./kvconf
+fuzz: elapsed: 0s, gathering baseline coverage: 0/4 completed
+fuzz: elapsed: 0s, gathering baseline coverage: 4/4 completed, now fuzzing with 8 workers
+fuzz: elapsed: 3s, execs: 118432 (39477/sec), new interesting: 12 (total: 16)
+--- FAIL: FuzzParse (3.21s)
+    --- FAIL: FuzzParse (0.00s)
+        testing.go:1591: panic: runtime error: index out of range [3] with length 3
+            /app/kvconf/parser.go:41 +0x1a4  kvconf.desescapar
+            /app/kvconf/parser.go:28 +0x2f8  kvconf.Parse
+
+    Failing input written to testdata/fuzz/FuzzParse/a1b2c3d4e5f60718
+    To re-run:
+    go test -run=FuzzParse/a1b2c3d4e5f60718</code></pre>
+
+<p><strong>3,2 segundos.</strong> El archivo minimizado que quedó commiteable:</p>
+
+<pre><code class="lang-bash">$ cat testdata/fuzz/FuzzParse/a1b2c3d4e5f60718
+go test fuzz v1
+string("0=\\")</code></pre>
+
+<p>La entrada mínima es <code>0=\</code>: una clave, un igual, una barra invertida colgando. Cuatro bytes.</p>
+
+<h3>Paso 4 — Arreglar y verificar</h3>
+
+<pre><code class="lang-go">func desescapar(s string) string {
+    var b strings.Builder
+    for i := 0; i &lt; len(s); i++ {
+        if s[i] == '\\' {
+            if i+1 &gt;= len(s) {
+                b.WriteByte('\\')   // barra final literal: decisión explícita
+                break
+            }
+            i++
+            switch s[i] {
+            case 'n':
+                b.WriteByte('\n')
+            case 't':
+                b.WriteByte('\t')
+            default:
+                b.WriteByte(s[i])
+            }
+            continue
+        }
+        b.WriteByte(s[i])
+    }
+    return b.String()
+}</code></pre>
+
+<pre><code class="lang-bash">$ go test ./kvconf                      # el caso de testdata ya corre como regresión
+ok      example.com/kvconf      0.312s
+
+$ go test -fuzz=FuzzParse -fuzztime=5m ./kvconf
+--- FAIL: FuzzParse (11.04s)
+        round-trip roto
+        src:     "a=b c"
+        primera: [{Seccion: Clave:a Valor:b c}]
+        segunda: [{Seccion: Clave:a Valor:b}]
+    Failing input written to testdata/fuzz/FuzzParse/7c9e0f221a3b45d8</code></pre>
+
+<p>Segundo bug, gratis: <code>Render</code> escribe un valor con espacios sin comillar y <code>Parse</code> lo trunca. Eso <strong>ya estaba corrompiendo configuraciones en producción</strong> desde hacía meses, en silencio, sin panic ni error: simplemente perdía datos. Ninguna tabla lo iba a encontrar, porque nadie escribe a mano el caso «valor con espacio en el medio» pensando que es interesante.</p>
+
+<h3>Paso 5 — El costo/beneficio, con la tabla</h3>
+
+<table>
+<thead><tr><th>Enfoque</th><th>Costo de escritura</th><th>Costo en CI</th><th>Bugs de esta clase</th><th>Qué NO encuentra</th></tr></thead>
+<tbody>
+<tr><td>40 casos en tabla</td><td>~3 h (y crece lineal)</td><td>0,3 s</td><td>0 de 2</td><td>Todo lo que no imaginaste</td></tr>
+<tr><td>Subir a 80 casos</td><td>+3 h</td><td>0,4 s</td><td>Probablemente 0 de 2</td><td>Ídem: más de lo mismo</td></tr>
+<tr><td>Fuzz target (no-panic)</td><td>~10 min</td><td>0,05 s (sin <code>-fuzz</code>)</td><td>1 de 2 en 3 s</td><td>Corrección semántica</td></tr>
+<tr><td>Fuzz + round-trip</td><td>~30 min</td><td>0,05 s (sin <code>-fuzz</code>)</td><td>2 de 2 en 11 s</td><td>Reglas de negocio específicas</td></tr>
+<tr><td>Job nocturno <code>-fuzztime=30m</code></td><td>0 (ya está escrito)</td><td>30 min, fuera del <em>path</em></td><td>Los que aparezcan mañana</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La conclusión no es «tirá las tablas».</strong> La tabla y el fuzz responden preguntas distintas y se necesitan las dos. La tabla dice <em>«el descuento de cliente premium es 15%»</em> — el fuzzing jamás va a deducir esa regla de negocio. El fuzzing dice <em>«pase lo que pase, no explota y el round-trip cierra»</em> — la tabla jamás va a llegar a <code>"0=\\"</code>. El error de la mayoría de los equipos no es tener tablas: es <strong>agregar el caso 41 a la tabla en vez de escribir las primeras nueve líneas de un fuzz target</strong>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tenés 95% de coverage y aun así te entró un panic a producción. ¿Qué te está midiendo ese número y qué no?</summary>
+<p>Mide <strong>cobertura de sentencias</strong>: qué porcentaje de las líneas ejecutables se ejecutó alguna vez durante la suite. No mide si hubo asserts, no mide cobertura de ramas dentro de una condición compuesta (<code>a &amp;&amp; b</code> cuenta como cubierta con solo evaluar un caso), y no mide si un test se pondría rojo al romper esa línea. En el ejemplo de <code>desescapar</code>, la línea <code>switch s[i]</code> se ejecutaba en los 40 casos de la tabla y figuraba cubierta al 100%; lo que ningún caso ejercitaba era el <em>valor del índice en el borde</em>, y eso el coverage de sentencias no lo puede ver. La pregunta útil no es «¿cuánto cubro?» sino «si rompo esta línea a propósito, ¿algo se pone rojo?».</p></details>
+
+<details><summary>Tu tabla usa <code>t.Parallel()</code> en cada subtest y desde ayer falla con «database is closed». No tocaste el código de producción. ¿Qué pasó?</summary>
+<p>Casi con seguridad alguien agregó un recurso compartido en el test padre y lo liberó con <code>defer</code>. <code>t.Parallel()</code> suspende el subtest hasta que la <em>función padre retorna</em>, y los <code>defer</code> del padre corren exactamente en ese momento: la conexión se cierra antes de que el primer subtest paralelo arranque. La cura es <code>t.Cleanup(func(){ db.Close() })</code>, que se ejecuta recién cuando terminaron todos los subtests, incluidos los paralelos. Como pista adicional: si el mensaje fuera de carrera de datos y no de recurso cerrado, la sospecha sería otra —una variable capturada del padre que se escribe desde varios subtests—, y ahí lo confirmás con <code>-race</code>.</p></details>
+
+<details><summary>¿Por qué un fake escrito a mano suele envejecer mejor que un mock generado, y en qué tres casos el mock igual gana?</summary>
+<p>Porque el mock verifica <em>interacción</em> (qué métodos se llamaron, con qué argumentos, en qué orden) y la interacción es un detalle de implementación: el día que reemplazás <code>Buscar</code>+<code>Insertar</code> por un <em>upsert</em>, el comportamiento observable es idéntico pero doscientos tests se ponen rojos sin que haya ningún bug. El fake verifica <em>resultado</em> contra un estado coherente, así que sobrevive al refactor. Los tres casos donde el mock gana: interfaces enormes que no controlás (un SDK de nube, un cliente gRPC generado), requisitos que <em>son</em> sobre la interacción («no llamar dos veces al gateway de pagos con el mismo idempotency key»), y contratos auditables donde hay que demostrar que se emitió exactamente un evento por operación.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Table-driven</strong>: nombres que describen la regla rota, <code>t.Run</code> siempre (te da <code>-run</code> por caso), y desde Go 1.22 el <code>c := c</code> sobra. La trampa viva es que <code>defer</code> del padre corre <em>antes</em> que los subtests paralelos: usá <code>t.Cleanup</code>.</li>
+  <li><strong><code>t.Helper()</code></strong> hace que la falla apunte al test y no al helper. No arregla el <code>t.Fatal</code> desde otra goroutine, que mata esa goroutine y deja el test pasando: desde goroutines, <code>t.Errorf</code> o canal de errores.</li>
+  <li><strong>Fuzzing nativo</strong>: escribís invariantes (no panic, round-trip, diferencial), el motor genera y muta guiado por cobertura. El caso que falla se minimiza y se guarda solo en <code>testdata/</code>, y pasa a ser regresión determinista. Sin <code>-fuzz</code> corre en CI en milisegundos; con <code>-fuzz</code> va a un job nocturno.</li>
+  <li><strong>Property-based</strong>: <code>testing.F</code> cubre bytes, strings y números; para estructuras generadas con forma y <em>shrinking</em> real hace falta <code>rapid</code>. <code>testing/quick</code> está congelado, no lo uses.</li>
+  <li><strong>Interfaces en el consumidor</strong> (GS4): una interfaz de un método se implementa a mano en cuatro líneas y hace innecesarios la mayoría de los mocks generados.</li>
+  <li><strong>Fake &gt; mock</strong> por defecto, porque el fake verifica resultado y el mock verifica implementación. El mock gana con SDKs enormes, con requisitos de interacción y con contratos auditables.</li>
+  <li><strong><code>httptest</code></strong>: <code>ResponseRecorder</code> para la lógica del handler (pasando por el mux, si usás <code>{wildcards}</code>), <code>NewServer</code> para probar tu cliente contra HTTP de verdad —reintentos, timeouts, TLS con <code>srv.Client()</code>.</li>
+  <li><strong>Testcontainers</strong> valida lo que ningún fake puede: el SQL, los índices, el driver, los deadlocks. Un contenedor por paquete en <code>TestMain</code>, aislamiento por transacción con rollback, y <code>WithOccurrence(2)</code> en el wait de Postgres.</li>
+  <li><strong>Build tags</strong> separan la suite rápida de la lenta, pero esconden el código del compilador: <code>go vet -tags=integration ./...</code> en CI es obligatorio. <code>testing.Short()</code> cuando solo molesta el tiempo.</li>
+  <li><strong><code>-race</code> y <code>goleak</code></strong>: siempre. El detector es dinámico, así que hay que <em>generar</em> concurrencia (<code>t.Parallel</code>, <code>-count</code>) para que tenga qué observar.</li>
+  <li><strong>Coverage</strong>: usalo por función para encontrar lo menos cubierto y con <code>GOCOVERDIR</code> para detectar código muerto en end-to-end. Como objetivo numérico, es una métrica de vanidad.</li>
+  <li><strong>Flaky</strong>: tiempo real → <code>testing/synctest</code> (Go 1.25+); orden de map → ordenar o <code>cmpopts.SortSlices</code>; puertos → <code>:0</code>; estado global → <code>-shuffle=on</code> para detectarlo y parámetros para curarlo. Reintentar nunca es el arreglo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá una función tuya que parsee texto (una URL, un CSV a mano, un formato de log). Escribí un fuzz target con el único invariante «no panic», corrélo con <code>-fuzztime=2m</code> y documentá qué encontró. Si no encontró nada, agregá un invariante de round-trip y volvé a correr.</li>
+  <li>Agarrá una suite con <code>t.Parallel()</code> y metele un recurso compartido liberado con <code>defer</code> en el padre. Reproducí la falla, entendé el mensaje exacto y arreglala con <code>t.Cleanup</code>. Escribí en dos líneas por qué el orden es ese.</li>
+  <li>Convertí un test que hoy usa <code>time.Sleep</code> a <code>testing/synctest</code>. Medí el antes y el después con <code>go test -count=20</code> y anotá los dos números: cuánto tardaba y cuántas veces falló.</li>
+  <li>Elegí una interfaz de 6+ métodos de tu código y partila en interfaces de uno o dos métodos declaradas en cada paquete consumidor. Contá cuántas líneas de mock generado podés borrar.</li>
+  <li>Escribí un test de repositorio con testcontainers y Postgres: un contenedor por paquete en <code>TestMain</code>, aislamiento por transacción con rollback. Medí el tiempo de la suite antes y después, y decidí con ese número si va con build tag o con <code>testing.Short()</code>.</li>
+  <li>Compilá tu servicio con <code>go build -cover</code>, corré tu suite end-to-end con <code>GOCOVERDIR</code> y sacá el reporte con <code>go tool covdata percent</code>. Buscá un paquete con cobertura cercana a cero y justificá por escrito si hay que testearlo o borrarlo.</li>
+  <li>Corré toda tu suite con <code>go test -race -shuffle=on -count=5 ./...</code>. Por cada falla que aparezca, clasificala en una de las cinco causas de GS6.14 y arreglá la raíz. Prohibido subir un <code>time.Sleep</code> o agregar un <code>t.Skip</code>.</li>
+</ol>
+
+<section class="quiz" id="quizGS6">
+  <style>
+    #quizGS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS6 .q{margin-bottom:1.5rem}
+    #quizGS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS6 .opt:hover{border-color:var(--accent)}
+    #quizGS6 .opt:disabled{cursor:default}
+    #quizGS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS6 .exp.show{display:block}
+    #quizGS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Cuando el motor de fuzzing encuentra una entrada que rompe tu código, ¿qué pasa con esa entrada?</p>
+    <button class="opt">Queda solo en el log de la corrida; si querés conservarla la tenés que copiar a mano a la tabla</button>
+    <button class="opt">Se guarda en la caché de build (<code>$GOCACHE/fuzz</code>), que es lo que se commitea al repo</button>
+    <button class="opt">Se minimiza y se escribe en <code>testdata/fuzz/&lt;Target&gt;/</code>, se commitea, y desde ahí corre como regresión determinista en cada <code>go test</code></button>
+    <div class="exp">Ese es el círculo virtuoso del fuzzing nativo: recorta la entrada al caso mínimo que sigue fallando y la deja como archivo de texto en <code>testdata/</code>. Ese archivo va al repo y a partir de ahí el target —sin <code>-fuzz</code>, en milisegundos— lo corre siempre. El corpus <em>generado</em> sí vive en <code>$GOCACHE/fuzz</code>, pero ese no se commitea y se pierde al limpiar la caché.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. En un test cuyos subtests llaman a <code>t.Parallel()</code>, ¿por qué <code>defer db.Close()</code> en la función padre rompe todo?</p>
+    <button class="opt">Porque <code>defer</code> no se ejecuta nunca en tests que usan subtests</button>
+    <button class="opt">Porque <code>t.Parallel()</code> suspende el subtest hasta que el padre retorna, y los <code>defer</code> del padre corren justo en ese momento: el recurso se cierra antes de que los subtests arranquen</button>
+    <button class="opt">Porque desde Go 1.22 <code>defer</code> quedó deprecado dentro de funciones de test</button>
+    <div class="exp">Ese es el orden real: el subtest paralelo se pausa, el cuerpo del padre termina, corren sus <code>defer</code> y recién ahí se liberan los subtests. La solución es <code>t.Cleanup</code>, que se ejecuta cuando terminaron el test y todos sus subtests. Y ojo: lo del <code>c := c</code> es otro tema distinto, y ese sí dejó de hacer falta en Go 1.22.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu paquete tiene 95% de coverage de sentencias. ¿Qué NO te garantiza ese número?</p>
+    <button class="opt">Que los tests hagan alguna afirmación, que se hayan evaluado ambas ramas de un <code>a &amp;&amp; b</code>, ni que romper una línea cubierta ponga rojo algún test</button>
+    <button class="opt">Que el 95% de los archivos del paquete tengan al menos un test</button>
+    <button class="opt">Nada: el coverage de Go mide ramas, así que un 95% sí garantiza que casi todas las condiciones se probaron</button>
+    <div class="exp">Go mide <strong>sentencias ejecutadas</strong>, no afirmaciones ni ramas. Un test que solo llama a la función da 100% sin verificar nada, y una línea con <code>a &amp;&amp; b</code> figura cubierta aunque nunca se haya evaluado el caso «a verdadero, b falso». Por eso el ejemplo de <code>desescapar</code> tenía 95,2% y aun así un panic: la línea corría en los 40 casos, pero ninguno la ejercitaba en el borde del índice.</div>
+  </div>
+
+  <div class="score" id="scoreGS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para el GS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs5-performance/lecture.html">← GS5: Performance</a>
+  <a href="../gs7-servicios/lecture.html">GS7: Servicios en producción →</a>
+</nav>
+
+</div>
+</body>
+</html>

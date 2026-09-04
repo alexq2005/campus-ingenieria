@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS4 — Tokio en producción · Rust Senior</title>
+  <meta name="description" content="El runtime de Tokio por dentro: multi-thread vs current-thread, work stealing, spawn_blocking, cancel safety en select!, sincronización, backpressure con Semaphore, JoinSet, shutdown ordenado y diagnóstico con tokio-console. Ecosistema 2026: async-std discontinuado (RUSTSEC-2025-0052) e io_uring en Tokio 2.x.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS4</span>
+  <span class="badge">⏱ 50–145 min</span>
+  <span class="badge">🎯 Pre-req: RuS3</span>
+  <span class="badge">🌐 Runtime</span>
+</div>
+
+<article>
+
+<h1>RuS4 — Tokio en producción</h1>
+
+<h2>RuS4.0 Por qué este módulo</h2>
+
+<p>En <a href="../rus3-async-interno/lecture.html">RuS3</a> desarmaste el <code>Future</code>: viste que <code>async fn</code> compila a una máquina de estados, que <code>poll</code> devuelve <code>Pending</code> o <code>Ready</code>, que el <code>Waker</code> es el mecanismo que avisa cuándo volver a intentar, y que <code>Pin</code> existe porque esas máquinas de estados se autoreferencian. Sabés cómo funciona <em>un</em> future. Lo que todavía no sabés es lo que separa un prototipo de un servicio: <strong>quién llama a <code>poll</code>, sobre qué hilos, con qué política, y qué pasa cuando eso se hace mal</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En Rust el lenguaje te da el <code>Future</code>, pero <strong>no te da el ejecutor</strong>. Esa decisión de diseño —única entre los lenguajes con async— significa que el comportamiento en producción de tu servicio no está definido por el compilador sino por una librería que elegís vos. Casi todos los incidentes serios de un servicio async en Rust no son bugs del lenguaje ni de tu lógica: son <strong>desencuentros entre lo que tu código asume del runtime y lo que el runtime realmente hace</strong>. Bloquear un worker, sostener un lock a través de un <code>await</code>, perder datos en un <code>select!</code>, spawnear sin límite. Nada de eso lo detecta el borrow checker.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo ahora. El ecosistema async de Rust pasó cinco años fragmentado, y en 2026 <strong>terminó de consolidarse</strong>: hay un ganador claro, hay un perdedor que fue oficialmente discontinuado con aviso de seguridad, y hay un cambio de arquitectura en el horizonte (io_uring) que va a mover los números de I/O de forma importante. Todo eso cambia qué recomendás, qué leés y qué escribís. Este módulo asume Rust 1.95 y edición 2024.</p>
+
+<h2>RuS4.1 El estado del ecosistema en 2026</h2>
+
+<p>Durante mucho tiempo la respuesta honesta a "qué runtime uso" era "depende". Ya no lo es. <strong>Tokio ganó</strong>, y ganó por goleada: alrededor de <strong>150 millones de descargas por mes</strong> en crates.io, y —lo que importa más— es la dependencia de facto de casi todo el stack de red: <code>hyper</code>, <code>axum</code>, <code>tonic</code>, <code>reqwest</code>, <code>sqlx</code>, <code>aws-sdk-rust</code>, <code>rdkafka</code>, <code>lapin</code>. Si tu servicio habla HTTP, gRPC o con una base de datos, ya estás corriendo sobre Tokio aunque no lo hayas escrito.</p>
+
+<table>
+<thead><tr><th>Runtime</th><th>Estado 2026</th><th>Para qué</th><th>Costo de elegirlo</th></tr></thead>
+<tbody>
+<tr><td><strong>Tokio</strong></td><td>🟢 Estándar de producción · ~150 M descargas/mes</td><td>Servicios de red, backends, CLIs con I/O concurrente, todo lo que use hyper/axum/sqlx</td><td>Binario más grande, superficie de API enorme, features que hay que entender</td></tr>
+<tr><td><strong>smol</strong></td><td>🟢 Vivo y mantenido</td><td>Herramientas chicas, binarios livianos, casos donde querés leer el runtime entero en una tarde</td><td>Ecosistema mucho más chico; muchas librerías te van a arrastrar Tokio igual</td></tr>
+<tr><td><strong>async-std</strong></td><td>🔴 <strong>DISCONTINUADO</strong> · RUSTSEC-2025-0052</td><td><strong>Nada. No lo uses.</strong></td><td>Sin mantenimiento ni parches de seguridad</td></tr>
+<tr><td><strong>Embassy</strong></td><td>🟢 Referencia en embebido</td><td>Microcontroladores, <code>no_std</code>, sin heap ni sistema operativo (lo vemos en RuS8)</td><td>Otro mundo: no comparte librerías con el async de servidor</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>🚨 <code>async-std</code> está oficialmente discontinuado y tiene un aviso de seguridad: RUSTSEC-2025-0052.</strong> Esto importa decirlo fuerte porque hay <em>mucho</em> material todavía en circulación —tutoriales, respuestas de Stack Overflow, libros de 2021, plantillas de proyecto— que lo presenta como la alternativa "más simple" a Tokio. No lo es: es una dependencia sin mantenedor. Si <code>cargo tree</code> te lo muestra, aunque sea transitivo, eso es deuda que hay que sacar. Y si tenés <code>cargo-deny</code> o <code>cargo audit</code> en CI, ya te lo está marcando.
+</div>
+
+<pre><code class="lang-bash"># ¿Lo tenés adentro sin saberlo? Estos dos comandos lo responden.
+cargo tree -i async-std            # quién lo trae, y por qué cadena
+cargo audit                        # avisos RUSTSEC de todo el árbol
+cargo deny check advisories        # lo mismo, pero como gate de CI</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla práctica de 2026: usá Tokio salvo que tengas un motivo escrito para no hacerlo.</strong> "Es más liviano" no es un motivo si igual vas a depender de <code>reqwest</code>. Los motivos válidos son dos: (a) es un binario embebido o de arranque ultra-rápido donde cada kilobyte cuenta y no usás el ecosistema de red, o (b) es <code>no_std</code> sobre hardware, y entonces la respuesta es Embassy. Mezclar dos runtimes en el mismo proceso es posible y es siempre una mala idea: duplicás pools de hilos, duplicás timers, y perdés la mitad de las herramientas de diagnóstico.
+</div>
+
+<h2>RuS4.2 El runtime: dos formas, dos contratos</h2>
+
+<p>Tokio no es "un" runtime: son dos schedulers distintos con propiedades muy distintas, y elegir el equivocado es una de las decisiones que después cuesta caro revertir.</p>
+
+<pre><code class="lang-toml">[dependencies]
+tokio = { version = "1", features = ["full"] }        # para arrancar
+tokio-util = { version = "0.7", features = ["rt"] }   # CancellationToken, codecs
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# En producción no uses "full": listá lo que realmente usás.
+# tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }</code></pre>
+
+<h3>Multi-thread: el default</h3>
+
+<pre><code class="lang-rust">use tokio::runtime::Builder;
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(8)               // default: núcleos disponibles
+        .max_blocking_threads(512)       // default: 512 (pool aparte)
+        .thread_name("api-worker")
+        .enable_all()                    // timers + I/O reactor
+        .build()?;
+
+    rt.block_on(async {
+        servir().await
+    })
+}
+
+// Equivalente declarativo, que es lo que vas a ver el 95% de las veces:
+// #[tokio::main]
+// async fn main() -&gt; anyhow::Result&lt;()&gt; { servir().await }</code></pre>
+
+<p>El scheduler multi-thread usa <strong>work stealing</strong>. Cada worker tiene una cola local de capacidad fija (256 tareas). Cuando spawneás, la tarea va a la cola local del worker que la creó; si esa cola está llena, la mitad se vuelca a una cola global (<em>injector</em>). Cuando un worker se queda sin trabajo, primero mira su cola local, después la global, y si sigue vacío <strong>le roba la mitad de la cola a otro worker elegido al azar</strong>. Hay además una ranura LIFO especial: la última tarea despertada por el worker actual se ejecuta primero, lo cual es una optimización enorme para el patrón "mandar un mensaje y que el otro lado responda", porque los datos siguen calientes en la caché de ese núcleo.</p>
+
+<div class="info">
+  Este diseño explica dos cosas que confunden. Primero: <strong>una tarea puede migrar de hilo entre dos <code>await</code></strong>, por eso <code>tokio::spawn</code> exige <code>Send</code>. Segundo: el trabajo <em>no</em> se reparte equitativamente por diseño, se reparte por robo reactivo, así que un worker atascado no libera sus tareas ya encoladas — nadie le puede robar mientras él no vuelva al bucle del scheduler. Guardá esa frase, es la raíz de la mitad de los incidentes de este módulo.
+</div>
+
+<h3>Current-thread: un solo hilo, cero sincronización</h3>
+
+<pre><code class="lang-rust">use std::rc::Rc;
+use tokio::task::LocalSet;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let local = LocalSet::new();
+
+    local.run_until(async {
+        // Rc NO es Send: en el runtime multi-thread esto ni compila.
+        let compartido = Rc::new(vec![1_u32, 2, 3]);
+        let copia = Rc::clone(&amp;compartido);
+
+        tokio::task::spawn_local(async move {
+            println!("suma = {}", copia.iter().sum::&lt;u32&gt;());
+        })
+        .await
+        .unwrap();
+    })
+    .await;
+}</code></pre>
+
+<p>El runtime <code>current_thread</code> corre todas las tareas en el hilo que llamó a <code>block_on</code>. No hay robo, no hay migración, no hay atómicos en el camino caliente del scheduler. Eso lo hace <strong>más rápido por operación</strong> y <strong>más predecible</strong>, y habilita futures <code>!Send</code> vía <code>spawn_local</code> y <code>LocalSet</code>.</p>
+
+<table>
+<thead><tr><th>Criterio</th><th>Multi-thread</th><th>Current-thread</th></tr></thead>
+<tbody>
+<tr><td>Paralelismo real</td><td>Sí, N workers</td><td>No: concurrencia sin paralelismo</td></tr>
+<tr><td>Futures <code>!Send</code> (<code>Rc</code>, <code>RefCell</code>)</td><td>No (salvo <code>LocalSet</code> dedicado)</td><td>Sí, con <code>spawn_local</code></td></tr>
+<tr><td>Costo por <code>await</code></td><td>Mayor: atómicos, posible migración</td><td>Menor: sin sincronización</td></tr>
+<tr><td>Efecto de bloquear</td><td>Degrada 1/N del runtime</td><td>Congela <strong>todo</strong></td></tr>
+<tr><td>Latencia de cola</td><td>Más variable (robo, contención)</td><td>Más estable y predecible</td></tr>
+<tr><td>Uso típico</td><td>Servicio HTTP/gRPC, worker de colas</td><td>Tests, CLIs, proxies con sharding manual, un runtime por núcleo</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>El patrón "un runtime por núcleo" (thread-per-core).</strong> Algunos servicios de latencia extrema —bases de datos, proxies, sistemas de trading— arrancan <em>N</em> runtimes <code>current_thread</code>, uno pineado a cada núcleo, con <code>SO_REUSEPORT</code> para que el kernel reparta las conexiones. Ganás: cero robo, cero migración, estructuras <code>!Send</code> por shard, colas de latencia mucho más chatas. Perdés: si un shard se desbalancea, nadie lo ayuda. Es una arquitectura, no un flag; no la adoptes sin medir que el work stealing te esté costando de verdad.
+</div>
+
+<div class="mistake">
+  <strong>Error clásico en tests.</strong> <code>#[tokio::test]</code> usa <code>current_thread</code> por defecto. Un test que "pasa siempre" ahí puede fallar en producción porque nunca ejercitó la migración entre hilos ni la contención real. Si tu código va a correr en multi-thread, al menos algunos tests deberían usar <code>#[tokio::test(flavor = "multi_thread", worker_threads = 4)]</code>.
+</div>
+
+<h2>RuS4.3 Tareas: qué es realmente un <code>spawn</code></h2>
+
+<p>Una tarea de Tokio <strong>no es un hilo</strong>. Es una máquina de estados en el heap más un puntero al scheduler. Confundir las dos cosas lleva a diseños equivocados en ambas direcciones: gente que evita spawnear "porque es caro" y gente que spawnea un millón de tareas sin pensar en la memoria.</p>
+
+<pre><code class="lang-rust">use tokio::task::JoinHandle;
+
+async fn procesar(id: u64) -&gt; anyhow::Result&lt;usize&gt; {
+    let cuerpo = reqwest::get(format!("https://api.local/items/{id}"))
+        .await?
+        .bytes()
+        .await?;
+    Ok(cuerpo.len())
+}
+
+#[tokio::main]
+async fn main() {
+    // spawn exige: Future + Send + 'static, y Output: Send + 'static
+    let h: JoinHandle&lt;anyhow::Result&lt;usize&gt;&gt; = tokio::spawn(procesar(42));
+
+    // JoinHandle ES un Future. Resuelve a Result&lt;T, JoinError&gt;.
+    match h.await {
+        Ok(Ok(n))    =&gt; println!("ok, {n} bytes"),
+        Ok(Err(e))   =&gt; eprintln!("la tarea corrió y falló: {e}"),
+        Err(je) if je.is_panic()     =&gt; eprintln!("la tarea entró en pánico"),
+        Err(je) if je.is_cancelled() =&gt; eprintln!("la tarea fue abortada"),
+        Err(e)       =&gt; eprintln!("otro JoinError: {e}"),
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Hay dos niveles de <code>Result</code> y confundirlos es un bug real.</strong> El <code>Result</code> de afuera es del <em>join</em>: dice si la tarea terminó normalmente, si entró en pánico o si fue abortada. El de adentro es el valor que devolvió tu función. Un <code>h.await.unwrap()</code> convierte un pánico de una tarea en un pánico de <em>otra</em> tarea, y ahí es donde los stack traces dejan de servir. Manejá los dos niveles por separado y logueá el <code>JoinError</code> con su causa.
+</div>
+
+<h3>Costo real: los números</h3>
+
+<pre><code class="lang-rust">use std::time::Instant;
+
+#[tokio::main]
+async fn main() {
+    let n = 100_000;
+
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        handles.push(tokio::spawn(async move { i * 2 }));
+    }
+    for h in handles { let _ = h.await; }
+    let dt = t0.elapsed();
+
+    println!("{n} tareas en {dt:?} · {:.0} ns por tarea",
+             dt.as_nanos() as f64 / n as f64);
+    // Orden de magnitud típico: ~200-900 ns por tarea, extremo a extremo.
+    // Un std::thread::spawn + join está en decenas de microsegundos.
+}</code></pre>
+
+<table>
+<thead><tr><th></th><th>Tarea de Tokio</th><th>Hilo del SO</th></tr></thead>
+<tbody>
+<tr><td>Memoria</td><td>Una asignación: header (~64 B) + el tamaño de la máquina de estados</td><td>Stack reservado, típicamente 8 MiB virtuales / 8–64 KiB residentes</td></tr>
+<tr><td>Costo de crear</td><td>Cientos de nanosegundos</td><td>Decenas de microsegundos (syscall)</td></tr>
+<tr><td>Cambio de contexto</td><td>Retorno de función; sin syscall</td><td>Syscall + cruce al kernel</td></tr>
+<tr><td>Cuántas caben</td><td>Cientos de miles, si son chicas</td><td>Miles, y ya duele</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El tamaño de la máquina de estados es tuyo, no de Tokio.</strong> Si tu <code>async fn</code> tiene un <code>[u8; 65536]</code> vivo a través de un <code>await</code>, ese buffer viaja dentro de la tarea y cada instancia pesa 64 KiB. Con 10.000 tareas son 640 MB. La solución no es dejar de spawnear: es sacar el buffer del estado (asignarlo dentro del scope corto, o usar un pool). <code>cargo +nightly rustc -- -Zprint-type-sizes</code> te muestra el tamaño real de cada future.
+</div>
+
+<h3>El detalle que muerde: soltar el <code>JoinHandle</code> no cancela</h3>
+
+<pre><code class="lang-rust">// Esto NO cancela nada: la tarea queda corriendo, huérfana.
+tokio::spawn(async {
+    limpieza_larga().await;   // sigue viva aunque nadie la espere
+});
+
+// Y si entra en pánico, el pánico se queda adentro del JoinError
+// que nadie lee: el servicio pierde una función y no se entera.</code></pre>
+
+<div class="mistake">
+  <strong>Tokio no tiene concurrencia estructurada.</strong> Soltar el <code>JoinHandle</code> <em>desvincula</em> (detach) la tarea: sigue corriendo hasta que termina sola o hasta que se cae el runtime. Esto es distinto de lo que hacen Swift o Kotlin, donde el scope padre cancela a los hijos. Consecuencia práctica: si spawneás y tirás el handle, aceptaste que esa tarea puede seguir viva después de que su "dueño" murió, y que un pánico adentro va a ser invisible. Las dos herramientas para evitarlo son <code>JoinSet</code> (RuS4.9) y <code>CancellationToken</code> (RuS4.5).
+</div>
+
+<h2>RuS4.4 <code>spawn_blocking</code>: el pecado original del async</h2>
+
+<p>Este es, con distancia, el error número uno en servicios async de Rust. Y es traicionero porque <strong>el código compila, los tests pasan, y el problema aparece solo bajo carga</strong>.</p>
+
+<pre><code class="lang-rust">// 🔴 MAL: una operación sincrónica larga adentro de una tarea async.
+async fn manejar(req: Peticion) -&gt; Respuesta {
+    let datos = leer_de_red(&amp;req).await;          // ok, cede el worker
+
+    // Estas tres NO ceden. Mientras corren, el worker está secuestrado:
+    let comprimido = zstd::encode_all(&amp;datos[..], 19).unwrap();  // ~18 ms de CPU
+    let hash       = argon2_hash(&amp;req.password);                 // ~120 ms
+    let cfg        = std::fs::read_to_string("/etc/app.toml");    // syscall bloqueante
+
+    Respuesta::nueva(comprimido, hash, cfg)
+}</code></pre>
+
+<div class="danger">
+  <strong>🚨 Por qué esto congela otras tareas.</strong> El scheduler de Tokio es <strong>cooperativo</strong>: solo puede cambiar de tarea en un punto <code>await</code> que devuelve <code>Pending</code>. Mientras tu función corre CPU sin ceder, el worker está adentro de un único <code>poll</code> y no vuelve al bucle del scheduler. No puede atender su cola local, no puede sacar de la global, y —clave— <strong>nadie le puede robar el trabajo que ya tiene encolado</strong>, porque el robo también lo ejecutan workers y este está ocupado. Con <code>worker_threads = 8</code>, ocho peticiones simultáneas con Argon2 de 120 ms dejan el runtime entero muerto durante 120 ms: no se aceptan conexiones nuevas, no corren los timers, el <code>/health</code> da timeout y el balanceador te saca del pool.
+</div>
+
+<pre><code class="lang-rust">// Demostración mínima: 4 workers, 4 tareas que bloquean, y un "latido"
+// que debería imprimirse cada 100 ms.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        loop {
+            tick.tick().await;
+            println!("latido a los {:?}", t0.elapsed());
+        }
+    });
+
+    for _ in 0..4 {
+        tokio::spawn(async {
+            std::thread::sleep(std::time::Duration::from_secs(2)); // 🔴 bloquea el worker
+        });
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+}
+// Salida real: el latido se imprime una vez, desaparece dos segundos,
+// y después escupe ~20 latidos atrasados de golpe. Eso es tu p99 explotando.</code></pre>
+
+<h3>La corrección</h3>
+
+<pre><code class="lang-rust">// 🟢 BIEN: el trabajo bloqueante va al pool de bloqueo.
+async fn manejar(req: Peticion) -&gt; anyhow::Result&lt;Respuesta&gt; {
+    let datos = leer_de_red(&amp;req).await;
+
+    let comprimido = tokio::task::spawn_blocking(move || {
+        zstd::encode_all(&amp;datos[..], 3)
+    })
+    .await??;    // primer ? = JoinError, segundo ? = el error de zstd
+
+    let pass = req.password.clone();
+    let hash = tokio::task::spawn_blocking(move || argon2_hash(&amp;pass)).await?;
+
+    // Para archivos, mejor la API async nativa que ya usa el pool por dentro:
+    let cfg = tokio::fs::read_to_string("/etc/app.toml").await?;
+
+    Ok(Respuesta::nueva(comprimido, hash, cfg))
+}</code></pre>
+
+<p><code>spawn_blocking</code> manda la clausura a un <strong>pool de hilos separado</strong>, que por defecto crece hasta <code>max_blocking_threads = 512</code> y recicla hilos ociosos a los 10 segundos. Los workers del runtime quedan libres para seguir haciendo I/O. Es el pool que usan por dentro <code>tokio::fs</code> y las resoluciones DNS.</p>
+
+<div class="rule">
+  <strong>📌 <code>spawn_blocking</code> no crea CPU de la nada.</strong> Es la trampa del arreglo a medias: mover la compresión al pool de bloqueo hace que el runtime <em>siga respondiendo</em>, pero si la operación es CPU-bound seguís teniendo el mismo número de núcleos. Con 8 cores y 18 ms de CPU por request, el techo es ~444 req/s, esté donde esté el trabajo. <code>spawn_blocking</code> arregla la <strong>starvation</strong>; el <strong>throughput</strong> lo arreglás bajando el costo, limitando la concurrencia o agregando máquinas. Ver el Worked Example.
+</div>
+
+<table>
+<thead><tr><th>Qué tenés</th><th>Qué usás</th></tr></thead>
+<tbody>
+<tr><td>I/O de red, timers, canales</td><td>La API async normal, <code>.await</code></td></tr>
+<tr><td>Archivos, DNS</td><td><code>tokio::fs</code> / <code>tokio::net::lookup_host</code> (ya van al pool)</td></tr>
+<tr><td>CPU acotada (&lt; 100 µs)</td><td>Directo en la tarea; no vale la pena el salto</td></tr>
+<tr><td>CPU media, mucha concurrencia (cripto, compresión, parseo, imágenes)</td><td><code>spawn_blocking</code> + un <code>Semaphore</code> que lo acote</td></tr>
+<tr><td>Cliente de DB sincrónico, FFI que bloquea</td><td><code>spawn_blocking</code>, o un pool dedicado (<code>deadpool</code>, <code>r2d2</code>)</td></tr>
+<tr><td>CPU pesada y sostenida (batch, ML, render)</td><td><code>rayon</code> en un pool aparte, con un <code>oneshot</code> para devolver el resultado</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">// Puente Tokio -&gt; rayon: el patrón correcto para CPU pesada de verdad.
+async fn calcular(datos: Vec&lt;f64&gt;) -&gt; f64 {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rayon::spawn(move || {
+        use rayon::prelude::*;
+        let r = datos.par_iter().map(|x| x.sqrt()).sum();
+        let _ = tx.send(r);          // si el receptor se fue, no pasa nada
+    });
+    rx.await.expect("el worker de rayon entró en pánico")
+}</code></pre>
+
+<div class="warn">
+  <strong><code>block_in_place</code> es la excepción, no la regla.</strong> <code>tokio::task::block_in_place</code> convierte al worker actual en hilo de bloqueo y avisa al scheduler que mueva el resto de sus tareas a otros workers. Sirve cuando no podés mover el trabajo por un problema de tipos (datos <code>!Send</code> ya en la tarea). Tiene tres letras chicas: solo existe en el runtime multi-thread (en <code>current_thread</code> hace <code>panic!</code>), no ayuda si <em>todos</em> los workers lo hacen a la vez, y sigue costando la redistribución. Preferí <code>spawn_blocking</code>.
+</div>
+
+<h3>El presupuesto cooperativo</h3>
+
+<pre><code class="lang-rust">// Un bucle "async" puede igual monopolizar el worker si nunca devuelve Pending.
+async fn drenar(mut rx: tokio::sync::mpsc::Receiver&lt;Msg&gt;) {
+    while let Some(m) = rx.recv().await {
+        procesar_rapido(&amp;m);      // 5 µs, pero el canal siempre tiene datos
+    }
+    // Sin el "coop budget" esto no cedería nunca.
+}
+
+// Si escribís un bucle CPU largo y querés portarte bien, cedé a mano:
+async fn sumar_mucho(v: &amp;[u64]) -&gt; u64 {
+    let mut acc = 0;
+    for (i, x) in v.iter().enumerate() {
+        acc += *x;
+        if i % 8192 == 0 { tokio::task::yield_now().await; }
+    }
+    acc
+}</code></pre>
+
+<p>Tokio le da a cada tarea un <strong>presupuesto de ~128 operaciones de recurso por <code>poll</code></strong>. Cuando se agota, las operaciones de Tokio (canales, sockets, mutex) empiezan a devolver <code>Pending</code> aunque tengan datos listos, forzando a la tarea a ceder. Eso evita que un consumidor rápido con una cola siempre llena mate a sus vecinos. Pero el presupuesto solo cuenta <em>operaciones de Tokio</em>: un bucle de puro cómputo no lo toca, y ahí tenés que llamar a <code>yield_now</code> vos.</p>
+
+<h2>RuS4.5 Cancelación: abortar, expirar, y no corromper nada</h2>
+
+<p>En RuS3 viste el mecanismo: cancelar un future en Rust es simplemente <strong>dejar de llamar a <code>poll</code> y dropearlo</strong>. Es barato y es instantáneo. También es la fuente de una clase de bugs que no existe en otros lenguajes, porque el punto de cancelación es <em>cualquier</em> <code>await</code>, y el estado a medio construir se va con el <code>Drop</code>.</p>
+
+<h3>Tres herramientas, tres alcances</h3>
+
+<pre><code class="lang-rust">use std::time::Duration;
+use tokio::time::{timeout, error::Elapsed};
+
+// 1) abort(): matar una tarea concreta desde afuera.
+let h = tokio::spawn(async { trabajo_largo().await });
+h.abort();                       // se cancela en su próximo punto de await
+match h.await {
+    Err(e) if e.is_cancelled() =&gt; println!("abortada, como pedimos"),
+    otro =&gt; println!("terminó antes de que llegara el abort: {otro:?}"),
+}
+
+// 2) timeout(): ponerle un límite a una operación.
+let r: Result&lt;Vec&lt;u8&gt;, Elapsed&gt; =
+    timeout(Duration::from_millis(300), bajar_archivo()).await;
+
+match r {
+    Ok(bytes) =&gt; println!("{} bytes", bytes.len()),
+    Err(_)    =&gt; println!("expiró: el future ya fue dropeado"),
+}</code></pre>
+
+<div class="mistake">
+  <strong><code>abort()</code> sobre un <code>spawn_blocking</code> casi no hace nada.</strong> Si la tarea bloqueante todavía no arrancó, se descarta de la cola. Si ya está corriendo, <strong>no hay forma de interrumpirla</strong>: no hay puntos de await donde soltarla, y Tokio no va a matar el hilo. Por eso las operaciones bloqueantes largas necesitan su propio mecanismo de cancelación cooperativa: un <code>AtomicBool</code> que la clausura chequee cada tanto, o la API de cancelación de la librería subyacente.
+</div>
+
+<pre><code class="lang-rust">use tokio_util::sync::CancellationToken;
+
+// 3) CancellationToken: cancelación jerárquica y explícita.
+#[tokio::main]
+async fn main() {
+    let raiz = CancellationToken::new();
+
+    for id in 0..4 {
+        let hijo = raiz.child_token();     // cancelar la raíz cancela a todos
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Rama de cancelación SIEMPRE primero: se lee mejor
+                    // y con `biased` tendría prioridad estricta.
+                    _ = hijo.cancelled() =&gt; {
+                        tracing::info!(id, "cierre pedido, liberando");
+                        break;
+                    }
+                    trabajo = siguiente_item(id) =&gt; {
+                        procesar(trabajo).await;
+                    }
+                }
+            }
+        });
+    }
+
+    tokio::signal::ctrl_c().await.unwrap();
+    raiz.cancel();                          // avisa a todo el árbol de una
+}</code></pre>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Alcance</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>JoinHandle::abort()</code></td><td>Una tarea</td><td>Cancelación puntual desde afuera; la tarea no se entera ni puede limpiar</td></tr>
+<tr><td><code>tokio::time::timeout</code></td><td>Un future</td><td>Límites por operación: llamadas externas, locks, handshakes</td></tr>
+<tr><td><code>CancellationToken</code></td><td>Árbol de tareas</td><td>Shutdown ordenado, cancelar un request completo con sus sub-tareas</td></tr>
+<tr><td><code>JoinSet::abort_all()</code></td><td>Grupo</td><td>Cancelar un lote de trabajo relacionado</td></tr>
+</tbody>
+</table>
+
+<h3>Cancel safety: la trampa que corrompe estado en silencio</h3>
+
+<p>Acá está el tema más difícil de todo el módulo, y el que más caro sale. <code>tokio::select!</code> poliea varios futures y, cuando <strong>uno</strong> termina, <strong>dropea todos los demás a mitad de camino</strong>. Si alguno de esos futures tenía estado adentro suyo, ese estado se va a la basura.</p>
+
+<pre><code class="lang-rust">use tokio::io::AsyncReadExt;
+
+// 🔴 INCORRECTO: read_exact NO es cancel-safe.
+async fn servir(mut sock: tokio::net::TcpStream, tok: CancellationToken) {
+    let mut cabecera = [0u8; 8];
+    loop {
+        tokio::select! {
+            _ = tok.cancelled() =&gt; break,
+
+            r = sock.read_exact(&amp;mut cabecera) =&gt; {
+                // Si `tok.cancelled()` gana mientras read_exact ya leyó 5 de 8
+                // bytes, el future se dropea. Esos 5 bytes YA salieron del socket
+                // y viven en el estado del future que acabamos de tirar.
+                // Se perdieron. En la próxima vuelta el protocolo queda desfasado
+                // y vas a parsear basura, sin ningún error visible.
+                if r.is_err() { break; }
+                manejar(&amp;cabecera).await;
+            }
+        }
+    }
+}</code></pre>
+
+<pre><code class="lang-rust">use futures::StreamExt;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+// 🟢 CORRECTO (opción A): que el estado viva FUERA del future.
+// Framed guarda el buffer parcial en el codec, no en el future de `next()`.
+// Por eso `StreamExt::next` sí es cancel-safe acá.
+async fn servir(sock: tokio::net::TcpStream, tok: CancellationToken) {
+    let mut frames = Framed::new(sock, LengthDelimitedCodec::new());
+    loop {
+        tokio::select! {
+            _ = tok.cancelled() =&gt; break,
+
+            Some(marco) = frames.next() =&gt; {
+                match marco {
+                    Ok(bytes) =&gt; manejar(&amp;bytes).await,
+                    Err(e)    =&gt; { tracing::warn!(%e, "marco inválido"); break; }
+                }
+            }
+            else =&gt; break,   // el stream se terminó
+        }
+    }
+}</code></pre>
+
+<pre><code class="lang-rust">// 🟢 CORRECTO (opción B): pinear el future AFUERA del loop, para que
+// sobreviva entre iteraciones y se siga poleando desde donde iba.
+async fn con_pin(mut sock: tokio::net::TcpStream, tok: CancellationToken) {
+    let mut buf = [0u8; 8];
+    let lectura = sock.read_exact(&amp;mut buf);
+    tokio::pin!(lectura);        // ahora es un &amp;mut a un future estable
+
+    loop {
+        tokio::select! {
+            _ = tok.cancelled() =&gt; break,
+            r = &amp;mut lectura =&gt; {
+                // Al polear `&amp;mut lectura`, si el select pierde esta rama
+                // el future NO se dropea: sigue vivo con sus 5 bytes adentro.
+                if r.is_ok() { manejar(&amp;buf).await; }
+                break;
+            }
+        }
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de cancel safety.</strong> Un future es <em>cancel-safe</em> si dropearlo a medio camino <strong>no pierde información observable</strong>. Antes de meter cualquier future en un <code>select!</code>, buscá la frase "Cancel safety" en su documentación de Tokio — está literalmente documentado método por método. Y si escribís una <code>async fn</code> propia que va a vivir en un <code>select!</code>, documentá vos si es cancel-safe o no. Esa línea de doc vale más que un test.
+</div>
+
+<table>
+<thead><tr><th>✅ Cancel-safe</th><th>❌ NO cancel-safe</th></tr></thead>
+<tbody>
+<tr><td><code>mpsc::Receiver::recv</code></td><td><code>AsyncReadExt::read_exact</code></td></tr>
+<tr><td><code>broadcast::Receiver::recv</code></td><td><code>AsyncWriteExt::write_all</code></td></tr>
+<tr><td><code>oneshot::Receiver</code> (await directo)</td><td><code>AsyncBufReadExt::read_line</code> / <code>read_to_end</code></td></tr>
+<tr><td><code>watch::Receiver::changed</code></td><td>Cualquier <code>async fn</code> tuya que mute estado compartido entre dos <code>await</code></td></tr>
+<tr><td><code>Mutex::lock</code>, <code>Semaphore::acquire</code></td><td>Transacciones a medio camino, contadores incrementados antes de un <code>await</code></td></tr>
+<tr><td><code>time::sleep</code> (pineado), <code>Interval::tick</code></td><td><code>StreamExt::next</code> sobre streams que bufferean adentro del future</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>🚨 Tu propio código también tiene que ser cancel-safe.</strong> El caso más caro que vas a ver: una <code>async fn</code> que descuenta stock, hace <code>await</code> sobre la pasarela de pago y después escribe el pedido. Si vive en un <code>select!</code> con un timeout y el timeout gana, el stock quedó descontado y el pedido nunca existió. El compilador no dice nada. La defensa es de diseño, no de sintaxis: hacé que las operaciones de varios pasos sean idempotentes o transaccionales, y poné el <code>select!</code> en el <em>borde</em> del sistema, no en el medio de la lógica de negocio.
+</div>
+
+<h2>RuS4.6 Sincronización: <code>tokio::sync</code> no reemplaza a <code>std::sync</code></h2>
+
+<p>Es muy común ver código que importa <code>tokio::sync::Mutex</code> en todos lados "porque estamos en async". Está mal, y cuesta rendimiento medible.</p>
+
+<pre><code class="lang-rust">use std::sync::{Arc, Mutex};
+
+// 🟢 Lo normal: el Mutex de std, tomado y soltado sin cruzar un await.
+#[derive(Clone)]
+struct Metricas(Arc&lt;Mutex&lt;Contadores&gt;&gt;);
+
+impl Metricas {
+    fn sumar(&amp;self, ruta: &amp;str) {
+        let mut g = self.0.lock().unwrap();
+        *g.por_ruta.entry(ruta.to_string()).or_insert(0) += 1;
+    }   // el guard muere acá: la sección crítica son nanosegundos
+}
+
+async fn manejar(m: &amp;Metricas, req: &amp;Peticion) -&gt; Respuesta {
+    m.sumar(&amp;req.ruta);                    // sin await adentro del lock
+    let cuerpo = consultar_db(req).await;  // el lock ya se soltó
+    Respuesta::nueva(cuerpo)
+}</code></pre>
+
+<pre><code class="lang-rust">// 🔴 Esto NO COMPILA, y está bien que no compile.
+async fn roto(m: Arc&lt;Mutex&lt;Estado&gt;&gt;) {
+    let g = m.lock().unwrap();
+    guardar_en_db(&amp;*g).await;    // el guard sigue vivo cruzando el await
+    drop(g);
+}
+// error: future cannot be sent between threads safely
+//   within this `async fn`, the trait `Send` is not implemented for
+//   `std::sync::MutexGuard&lt;'_, Estado&gt;`
+//   note: future is not `Send` as this value is used across an await</code></pre>
+
+<div class="info">
+  Ese error de compilación es una de las mejores cosas de Rust async: el <code>MutexGuard</code> de <code>std</code> es <code>!Send</code>, así que sostenerlo a través de un <code>await</code> hace que el future entero sea <code>!Send</code>, y <code>tokio::spawn</code> lo rechaza. El compilador te está bloqueando un deadlock. <strong>Ojo:</strong> en un runtime <code>current_thread</code> con <code>spawn_local</code> sí compila, y ahí el deadlock es real: la tarea A duerme con el lock tomado y la tarea B, en el mismo hilo, se bloquea esperándolo para siempre.
+</div>
+
+<pre><code class="lang-rust">// 🟢 Cuando de verdad necesitás sostener el lock a través de un await:
+use tokio::sync::Mutex as AsyncMutex;
+
+struct Conexion { /* handshake caro, un solo usuario a la vez */ }
+
+async fn enviar(c: &amp;Arc&lt;AsyncMutex&lt;Conexion&gt;&gt;, msg: &amp;[u8]) -&gt; anyhow::Result&lt;()&gt; {
+    let mut g = c.lock().await;      // esperar acá NO bloquea el worker
+    g.escribir(msg).await?;          // el protocolo exige exclusión durante el await
+    g.leer_ack().await?;
+    Ok(())
+}</code></pre>
+
+<table>
+<thead><tr><th></th><th><code>std::sync::Mutex</code></th><th><code>tokio::sync::Mutex</code></th></tr></thead>
+<tbody>
+<tr><td>Sostener a través de <code>.await</code></td><td>No (no compila en <code>spawn</code>)</td><td>Sí, es su razón de existir</td></tr>
+<tr><td>Costo sin contención</td><td>Unos pocos nanosegundos</td><td>Bastante mayor: es un semáforo con cola</td></tr>
+<tr><td>Al esperar</td><td>Bloquea el hilo (🚨 en un worker)</td><td>Cede el worker</td></tr>
+<tr><td>Equidad</td><td>Depende del SO</td><td>FIFO garantizado</td></tr>
+<tr><td>Usable desde código sync</td><td>Sí</td><td>Solo <code>try_lock</code> / <code>blocking_lock</code></td></tr>
+<tr><td><strong>Elegilo cuando…</strong></td><td><strong>Siempre, por defecto</strong></td><td>El await tiene que pasar adentro de la sección crítica</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El árbol de decisión completo.</strong> ¿Podés evitar el estado compartido mandando mensajes por un canal a una tarea dueña? → hacé eso, es lo más rápido y lo más simple de razonar. ¿Es un contador o un flag? → <code>AtomicU64</code> / <code>AtomicBool</code>, sin lock. ¿Es lectura casi siempre y escritura rara? → <code>arc-swap</code> o <code>RwLock</code> de std. ¿Sección crítica corta y sincrónica? → <code>std::sync::Mutex</code>. ¿Hay un <code>await</code> adentro que no podés sacar? → recién ahí <code>tokio::sync::Mutex</code>.
+</div>
+
+<h2>RuS4.7 Los canales, y cuál usar</h2>
+
+<p><code>tokio::sync</code> trae cuatro canales que se parecen y sirven para cosas distintas. Elegir mal el canal es una fuente silenciosa de pérdida de mensajes o de crecimiento de memoria.</p>
+
+<pre><code class="lang-rust">use tokio::sync::mpsc;
+
+// mpsc: muchos productores, UN consumidor. El caballito de batalla.
+#[tokio::main]
+async fn main() {
+    let (tx, mut rx) = mpsc::channel::&lt;Trabajo&gt;(128);   // ACOTADO: 128 en vuelo
+
+    for id in 0..4 {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for t in generar(id) {
+                // send().await espera si el canal está lleno: eso ES backpressure.
+                if tx.send(t).await.is_err() { break; }  // el receptor se fue
+            }
+        });
+    }
+    drop(tx);   // 🔑 soltar el emisor original, si no recv() nunca da None
+
+    while let Some(t) = rx.recv().await {   // recv es cancel-safe
+        procesar(t).await;
+    }
+    println!("todos los emisores cerraron, salimos limpio");
+}</code></pre>
+
+<pre><code class="lang-rust">use tokio::sync::oneshot;
+
+// oneshot: exactamente un valor. El patrón request/response de los actores.
+enum Comando {
+    Leer  { clave: String, resp: oneshot::Sender&lt;Option&lt;String&gt;&gt; },
+    Escribir { clave: String, valor: String, resp: oneshot::Sender&lt;()&gt; },
+}
+
+async fn actor(mut rx: mpsc::Receiver&lt;Comando&gt;) {
+    let mut mapa = std::collections::HashMap::new();   // sin Mutex: hay un solo dueño
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            Comando::Leer { clave, resp } =&gt; {
+                let _ = resp.send(mapa.get(&amp;clave).cloned());
+            }
+            Comando::Escribir { clave, valor, resp } =&gt; {
+                mapa.insert(clave, valor);
+                let _ = resp.send(());
+            }
+        }
+    }
+}
+
+async fn leer(tx: &amp;mpsc::Sender&lt;Comando&gt;, clave: &amp;str) -&gt; anyhow::Result&lt;Option&lt;String&gt;&gt; {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(Comando::Leer { clave: clave.into(), resp: resp_tx }).await?;
+    Ok(resp_rx.await?)
+}</code></pre>
+
+<pre><code class="lang-rust">use tokio::sync::broadcast;
+
+// broadcast: TODOS los receptores ven TODOS los mensajes. Buffer circular.
+let (tx, _) = broadcast::channel::&lt;Evento&gt;(1024);
+
+for _ in 0..3 {
+    let mut rx = tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) =&gt; manejar(ev).await,
+                // 🚨 Lo importante: un receptor lento NO frena a los demás.
+                // Pierde mensajes y te lo dice. Ignorar esto es perder datos en silencio.
+                Err(broadcast::error::RecvError::Lagged(n)) =&gt; {
+                    tracing::warn!(perdidos = n, "receptor atrasado");
+                }
+                Err(broadcast::error::RecvError::Closed) =&gt; break,
+            }
+        }
+    });
+}</code></pre>
+
+<pre><code class="lang-rust">use tokio::sync::watch;
+
+// watch: un solo valor "actual". Los receptores ven el ÚLTIMO, no el historial.
+let (tx, rx) = watch::channel(Config::por_defecto());
+
+// Recargador de configuración
+tokio::spawn(async move {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        if let Ok(nueva) = leer_config().await { let _ = tx.send(nueva); }
+    }
+});
+
+// Consumidor: reacciona solo a los cambios
+let mut rx2 = rx.clone();
+tokio::spawn(async move {
+    while rx2.changed().await.is_ok() {         // cancel-safe
+        let cfg = rx2.borrow_and_update().clone();
+        tracing::info!(?cfg, "config recargada");
+    }
+});</code></pre>
+
+<table>
+<thead><tr><th>Canal</th><th>Forma</th><th>Si el receptor va lento</th><th>Caso típico</th></tr></thead>
+<tbody>
+<tr><td><code>mpsc</code></td><td>N → 1</td><td>Acotado: el emisor espera (backpressure) · Sin acotar: la memoria crece</td><td>Cola de trabajo, pipeline, actor</td></tr>
+<tr><td><code>oneshot</code></td><td>1 → 1, un valor</td><td>N/A</td><td>Devolver un resultado, señalar un evento único</td></tr>
+<tr><td><code>broadcast</code></td><td>N → N, todos ven todo</td><td>Pierde los más viejos y devuelve <code>Lagged(n)</code></td><td>Pub/sub, eventos a todas las conexiones WebSocket</td></tr>
+<tr><td><code>watch</code></td><td>1 → N, solo el último valor</td><td>Se saltea intermedios <em>por diseño</em></td><td>Config en caliente, flag de shutdown, estado de salud</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Dos errores que se repiten.</strong> <strong>(1)</strong> Usar <code>mpsc::unbounded_channel</code> "para que nunca bloquee": lo que hacés es cambiar una espera visible por un crecimiento invisible de memoria hasta el OOM-killer. Un canal sin cota es un bug latente con fecha de vencimiento. <strong>(2)</strong> Olvidarse de dropear el <code>Sender</code> original después de clonarlo: mientras exista un <code>Sender</code> vivo, <code>recv()</code> nunca devuelve <code>None</code> y tu bucle de shutdown se cuelga para siempre.
+</div>
+
+<h2>RuS4.8 Backpressure: por qué "una tarea por request" es un bug</h2>
+
+<p>El patrón más natural del mundo async es también uno de los más peligrosos:</p>
+
+<pre><code class="lang-rust">// 🔴 Sin límite: cada conexión spawnea, y nada dice cuántas caben.
+loop {
+    let (sock, _) = listener.accept().await?;
+    tokio::spawn(async move { manejar(sock).await });   // ¿cuántas? las que vengan
+}</code></pre>
+
+<p>Bajo carga normal esto anda perfecto. Bajo un pico —o un cliente hostil, o una base de datos que se puso lenta y hace que cada request dure 20× más— el número de tareas vivas crece sin techo. Cada una tiene su buffer, su conexión a la DB, su estado. La memoria sube, el <em>pool</em> de la base se agota, las latencias se disparan, y el sistema no se degrada: <strong>colapsa</strong>. Un servidor con backpressure atiende 500 req/s y rechaza el resto con un 503 rápido; uno sin backpressure intenta atender 5.000 y no atiende ninguna.</p>
+
+<pre><code class="lang-rust">use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+// 🟢 Con límite duro de concurrencia.
+#[tokio::main]
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let cupos = Arc::new(Semaphore::new(1_000));       // techo explícito
+
+    loop {
+        let (sock, _) = listener.accept().await?;
+
+        // acquire_owned da un permiso 'static que viaja a la tarea.
+        // El permiso se devuelve solo cuando se dropea al final del scope.
+        let permiso = match Arc::clone(&amp;cupos).try_acquire_owned() {
+            Ok(p)  =&gt; p,
+            Err(_) =&gt; {                                 // saturado: shed load
+                tracing::warn!("capacidad llena, rechazando");
+                responder_503(sock).await;
+                continue;
+            }
+        };
+
+        tokio::spawn(async move {
+            let _permiso = permiso;                     // vive lo que vive la tarea
+            manejar(sock).await;
+        });
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>try_acquire</code> vs <code>acquire</code>: es una decisión de producto, no de código.</strong> <code>acquire().await</code> <em>encola</em> al cliente: la petición espera su turno. <code>try_acquire()</code> <em>rechaza</em> al toque. Encolar sirve para trabajo interno donde nadie está mirando un reloj. Rechazar sirve para tráfico de usuarios, porque una petición encolada 8 segundos ya fue abandonada del otro lado y atenderla es trabajo tirado. La combinación correcta suele ser: <code>timeout(300ms, sem.acquire())</code> — esperás un poquito, y si no hay lugar devolvés 503 con <code>Retry-After</code>.
+</div>
+
+<pre><code class="lang-rust">// Backpressure en una cadena de procesamiento, con canales acotados.
+// Cada etapa frena a la anterior cuando se llena: la presión viaja hacia atrás.
+async fn pipeline() {
+    let (tx_crudo, mut rx_crudo)   = tokio::sync::mpsc::channel::&lt;Crudo&gt;(256);
+    let (tx_listo, mut rx_listo)   = tokio::sync::mpsc::channel::&lt;Listo&gt;(64);
+
+    // Etapa 2: si escribir en la DB va lento, rx_listo se llena,
+    // la etapa 1 se frena en su send().await, y el productor original también.
+    tokio::spawn(async move {
+        while let Some(item) = rx_crudo.recv().await {
+            let listo = transformar(item).await;
+            if tx_listo.send(listo).await.is_err() { break; }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(item) = rx_listo.recv().await {
+            escribir_db(item).await;
+        }
+    });
+
+    let _ = tx_crudo;   // el productor real usa este extremo
+}</code></pre>
+
+<div class="tip">
+  <strong>Limitá también hacia afuera.</strong> El backpressure no es solo defensivo. Un <code>Semaphore</code> alrededor de las llamadas a un servicio externo evita que vos seas el que lo tira abajo, y es la mitad de un circuit breaker. La otra mitad es el timeout. Los dos juntos convierten "un servicio lento me arrastra" en "un servicio lento me devuelve errores rápidos que puedo manejar".
+</div>
+
+<h2>RuS4.9 <code>JoinSet</code>: manejar N tareas sin perder ninguna</h2>
+
+<p>Cuando spawneás un grupo de tareas relacionadas, guardar los handles en un <code>Vec</code> y hacer <code>await</code> uno por uno tiene tres problemas: procesás en orden de creación y no de finalización, un pánico en la tarea 7 lo descubrís recién cuando llegás a ella, y no hay forma limpia de cancelar el grupo entero.</p>
+
+<pre><code class="lang-rust">use tokio::task::JoinSet;
+
+async fn bajar_todo(urls: Vec&lt;String&gt;) -&gt; Vec&lt;(String, usize)&gt; {
+    let mut set = JoinSet::new();
+    let cupos = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+
+    for u in urls {
+        let permiso = std::sync::Arc::clone(&amp;cupos).acquire_owned().await.unwrap();
+        set.spawn(async move {
+            let _p = permiso;
+            let bytes = reqwest::get(&amp;u).await?.bytes().await?;
+            Ok::&lt;_, anyhow::Error&gt;((u, bytes.len()))
+        });
+    }
+
+    let mut salida = Vec::new();
+    // join_next devuelve las tareas EN ORDEN DE FINALIZACIÓN, no de creación.
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(par))  =&gt; salida.push(par),
+            Ok(Err(e))   =&gt; tracing::warn!(%e, "una descarga falló"),
+            Err(je) if je.is_panic() =&gt; tracing::error!("una tarea entró en pánico"),
+            Err(je)      =&gt; tracing::error!(%je, "join falló"),
+        }
+    }
+    salida
+}</code></pre>
+
+<pre><code class="lang-rust">// Patrón "el primero que termine gana, cancelo el resto".
+async fn el_mas_rapido(replicas: Vec&lt;String&gt;) -&gt; anyhow::Result&lt;Datos&gt; {
+    let mut set = JoinSet::new();
+    for r in replicas { set.spawn(consultar(r)); }
+
+    while let Some(res) = set.join_next().await {
+        if let Ok(Ok(d)) = res {
+            set.shutdown().await;   // aborta las que quedan y ESPERA a que mueran
+            return Ok(d);
+        }
+    }
+    anyhow::bail!("todas las réplicas fallaron")
+}</code></pre>
+
+<div class="info">
+  <strong>Dropear un <code>JoinSet</code> aborta todas sus tareas.</strong> Esa es la diferencia grande con un <code>Vec&lt;JoinHandle&gt;</code>, donde soltar los handles deja las tareas huérfanas corriendo. Por eso el <code>JoinSet</code> es la forma más cercana que tiene Tokio a la concurrencia estructurada, y por eso conviene que sea tu default para cualquier grupo de tareas. Cuidado con una letra chica: el <code>drop</code> pide el abort pero no espera; si necesitás la garantía de que terminaron, usá <code>shutdown().await</code>.
+</div>
+
+<div class="warn">
+  <strong>Cuándo NO usar <code>JoinSet</code>.</strong> Si las tareas son homogéneas, ligeras y no necesitás resultados individuales, <code>futures::stream::iter(items).for_each_concurrent(16, |i| async move { ... })</code> es más barato: no spawnea nada, corre todo en la misma tarea con concurrencia acotada. La contra es que no hay paralelismo entre ellas (un solo worker) y un pánico se lleva puesta toda la operación. Usá <code>JoinSet</code> cuando querés paralelismo real y aislamiento de fallas.
+</div>
+
+<h2>RuS4.10 Shutdown ordenado</h2>
+
+<p>Un servicio que muere de golpe con <code>SIGTERM</code> deja peticiones a medias, transacciones sin cerrar y buffers sin volcar. En Kubernetes esto se nota como errores 502 en cada despliegue. El shutdown ordenado tiene cinco pasos y ninguno es opcional.</p>
+
+<div class="step"><strong>1. Escuchar la señal.</strong> <code>SIGTERM</code> en Linux, <code>Ctrl+C</code> en desarrollo. Los dos, siempre.</div>
+<div class="step"><strong>2. Dejar de aceptar trabajo nuevo.</strong> Cerrar el listener y marcar <code>/health</code> como no-listo, para que el balanceador te saque del pool <em>antes</em> de que empieces a cerrar.</div>
+<div class="step"><strong>3. Avisarle a todo el árbol.</strong> Un <code>CancellationToken</code> raíz cancela y cada tarea decide cómo cerrar.</div>
+<div class="step"><strong>4. Drenar.</strong> Esperar a que terminen las peticiones en vuelo, <strong>con un límite de tiempo</strong>.</div>
+<div class="step"><strong>5. Cerrar recursos y salir.</strong> Volcar buffers, cerrar el pool de la DB, y darle al runtime un <code>shutdown_timeout</code> para el pool de bloqueo.</div>
+
+<pre><code class="lang-rust">use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tokio::task::JoinSet;
+
+async fn senal_de_cierre() {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("ctrl_c") };
+
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate()).expect("SIGTERM").recv().await;
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::&lt;()&gt;();
+
+    tokio::select! { _ = ctrl_c =&gt; {}, _ = term =&gt; {} }
+    tracing::info!("señal de cierre recibida");
+}
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    rt.block_on(async {
+        let token = CancellationToken::new();
+        let mut tareas = JoinSet::new();
+
+        // Trabajadores de fondo, cada uno con su hijo del token raíz.
+        for id in 0..4 {
+            let t = token.child_token();
+            tareas.spawn(async move { trabajador(id, t).await });
+        }
+
+        // Servidor HTTP con shutdown integrado (axum / hyper).
+        let t_http = token.child_token();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+        tareas.spawn(async move {
+            axum::serve(listener, rutas())
+                .with_graceful_shutdown(async move { t_http.cancelled().await })
+                .await
+                .map_err(anyhow::Error::from)
+        });
+
+        senal_de_cierre().await;
+        marcar_no_listo();          // paso 2: el balanceador nos saca
+        tokio::time::sleep(Duration::from_secs(2)).await;   // que se entere
+        token.cancel();             // paso 3
+
+        // Paso 4: drenar con techo. Si alguien se cuelga, no nos colgamos con él.
+        match tokio::time::timeout(Duration::from_secs(25), async {
+            while let Some(r) = tareas.join_next().await {
+                if let Err(e) = r { tracing::error!(%e, "tarea terminó mal"); }
+            }
+        }).await {
+            Ok(())  =&gt; tracing::info!("todas las tareas drenaron"),
+            Err(_)  =&gt; { tracing::warn!("timeout de drenaje, abortando"); tareas.abort_all(); }
+        }
+
+        cerrar_pool_db().await;     // paso 5
+        anyhow::Ok(())
+    })?;
+
+    // Le damos 10 s al pool de bloqueo antes de matar el proceso.
+    rt.shutdown_timeout(Duration::from_secs(10));
+    Ok(())
+}</code></pre>
+
+<div class="mistake">
+  <strong>El drenaje sin timeout es peor que no drenar.</strong> Si una tarea tiene un bug y nunca termina, un <code>join_next()</code> sin límite deja el proceso colgado hasta que el orquestador lo mata con <code>SIGKILL</code>: perdiste el shutdown ordenado <em>y</em> además tardaste 30 segundos en morir. Regla: el timeout de drenaje siempre menor al <code>terminationGracePeriodSeconds</code> del pod, con margen.
+</div>
+
+<div class="danger">
+  <strong>🚨 No dropees un <code>Runtime</code> desde adentro de un contexto async.</strong> Hacerlo produce <code>Cannot drop a runtime in a context where blocking is not allowed</code>. Pasa cuando alguien crea un runtime dentro de una <code>async fn</code>, o cuando un <code>Drop</code> de una struct que contiene un <code>Runtime</code> se ejecuta dentro de <code>block_on</code>. Un runtime se crea y se dropea en el <code>main</code> sincrónico, punto.
+</div>
+
+<h2>RuS4.11 Diagnóstico: <code>tracing</code> y <code>tokio-console</code></h2>
+
+<p>Un perfilador de CPU tradicional no sirve para diagnosticar un runtime async. Te va a decir que el 90% del tiempo está en <code>epoll_wait</code>, que es exactamente donde debe estar, y no te va a decir nada sobre las 4.000 tareas que están esperando un permiso que nunca llega. Necesitás herramientas que entiendan el modelo de tareas.</p>
+
+<pre><code class="lang-rust">use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+fn init_telemetria() {
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env()
+              .unwrap_or_else(|_| "info,mi_app=debug".into()))
+        .with(tracing_subscriber::fmt::layer().json())
+        .init();
+}
+
+// #[instrument] crea un span por invocación y lo propaga a través de los await.
+#[tracing::instrument(skip(pool), fields(req_id = %req.id))]
+async fn manejar(pool: &amp;Pool, req: Peticion) -&gt; anyhow::Result&lt;Respuesta&gt; {
+    tracing::debug!(ruta = %req.ruta, "entrando");
+    let fila = consultar(pool, &amp;req).await?;      // hereda el span
+    tracing::info!(filas = 1, "listo");
+    Ok(Respuesta::de(fila))
+}</code></pre>
+
+<p><code>tracing</code> es la base: a diferencia de <code>log</code>, sus <em>spans</em> sobreviven a los <code>await</code> y se propagan a las tareas hijas, así que podés reconstruir el recorrido de una petición aunque haya saltado entre cinco hilos. Encima de eso, <code>tokio-console</code> te muestra el runtime en vivo.</p>
+
+<pre><code class="lang-toml">[dependencies]
+console-subscriber = "0.4"
+
+[build]
+# .cargo/config.toml — tokio-console necesita la instrumentación inestable
+rustflags = ["--cfg", "tokio_unstable"]</code></pre>
+
+<pre><code class="lang-bash"># 1. Instalar la consola (una sola vez)
+cargo install --locked tokio-console
+
+# 2. Compilar y correr el servicio con la instrumentación activada
+RUSTFLAGS="--cfg tokio_unstable" cargo run --release
+
+# 3. En otra terminal, conectarse (por defecto en 127.0.0.1:6669)
+tokio-console
+tokio-console http://mi-host:6669</code></pre>
+
+<pre><code class="lang-rust">fn main() {
+    console_subscriber::init();       // forma rápida
+    // Con más control:
+    // console_subscriber::ConsoleLayer::builder()
+    //     .server_addr(([0, 0, 0, 0], 6669))
+    //     .retention(std::time::Duration::from_secs(60))
+    //     .init();
+    tokio::runtime::Runtime::new().unwrap().block_on(servir());
+}</code></pre>
+
+<p>La consola lista todas las tareas vivas con su nombre, su ubicación en el código, cuántas veces se poleó, y —lo importante— cuánto tiempo estuvo <strong>busy</strong> (poleándose) contra <strong>idle</strong> (esperando). Ese par de números es el diagnóstico:</p>
+
+<table>
+<thead><tr><th>Lo que ves</th><th>Lo que significa</th><th>Dónde mirar</th></tr></thead>
+<tbody>
+<tr><td>Una tarea con <strong>poll times</strong> de milisegundos</td><td>Está bloqueando el worker: hay CPU o I/O sincrónico adentro</td><td>Mover a <code>spawn_blocking</code></td></tr>
+<tr><td>Aviso <em>"task has never yielded"</em></td><td>Un bucle que nunca devuelve <code>Pending</code></td><td><code>yield_now()</code> o rediseñar el bucle</td></tr>
+<tr><td>Miles de tareas <strong>idle</strong> creciendo</td><td>Falta backpressure: se spawnea más rápido de lo que se termina</td><td><code>Semaphore</code>, canal acotado</td></tr>
+<tr><td>Muchos <strong>self-wakes</strong></td><td>La tarea se despierta a sí misma sin progresar: busy-loop disfrazado</td><td>Revisar el <code>Waker</code> del future propio</td></tr>
+<tr><td>Aviso <em>"lost waker"</em></td><td>Una tarea quedó dormida sin nadie que la despierte: está colgada para siempre</td><td>Bug en un future manual o un canal cerrado mal</td></tr>
+<tr><td>Total de tareas estable, latencia alta</td><td>Saturación real de CPU, no starvation</td><td>Bajar el costo por request o sumar núcleos</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Dale nombre a tus tareas.</strong> Con <code>tokio_unstable</code>, <code>tokio::task::Builder::new().name("compresor").spawn(fut)</code> hace que la consola muestre nombres en vez de líneas de código. En un servicio con veinte tipos de tarea, esa diferencia es la que hace usable la herramienta a las tres de la mañana.
+</div>
+
+<h2>RuS4.12 Los cinco errores clásicos</h2>
+
+<table>
+<thead><tr><th>#</th><th>Error</th><th>Síntoma</th><th>Corrección</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Bloquear el runtime (CPU larga, <code>std::fs</code>, <code>std::thread::sleep</code>, cliente sync)</td><td>Latencias en dientes de sierra, <code>/health</code> con timeout, throughput que no sube con más carga</td><td><code>spawn_blocking</code>, APIs async, <code>yield_now</code></td></tr>
+<tr><td>2</td><td><code>std::sync::MutexGuard</code> sostenido a través de un <code>await</code></td><td>No compila en multi-thread; deadlock silencioso en <code>current_thread</code></td><td>Soltar el guard antes del await, o <code>tokio::sync::Mutex</code></td></tr>
+<tr><td>3</td><td>Tareas huérfanas (<code>spawn</code> + tirar el handle)</td><td>Pánicos invisibles, trabajo que sigue después del shutdown, fugas de memoria</td><td><code>JoinSet</code>, <code>CancellationToken</code>, loguear el <code>JoinError</code></td></tr>
+<tr><td>4</td><td>Runtimes anidados (<code>block_on</code> adentro de async)</td><td><code>panic: Cannot start a runtime from within a runtime</code></td><td><code>Handle::current().spawn</code>, o <code>spawn_blocking</code> + <code>Handle::block_on</code></td></tr>
+<tr><td>5</td><td><code>select!</code> con futures no cancel-safe</td><td>Corrupción silenciosa de protocolo, bytes perdidos, estado inconsistente</td><td><code>tokio::pin!</code> afuera del loop, o APIs con estado externo (<code>Framed</code>)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-rust">// 🔴 Error 4 en su forma más común: una librería sync que por dentro
+// crea su propio runtime, llamada desde una tarea async.
+async fn manejar() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let r = rt.block_on(otra_cosa());       // 💥 panic en runtime
+    usar(r);
+}
+
+// 🟢 Si de verdad tenés que llamar código sync que a su vez bloquea
+// esperando un future, el puente correcto es este:
+async fn manejar_bien() {
+    let handle = tokio::runtime::Handle::current();
+    let r = tokio::task::spawn_blocking(move || {
+        // Estamos en el pool de bloqueo: acá SÍ se puede block_on.
+        handle.block_on(otra_cosa())
+    })
+    .await
+    .unwrap();
+    usar(r);
+}</code></pre>
+
+<pre><code class="lang-rust">// 🔴 Error 3 en su forma más costosa: el pánico que nadie ve.
+tokio::spawn(async { reconciliar().await });   // si entra en pánico, silencio total
+
+// 🟢 Un supervisor mínimo: reporta y reinicia con backoff.
+fn supervisar&lt;F, Fut&gt;(nombre: &amp;'static str, hacer: F) -&gt; tokio::task::JoinHandle&lt;()&gt;
+where
+    F: Fn() -&gt; Fut + Send + 'static,
+    Fut: std::future::Future&lt;Output = ()&gt; + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut espera = std::time::Duration::from_millis(100);
+        loop {
+            let h = tokio::spawn(hacer());
+            match h.await {
+                Ok(())  =&gt; { tracing::info!(nombre, "terminó normalmente"); return; }
+                Err(e) if e.is_panic() =&gt; tracing::error!(nombre, "pánico, reiniciando"),
+                Err(e) =&gt; { tracing::warn!(nombre, %e, "abortada"); return; }
+            }
+            tokio::time::sleep(espera).await;
+            espera = (espera * 2).min(std::time::Duration::from_secs(30));
+        }
+    })
+}</code></pre>
+
+<h2>RuS4.13 io_uring y Tokio 2.x</h2>
+
+<p>El modelo de I/O de Tokio 1.x es <em>readiness-based</em>: <code>epoll</code> avisa "este socket tiene datos" y después vos hacés un <code>read()</code>. Son dos viajes al kernel por operación. <strong>io_uring</strong> es <em>completion-based</em>: le enviás la operación al kernel por una cola compartida en memoria y él te avisa cuando ya la completó, sin syscall por operación. Para servicios con muchas operaciones chicas, la diferencia es grande.</p>
+
+<p>El plan del proyecto para <strong>Tokio 2.x</strong> es <strong>estabilizar el soporte de io_uring en Linux</strong>, con ganancias importantes de throughput de I/O. Es el cambio de arquitectura más grande del runtime desde su 1.0.</p>
+
+<div class="rule">
+  <strong>📌 Por qué esto no es un flag y sí un cambio de API.</strong> Con <code>epoll</code>, <code>read(&amp;mut buf)</code> funciona porque el kernel copia mientras vos esperás. Con io_uring, el kernel escribe en tu buffer <strong>después</strong>, de forma asíncrona: si cancelás la operación y liberás el buffer, el kernel escribe en memoria liberada. Por eso las APIs de io_uring pasan buffers <em>por valor</em> y te los devuelven al completar, en vez de tomarlos prestados. Los traits <code>AsyncRead</code> y <code>AsyncWrite</code>, que se basan en <code>&amp;mut [u8]</code>, no mapean directo. Ese es el problema de diseño que hay que resolver, y por eso tardó.
+</div>
+
+<pre><code class="lang-rust">// Así se ve hoy el estilo "ownership-passing" en tokio-uring (experimental).
+// Fijate que el buffer VIAJA hacia adentro y VUELVE con el resultado.
+fn ejemplo() -&gt; std::io::Result&lt;()&gt; {
+    tokio_uring::start(async {
+        let archivo = tokio_uring::fs::File::open("datos.bin").await?;
+        let buf = vec![0u8; 4096];
+
+        // read_at consume el buffer y devuelve (resultado, buffer).
+        let (res, buf) = archivo.read_at(buf, 0).await;
+        let n = res?;
+        println!("{n} bytes: {:?}", &amp;buf[..n.min(16)]);
+        Ok(())
+    })
+}</code></pre>
+
+<div class="warn">
+  <strong>Qué hacer hoy: nada especial, y eso es lo correcto.</strong> No reescribas tu servicio para io_uring. Tres razones concretas. <strong>(1)</strong> Es solo Linux, y con kernel razonablemente nuevo: si desplegás en macOS o Windows necesitás igual el camino <code>epoll</code>. <strong>(2)</strong> Muchos entornos —contenedores con <code>seccomp</code> restrictivo, varios proveedores gestionados— bloquean las syscalls de io_uring por su historial de CVEs, así que la ganancia puede no estar disponible donde corrés. <strong>(3)</strong> La ganancia es en el <em>syscall overhead</em> de I/O; si tu p99 lo domina la base de datos o la CPU de tu propio código, no vas a ver nada. Lo que sí conviene hacer ahora: aislar tu I/O detrás de traits propios, para que el día que llegue el cambio toques una capa y no doscientos archivos.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el servicio que se degrada a 500 req/s</h2>
+
+<blockquote>Un servicio de ingesta acepta documentos por HTTP, los comprime y los guarda en S3. En staging, con 100 req/s, la p99 es de 38 ms. En producción, a 500 req/s, la p99 se va a 2,3 segundos, el <code>/health</code> empieza a dar timeout y Kubernetes reinicia los pods en bucle. La CPU marca 100%. El equipo pide más réplicas. ¿Qué está pasando en realidad?</blockquote>
+
+<p><strong>Paso 1 — No adivinar. Mirar el runtime, no la CPU.</strong> "CPU al 100%" no distingue entre "estamos usando bien la máquina" y "ocho hilos están secuestrados". <code>tokio-console</code> sí lo distingue.</p>
+
+<pre><code class="lang-bash">RUSTFLAGS="--cfg tokio_unstable" cargo build --release
+kubectl port-forward pod/ingesta-7f9c 6669:6669
+tokio-console</code></pre>
+
+<pre><code class="lang-bash"># Lo que muestra la consola (resumido):
+#
+# Tasks: 4187 total, 8 running, 4179 idle
+#
+# ID  Name          Total     Busy      Idle    Polls  Warnings
+# 12  manejar      18.4s     18.1s     0.3s      412   ⚠ poll times &gt; 10ms
+# 47  manejar      17.9s     17.6s     0.3s      398   ⚠ poll times &gt; 10ms
+# 3   health         1.2s      0.0s     1.2s        4
+# 1   accept        42.0s      0.1s    41.9s       12
+#
+# ⚠ 8 tasks have poll times longer than 10ms
+# ⚠ task count growing: 4187 (+340/s)</code></pre>
+
+<p><strong>Paso 2 — Leer el diagnóstico.</strong> Dos hechos, y los dos importan:</p>
+
+<ul>
+  <li><strong>Ocho tareas con <em>busy</em> ≈ <em>total</em>.</strong> Son exactamente los ocho workers. Están adentro de un <code>poll</code> que tarda más de 10 ms. Eso no es I/O: es CPU sincrónica dentro de una tarea async. El <code>accept</code> y el <code>health</code> casi no se poleán porque no hay worker libre que los atienda.</li>
+  <li><strong>El total de tareas crece 340 por segundo.</strong> Llegan 500 req/s y se completan ~160. La diferencia se acumula. Los 2,1 GB de RSS son 4.000 requests en vuelo, cada uno con su cuerpo en memoria.</li>
+</ul>
+
+<pre><code class="lang-rust">// El código culpable, encontrado por la ubicación que reporta la consola:
+async fn manejar(State(app): State&lt;App&gt;, cuerpo: Bytes) -&gt; Result&lt;StatusCode, Error&gt; {
+    let doc = serde_json::from_slice::&lt;Documento&gt;(&amp;cuerpo)?;   // ~0.4 ms, tolerable
+
+    // 🔴 Acá está. zstd nivel 19 sobre ~800 KB: ~18 ms de CPU pura,
+    // sin un solo punto de await donde ceder el worker.
+    let comprimido = zstd::encode_all(&amp;cuerpo[..], 19)?;
+
+    app.s3.put(&amp;doc.clave, comprimido).await?;                 // I/O, esto sí cede
+    Ok(StatusCode::ACCEPTED)
+}</code></pre>
+
+<p><strong>Paso 3 — Hacer la cuenta antes de tocar código.</strong> Este es el paso que casi nadie hace y el que decide todo. 8 núcleos × 1 s ÷ 18 ms = <strong>444 compresiones por segundo</strong>. Es el techo físico. A 500 req/s ofrecidas, el servicio está estructuralmente por encima de su capacidad: <em>ninguna</em> reorganización del código async lo arregla. Y sumar réplicas tampoco, porque cada réplica nueva tiene el mismo techo y el tráfico se reparte — sí ayudaría, pero cuesta plata y no era el problema principal.</p>
+
+<p><strong>Paso 4 — Arreglar por capas, midiendo cada una.</strong></p>
+
+<pre><code class="lang-rust">use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+#[derive(Clone)]
+struct App { s3: Arc&lt;S3&gt;, cupos_cpu: Arc&lt;Semaphore&gt;, nivel: i32 }
+
+// cupos_cpu: Semaphore::new(16) — dos veces los núcleos, para tapar
+// los huecos sin permitir una cola infinita.
+// nivel: 3 en vez de 19.
+
+async fn manejar(State(app): State&lt;App&gt;, cuerpo: Bytes) -&gt; Result&lt;StatusCode, Error&gt; {
+    let doc = serde_json::from_slice::&lt;Documento&gt;(&amp;cuerpo)?;
+
+    // (a) Backpressure: esperamos poquito y, si no hay lugar, 503 rápido.
+    //     Rechazar en 300 ms es infinitamente mejor que responder en 2,3 s.
+    let permiso = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        Arc::clone(&amp;app.cupos_cpu).acquire_owned(),
+    )
+    .await
+    .map_err(|_| Error::Saturado)?      // 503 + Retry-After
+    .expect("el semáforo no se cierra");
+
+    // (b) El trabajo de CPU sale del runtime: los workers quedan libres
+    //     para aceptar conexiones, correr timers y responder /health.
+    let nivel = app.nivel;
+    let comprimido = tokio::task::spawn_blocking(move || {
+        let _p = permiso;                          // el permiso muere con la tarea
+        zstd::encode_all(&amp;cuerpo[..], nivel)       // (c) nivel 3: ~2,4 ms
+    })
+    .await
+    .map_err(|_| Error::Interno)??;
+
+    app.s3.put(&amp;doc.clave, comprimido).await?;
+    Ok(StatusCode::ACCEPTED)
+}</code></pre>
+
+<p><strong>Paso 5 — Los números, etapa por etapa.</strong> Carga constante de 500 req/s durante 10 minutos, 8 núcleos, la misma máquina en las cuatro corridas:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Original</th><th>Solo <code>spawn_blocking</code></th><th>+ <code>Semaphore(16)</code></th><th>+ zstd nivel 3</th></tr></thead>
+<tbody>
+<tr><td>p50 latencia</td><td>820 ms</td><td>210 ms</td><td>240 ms</td><td><strong>12 ms</strong></td></tr>
+<tr><td>p99 latencia</td><td>2 340 ms</td><td>1 890 ms</td><td>318 ms</td><td><strong>41 ms</strong></td></tr>
+<tr><td>Throughput sostenido</td><td>158 req/s</td><td>441 req/s</td><td>444 req/s + 56 rechazadas</td><td><strong>500 req/s, 0 rechazadas</strong></td></tr>
+<tr><td><code>/health</code> p99</td><td>1 900 ms (timeout)</td><td>3 ms</td><td>2 ms</td><td><strong>2 ms</strong></td></tr>
+<tr><td>Tareas vivas (consola)</td><td>4 187 y subiendo</td><td>3 940 y subiendo</td><td>38 estable</td><td><strong>21 estable</strong></td></tr>
+<tr><td>RSS</td><td>2,1 GB y subiendo</td><td>1,9 GB y subiendo</td><td>194 MB</td><td><strong>180 MB</strong></td></tr>
+<tr><td>Ratio de compresión</td><td>3,9×</td><td>3,9×</td><td>3,9×</td><td>3,1×</td></tr>
+</tbody>
+</table>
+
+<p>Lo que enseña cada columna:</p>
+
+<div class="step"><strong><code>spawn_blocking</code> solo</strong> curó la <em>starvation</em>: el <code>/health</code> volvió a 3 ms y el pod dejó de reiniciarse. Pero el throughput apenas subió a 441 req/s y las tareas seguían creciendo — porque el cuello era CPU, y mover trabajo de pool no crea núcleos.</div>
+
+<div class="step"><strong>El <code>Semaphore</code></strong> no mejoró la latencia promedio, y no tenía por qué. Lo que hizo fue <strong>acotar el desastre</strong>: 38 tareas vivas en vez de 4.000, 194 MB en vez de 2,1 GB, y 56 req/s rechazadas con un 503 honesto en 300 ms en lugar de aceptadas y respondidas en 2,3 s. Cambió un colapso silencioso por una degradación visible y medible.</div>
+
+<div class="step"><strong>Bajar el nivel de zstd de 19 a 3</strong> fue el único cambio que subió la capacidad real: 18 ms → 2,4 ms de CPU, o sea de 444 a ~3.300 compresiones/s teóricas. El precio está en la última fila: el ratio bajó de 3,9× a 3,1×, es decir ~25% más de almacenamiento en S3. Esa es la decisión de ingeniería de verdad, y es de producto, no de código.</div>
+
+<div class="rule">
+  <strong>📌 Lo que enseña el ejercicio no es "usá <code>spawn_blocking</code>".</strong> Es el orden del razonamiento: <strong>(1)</strong> medir el runtime, no la CPU, porque "100% de CPU" no distingue trabajo útil de workers secuestrados; <strong>(2)</strong> hacer la cuenta de capacidad <em>antes</em> de tocar código, porque decide si el problema es de arquitectura o de aritmética; <strong>(3)</strong> separar los tres arreglos —starvation, backpressure y costo— porque cada uno resuelve algo distinto y solo el tercero sube el techo; <strong>(4)</strong> dejar el número escrito. Si mañana alguien sube el nivel de compresión "porque ahorra disco", que encuentre en el código el comentario que dice que a nivel 19 el techo es 444 req/s.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué una sola operación bloqueante puede tumbar un runtime multi-thread de 8 workers, si son 8 hilos independientes?</summary>
+<p>Porque el scheduler es cooperativo y el work stealing es reactivo. Un worker que está adentro de un <code>poll</code> largo no vuelve al bucle del scheduler, así que no atiende su cola local ni la global — y, lo más importante, <strong>nadie le puede robar las tareas que ya tiene encoladas</strong>, porque el robo también lo ejecutan workers ocupados. Una sola operación de 120 ms degrada 1/8 del runtime; ocho peticiones concurrentes lo congelan entero: no se aceptan conexiones, no corren los timers, el <code>/health</code> da timeout y el balanceador te saca. En un runtime <code>current_thread</code> alcanza con una.</p></details>
+
+<details><summary>¿Qué significa exactamente que un future sea "cancel-safe", y cómo hago segura una lectura de socket dentro de un <code>select!</code>?</summary>
+<p>Un future es cancel-safe si dropearlo a medio camino no pierde información observable. <code>read_exact</code> no lo es: si leyó 5 de 8 bytes, esos 5 bytes ya salieron del socket y viven <em>dentro</em> del future; al dropearlo se pierden y el protocolo queda desfasado, sin error visible. Hay dos arreglos. El primero es mover el estado afuera del future: un <code>Framed</code> con un codec guarda el buffer parcial en el codec, así que <code>next()</code> sí es cancel-safe. El segundo es crear el future una sola vez fuera del bucle y pinearlo con <code>tokio::pin!</code>, poleando <code>&amp;mut future</code> adentro del <code>select!</code>: si esa rama pierde, el future no se dropea y sigue desde donde iba. Y cuando escribas <code>async fn</code> propias que vayan a un <code>select!</code>, documentá si son cancel-safe.</p></details>
+
+<details><summary>Tenés un <code>HashMap</code> compartido por 200 tareas. ¿<code>std::sync::Mutex</code> o <code>tokio::sync::Mutex</code>?</summary>
+<p>El de <code>std</code>, salvo que haya un <code>await</code> adentro de la sección crítica. Un <code>get</code> o un <code>insert</code> son nanosegundos: tomar el lock, operar y soltarlo antes de cualquier <code>await</code> no bloquea a nadie de forma apreciable, y el <code>Mutex</code> de <code>std</code> es varias veces más barato que el de Tokio, que es un semáforo con cola FIFO donde cada <code>lock()</code> es un punto de suspensión. El de Tokio se justifica solo cuando el <code>await</code> tiene que pasar <em>dentro</em> del lock —por ejemplo un protocolo sobre una conexión que exige exclusión durante el intercambio—. Y si el <code>MutexGuard</code> de <code>std</code> se te cuela a través de un <code>await</code>, el compilador te frena: el guard es <code>!Send</code>, el future deja de ser <code>Send</code> y <code>tokio::spawn</code> lo rechaza. Antes de decidir entre los dos, preguntate si no conviene directamente que una tarea sea dueña del mapa y las demás le hablen por un <code>mpsc</code>.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El ecosistema se consolidó en Tokio</strong> (~150 M descargas/mes). <code>smol</code> es la alternativa liviana viva, Embassy es para embebido, y <strong><code>async-std</code> está discontinuado con aviso de seguridad RUSTSEC-2025-0052: no lo uses y sacalo si aparece en <code>cargo tree</code></strong>.</li>
+  <li>El runtime <strong>multi-thread</strong> usa work stealing y exige <code>Send</code>; el <strong>current-thread</strong> no sincroniza nada, permite futures <code>!Send</code> y da latencias más predecibles, pero un bloqueo lo congela entero.</li>
+  <li>Una <strong>tarea no es un hilo</strong>: cuesta cientos de nanosegundos y una asignación. Soltar el <code>JoinHandle</code> no cancela: desvincula, y el pánico que ocurra adentro se pierde.</li>
+  <li>Meter trabajo bloqueante en una tarea async <strong>congela workers enteros</strong>, porque el scheduler solo cambia de tarea en un <code>await</code>. Se arregla con <code>spawn_blocking</code> — que cura la starvation pero <strong>no crea CPU</strong>.</li>
+  <li><strong>Cancel safety</strong>: <code>select!</code> dropea los futures perdedores a medio camino. <code>read_exact</code> y <code>write_all</code> pierden datos ahí; <code>Framed::next</code> y un future pineado afuera del bucle, no. Buscá "Cancel safety" en la doc de cada método.</li>
+  <li><code>tokio::sync::Mutex</code> <strong>no reemplaza</strong> al de <code>std</code>: usá el de <code>std</code> salvo que necesites sostener el lock a través de un <code>await</code>. Mejor todavía: mensajes por canal a una tarea dueña.</li>
+  <li>Los cuatro canales resuelven cosas distintas: <code>mpsc</code> (cola con backpressure), <code>oneshot</code> (respuesta), <code>broadcast</code> (todos ven todo, con <code>Lagged</code>), <code>watch</code> (solo el último valor).</li>
+  <li><strong>Spawnear una tarea por request sin límite es un bug.</strong> Canales acotados y <code>Semaphore</code> convierten un colapso en una degradación medible con 503 honestos.</li>
+  <li><code>JoinSet</code> es lo más cerca que está Tokio de la concurrencia estructurada: resultados por orden de finalización, y dropearlo aborta el grupo.</li>
+  <li>El <strong>shutdown ordenado</strong> son cinco pasos —señal, dejar de aceptar, cancelar el árbol, drenar <em>con timeout</em>, cerrar recursos— y el timeout de drenaje no es opcional.</li>
+  <li><code>tracing</code> + <code>tokio-console</code> son el diagnóstico correcto: un perfilador de CPU te va a mostrar <code>epoll_wait</code> y no las 4.000 tareas hambrientas.</li>
+  <li><strong>io_uring llega con Tokio 2.x en Linux</strong> y promete ganancias grandes de throughput de I/O, pero cambia la forma de las APIs (buffers por valor). Hoy: no reescribas nada, aislá tu I/O detrás de traits propios.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Reproducí el experimento del latido de RuS4.4 con <code>worker_threads</code> en 1, 2, 4 y 8, y con 1, 4 y 16 tareas bloqueantes. Armá una tabla con el atraso máximo del latido en cada combinación y explicá la fórmula que gobierna el resultado.</li>
+  <li>Escribí un servidor TCP de eco con protocolo por longitud (4 bytes de tamaño + payload) usando <code>read_exact</code> dentro de un <code>select!</code> junto a un <code>CancellationToken</code>. Provocá la cancelación en medio de una lectura parcial y demostrá con capturas de <code>tcpdump</code> o con logs que el protocolo se desfasa. Después reescribilo con <code>Framed</code> + <code>LengthDelimitedCodec</code> y mostrá que ya no pasa.</li>
+  <li>Instrumentá cualquier servicio tuyo con <code>console-subscriber</code> e identificá, con evidencia de la consola, la tarea con mayor tiempo <em>busy</em>. Explicá si eso es correcto o si es un bloqueo disfrazado.</li>
+  <li>Implementá el patrón actor de RuS4.7 (<code>mpsc</code> + <code>oneshot</code>) para un contador compartido y compará su throughput contra <code>Arc&lt;Mutex&lt;u64&gt;&gt;</code> de <code>std</code> y contra <code>Arc&lt;tokio::sync::Mutex&lt;u64&gt;&gt;</code>, con 1, 8 y 64 tareas concurrentes. Los tres números en una tabla, con tu explicación de por qué salen en ese orden.</li>
+  <li>Tomá un servidor sin límite de concurrencia, cargalo con <code>oha</code> o <code>wrk</code> hasta que se caiga, y anotá RSS y p99 en el momento del colapso. Agregale un <code>Semaphore</code> con <code>try_acquire</code> + 503 y repetí exactamente la misma carga. Compará las dos curvas y decidí, con los números, qué valor de permisos elegirías.</li>
+  <li>Escribí el shutdown ordenado completo de RuS4.10 para un servicio con un servidor HTTP, dos trabajadores de fondo y un pool de base de datos. Verificá con <code>kill -TERM</code> que ninguna petición en vuelo se pierde, y que si un trabajador se cuelga a propósito el proceso igual sale dentro del timeout de drenaje.</li>
+  <li>Auditá un proyecto real (tuyo o de código abierto): corré <code>cargo tree -i async-std</code> y <code>cargo audit</code>, y buscá con <code>grep</code> los cinco errores de la tabla de RuS4.12 — <code>std::thread::sleep</code> o <code>std::fs</code> dentro de <code>async fn</code>, <code>Runtime::new</code> anidado, <code>spawn</code> con el handle descartado, <code>select!</code> con <code>read_exact</code> o <code>write_all</code>, y locks de <code>std</code> cerca de un <code>await</code>. Escribí un informe de una carilla con lo que encontraste y su severidad.</li>
+</ol>
+
+<section class="quiz" id="quizRuS4">
+  <style>
+    #quizRuS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS4 .q{margin-bottom:1.5rem}
+    #quizRuS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS4 .opt:hover{border-color:var(--accent)}
+    #quizRuS4 .opt:disabled{cursor:default}
+    #quizRuS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS4 .exp.show{display:block}
+    #quizRuS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un proyecto nuevo de 2026 necesita un runtime async para un servicio HTTP. Un tutorial recomienda <code>async-std</code> "porque su API se parece a la de la librería estándar". ¿Qué respondés?</p>
+    <button class="opt">Es válido: <code>async-std</code> y Tokio son equivalentes, se elige por gusto de API</button>
+    <button class="opt">Conviene <code>async-std</code> para el prototipo y migrar a Tokio si hace falta escalar</button>
+    <button class="opt">Que el tutorial está desactualizado: <code>async-std</code> fue discontinuado y tiene el aviso RUSTSEC-2025-0052; el default de producción es Tokio</button>
+    <div class="exp">El ecosistema se consolidó en Tokio (~150 M descargas/mes) y <code>async-std</code> quedó sin mantenimiento, con aviso de seguridad. No es una preferencia de estilo: es una dependencia que <code>cargo audit</code> marca y que no va a recibir parches. Encima, casi todo el stack de red (hyper, axum, sqlx, reqwest) ya corre sobre Tokio, así que "migrar después" significa reescribir la parte que más duele. La alternativa liviana viva es <code>smol</code>; para embebido, Embassy.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Tu servicio tiene <code>zstd::encode_all</code> (18 ms de CPU) dentro de una <code>async fn</code>, corriendo en un runtime multi-thread de 8 workers. Lo movés a <code>spawn_blocking</code> y medís de nuevo con 500 req/s ofrecidas. ¿Qué esperás ver?</p>
+    <button class="opt">Throughput de 500 req/s y p99 baja: <code>spawn_blocking</code> resuelve el cuello de botella</button>
+    <button class="opt">El <code>/health</code> y el <code>accept</code> vuelven a responder rápido, pero el throughput sigue clavado en ~444 req/s y la cola sigue creciendo</button>
+    <button class="opt">Todo empeora, porque el pool de bloqueo agrega el costo de cambiar de hilo</button>
+    <div class="exp"><code>spawn_blocking</code> cura la <em>starvation</em>: los workers dejan de estar secuestrados, así que el <code>accept</code>, los timers y el <code>/health</code> vuelven a atenderse. Pero no crea CPU: 8 núcleos ÷ 18 ms da un techo de ~444 compresiones/s, esté el trabajo donde esté. Con 500 req/s ofrecidas la cola sigue creciendo y la memoria también. Los otros dos arreglos son distintos y necesarios: un <code>Semaphore</code> que acote la cola (convierte el colapso en 503 honestos) y bajar el costo real por request — que es lo único que sube el techo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Dentro de un <code>select!</code> tenés una rama con <code>sock.read_exact(&amp;mut buf)</code> y otra con <code>token.cancelled()</code>. El token se cancela cuando <code>read_exact</code> ya leyó 5 de los 8 bytes. ¿Qué pasa?</p>
+    <button class="opt">Los 5 bytes se pierden: ya salieron del socket y vivían dentro del future que <code>select!</code> dropeó, así que el protocolo queda desfasado sin ningún error visible</button>
+    <button class="opt">Nada malo: <code>read_exact</code> devuelve los bytes parciales en un <code>Err</code> y podés reintentar</button>
+    <button class="opt">Los 5 bytes vuelven al buffer del socket y la próxima lectura los recupera</button>
+    <div class="exp">Ese es el caso de manual de un future <strong>no cancel-safe</strong>. <code>read_exact</code> acumula lo leído en el estado del propio future; al dropearlo, esos bytes desaparecen y el kernel no los "devuelve" a ningún lado. Como no hay error, el bug se manifiesta más tarde como datos corruptos o un parseo imposible. Las dos correcciones: mover el estado afuera del future (un <code>Framed</code> con codec, cuyo buffer parcial vive en el codec y hace que <code>next()</code> sea cancel-safe) o crear el future una sola vez fuera del bucle, pinearlo con <code>tokio::pin!</code> y polear <code>&amp;mut future</code>, para que perder la rama no lo destruya.</div>
+  </div>
+
+  <div class="score" id="scoreRuS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RuS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus3-async-interno/lecture.html">← RuS3: Async por dentro</a>
+  <a href="../rus5-unsafe/lecture.html">RuS5: Unsafe correcto →</a>
+</nav>
+
+</div>
+</body>
+</html>

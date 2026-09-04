@@ -1,0 +1,1512 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS4 — Interfaces, genéricos y diseño de API · Go Senior</title>
+  <meta name="description" content="Cómo se representa una interfaz por dentro, la trampa del nil tipado, interfaces chicas definidas donde se consumen, genéricos y constraints, GC shape stenciling, genéricos auto-referenciales y errors.AsType[T] de Go 1.26, y diseño de API que no rompe.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS4</span>
+  <span class="badge">⏱ 55–170 min</span>
+  <span class="badge">🎯 Pre-req: GS2</span>
+  <span class="badge">🧬 Tipos</span>
+</div>
+
+<article>
+
+<h1>GS4 — Interfaces, genéricos y diseño de API</h1>
+
+<h2>GS4.0 Por qué este módulo</h2>
+
+<p>Go te sacó casi todas las herramientas con las que otros lenguajes expresan abstracciones. No hay herencia. No hay sobrecarga de funciones ni de operadores. No hay excepciones. No hay parámetros por defecto. No hay <em>tipos suma</em> como valores. Lo que te queda es una lista corta: <strong>structs, interfaces, funciones y —desde 1.18— parámetros de tipo</strong>. Con eso tenés que decir todo.</p>
+
+<p>La consecuencia es incómoda y liberadora al mismo tiempo: en Go <strong>el diseño de tipos <em>es</em> el diseño de la API</strong>. No hay una capa de patrones sobre la cual esconder una mala decisión de tipos. Si elegiste mal la firma de una función, se nota en cada llamada. Si publicaste una interfaz de doce métodos, se nota en cada test de cada usuario de tu librería.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Las decisiones de tipos que más duelen a los seis meses son las que <em>parecían inocentes</em> el día que las tomaste: devolver un tipo concreto de error en vez de <code>error</code>, publicar una interfaz "por si acaso", agregar un parámetro más al constructor, exponer un campo que después no podés cambiar. Ninguna de esas se siente como una decisión de arquitectura cuando la escribís. Todas lo son.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>. <strong>Go 1.26</strong> movió tres piezas de este tablero: los tipos genéricos ya pueden <strong>referirse a sí mismos en su propia lista de parámetros de tipo</strong> (lo que destraba estructuras recursivas y constraints del estilo "el tipo se restringe a sí mismo"), <code>new</code> pasó a aceptar <strong>una expresión</strong> (matando de un plumazo el helper genérico más copiado de la historia de Go), y <code>errors.AsType[T]()</code> llegó a la biblioteca estándar. Nada de eso cambia el lenguaje de raíz, pero sí cambia cuál es el código idiomático a escribir hoy.</p>
+
+<h2>GS4.1 Una interfaz por dentro: dos punteros</h2>
+
+<p>Antes de discutir cuándo usar una interfaz, hay que saber qué <em>es</em>. Un valor de tipo interfaz en Go no es un puntero a un objeto: son <strong>dos palabras</strong> del tamaño de un puntero, siempre.</p>
+
+<pre><code class="lang-go">// runtime/runtime2.go — simplificado
+
+// Interfaz CON métodos (io.Reader, error, tu propia interfaz)
+type iface struct {
+    tab  *itab          // tipo dinámico + tabla de métodos
+    data unsafe.Pointer // puntero al valor concreto
+}
+
+// Interfaz VACÍA: any / interface{}
+type eface struct {
+    _type *_type        // solo el tipo dinámico: no hay métodos que resolver
+    data  unsafe.Pointer
+}
+
+// La itab es lo que hace posible el despacho dinámico
+type itab struct {
+    inter *interfacetype // qué interfaz
+    _type *_type         // qué tipo concreto la satisface
+    hash  uint32
+    _     [4]byte
+    fun   [1]uintptr     // punteros a los métodos (arreglo de largo variable)
+}</code></pre>
+
+<p>Podés verlo sin creerme:</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "fmt"
+    "unsafe"
+)
+
+type Forma interface{ Area() float64 }
+
+type Cuadrado struct{ Lado float64 }
+
+func (c Cuadrado) Area() float64 { return c.Lado * c.Lado }
+
+func main() {
+    var f Forma = Cuadrado{Lado: 3}
+
+    fmt.Println(unsafe.Sizeof(f))   // 16 en 64 bits: DOS palabras, siempre
+
+    // Leemos esas dos palabras crudas (solo para entender; nunca en producción)
+    palabras := *(*[2]uintptr)(unsafe.Pointer(&amp;f))
+    fmt.Printf("itab=%#x  data=%#x\n", palabras[0], palabras[1])
+
+    var vacia Forma
+    fmt.Println(vacia == nil)       // true: LAS DOS palabras están en cero
+}</code></pre>
+
+<p>De esa representación salen tres consecuencias que vas a ver el resto del módulo:</p>
+
+<div class="step"><strong>1. Una interfaz siempre pesa 16 bytes</strong> (en 64 bits), guarde lo que guarde. Un <code>[]any</code> de un millón de elementos son 16 MB solo de cabeceras, más los valores apuntados.</div>
+
+<div class="step"><strong>2. Meter un valor que no es puntero en una interfaz suele mandarlo al heap.</strong> El campo <code>data</code> es un puntero: si guardás un <code>Cuadrado</code>, el compilador tiene que darle una dirección. Eso se llama <em>boxing</em> y lo detectás con el análisis de escape.</div>
+
+<div class="step"><strong>3. Llamar a un método por interfaz es una llamada indirecta.</strong> El destino sale de <code>tab.fun[i]</code> en tiempo de ejecución, así que el compilador normalmente <strong>no puede inlinear</strong> ni optimizar a través de esa llamada. A veces sí, cuando puede <em>devirtualizar</em> porque probó que el tipo dinámico es único.</div>
+
+<pre><code class="lang-bash"># El análisis de escape te dice exactamente qué se fue al heap y por qué
+go build -gcflags='-m -m' ./... 2&gt;&amp;1 | grep -i 'escapes to heap'
+
+# Ejemplo de salida típica:
+#   ./main.go:14:16: Cuadrado{...} escapes to heap:
+#   ./main.go:14:16:   flow: {storage for ... } = &amp;{storage for Cuadrado{...}}
+#   ./main.go:14:16:   from Forma(Cuadrado{...}) (interface-converted)</code></pre>
+
+<div class="info">
+  El compilador tiene una optimización para el caso más común: si el valor que metés en la interfaz es una <strong>constante conocida en compilación</strong> o un entero chico, usa una copia de solo lectura ya existente en vez de asignar. Por eso <code>fmt.Println(1)</code> no asigna pero <code>fmt.Println(x)</code> con <code>x</code> variable sí. No confíes en la regla: medí con <code>-benchmem</code>.
+</div>
+
+<h2>GS4.2 La trampa: una interfaz con un puntero nil NO es nil</h2>
+
+<p>Esta es la trampa más famosa de Go, la que aparece en toda entrevista senior, y la razón por la que hay servicios en producción devolviendo error 500 cuando todo salió bien. Y sale directo de GS4.1.</p>
+
+<div class="rule">
+  <strong>📌 La regla exacta.</strong> Un valor de interfaz es <code>nil</code> <strong>si y solo si sus dos palabras están en cero</strong>: sin tipo dinámico y sin dato. Si le asignás un puntero nil <em>de un tipo concreto</em>, la palabra del tipo queda escrita. La interfaz tiene tipo. Y por lo tanto <strong>no es nil</strong>.
+</div>
+
+<pre><code class="lang-go">package main
+
+import "fmt"
+
+type ErrorValidacion struct{ Campo string }
+
+func (e *ErrorValidacion) Error() string {
+    return "campo inválido: " + e.Campo
+}
+
+// ⚠️ El pecado original: devolver el TIPO CONCRETO en vez de error
+func validar(entrada string) *ErrorValidacion {
+    if entrada == "" {
+        return &amp;ErrorValidacion{Campo: "entrada"}
+    }
+    return nil // esto es un *ErrorValidacion nil
+}
+
+func procesar(entrada string) error {
+    return validar(entrada) // ← acá se convierte a interfaz: tipo=*ErrorValidacion, dato=nil
+}
+
+func main() {
+    err := procesar("todo bien")
+
+    fmt.Println(err == nil) // false   ← el bug
+    fmt.Println(err)        // &lt;nil&gt;    ← y encima IMPRIME como si fuera nil
+    fmt.Printf("%T\n", err) // *main.ErrorValidacion
+
+    if err != nil {
+        fmt.Println("devolvemos 500 al usuario aunque no pasó nada malo")
+    }
+}</code></pre>
+
+<div class="danger">
+  <strong>Por qué muerde específicamente en <code>error</code>.</strong> Porque <code>if err != nil</code> es el idiom más repetido del lenguaje: está en cada línea de cada archivo. Cuando ese chequeo miente, miente en todos lados a la vez. Y el síntoma es cruel: <code>fmt.Println(err)</code> imprime <code>&lt;nil&gt;</code>, porque <code>fmt</code> ve un puntero nil y lo formatea como tal. Vas a leer el log, ver "<code>&lt;nil&gt;</code>", y concluir que el error es nil. No lo es.
+</div>
+
+<p>Si necesitás <em>diagnosticar</em> un caso así en código ajeno, la única forma es preguntar por reflexión:</p>
+
+<pre><code class="lang-go">import "reflect"
+
+// Herramienta de DIAGNÓSTICO, no de producción.
+func esNilDeVerdad(err error) bool {
+    if err == nil {
+        return true // interfaz nil de verdad: dos palabras en cero
+    }
+    v := reflect.ValueOf(err)
+    switch v.Kind() {
+    case reflect.Pointer, reflect.Map, reflect.Slice,
+        reflect.Chan, reflect.Func, reflect.Interface:
+        return v.IsNil() // tiene tipo, pero el dato adentro es nil
+    }
+    return false
+}</code></pre>
+
+<div class="mistake">
+  <strong>No metas esa función en producción.</strong> Es una curita sobre un diseño roto, es lenta, y esconde el problema real en vez de arreglarlo. Si la ves en un code review, el hallazgo no es "esta función es fea": es "hay una función en algún lado devolviendo un tipo concreto de error".
+</div>
+
+<p>El arreglo estructural es de una línea, y es la regla que tenés que internalizar:</p>
+
+<pre><code class="lang-go">// ✅ Devolvé SIEMPRE la interfaz error, nunca el tipo concreto
+func validar(entrada string) error {
+    if entrada == "" {
+        return &amp;ErrorValidacion{Campo: "entrada"}
+    }
+    return nil // nil de la INTERFAZ: las dos palabras en cero
+}</code></pre>
+
+<p>Hay una variante más sutil, con retornos nombrados y <code>defer</code>, que engaña incluso a gente con años de Go:</p>
+
+<pre><code class="lang-go">// ⚠️ Mismo bug, disfrazado
+func abrirYProcesar(ruta string) (err error) {
+    var perr *ErrorValidacion // ← declarado como tipo concreto
+
+    defer func() {
+        err = perr // si perr es nil, err queda como interfaz NO nil
+    }()
+
+    // ... trabajo que puede o no asignar perr ...
+    return nil
+}
+
+// ✅ La corrección: la variable local también es de tipo error
+func abrirYProcesar2(ruta string) (err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("pánico recuperado: %v", r)
+        }
+    }()
+    return nil
+}</code></pre>
+
+<div class="tip">
+  <strong>Ponelo en el CI, no en tu memoria.</strong> <code>staticcheck</code> detecta varios de estos casos (comparaciones imposibles contra <code>nil</code>, retornos de tipo concreto que solo se usan como <code>error</code>). Un linter que corre en cada PR vale más que una regla que vos tenés que recordar a las siete de la tarde de un viernes.
+</div>
+
+<h2>GS4.3 Interfaces implícitas: definilas donde se consumen</h2>
+
+<p>En Java o C# un tipo declara qué interfaces implementa. En Go no: <strong>si tenés los métodos, satisfacés la interfaz</strong>, aunque no sepas que existe, aunque se haya escrito después que vos, aunque esté en un módulo que no importás. Eso no es una curiosidad sintáctica: cambia por completo <em>quién</em> debería declarar la interfaz.</p>
+
+<p>La forma que traés de otros lenguajes es esta, y es la incorrecta:</p>
+
+<pre><code class="lang-go">// ❌ paquete storage: define la interfaz JUNTO a su implementación
+package storage
+
+type Store interface {
+    Get(ctx context.Context, id string) ([]byte, error)
+    Put(ctx context.Context, id string, b []byte) error
+    Delete(ctx context.Context, id string) error
+    List(ctx context.Context, prefijo string) ([]string, error)
+    Stat(ctx context.Context, id string) (Info, error)
+}
+
+type S3Store struct{ /* ... */ }
+
+func NuevoS3(bucket string) Store { /* ... */ } // devuelve la interfaz: peor todavía</code></pre>
+
+<p>¿Qué pasa cuando el paquete <code>report</code> solo necesita leer? Tiene que importar <code>storage</code> para nombrar el tipo del parámetro. Y su test tiene que implementar los <strong>cinco</strong> métodos, aunque use uno. Y el día que <code>storage</code> agregue un sexto método, el test de <code>report</code> deja de compilar sin que nadie haya tocado <code>report</code>.</p>
+
+<pre><code class="lang-go">// ✅ paquete report: declara la interfaz MÁS CHICA que necesita, donde la necesita
+package report
+
+import "context"
+
+// Sin exportar. No hace falta que sea pública para ser útil.
+type lector interface {
+    Get(ctx context.Context, id string) ([]byte, error)
+}
+
+func Generar(ctx context.Context, l lector, ids []string) ([]byte, error) {
+    var salida []byte
+    for _, id := range ids {
+        b, err := l.Get(ctx, id)
+        if err != nil {
+            return nil, fmt.Errorf("report: leyendo %q: %w", id, err)
+        }
+        salida = append(salida, b...)
+    }
+    return salida, nil
+}</code></pre>
+
+<p>Ahora <code>storage</code> puede exportar el struct concreto y no declarar ninguna interfaz. <code>report</code> no importa <code>storage</code> para nada: recibe cualquier cosa que sepa hacer <code>Get</code>. Y el fake del test es esto:</p>
+
+<pre><code class="lang-go">type lectorFalso map[string][]byte
+
+func (l lectorFalso) Get(_ context.Context, id string) ([]byte, error) {
+    b, ok := l[id]
+    if !ok {
+        return nil, fmt.Errorf("no encontrado: %s", id)
+    }
+    return b, nil
+}
+
+func TestGenerar(t *testing.T) {
+    l := lectorFalso{"a": []byte("hola "), "b": []byte("mundo")}
+
+    got, err := report.Generar(context.Background(), l, []string{"a", "b"})
+    if err != nil {
+        t.Fatal(err)
+    }
+    if string(got) != "hola mundo" {
+        t.Fatalf("got %q", got)
+    }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Aceptá interfaces, devolvé structs.</strong> El productor exporta el tipo concreto (<code>func NuevoS3(bucket string) *S3Store</code>). El consumidor declara la interfaz que necesita. Así el productor puede <strong>agregar métodos sin romper a nadie</strong> —agregarle un método a un struct nunca es breaking— y el consumidor puede pedir exactamente lo que usa. Si el productor exporta la interfaz, agregarle un método rompe a todos los que la implementaron.
+</div>
+
+<div class="analogy">
+  <strong>La analogía del enchufe.</strong> El fabricante de la lámpara no define qué es un tomacorriente; define un enchufe que encaja. La forma la define la pared —el que consume—. Si cada fabricante definiera su propio estándar de pared, tendrías que importar la lámpara para poder enchufarla.
+</div>
+
+<h2>GS4.4 Interfaces chicas: por qué <code>io.Reader</code> ganó</h2>
+
+<p>Las dos interfaces más exitosas de la historia de Go tienen un método cada una:</p>
+
+<pre><code class="lang-go">package io
+
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+type Writer interface {
+    Write(p []byte) (n int, err error)
+}</code></pre>
+
+<p>Un método. Con eso se conectan cosas que no se conocen entre sí: un archivo, una conexión TCP, un buffer en memoria, un descompresor gzip, un lector limitado, un hash, el cuerpo de una respuesta HTTP, el <code>stdout</code> de un proceso hijo. Todo eso es intercambiable porque el contrato es diminuto.</p>
+
+<pre><code class="lang-go">// Todo esto compone porque el contrato es de UN método
+r := io.LimitReader(resp.Body, 10&lt;&lt;20)     // máximo 10 MB
+gz, _ := gzip.NewReader(r)                 // descomprimir al vuelo
+h := sha256.New()                          // hash.Hash es un io.Writer
+tee := io.TeeReader(gz, h)                 // leer y hashear en un solo paso
+
+n, err := io.Copy(destino, tee)            // y todo esto sin buffers intermedios</code></pre>
+
+<p>Ahora imaginá esa misma cadena si <code>io.Reader</code> tuviera doce métodos. Cada eslabón tendría que implementar los doce. <code>LimitReader</code> no existiría: nadie escribe un adaptador de doce métodos para limitar bytes.</p>
+
+<table>
+<thead><tr><th>Métodos en la interfaz</th><th>Costo de implementarla</th><th>Costo de un fake en tests</th><th>Componibilidad</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Trivial: cualquier tipo se adapta</td><td>3 líneas</td><td>✅ Adaptadores, decoradores, pipelines</td></tr>
+<tr><td>2–3</td><td>Razonable</td><td>10 líneas</td><td>🟡 Todavía se puede envolver</td></tr>
+<tr><td>5–8</td><td>Solo la implementa quien la diseñó</td><td>Se genera con <code>mockgen</code></td><td>🔴 Cada decorador es un archivo entero</td></tr>
+<tr><td>12+</td><td>Es una clase abstracta disfrazada</td><td>Un archivo generado de 300 líneas</td><td>🔴 Ninguna</td></tr>
+</tbody>
+</table>
+
+<p>Cuando necesitás más de un método, la forma idiomática no es declarar una interfaz gorda: es <strong>componer las chicas</strong>.</p>
+
+<pre><code class="lang-go">package io
+
+type ReadWriter interface {
+    Reader
+    Writer
+}
+
+type ReadWriteCloser interface {
+    Reader
+    Writer
+    Closer
+}</code></pre>
+
+<div class="warn">
+  <strong>Agregarle un método a una interfaz publicada rompe a TODOS los que la implementaron</strong>, incluso a gente que no conocés, en repos que no podés ver. Por eso <code>io.Reader</code> no cambió en quince años. Comparalo con agregar un campo a un struct: eso <strong>no</strong> es breaking (salvo que alguien use literales sin nombres de campo, y ya vamos a ver cómo prevenirlo). Los structs se pueden extender; las interfaces publicadas, prácticamente no.
+</div>
+
+<p>Si querés publicar una interfaz y <em>además</em> conservar la libertad de agregarle métodos, existe el truco de la <strong>interfaz sellada</strong>: un método sin exportar que nadie fuera de tu paquete puede implementar.</p>
+
+<pre><code class="lang-go">package ast
+
+// Nadie fuera de este paquete puede implementar Nodo, porque no puede
+// declarar el método nodo(). Así podemos agregarle métodos a Nodo
+// sin romper a ningún usuario externo.
+type Nodo interface {
+    Pos() int
+    Fin() int
+    nodo() // no exportado: sella la interfaz
+}
+
+type Literal struct{ inicio, fin int }
+
+func (l *Literal) Pos() int { return l.inicio }
+func (l *Literal) Fin() int { return l.fin }
+func (l *Literal) nodo()    {}</code></pre>
+
+<div class="info">
+  Además de proteger la evolución, sellar una interfaz te da lo más parecido a un <strong>tipo suma</strong> que hay en Go: el conjunto de implementaciones es cerrado y conocido, así que un <code>switch</code> de tipos sobre <code>Nodo</code> es exhaustivo por construcción. El compilador no te lo verifica —eso Go no lo tiene— pero al menos nadie puede agregar un caso desde afuera.
+</div>
+
+<h2>GS4.5 Cuándo NO usar una interfaz</h2>
+
+<p>Este patrón está en el 80% de los repos de Go que vas a tocar en tu vida profesional:</p>
+
+<pre><code class="lang-go">// ❌ La abstracción prematura, en su forma más pura
+package usuario
+
+type Servicio interface {
+    Crear(ctx context.Context, u Usuario) (string, error)
+    Obtener(ctx context.Context, id string) (Usuario, error)
+    Actualizar(ctx context.Context, u Usuario) error
+    Borrar(ctx context.Context, id string) error
+}
+
+type servicio struct{ db *sql.DB } // ← única implementación, para siempre
+
+func NuevoServicio(db *sql.DB) Servicio { return &amp;servicio{db: db} }</code></pre>
+
+<p>Los síntomas son inconfundibles: la interfaz y la implementación viven en el mismo archivo, tienen el mismo nombre (uno con mayúscula, otro sin), son 1 a 1, y el constructor devuelve la interfaz. Se hizo "para poder testear" y "por si mañana cambiamos de base".</p>
+
+<p>Qué se paga por eso, concretamente:</p>
+
+<div class="step"><strong>1. Se pierde la documentación.</strong> <code>godoc</code> del método muestra la firma de la interfaz, sin cuerpo, sin comportamiento. Para entender qué hace <code>Crear</code> tenés que buscar a mano quién la implementa.</div>
+
+<div class="step"><strong>2. Se pierde el "ir a la definición".</strong> Tu IDE te lleva a la interfaz, no al código. En una cadena de tres capas hechas así, leer un flujo se vuelve un juego de saltos.</div>
+
+<div class="step"><strong>3. Se pierde despacho estático e inlining.</strong> Cada llamada pasa por la <code>itab</code>. En el 99% de los casos no importa; en el 1% que importa, ya está enterrado bajo diez capas.</div>
+
+<div class="step"><strong>4. Hay que mantener dos cosas sincronizadas.</strong> Cada método nuevo se escribe dos veces. Cada firma que cambia, dos veces.</div>
+
+<div class="step"><strong>5. El test termina probando el mock.</strong> Se genera un mock desde la interfaz, se programa "cuando te llamen con X devolvé Y", y se verifica que se llamó con X. Eso no prueba el sistema: prueba que escribiste dos veces la misma expectativa.</div>
+
+<div class="mistake">
+  <strong>Un mock no cuenta como segunda implementación.</strong> "Tiene dos implementaciones: la real y la de tests" es el argumento circular más común de Go. Si la única razón para que exista la interfaz es el test, primero preguntate si no hay una costura más barata: una función como campo del struct, un <code>httptest.NewServer</code>, un <code>t.TempDir()</code>, una base real en un contenedor.
+</div>
+
+<p>Cuándo una interfaz <strong>sí</strong> se justifica, sin discusión:</p>
+
+<ul>
+  <li>Ya existen <strong>dos o más implementaciones reales</strong> —no una real y un mock—: S3 y disco local, Postgres y SQLite, un transporte HTTP y uno gRPC.</li>
+  <li>Es un <strong>borde real del sistema</strong> que en tests reemplazás por necesidad: el reloj, la red, el generador de aleatorios, el filesystem.</li>
+  <li>Es un <strong>punto de extensión publicado</strong>: querés que los usuarios de tu librería enchufen su propia implementación (<code>http.RoundTripper</code>, <code>slog.Handler</code>, <code>sort.Interface</code>).</li>
+  <li>Necesitás <strong>romper un ciclo de importación</strong> entre dos paquetes que se necesitan mutuamente.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 La regla operativa.</strong> Escribí el struct concreto. Usalo. Cuando aparezca la <em>segunda</em> implementación real, extraé la interfaz —y extraela en el paquete que la consume, con los métodos que ese paquete usa—. Refactorizar un tipo concreto a una interfaz es un cambio mecánico de quince minutos. Desarmar tres capas de interfaces de una sola implementación es un proyecto de dos semanas.
+</div>
+
+<h2>GS4.6 Genéricos: qué problema resolvieron de verdad</h2>
+
+<p>Antes de 1.18 tenías tres formas de escribir código reutilizable sobre tipos: copiar y pegar, <code>interface{}</code> con asserts, o generar código con <code>go generate</code>. Los genéricos mataron la segunda y la tercera <strong>para estructuras de datos y utilidades</strong>. Eso es todo lo que resolvieron, y es muchísimo.</p>
+
+<pre><code class="lang-go">// La versión pre-1.18: dinámica, verbosa, y rota en runtime
+func Min(a, b interface{}) interface{} {
+    switch x := a.(type) {
+    case int:
+        y, ok := b.(int)
+        if !ok {
+            panic("tipos distintos")
+        }
+        if x &lt; y {
+            return x
+        }
+        return y
+    case float64:
+        y, ok := b.(float64)
+        if !ok {
+            panic("tipos distintos")
+        }
+        if x &lt; y {
+            return x
+        }
+        return y
+    }
+    panic("tipo no soportado") // el error llega a las 3 AM, no en compilación
+}
+
+// Y en cada uso, el assert de vuelta:
+m := Min(3, 7).(int)</code></pre>
+
+<pre><code class="lang-go">// La versión 1.18+: una línea de firma, cero asserts, error en compilación
+import "cmp"
+
+func Min[T cmp.Ordered](a, b T) T {
+    if a &lt; b {
+        return a
+    }
+    return b
+}
+
+m := Min(3, 7)        // int, inferido
+s := Min("ada", "go") // string, inferido
+// Min(3, "go")       // ← no compila: "default type string does not match int"</code></pre>
+
+<p>Ahora la parte que casi nadie te cuenta: <strong>qué NO resolvieron</strong>.</p>
+
+<table>
+<thead><tr><th>Lo que la gente espera</th><th>¿Existe en Go?</th><th>Qué hacer en su lugar</th></tr></thead>
+<tbody>
+<tr><td>Parámetros de tipo en <strong>métodos</strong></td><td>❌ No</td><td>Función libre a nivel de paquete</td></tr>
+<tr><td>Covarianza: usar <code>[]Perro</code> como <code>[]Animal</code></td><td>❌ No</td><td>Convertir explícitamente, o usar <code>[]Animal</code> desde el principio</td></tr>
+<tr><td>Sobrecarga de operadores</td><td>❌ No</td><td>Métodos con nombre (<code>Add</code>, <code>Equal</code>)</td></tr>
+<tr><td>Especialización por tipo (como C++)</td><td>❌ No</td><td><code>switch</code> de tipos adentro, o funciones separadas</td></tr>
+<tr><td>Uniones como tipo de un valor</td><td>❌ No</td><td>Interfaz sellada + <code>switch</code> de tipos</td></tr>
+<tr><td>Constraints sobre campos de struct</td><td>❌ No</td><td>Un método de acceso en el constraint</td></tr>
+</tbody>
+</table>
+
+<p>La primera es la que más duele en la práctica, y conviene verla escrita:</p>
+
+<pre><code class="lang-go">type Conjunto[T comparable] struct{ m map[T]struct{} }
+
+// ❌ NO COMPILA: "method must have no type parameters"
+func (s *Conjunto[T]) Mapear[U comparable](f func(T) U) *Conjunto[U] { /* ... */ }
+
+// ✅ La salida obligada: una función a nivel de paquete
+func Mapear[T, U comparable](s *Conjunto[T], f func(T) U) *Conjunto[U] {
+    salida := NuevoConjunto[U]()
+    for v := range s.m {
+        salida.Agregar(f(v))
+    }
+    return salida
+}
+
+// Y por eso se escribe así, y no encadenado:
+nombres := Mapear(usuarios, func(u Usuario) string { return u.Nombre })</code></pre>
+
+<div class="info">
+  Esta restricción no es un olvido: permitir parámetros de tipo en métodos rompería la implementación actual de interfaces, porque la <code>itab</code> tendría que contener un número <em>infinito</em> de instanciaciones posibles del método. Por eso <code>slices.Map</code> no existe como método y toda la stdlib genérica —<code>slices</code>, <code>maps</code>, <code>cmp</code>— son funciones de paquete.
+</div>
+
+<h2>GS4.7 Constraints, <code>comparable</code> y el sombrerito <code>~</code></h2>
+
+<p>Un <em>constraint</em> es una interfaz usada de otra manera: en vez de describir un conjunto de métodos, describe un <strong>conjunto de tipos</strong>.</p>
+
+<pre><code class="lang-go">// Un conjunto de tipos, expresado con una unión
+type Numero interface {
+    ~int | ~int8 | ~int16 | ~int32 | ~int64 |
+        ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 |
+        ~float32 | ~float64
+}
+
+func Sumar[T Numero](xs []T) T {
+    var total T // el valor cero del parámetro de tipo
+    for _, x := range xs {
+        total += x
+    }
+    return total
+}</code></pre>
+
+<p>Ese <code>~</code> es el detalle que separa a quien copió un constraint de Internet de quien entendió el modelo. <code>int</code> significa "exactamente el tipo <code>int</code>". <code>~int</code> significa "<strong>cualquier tipo cuyo tipo subyacente sea <code>int</code></strong>".</p>
+
+<pre><code class="lang-go">type Celsius float64      // tipo propio, subyacente float64
+type IDUsuario int64      // tipo propio, subyacente int64
+
+func main() {
+    temps := []Celsius{20.5, 22.0, 19.5}
+    fmt.Println(Sumar(temps)) // 62 — funciona SOLO gracias a ~float64
+
+    // Si el constraint dijera "float64" sin ~, el compilador tiraría:
+    //   Celsius does not satisfy Numero (possibly missing ~ for float64)
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Si tu constraint enumera tipos, casi siempre querés <code>~</code>.</strong> Sin el sombrerito, tu función genérica deja afuera a todos los tipos con nombre propio: <code>time.Duration</code>, <code>os.FileMode</code>, y cada <code>type MiID int</code> que tenga tu dominio. Y esos son justamente los tipos que más querés que funcionen.
+</div>
+
+<p>La biblioteca estándar ya te da los constraints que necesitás el 90% del tiempo:</p>
+
+<pre><code class="lang-go">import "cmp"
+
+// cmp.Ordered — todo lo que soporta &lt; &lt;= &gt; &gt;= (enteros, floats, strings)
+func Maximo[T cmp.Ordered](xs []T) (T, bool) {
+    if len(xs) == 0 {
+        var cero T
+        return cero, false
+    }
+    m := xs[0]
+    for _, x := range xs[1:] {
+        if x &gt; m {
+            m = x
+        }
+    }
+    return m, true
+}
+
+// comparable — todo lo que soporta == y != (o sea, todo lo que puede ser clave de map)
+func Indice[T comparable](xs []T, buscado T) int {
+    for i, x := range xs {
+        if x == buscado {
+            return i
+        }
+    }
+    return -1
+}</code></pre>
+
+<div class="warn">
+  <strong>Ojo con <code>comparable</code>.</strong> Desde Go 1.20 lo satisfacen también los tipos que son comparables "en sentido amplio", como <code>any</code>. Eso significa que <code>Indice[any]</code> <strong>compila</strong>, pero si adentro de esos <code>any</code> hay un slice o un map, el <code>==</code> <strong>entra en pánico en runtime</strong>. El constraint te garantiza que el operador existe, no que sea seguro con el contenido que le metas.
+</div>
+
+<p>Un constraint también puede mezclar métodos con el conjunto de tipos, y ahí aparece la regla que confunde a todos:</p>
+
+<pre><code class="lang-go">// ✅ Constraint con método: perfectamente usable, y además usable como tipo
+type Nombrable interface {
+    Nombre() string
+}
+
+// ✅ Constraint mezclando conjunto de tipos y método
+type ClaveTexto interface {
+    ~string
+    // (los tipos del conjunto deben tener también los métodos declarados)
+}
+
+// ⚠️ Una interfaz con UNIÓN de tipos solo sirve como constraint
+type Numero interface{ ~int | ~float64 }
+
+var n Numero // ❌ no compila:
+             // "cannot use type Numero outside a type constraint:
+             //  interface contains type constraints"</code></pre>
+
+<h3>Inferencia: hasta dónde llega</h3>
+
+<p>Go infiere los argumentos de tipo <strong>a partir de los argumentos de la función</strong>. Nunca a partir del tipo de retorno esperado.</p>
+
+<pre><code class="lang-go">// ✅ Inferido: T sale de xs
+total := Sumar([]int{1, 2, 3})
+
+// ✅ Inferido en cadena: T sale de xs, U sale del tipo de retorno de f
+nombres := Mapear(usuarios, func(u Usuario) string { return u.Nombre })
+
+// ❌ NO se puede inferir: no hay ningún argumento del que sacar T
+// c := NuevoConjunto()
+// ✅ Hay que decirlo
+c := NuevoConjunto[string]()
+
+// ❌ Tampoco desde la variable de destino: Go no infiere "hacia atrás"
+// var s Conjunto[int] = NuevoConjunto()
+
+// ⚠️ Caso clásico que sorprende: T se infiere del PRIMER argumento
+Min(3, 7)      // T = int
+Min(3, 7.5)    // T = float64 (3 es constante sin tipo, se adapta)
+// Min(x, 7.5) con x int declarado → error: no hay un T que sirva</code></pre>
+
+<div class="tip">
+  Cuando una función genérica no te infiere, no pelees: <strong>escribí el argumento de tipo</strong>. <code>NuevoConjunto[string]()</code> es más legible que tres capas de trucos para que la inferencia funcione. Y si tu API obliga al usuario a escribir los tipos siempre, es señal de que hay un parámetro de tipo que sobra.
+</div>
+
+<h2>GS4.8 Genéricos vs interfaces: la regla práctica</h2>
+
+<p>Los dos mecanismos parametrizan código. Pero parametrizan <strong>cosas distintas</strong>, y confundirlos es la fuente principal de código genérico malo.</p>
+
+<div class="concept">
+  <strong>💡 Los genéricos parametrizan DATOS. Las interfaces parametrizan COMPORTAMIENTO.</strong> Un genérico dice "esta estructura funciona con cualquier tipo de elemento, y lo resuelvo en compilación". Una interfaz dice "este agujero lo llena cualquiera que sepa hacer estas cosas, y lo resuelvo en ejecución". Si tu pregunta es "¿qué guarda?", es un genérico. Si es "¿quién lo hace?", es una interfaz.
+</div>
+
+<table>
+<thead><tr><th>Necesidad</th><th>Herramienta</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Contenedor tipado: lista, set, caché, cola, árbol</td><td><strong>Genéricos</strong></td><td>Preserva el tipo del elemento, sin assert ni boxing</td></tr>
+<tr><td>Utilidad sobre colecciones: <code>Map</code>, <code>Filter</code>, <code>Keys</code></td><td><strong>Genéricos</strong></td><td>Misma lógica, cualquier tipo de elemento</td></tr>
+<tr><td>Comportamiento intercambiable: storage, transporte, reloj</td><td><strong>Interfaz</strong></td><td>Se elige la implementación en runtime</td></tr>
+<tr><td>Punto de extensión para usuarios de tu librería</td><td><strong>Interfaz</strong></td><td>Pueden implementarla sin tocar tu código</td></tr>
+<tr><td>Elegir implementación según un archivo de config</td><td><strong>Interfaz</strong></td><td>Los genéricos se resuelven en compilación; la config, no</td></tr>
+<tr><td>Guardar cosas heterogéneas en un mismo slice</td><td><strong>Interfaz</strong></td><td>Un <code>[]T</code> genérico es homogéneo por definición</td></tr>
+<tr><td>Devolver "esto o aquello" según el caso</td><td><strong>Interfaz sellada</strong></td><td>Go no tiene uniones como valores</td></tr>
+</tbody>
+</table>
+
+<p>El antipatrón concreto: usar un parámetro de tipo donde alcanzaba un parámetro de interfaz.</p>
+
+<pre><code class="lang-go">// ❌ Genérico sin motivo: el parámetro de tipo no aporta nada
+func Guardar[S Store](s S, id string, b []byte) error {
+    return s.Put(id, b)
+}
+
+// ✅ Lo mismo, más simple, y una sola copia en el binario
+func Guardar(s Store, id string, b []byte) error {
+    return s.Put(id, b)
+}</code></pre>
+
+<p>La versión genérica genera una instanciación por cada implementación de <code>Store</code> que la llame, engorda el binario, alarga la compilación, y no gana nada: adentro igual llama a un método por diccionario. Solo tiene sentido si <strong>medís</strong> que en un camino caliente el compilador logra devirtualizar e inlinear la llamada. Eso pasa, pero es raro, y sin un benchmark no lo sabés.</p>
+
+<div class="mistake">
+  <strong>El síntoma de que te fuiste al pasto:</strong> una firma con tres o más parámetros de tipo donde alguno aparece una sola vez en toda la función. Si <code>U</code> aparece solo en la posición de un parámetro y nunca en el retorno ni en el cuerpo, ese <code>U</code> quería ser una interfaz.
+</div>
+
+<h2>GS4.9 Genéricos auto-referenciales — la novedad de Go 1.26</h2>
+
+<p>Hay un patrón que en otros lenguajes tiene nombre propio —CRTP en C++, <em>self type</em> en Scala— y que en Go venía chocando contra una restricción del compilador: <strong>un tipo genérico no podía nombrarse a sí mismo dentro de su propia lista de parámetros de tipo</strong>. Go 1.26 levantó esa restricción.</p>
+
+<p>El caso de uso es el de "un tipo que se restringe a sí mismo": quiero exigir que un método devuelva <em>el tipo concreto</em>, no la interfaz.</p>
+
+<pre><code class="lang-go">// ✅ Go 1.26: Combinable aparece en SU PROPIA lista de parámetros de tipo
+type Combinable[T Combinable[T]] interface {
+    Combinar(T) T
+    Cero() T
+}
+
+// Ahora un tipo concreto se ata a sí mismo, y el compilador lo verifica
+type Total float64
+
+func (t Total) Combinar(o Total) Total { return t + o }
+func (t Total) Cero() Total            { return 0 }
+
+func Plegar[T Combinable[T]](xs []T) T {
+    var acc T
+    if len(xs) == 0 {
+        return acc
+    }
+    acc = xs[0].Cero()
+    for _, x := range xs {
+        acc = acc.Combinar(x)
+    }
+    return acc
+}</code></pre>
+
+<p>Lo que gana es preciso: <code>Combinar</code> devuelve <code>Total</code>, no <code>Combinable</code>. No hay conversión, no hay assert, no hay interfaz en el medio, y el compilador te impide que <code>Total.Combinar</code> devuelva otra cosa por error.</p>
+
+<p>Hasta 1.25 el rodeo era alguno de estos tres, todos peores:</p>
+
+<pre><code class="lang-go">// Rodeo A — parámetro de tipo extra, y el usuario se repite
+type Combinable2[T any] interface {
+    Combinar(T) T
+}
+// El llamador tiene que escribir el tipo dos veces y nada garantiza que
+// coincidan con el receptor:
+func Plegar2[T Combinable2[T]](xs []T) T { /* ... */ }
+
+// Rodeo B — devolver la interfaz y perder el tipo concreto
+type Combinable3 interface {
+    Combinar(Combinable3) Combinable3 // ← cada uso necesita un type assert
+}
+
+// Rodeo C — any y verificar en runtime
+func Plegar3(xs []any) any { /* asserts y pánicos */ }</code></pre>
+
+<p>Y la misma relajación aplica a structs recursivos que antes había que partir en dos declaraciones:</p>
+
+<pre><code class="lang-go">// ✅ Go 1.26: un nodo que exige que sus hijos sean del mismo tipo que él
+type Nodo[T Nodo[T]] struct {
+    Hijos []T
+}</code></pre>
+
+<div class="warn">
+  <strong>Verificá la versión antes de escribir esto.</strong> En Go 1.25 y anteriores, estas declaraciones son un <strong>error de compilación</strong> (<em>invalid recursive type</em> / ciclo de instanciación), no una advertencia. Si tu módulo declara <code>go 1.24</code> en el <code>go.mod</code>, no vas a poder usarlo aunque tengas el toolchain nuevo instalado: la versión del lenguaje la fija el <code>go.mod</code>, no el compilador que tenés en la máquina.
+</div>
+
+<h3>Y de paso: <code>new</code> con expresión</h3>
+
+<p>La otra novedad de 1.26 que toca directamente el diseño de API: <code>new</code> ahora acepta una expresión, no solo un tipo.</p>
+
+<pre><code class="lang-go">// Antes: el helper genérico más copiado de la historia de Go
+func ptr[T any](v T) *T { return &amp;v }
+
+cfg := Config{
+    Timeout: ptr(5 * time.Second),
+    Reintentos: ptr(3),
+}
+
+// Go 1.26: viene de fábrica
+cfg := Config{
+    Timeout:    new(5 * time.Second), // *time.Duration
+    Reintentos: new(3),               // *int
+}
+
+p := new(42)  // *int apuntando a 42
+q := new(int) // *int apuntando a 0 — la forma vieja sigue funcionando</code></pre>
+
+<div class="tip">
+  Esto importa más de lo que parece para el diseño de structs de configuración. La única forma de distinguir "el usuario no configuró este campo" de "el usuario lo puso en cero" es usar un puntero, y hasta ahora eso te obligaba a arrastrar un helper en cada paquete. Ahora un <code>Opciones</code> con campos <code>*int</code> y <code>*time.Duration</code> es cómodo de construir, y el valor cero (<code>nil</code>) significa inequívocamente "usá el default".
+</div>
+
+<h2>GS4.10 El costo de los genéricos: GC shape stenciling</h2>
+
+<p>Go no implementó los genéricos como C++ o Rust (monomorfización total: una copia de código por cada tipo) ni como Java (borrado total: todo se convierte en <code>Object</code>). Eligió un punto intermedio llamado <strong>GC shape stenciling</strong>, y todos sus costos y beneficios salen de ahí.</p>
+
+<div class="concept">
+  <strong>💡 Cómo funciona.</strong> El compilador genera <strong>una copia del código por cada "GC shape"</strong> distinta, no por cada tipo. La <em>shape</em> es cómo ve el recolector de basura la memoria de ese tipo. Todos los tipos puntero comparten una sola shape, así que <code>Primero[*Usuario]</code> y <code>Primero[*Pedido]</code> ejecutan <strong>el mismo código máquina</strong>. Para saber el tipo real y encontrar los métodos, ese código recibe un argumento oculto: un <strong>diccionario</strong>.
+</div>
+
+<pre><code class="lang-go">func Primero[T any](xs []T) T { return xs[0] }
+
+// UNA sola copia de código, compartida (shape = puntero):
+//   Primero[*Usuario]  Primero[*Pedido]  Primero[*os.File]  Primero[error]
+//   → cada instanciación pasa su propio diccionario
+
+// UNA copia de código CADA UNA (shapes distintas):
+//   Primero[int]         → shape: 8 bytes sin punteros
+//   Primero[float64]     → shape: 8 bytes sin punteros (comparte con int)
+//   Primero[string]      → shape: puntero + largo
+//   Primero[struct{a, b int}] → shape propia
+//   Primero[[3]byte]     → shape propia</code></pre>
+
+<p>De ahí salen tres efectos medibles:</p>
+
+<div class="step"><strong>1. El binario crece</strong> —pero menos de lo que temerías—, porque las instanciaciones sobre punteros no duplican código. Crece con la variedad de <em>formas de memoria</em>, no con la cantidad de tipos.</div>
+
+<div class="step"><strong>2. Llamar a un método de un parámetro de tipo va por el diccionario.</strong> Es una llamada indirecta, muy parecida en costo a una llamada por interfaz, y <strong>no se inlinea</strong>. Acá está el mito que hay que enterrar: los genéricos <em>no</em> hacen que llamar métodos sea más rápido.</div>
+
+<div class="step"><strong>3. Donde sí ganás velocidad es eliminando el boxing.</strong> Un <code>[]int</code> genérico guarda enteros contiguos; un <code>[]interface{}</code> guarda cabeceras de 16 bytes apuntando a enteros en el heap. La diferencia no es el despacho: es la memoria y la caché.</div>
+
+<pre><code class="lang-go">// El costo REAL de interface{}: una asignación por valor
+var xs []interface{}
+for i := 0; i &lt; 1_000_000; i++ {
+    xs = append(xs, i) // cada int se copia al heap (salvo los chiquitos cacheados)
+}
+// ~16 MB de cabeceras + un objeto por entero, disperso en el heap
+
+// La versión genérica (o simplemente tipada): cero asignaciones extra
+var ys []int
+for i := 0; i &lt; 1_000_000; i++ {
+    ys = append(ys, i)
+}
+// 8 MB contiguos, amigables con la caché de la CPU</code></pre>
+
+<p>Medilo vos, en tu carga, con estas tres herramientas:</p>
+
+<pre><code class="lang-bash"># 1) Tamaño del binario y qué símbolos lo ocupan
+go build -o bin/app ./cmd/app
+ls -l bin/app
+go tool nm -size -sort size bin/app | head -30
+
+# 2) Qué NO se pudo inlinear (buscá tus funciones genéricas acá)
+go build -gcflags='-m' ./... 2&gt;&amp;1 | grep 'cannot inline'
+
+# 3) El código máquina de una instanciación concreta
+go build -gcflags='-S' ./pkg/cache 2&gt;&amp;1 | grep -A 40 'Get\[go.shape'</code></pre>
+
+<pre><code class="lang-go">// Y el benchmark que decide la discusión, en vez de la opinión
+func BenchmarkAssert(b *testing.B) {
+    c := NuevaVieja(time.Minute) // guarda interface{}
+    c.Set("k", Usuario{Nombre: "Ada"})
+    b.ReportAllocs()
+    b.ResetTimer()
+    for i := 0; i &lt; b.N; i++ {
+        v, _ := c.Get("k")
+        u := v.(Usuario)
+        _ = u.Nombre
+    }
+}
+
+func BenchmarkGenerico(b *testing.B) {
+    c := Nueva[string, Usuario](ConTTL(time.Minute))
+    c.Set("k", Usuario{Nombre: "Ada"})
+    b.ReportAllocs()
+    b.ResetTimer()
+    for i := 0; i &lt; b.N; i++ {
+        u, _ := c.Get("k")
+        _ = u.Nombre
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">go test -run='^$' -bench=. -benchmem -count=10 ./pkg/cache | tee nuevo.txt
+go install golang.org/x/perf/cmd/benchstat@latest
+benchstat viejo.txt nuevo.txt   # con 10 corridas y significancia estadística</code></pre>
+
+<div class="rule">
+  <strong>📌 Los genéricos te dan seguridad de tipos, no velocidad.</strong> Cuando dan velocidad es porque eliminaron el <em>boxing</em> de <code>interface{}</code> y sus asignaciones, no porque el despacho sea más rápido. Y cuando hay una llamada a método sobre el parámetro de tipo, el diccionario te pone más o menos donde estabas con una interfaz. Si alguien te dice "lo hice genérico para que ande más rápido" y no muestra un <code>benchstat</code>, la afirmación no existe.
+</div>
+
+<div class="warn">
+  El tiempo de compilación también paga. Cada instanciación con shape propia es código que hay que generar, optimizar y enlazar. En repos grandes con utilidades genéricas muy usadas, la diferencia de <code>go build</code> es perceptible. No es razón para no usarlos: es razón para no genericizar cosas que no lo necesitan.
+</div>
+
+<h2>GS4.11 Errores como valores, a nivel senior</h2>
+
+<p>En M07 aprendiste el idiom. Acá aprendés a decidir: <strong>qué parte de tus errores es API pública</strong> y qué parte es detalle interno que podés cambiar mañana.</p>
+
+<h3>Los dos sabores: centinela y tipado</h3>
+
+<pre><code class="lang-go">package repo
+
+import "errors"
+
+// CENTINELA: un valor único, comparable con errors.Is.
+// Al exportarlo, pasa a ser parte de tu API pública. Para siempre.
+var (
+    ErrNoEncontrado = errors.New("repo: no encontrado")
+    ErrConflicto    = errors.New("repo: conflicto de versión")
+)
+
+// TIPADO: lleva DATOS del fallo. Cada campo exportado es contrato.
+type ErrValidacion struct {
+    Campo  string
+    Motivo string
+}
+
+func (e *ErrValidacion) Error() string {
+    return fmt.Sprintf("repo: campo %q inválido: %s", e.Campo, e.Motivo)
+}
+
+// Si querés que errors.Is/As atraviesen tu error, implementá Unwrap
+type ErrConsulta struct {
+    SQL   string
+    Causa error
+}
+
+func (e *ErrConsulta) Error() string { return "repo: consulta falló: " + e.Causa.Error() }
+func (e *ErrConsulta) Unwrap() error { return e.Causa }</code></pre>
+
+<h3>Envolver con <code>%w</code> es una decisión de API</h3>
+
+<pre><code class="lang-go">func (r *Repo) Usuario(ctx context.Context, id string) (*Usuario, error) {
+    u, err := r.buscar(ctx, id)
+    if err != nil {
+        // %w: el error de adentro queda VISIBLE para errors.Is/As del llamador.
+        // Eso es un compromiso público: si mañana cambiás la causa, rompés a alguien.
+        return nil, fmt.Errorf("repo.Usuario %q: %w", id, err)
+    }
+    return u, nil
+}
+
+func (r *Repo) recuento(ctx context.Context) (int, error) {
+    n, err := r.contar(ctx)
+    if err != nil {
+        // %v: el error de adentro queda OPACO. Solo se lee en el mensaje.
+        // Eso te deja libertad para cambiar la implementación mañana.
+        return 0, fmt.Errorf("repo.recuento: %v", err)
+    }
+    return n, nil
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>%w</code> hace público lo que envolvés; <code>%v</code> no.</strong> Elegir el verbo no es cosmética: con <code>%w</code> estás prometiendo que ese error interno va a seguir estando ahí. Si envolvés con <code>%w</code> un <code>*pq.Error</code> de tu driver de Postgres, acabás de meter tu driver de base de datos en tu API pública, y migrar a otro driver pasó a ser un cambio breaking.
+</div>
+
+<h3><code>errors.Is</code>, <code>errors.As</code> y el nuevo <code>errors.AsType[T]</code></h3>
+
+<pre><code class="lang-go">// Is: ¿la cadena contiene ESTE valor? → para centinelas
+if errors.Is(err, repo.ErrNoEncontrado) {
+    http.Error(w, "no existe", http.StatusNotFound)
+    return
+}
+
+// As (clásico): ¿hay un error de ESTE TIPO? → hay que declarar la variable antes
+var ev *repo.ErrValidacion
+if errors.As(err, &amp;ev) {
+    responderJSON(w, 400, map[string]string{"campo": ev.Campo, "motivo": ev.Motivo})
+    return
+}</code></pre>
+
+<pre><code class="lang-go">// Go 1.26 — errors.AsType[T]: la versión genérica
+if ev, ok := errors.AsType[*repo.ErrValidacion](err); ok {
+    responderJSON(w, 400, map[string]string{"campo": ev.Campo, "motivo": ev.Motivo})
+    return
+}
+
+// Y compone de forma natural en un switch de decisiones
+switch {
+case errors.Is(err, repo.ErrNoEncontrado):
+    return 404
+case errors.Is(err, context.DeadlineExceeded):
+    return 504
+default:
+    if ev, ok := errors.AsType[*repo.ErrValidacion](err); ok {
+        log.Warn("validación", "campo", ev.Campo)
+        return 400
+    }
+    return 500
+}</code></pre>
+
+<p>Por qué es mejor que <code>errors.As</code>, concretamente: <code>errors.As</code> recibe un <code>any</code> y verifica <strong>en tiempo de ejecución</strong> que le hayas pasado un puntero a un tipo que implemente <code>error</code>; si te equivocás, <strong>entra en pánico</strong>. <code>errors.AsType[T]</code> lo verifica en compilación, no necesita variable previa, y lee igual que cualquier otro <code>v, ok :=</code> de Go.</p>
+
+<pre><code class="lang-go">// Errores múltiples: errors.Join (1.20). Devuelve nil si no hay ninguno.
+func validarTodo(u Usuario) error {
+    var errs []error
+    if u.Nombre == "" {
+        errs = append(errs, &amp;ErrValidacion{Campo: "nombre", Motivo: "vacío"})
+    }
+    if u.Edad &lt; 0 {
+        errs = append(errs, &amp;ErrValidacion{Campo: "edad", Motivo: "negativa"})
+    }
+    if !strings.Contains(u.Email, "@") {
+        errs = append(errs, &amp;ErrValidacion{Campo: "email", Motivo: "sin arroba"})
+    }
+    return errors.Join(errs...) // errors.Is/As recorren TODAS las ramas
+}</code></pre>
+
+<div class="mistake">
+  <strong>El antipatrón que sigue vivo en 2026:</strong>
+  <pre><code class="lang-go">if err.Error() == "no encontrado" { /* ... */ }
+if strings.Contains(err.Error(), "duplicate key") { /* ... */ }</code></pre>
+  Comparar strings de error se rompe apenas alguien agrega contexto con <code>fmt.Errorf</code>, apenas cambia una traducción, apenas actualizás la versión del driver. Y se rompe <strong>en silencio</strong>: la condición pasa a ser falsa siempre y nadie se entera hasta que un usuario reporta algo raro.
+</div>
+
+<h3>¿Cuándo un error debe ser parte de tu API pública?</h3>
+
+<div class="step"><strong>1. Cuando el llamador puede hacer algo distinto por causa de ese error.</strong> ¿Va a reintentar? ¿Va a devolver 404 en vez de 500? ¿Va a caer a un plan B? Si la respuesta es sí, exportá el centinela o el tipo. Si el llamador solo lo va a loguear, no exportes nada.</div>
+
+<div class="step"><strong>2. Nunca expongas el error de una dependencia.</strong> Si envolvés con <code>%w</code> un error de tu ORM, tu ORM es parte de tu API. Traducilo a un error tuyo en el borde de tu paquete.</div>
+
+<div class="step"><strong>3. Si lo exportás, documentalo como cualquier símbolo público.</strong> "<code>Usuario</code> devuelve <code>ErrNoEncontrado</code> si el id no existe." Eso es un contrato, y borrarlo es un cambio breaking igual que borrar una función.</div>
+
+<table>
+<thead><tr><th></th><th>Centinela (<code>var ErrX = errors.New(...)</code>)</th><th>Error tipado (struct)</th></tr></thead>
+<tbody>
+<tr><td><strong>Cuándo</strong></td><td>El llamador solo necesita saber <em>qué</em> pasó</td><td>Necesita <em>datos</em> del fallo: campo, código, si conviene reintentar</td></tr>
+<tr><td><strong>Se chequea con</strong></td><td><code>errors.Is</code></td><td><code>errors.As</code> / <code>errors.AsType[T]</code></td></tr>
+<tr><td><strong>Costo de API</strong></td><td>Bajo: un símbolo más</td><td>Alto: cada campo exportado es contrato</td></tr>
+<tr><td><strong>Riesgo típico</strong></td><td>Proliferación: veinte centinelas que nadie chequea</td><td>Cambiar un campo rompe a todos los llamadores</td></tr>
+<tr><td><strong>Regla</strong></td><td>Empezá acá</td><td>Pasate cuando el llamador necesite leer algo</td></tr>
+</tbody>
+</table>
+
+<h2>GS4.12 Diseño de API: qué rompe y qué no</h2>
+
+<p>Go tiene un <strong>compromiso de compatibilidad</strong> explícito: el código escrito para Go 1 sigue compilando y funcionando con cada versión de Go 1. La comunidad heredó esa cultura, y se espera lo mismo de tu módulo dentro de una misma versión mayor. Por eso hay que saber, con precisión quirúrgica, qué cambio rompe.</p>
+
+<table>
+<thead><tr><th>Cambio</th><th>¿Rompe?</th><th>Detalle</th></tr></thead>
+<tbody>
+<tr><td>Agregar un método a una <strong>interfaz</strong> exportada</td><td>🔴 Sí</td><td>Deja de compilar todo implementador externo</td></tr>
+<tr><td>Agregar un método a un <strong>struct</strong> exportado</td><td>🟢 No</td><td>Salvo que colisione con un método embebido</td></tr>
+<tr><td>Agregar un <strong>campo</strong> a un struct exportado</td><td>🟡 Casi no</td><td>Rompe solo los literales sin nombres de campo: <code>T{1, 2}</code></td></tr>
+<tr><td>Cambiar cualquier firma de función</td><td>🔴 Sí</td><td>Incluye agregar un variádico o un valor de retorno</td></tr>
+<tr><td>Cambiar el retorno de tipo concreto a interfaz</td><td>🔴 Sí</td><td>El llamador que guardaba <code>*T</code> deja de compilar</td></tr>
+<tr><td>Agregar un campo <code>[]byte</code> a un struct comparable</td><td>🔴 Sí</td><td>El struct deja de ser comparable: se rompe <code>==</code> y su uso como clave de map</td></tr>
+<tr><td>Renombrar cualquier símbolo exportado</td><td>🔴 Sí</td><td>Dejá el viejo como alias deprecado</td></tr>
+<tr><td>Agregar un <strong>parámetro de tipo</strong> a un tipo genérico</td><td>🔴 Sí</td><td><code>Cache[V]</code> → <code>Cache[K, V]</code> rompe cada instanciación</td></tr>
+<tr><td>Relajar un constraint (<code>int</code> → <code>~int</code>)</td><td>🟢 No</td><td>Solo agranda el conjunto de tipos aceptados</td></tr>
+<tr><td>Endurecer un constraint</td><td>🔴 Sí</td><td>Alguien que lo satisfacía deja de hacerlo</td></tr>
+</tbody>
+</table>
+
+<p>El caso del literal sin nombres de campo tiene una defensa de una línea, y la usa la propia stdlib:</p>
+
+<pre><code class="lang-go">type Opciones struct {
+    TTL time.Duration
+    Max int
+
+    _ struct{} // campo sin exportar: obliga a construir con nombres de campo
+}
+
+// En OTRO módulo:
+o := paquete.Opciones{TTL: time.Minute, Max: 100} // ✅
+// o := paquete.Opciones{time.Minute, 100}        // ❌ no compila
+// → ahora podés agregar campos sin romper a nadie, para siempre</code></pre>
+
+<h3>Struct de config vs opciones funcionales</h3>
+
+<p>El problema clásico: <code>Nueva(ttl)</code> ya está publicado y ahora necesitás un máximo, un reloj y un callback de desalojo. Cada parámetro nuevo rompe a todos los llamadores. Hay dos salidas.</p>
+
+<pre><code class="lang-go">// Opción A — struct de configuración
+type Opciones struct {
+    TTL      time.Duration // 0 = default
+    Max      int           // 0 = default
+    Reloj    func() time.Time
+    AlBorrar func(clave string)
+
+    _ struct{}
+}
+
+func Nueva(o Opciones) *Cache {
+    if o.TTL == 0 {
+        o.TTL = 5 * time.Minute
+    }
+    if o.Reloj == nil {
+        o.Reloj = time.Now
+    }
+    // ...
+}
+
+// Uso:
+c := cache.Nueva(cache.Opciones{TTL: time.Minute})</code></pre>
+
+<pre><code class="lang-go">// Opción B — opciones funcionales
+type config struct { // sin exportar: lo cambiás cuando quieras
+    ttl      time.Duration
+    max      int
+    ahora    func() time.Time
+    alBorrar func(string)
+}
+
+type Opcion func(*config)
+
+func ConTTL(d time.Duration) Opcion  { return func(c *config) { c.ttl = d } }
+func ConMaximo(n int) Opcion         { return func(c *config) { c.max = n } }
+func ConReloj(f func() time.Time) Opcion { return func(c *config) { c.ahora = f } }
+
+func Nueva(opts ...Opcion) *Cache {
+    c := config{ttl: 5 * time.Minute, max: 1024, ahora: time.Now}
+    for _, o := range opts {
+        o(&amp;c)
+    }
+    // ...
+}
+
+// Uso:
+c := cache.Nueva(cache.ConTTL(time.Minute), cache.ConMaximo(500))</code></pre>
+
+<table>
+<thead><tr><th>Criterio</th><th>Struct de config</th><th>Opciones funcionales</th></tr></thead>
+<tbody>
+<tr><td>Agregar un parámetro nuevo</td><td>🟢 No rompe (con el campo <code>_</code>)</td><td>🟢 No rompe nunca</td></tr>
+<tr><td>Descubrirlo en <code>godoc</code></td><td>🟢 Un struct con todos los campos juntos</td><td>🔴 Funciones <code>ConXxx</code> desparramadas</td></tr>
+<tr><td>Distinguir "sin configurar" de "cero"</td><td>🟡 Necesita punteros (con 1.26, <code>new(x)</code> lo hace cómodo)</td><td>🟢 Gratis: si no llamaste la opción, no se tocó</td></tr>
+<tr><td>Construirlo desde JSON / variables de entorno</td><td>🟢 Directo</td><td>🔴 Hay que mapear a mano</td></tr>
+<tr><td>Validar combinaciones inválidas</td><td>🟢 Todo junto en un lugar</td><td>🟡 Recién después de aplicar todas</td></tr>
+<tr><td>Cambiar la representación interna</td><td>🔴 Los campos son públicos: no podés</td><td>🟢 La <code>config</code> es privada: libertad total</td></tr>
+<tr><td>Cantidad de código</td><td>🟢 Poco</td><td>🔴 Una función por opción</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio de desempate.</strong> ¿La configuración viene de un archivo o del entorno? Struct. ¿Es una librería con muchas opciones que van a crecer y querés poder cambiar la representación interna? Opciones funcionales. ¿Son dos parámetros que no van a crecer? Ninguna de las dos: parámetros normales, y no te compliques.
+</div>
+
+<h3>Verificá los cambios de API en el CI, no en tu cabeza</h3>
+
+<pre><code class="lang-bash">go install golang.org/x/exp/cmd/apidiff@latest
+go install golang.org/x/exp/cmd/gorelease@latest
+
+# Qué cambió en la API pública respecto de la última etiqueta
+gorelease -base=v1.3.0
+# Salida típica:
+#   ## incompatible changes
+#   Store: added method Stat
+#   → gorelease te dice incluso qué versión te corresponde publicar</code></pre>
+
+<div class="tip">
+  Ponelo como paso obligatorio del pipeline en cualquier módulo que publiques. Un cambio breaking detectado antes del <code>git tag</code> cuesta cinco minutos; detectado después, cuesta una versión mayor, un <code>/v2</code> en la ruta del módulo, y una migración para cada usuario.
+</div>
+
+<h2>GS4.13 <code>any</code> y reflexión: cuándo se justifica</h2>
+
+<p>Después de 1.18, la mayoría de los usos legítimos de <code>any</code> en <em>tu</em> código desaparecieron: casi todos eran contenedores y utilidades, y eso ahora es un genérico. Lo que queda es un conjunto chico y bien delimitado.</p>
+
+<table>
+<thead><tr><th>Se justifica</th><th>No se justifica</th></tr></thead>
+<tbody>
+<tr><td>Serialización de tipos desconocidos (<code>encoding/json</code>, YAML)</td><td>"Una función que acepte cualquier cosa"</td></tr>
+<tr><td>Escanear filas de base de datos a destinos arbitrarios</td><td>Contenedores: eso es un genérico</td></tr>
+<tr><td>Formateo genérico (<code>fmt</code>, <code>log/slog</code>)</td><td>Evitar escribir dos funciones</td></tr>
+<tr><td>Registros de plugins con tipos que no conocés</td><td>Devolver "el resultado" sin comprometerse</td></tr>
+<tr><td>Helpers de test (<code>reflect.DeepEqual</code>, <code>cmp.Diff</code>)</td><td>Configuración: usá un struct</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-go">// El mismo trabajo, tres veces, en orden de peor a mejor
+func igualesReflect(a, b any) bool  { return reflect.DeepEqual(a, b) } // lento, asigna
+func igualesAssert(a, b any) bool   { return a == b }                 // puede entrar en pánico
+func iguales[T comparable](a, b T) bool { return a == b }             // verificado en compilación
+
+// El pánico del segundo, en vivo:
+// igualesAssert([]int{1}, []int{1}) → panic: runtime error: comparing uncomparable type []int</code></pre>
+
+<div class="warn">
+  <strong>La reflexión no solo es lenta: es invisible para las herramientas.</strong> "Buscar usos" no encuentra un campo que se accede por <code>reflect.FieldByName("Nombre")</code>. Renombrar ese campo con el refactor del IDE compila perfecto y falla en producción. Cada string que nombra un símbolo es una dependencia que el compilador no puede ver.
+</div>
+
+<div class="tip">
+  Si <strong>tenés</strong> que usar reflexión, hacelo <strong>una vez y cacheá</strong>. Es exactamente lo que hace <code>encoding/json</code>: la primera vez que serializa un tipo, arma un plan de codificación y lo guarda en un <code>sync.Map</code> indexado por <code>reflect.Type</code>. Las siguientes millones de veces ejecutan el plan, sin volver a reflexionar. Reflexionar en el camino caliente es el error; reflexionar al inicializar es una técnica válida.
+</div>
+
+<h2>🧑‍🎓 Worked Example — una librería de caché reutilizable</h2>
+
+<blockquote>Necesitás un caché en memoria con TTL y límite de entradas. Lo van a usar tres servicios distintos con tipos distintos. Y el vencimiento tiene que poder testearse sin dormir el test.</blockquote>
+
+<h3>Paso 1 — La versión con <code>interface{}</code></h3>
+
+<pre><code class="lang-go">package cache
+
+import (
+    "sync"
+    "time"
+)
+
+type entrada struct {
+    valor interface{}
+    vence time.Time
+}
+
+type Cache struct {
+    mu    sync.Mutex
+    datos map[string]entrada
+    ttl   time.Duration
+}
+
+func Nueva(ttl time.Duration) *Cache {
+    return &amp;Cache{datos: make(map[string]entrada), ttl: ttl}
+}
+
+func (c *Cache) Set(k string, v interface{}) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.datos[k] = entrada{valor: v, vence: time.Now().Add(c.ttl)}
+}
+
+func (c *Cache) Get(k string) (interface{}, bool) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    e, ok := c.datos[k]
+    if !ok || time.Now().After(e.vence) {
+        return nil, false
+    }
+    return e.valor, true
+}</code></pre>
+
+<p>Funciona. Y en cada lugar donde se usa, aparece esto:</p>
+
+<pre><code class="lang-go">c := cache.Nueva(time.Minute)
+c.Set("u:1", Usuario{Nombre: "Ada"})
+
+v, ok := c.Get("u:1")
+if !ok {
+    // buscar en la base
+}
+u, ok := v.(Usuario) // ← el assert, en CADA uso, para siempre
+if !ok {
+    // ¿y ahora qué? Esto no es un error de negocio: es un bug.
+    // Y no hay nada que impida que alguien haya guardado un Pedido acá.
+}</code></pre>
+
+<div class="mistake">
+  Los cuatro problemas, ordenados por qué tan tarde te enterás: <strong>(1)</strong> el assert se repite en cada llamada; <strong>(2)</strong> nada impide guardar un <code>Pedido</code> bajo una clave de usuario; <strong>(3)</strong> cada <code>Set</code> con un valor no-puntero hace <em>boxing</em> y asigna en el heap; <strong>(4)</strong> si alguien escribe <code>v.(Usuario)</code> sin el <code>, ok</code>, el pánico llega en producción, un martes.
+</div>
+
+<h3>Paso 2 — Genéricos</h3>
+
+<pre><code class="lang-go">package cache
+
+type entrada[V any] struct {
+    valor V
+    vence time.Time
+}
+
+type Cache[K comparable, V any] struct {
+    mu    sync.Mutex
+    datos map[K]entrada[V]
+    ttl   time.Duration
+}
+
+func Nueva[K comparable, V any](ttl time.Duration) *Cache[K, V] {
+    return &amp;Cache[K, V]{datos: make(map[K]entrada[V]), ttl: ttl}
+}
+
+func (c *Cache[K, V]) Set(k K, v V) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.datos[k] = entrada[V]{valor: v, vence: time.Now().Add(c.ttl)}
+}
+
+func (c *Cache[K, V]) Get(k K) (V, bool) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    e, ok := c.datos[k]
+    if !ok || time.Now().After(e.vence) {
+        var cero V // ← no podés escribir "return nil, false": V puede ser int
+        return cero, false
+    }
+    return e.valor, true
+}</code></pre>
+
+<pre><code class="lang-go">c := cache.Nueva[string, Usuario](time.Minute)
+c.Set("u:1", Usuario{Nombre: "Ada"})
+
+u, ok := c.Get("u:1") // u ya ES un Usuario. Cero asserts. Cero pánicos posibles.
+if !ok {
+    // buscar en la base
+}
+fmt.Println(u.Nombre)
+
+// Y esto ni siquiera compila:
+// c.Set("p:1", Pedido{})  → cannot use Pedido{} as Usuario value</code></pre>
+
+<div class="info">
+  Fijate en <code>var cero V</code>. Es el idiom que vas a escribir en toda función genérica que pueda "no devolver nada": no existe un <code>nil</code> universal porque <code>V</code> puede ser <code>int</code>, <code>string</code> o un struct. Es feo las primeras diez veces y después deja de verse.
+</div>
+
+<h3>Paso 3 — La costura para el reloj</h3>
+
+<p>El TTL depende del tiempo, y un test que hace <code>time.Sleep(2 * time.Minute)</code> no es un test: es un castigo. Necesitás poder mover el reloj. La pregunta de diseño es: <strong>¿interfaz o función?</strong></p>
+
+<pre><code class="lang-go">// Opción A — una interfaz de UN método (punto de extensión público)
+type Reloj interface {
+    Ahora() time.Time
+}
+
+// Opción B — un campo de tipo función (costura privada, sin interfaz)
+type Cache[K comparable, V any] struct {
+    // ...
+    ahora func() time.Time // por defecto: time.Now
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El criterio.</strong> ¿Querés que los <em>usuarios</em> de la librería enchufen su propio reloj —por ejemplo, uno sincronizado con NTP o uno de un simulador—? Interfaz pública. ¿Solo lo necesitás para tus tests? Campo de función, sin exportar, configurable por opción. Acá es lo segundo: <strong>una interfaz de un método que solo usás vos es una interfaz que sobra</strong>.
+</div>
+
+<pre><code class="lang-go">// El "reloj falso" del test: doce líneas, sin mocks generados, sin librerías
+type relojFalso struct{ t time.Time }
+
+func (r *relojFalso) Ahora() time.Time       { return r.t }
+func (r *relojFalso) Avanzar(d time.Duration) { r.t = r.t.Add(d) }</code></pre>
+
+<pre><code class="lang-go">func TestVencimiento(t *testing.T) {
+    reloj := &amp;relojFalso{t: time.Unix(0, 0)}
+    c := cache.Nueva[string, int](
+        cache.ConTTL(time.Minute),
+        cache.ConReloj(reloj.Ahora), // pasamos el MÉTODO como func() time.Time
+    )
+
+    c.Set("a", 1)
+    if _, ok := c.Get("a"); !ok {
+        t.Fatal("debería estar presente recién puesto")
+    }
+
+    reloj.Avanzar(59 * time.Second)
+    if _, ok := c.Get("a"); !ok {
+        t.Fatal("no debería vencer antes del TTL")
+    }
+
+    reloj.Avanzar(2 * time.Second)
+    if _, ok := c.Get("a"); ok {
+        t.Fatal("debería haber vencido")
+    }
+}
+// Corre en microsegundos. Sin sleeps. Sin flakiness. Y prueba los BORDES,
+// que con time.Sleep serían imposibles de testear con precisión.</code></pre>
+
+<h3>Paso 4 — Opciones funcionales, y la fricción con los genéricos</h3>
+
+<p>Ya son tres parámetros (TTL, reloj, máximo) y van a ser cinco. Opciones funcionales. Pero acá aparece un problema real que casi nadie menciona:</p>
+
+<pre><code class="lang-go">// ⚠️ El intento ingenuo: opciones genéricas
+type Opcion[K comparable, V any] func(*Cache[K, V])
+
+func ConTTL[K comparable, V any](d time.Duration) Opcion[K, V] {
+    return func(c *Cache[K, V]) { c.ttl = d }
+}
+
+// El uso queda insoportable: la inferencia NO ayuda, porque K y V solo
+// aparecen en el tipo de RETORNO de la opción.
+c := cache.Nueva[string, Usuario](
+    cache.ConTTL[string, Usuario](time.Minute),   // ← repetir los tipos
+    cache.ConMaximo[string, Usuario](500),        // ← otra vez
+)</code></pre>
+
+<pre><code class="lang-go">// ✅ La salida: la config NO es genérica, porque no depende de K ni de V
+type config struct {
+    ttl   time.Duration
+    max   int
+    ahora func() time.Time
+}
+
+type Opcion func(*config) // ← sin parámetros de tipo
+
+func ConTTL(d time.Duration) Opcion      { return func(c *config) { c.ttl = d } }
+func ConMaximo(n int) Opcion             { return func(c *config) { c.max = n } }
+func ConReloj(f func() time.Time) Opcion { return func(c *config) { c.ahora = f } }
+
+func Nueva[K comparable, V any](opts ...Opcion) *Cache[K, V] {
+    cfg := config{ttl: 5 * time.Minute, max: 1024, ahora: time.Now}
+    for _, o := range opts {
+        o(&amp;cfg)
+    }
+    return &amp;Cache[K, V]{
+        datos: make(map[K]entrada[V], cfg.max),
+        ttl:   cfg.ttl,
+        max:   cfg.max,
+        ahora: cfg.ahora,
+    }
+}
+
+// Y ahora el uso vuelve a ser humano:
+c := cache.Nueva[string, Usuario](cache.ConTTL(time.Minute), cache.ConMaximo(500))</code></pre>
+
+<div class="rule">
+  <strong>📌 Si tus opciones no dependen de los parámetros de tipo, no las hagas genéricas.</strong> Separá la configuración (no genérica) del contenedor (genérico). Esto es lo que hacen las librerías reales, y es la lección más transferible de todo el ejemplo: <strong>los parámetros de tipo se propagan como un virus si los dejás</strong>. Cortalos en el borde más chico posible.
+</div>
+
+<h3>Paso 5 — Qué se expone como interfaz</h3>
+
+<p>El instinto es publicar <code>type Cache[K, V] interface { Get(...); Set(...) }</code> "para que se pueda mockear". Es un error doble: agrega una indirección por diccionario a cada llamada, y viola GS4.3 —el consumidor es quien debe declarar la interfaz—.</p>
+
+<pre><code class="lang-go">// paquete cache: exporta el STRUCT concreto. Ninguna interfaz.
+func Nueva[K comparable, V any](opts ...Opcion) *Cache[K, V]
+
+// paquete perfil, que CONSUME el caché: declara lo que necesita, y nada más
+package perfil
+
+type cacheUsuarios interface { // sin exportar, sin genéricos, dos métodos
+    Get(string) (Usuario, bool)
+    Set(string, Usuario)
+}
+
+type Servicio struct {
+    cache cacheUsuarios
+    repo  *repo.Repo
+}
+
+// *cache.Cache[string, Usuario] satisface cacheUsuarios sin saber que existe.
+// Y el fake del test son cuatro líneas:
+type cacheFalso map[string]Usuario
+
+func (c cacheFalso) Get(k string) (Usuario, bool) { u, ok := c[k]; return u, ok }
+func (c cacheFalso) Set(k string, u Usuario)      { c[k] = u }</code></pre>
+
+<h3>El balance: qué se ganó y qué costó</h3>
+
+<table>
+<thead><tr><th>Paso</th><th>Se ganó</th><th>Se pagó</th></tr></thead>
+<tbody>
+<tr><td>1. <code>interface{}</code></td><td>Un solo tipo sirve para todo</td><td>Assert en cada uso · errores en runtime · boxing y una asignación por valor</td></tr>
+<tr><td>2. Genéricos</td><td>Verificación en compilación · cero asserts · cero boxing</td><td>Firmas más largas · una instanciación por <em>shape</em> · <code>var cero V</code> en vez de <code>nil</code></td></tr>
+<tr><td>3. Costura del reloj</td><td>Tests deterministas en microsegundos, incluyendo los bordes</td><td>Un campo más · decidir interfaz vs función</td></tr>
+<tr><td>4. Opciones funcionales</td><td>Agregar parámetros deja de ser breaking, para siempre</td><td>Una función por opción · peor descubribilidad en <code>godoc</code> · hay que mantener la config fuera de los genéricos</td></tr>
+<tr><td>5. Interfaz en el consumidor</td><td>El caché no impone dependencias a nadie · fake de 4 líneas</td><td>Cada consumidor escribe 4 líneas de interfaz</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá genéricos".</strong> Es que <strong>cada paso resolvió un problema que ya existía</strong>, no uno hipotético. El assert existía y dolía. El <code>time.Sleep</code> en el test existía y dolía. El parámetro nuevo que rompía a los llamadores existía y dolía. Nadie agregó una capa "por si acaso" — y por eso el resultado tiene cinco decisiones defendibles en vez de cinco abstracciones que alguien va a tener que desarmar.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu función devuelve <code>error</code>, el log dice <code>&lt;nil&gt;</code>, y sin embargo <code>err != nil</code> es <code>true</code>. ¿Qué pasó y cómo lo arreglás?</summary>
+<p>Un valor de interfaz son <strong>dos palabras</strong>: tipo dinámico y dato. Es <code>nil</code> solo si <strong>las dos</strong> están en cero. En algún lado hay una función declarada como <code>func f() *MiError</code> —tipo concreto— cuyo <code>return nil</code> se convierte a <code>error</code>: la palabra del tipo queda escrita con <code>*MiError</code> y la del dato en cero. La interfaz tiene tipo, así que no es nil. Y <code>fmt</code> imprime <code>&lt;nil&gt;</code> porque formatea el puntero, que sí es nil — de ahí la confusión. El arreglo no es comparar con reflexión: es cambiar la firma a <code>func f() error</code>, así el <code>return nil</code> produce una interfaz genuinamente vacía. La misma trampa aparece con retornos nombrados asignados desde una variable de tipo concreto dentro de un <code>defer</code>.</p></details>
+
+<details><summary>Tenés que escribir código reutilizable. ¿Cómo decidís entre un genérico y una interfaz?</summary>
+<p>Preguntate qué estás parametrizando. Si es <strong>el dato</strong> —"esta estructura guarda cualquier tipo de elemento"— es un genérico: contenedores, utilidades de colecciones, funciones tipo <code>Map</code>/<code>Filter</code>/<code>Min</code>. Se resuelve en compilación, no hay boxing, y el tipo se preserva de punta a punta. Si es <strong>el comportamiento</strong> —"esto lo puede hacer cualquiera que sepa hacer X"— es una interfaz: storage, transporte, reloj, puntos de extensión para usuarios. Se resuelve en ejecución, que es justamente lo que necesitás cuando la implementación depende de la config o del entorno. La señal de alarma: un parámetro de tipo que aparece una sola vez, en la posición de un parámetro, y nunca en el retorno ni en el cuerpo — ese quería ser una interfaz, y hacerlo genérico solo agrega instanciaciones al binario. Y ojo con el mito: los genéricos no aceleran las llamadas a métodos —el diccionario del <em>GC shape stenciling</em> las deja tan indirectas como una interfaz—; aceleran cuando eliminan el boxing de <code>interface{}</code>.</p></details>
+
+<details><summary>¿Por qué agregar un método a una interfaz publicada rompe a tus usuarios, pero agregar un campo a un struct casi nunca?</summary>
+<p>Porque las interfaces en Go se satisfacen <strong>implícitamente</strong>: cualquiera pudo haber escrito un tipo que la implementa sin importar tu paquete ni avisarte. Al agregarle un método, todos esos tipos dejan de satisfacerla y su código deja de compilar. Con un struct pasa lo contrario: nadie "implementa" tu struct, solo lo usa; agregarle un campo o un método no invalida nada que ya funcionaba. La única excepción son los <strong>literales sin nombres de campo</strong> (<code>T{1, 2}</code>), que dependen del orden y la cantidad exacta — y eso se previene poniéndole al struct un campo sin exportar, como <code>_ struct{}</code>, que obliga a construirlo con nombres. De ahí sale la regla "aceptá interfaces, devolvé structs": el struct te deja crecer, la interfaz publicada te congela. Y si necesitás publicar una interfaz conservando el derecho a extenderla, sellala con un método sin exportar.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Una interfaz son <strong>dos palabras</strong>: tipo dinámico y dato. Es <code>nil</code> solo si ambas están en cero — de ahí sale la trampa del <strong>puntero nil que no es nil</strong>, y por eso <strong>nunca</strong> declares una función que devuelva un tipo concreto de error.</li>
+  <li>Las interfaces son <strong>implícitas</strong>: declaralas <strong>donde se consumen</strong>, con los métodos que ese consumidor usa. <strong>Aceptá interfaces, devolvé structs.</strong></li>
+  <li>Interfaces <strong>chicas</strong>: <code>io.Reader</code> ganó con un método. Doce métodos es una clase abstracta disfrazada. Componé con embedding, y sellá con un método sin exportar si necesitás poder extenderla.</li>
+  <li>La interfaz de <strong>una sola implementación</strong>, creada "para testear", cuesta documentación, navegabilidad, despacho estático y mantenimiento. Un mock no es una segunda implementación. Extraé la interfaz cuando aparezca la segunda implementación <em>real</em>.</li>
+  <li>Los <strong>genéricos parametrizan datos</strong>; las <strong>interfaces parametrizan comportamiento</strong>. No hay parámetros de tipo en métodos, ni covarianza, ni sobrecarga de operadores.</li>
+  <li>En los constraints, <code>~</code> significa "tipo subyacente" y casi siempre lo querés. <code>comparable</code> garantiza que <code>==</code> existe, <strong>no</strong> que no vaya a entrar en pánico con un <code>any</code> adentro. La inferencia sale de los argumentos, nunca del retorno.</li>
+  <li><strong>Go 1.26</strong>: un tipo genérico puede <strong>nombrarse a sí mismo en su lista de parámetros de tipo</strong> (destraba el patrón <em>self type</em> y los recursivos); <code>new</code> acepta una <strong>expresión</strong> (<code>new(42)</code>); y <code>errors.AsType[T]()</code> reemplaza a <code>errors.As</code> con verificación en compilación.</li>
+  <li><strong>GC shape stenciling</strong>: una copia de código por forma de memoria, no por tipo, más un diccionario. Los genéricos dan <strong>seguridad de tipos</strong>, no velocidad de despacho; la velocidad viene de eliminar el <em>boxing</em>.</li>
+  <li><code>%w</code> hace <strong>público</strong> el error que envolvés; <code>%v</code> no. Centinela para "qué pasó", error tipado para "con qué datos". Nunca compares <code>err.Error()</code> como string.</li>
+  <li>Agregar un método a una interfaz publicada <strong>rompe</strong>; agregar un campo a un struct <strong>no</strong> (poné <code>_ struct{}</code> y deja de romper del todo). Verificá con <code>gorelease</code> en el CI, no de memoria.</li>
+  <li><code>any</code> + reflexión: solo en el borde dinámico real (serialización, filas de base, plugins). Si tenés que reflexionar, hacelo una vez al inicializar y cacheá el resultado.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Reproducí la trampa del nil tipado: escribí una función que devuelva <code>*MiError</code>, envolvela en una que devuelva <code>error</code>, y comprobá con <code>%T</code> y <code>unsafe.Sizeof</code> qué hay realmente adentro de la interfaz. Después arreglala cambiando <strong>solo la firma</strong> y verificá que <code>err == nil</code> pase a ser <code>true</code>.</li>
+  <li>Tomá un paquete tuyo (o de un repo que conozcas) que declare una interfaz junto a su única implementación. Movela al paquete consumidor, dejándole <strong>solo los métodos que ese paquete usa</strong>. Contá cuántas líneas tenía el fake del test antes y cuántas después.</li>
+  <li>Escribí <code>Filtrar[T any](xs []T, pred func(T) bool) []T</code> y su versión con <code>[]interface{}</code>. Comparalas con <code>go test -bench -benchmem</code> sobre 100.000 <code>int</code> y sobre 100.000 <code>*Usuario</code>. Explicá <strong>por qué la diferencia es enorme en un caso y casi nula en el otro</strong> — la respuesta está en GS4.10.</li>
+  <li>Definí un constraint <code>Numero</code> <strong>sin</strong> <code>~</code> y probá usarlo con <code>type Celsius float64</code>. Copiá el error del compilador, agregá los sombreritos, y verificá que compile. Después probá que <code>time.Duration</code> también entre.</li>
+  <li>Compilá un paquete que instancie una función genérica con diez tipos puntero distintos y con diez tipos struct distintos. Compará el tamaño del binario en cada caso con <code>go tool nm -size</code> y explicá la diferencia con el modelo de <em>GC shape</em>.</li>
+  <li>Convertí una API tuya de "constructor con N parámetros" a opciones funcionales, manteniendo el constructor viejo como deprecado. Corré <code>gorelease -base=&lt;tu última etiqueta&gt;</code> y verificá que reporte <strong>cero</strong> cambios incompatibles.</li>
+  <li>Tomá tres <code>if err != nil</code> de tu código que hoy usen <code>%v</code> y decidí, uno por uno, si deberían usar <code>%w</code>. Escribí en un comentario la razón de cada decisión en términos de <em>qué puede hacer el llamador con esa información</em>. Después reemplazá un <code>errors.As</code> por <code>errors.AsType[T]</code> y compará legibilidad.</li>
+</ol>
+
+<section class="quiz" id="quizGS4">
+  <style>
+    #quizGS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS4 .q{margin-bottom:1.5rem}
+    #quizGS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS4 .opt:hover{border-color:var(--accent)}
+    #quizGS4 .opt:disabled{cursor:default}
+    #quizGS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS4 .exp.show{display:block}
+    #quizGS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Una función devuelve <code>error</code>, el log imprime <code>&lt;nil&gt;</code> y sin embargo <code>err != nil</code> da <code>true</code>. ¿Cuál es la causa?</p>
+    <button class="opt">Un bug del compilador de Go al convertir punteros a interfaces</button>
+    <button class="opt">Alguna función devuelve el <strong>tipo concreto</strong> del error (<code>*MiError</code>) en vez de <code>error</code>: al convertirse a interfaz, la palabra del tipo queda escrita y solo el dato es nil</button>
+    <button class="opt">Falta llamar a <code>errors.Unwrap</code> antes de comparar contra <code>nil</code></button>
+    <div class="exp">Un valor de interfaz son dos palabras (tipo dinámico + dato) y es <code>nil</code> solo si <strong>ambas</strong> están en cero. Devolver <code>*MiError</code> y convertirlo a <code>error</code> escribe la palabra del tipo, así que la interfaz no es nil aunque el puntero sí lo sea. <code>fmt</code> imprime <code>&lt;nil&gt;</code> porque formatea el puntero. El arreglo es declarar la firma como <code>error</code>, no comparar con reflexión.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Sobre el costo de los genéricos en Go, ¿cuál afirmación es correcta?</p>
+    <button class="opt">Go monomorfiza como C++: genera una copia de código por cada tipo concreto, así que siempre son más rápidos que una interfaz</button>
+    <button class="opt">Go los borra como Java: todo se convierte a <code>any</code>, así que rinden igual que <code>interface{}</code></button>
+    <button class="opt">Go usa <strong>GC shape stenciling</strong>: una copia por forma de memoria (todos los punteros comparten una) más un diccionario. La ganancia real viene de eliminar el <em>boxing</em>, no del despacho</button>
+    <div class="exp">Go eligió un punto intermedio. Las instanciaciones sobre tipos puntero comparten una sola copia de código y reciben un diccionario oculto con el tipo real y los métodos; los tipos con forma de memoria propia (<code>int</code>, structs de escalares) generan copias separadas. Por eso llamar a un método de un parámetro de tipo va por el diccionario y cuesta parecido a una llamada por interfaz: los genéricos dan seguridad de tipos, y velocidad solo cuando eliminan asignaciones de <code>interface{}</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Estás diseñando la API pública de un módulo. ¿Cuál de estos cambios <strong>NO</strong> rompe a tus usuarios?</p>
+    <button class="opt">Agregarle un método a un <strong>struct</strong> exportado</button>
+    <button class="opt">Agregarle un método a una <strong>interfaz</strong> exportada</button>
+    <button class="opt">Agregarle un parámetro de tipo a un tipo genérico exportado (<code>Cache[V]</code> → <code>Cache[K, V]</code>)</button>
+    <div class="exp">Nadie "implementa" tu struct: solo lo usa, así que agregarle métodos (o campos, si el struct tiene un campo sin exportar que impide literales posicionales) no invalida nada. En cambio, las interfaces se satisfacen implícitamente: al agregar un método, todos los tipos externos que la implementaban dejan de compilar — por eso <code>io.Reader</code> no cambió nunca. Y agregar un parámetro de tipo rompe cada instanciación existente. De ahí la regla: aceptá interfaces, devolvé structs.</div>
+  </div>
+
+  <div class="score" id="scoreGS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para GS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs3-concurrencia/lecture.html">← GS3: Concurrencia avanzada</a>
+  <a href="../gs5-performance/lecture.html">GS5: Performance →</a>
+</nav>
+
+</div>
+</body>
+</html>

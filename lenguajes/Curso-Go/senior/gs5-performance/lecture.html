@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS5 — Performance: pprof, benchmarks y optimización real · Go Senior</title>
+  <meta name="description" content="Benchmarks que el compilador no puede borrar, benchstat y significancia estadística, los cinco perfiles de pprof, alloc_space vs inuse_space, net/http/pprof seguro en producción, go tool trace, inlining, bounds check elimination y el SIMD experimental de Go 1.26.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS5</span>
+  <span class="badge">⏱ 45–135 min</span>
+  <span class="badge">🎯 Pre-req: GS2</span>
+  <span class="badge">📊 Performance</span>
+</div>
+
+<article>
+
+<h1>GS5 — Performance: pprof, benchmarks y optimización real</h1>
+
+<h2>GS5.0 Por qué este módulo</h2>
+
+<p>Go trae, de fábrica y sin instalar nada, el mejor tooling de profiling de cualquier lenguaje mainstream. Un perfil de CPU, uno de heap, uno de contención de candados, un trace del scheduler con resolución de microsegundos, y una herramienta para diffear dos perfiles y ver exactamente qué empeoró entre dos commits. Todo eso viene en el binario que ya tenés instalado.</p>
+
+<p>Y casi nadie lo usa más allá de tirar un <code>-cpuprofile</code>, mirar el <code>top</code>, ver que el 30% está en <code>runtime.mallocgc</code>, y sacar la conclusión equivocada.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Optimizar no es escribir código más rápido: es <strong>medir dónde se va el tiempo, cambiar una sola cosa, y volver a medir con suficiente rigor estadístico como para saber si el cambio hizo algo</strong>. El 80% del trabajo es instrumentación y método; el 20% es el truco de Go que aplicás al final. La gente hace esos porcentajes al revés y por eso pasa semanas optimizando funciones que representan el 2% del tiempo total.
+</div>
+
+<p>Hay tres errores que se repiten en todos los equipos, y este módulo existe para vacunarte contra los tres:</p>
+
+<div class="step"><strong>1. Benchmarks que el compilador borró.</strong> Escribís un <code>BenchmarkX</code>, te da 0.31 ns/op, celebrás. Ese número es físicamente imposible: a 3 GHz un ciclo de reloj dura 0.33 ns. Lo que medís es un bucle vacío, porque el compilador probó que el resultado no se usa y eliminó la llamada entera.</div>
+
+<div class="step"><strong>2. Una sola corrida como evidencia.</strong> Corrés el benchmark antes y después, ves 412 µs contra 398 µs, declarás una mejora del 3,4%. En esa misma máquina, corriendo el mismo binario diez veces, la varianza es del 5%. No mediste una mejora: mediste ruido térmico.</div>
+
+<div class="step"><strong>3. Optimizar donde no está el tiempo.</strong> El perfil de CPU dice que <code>encoding/json</code> es el 40%. Lo optimizás y el endpoint baja de 180 ms a 156 ms, porque el resto del tiempo el proceso estaba <em>bloqueado</em> esperando a la base de datos, y un perfil de CPU no muestra tiempo bloqueado. Ese es el momento de dejar de tocar Go.</div>
+
+<div class="info">
+  <strong>Contexto 2026.</strong> Este módulo asume <strong>Go 1.26</strong>. Lo relevante para performance en esta versión: llegó <strong>SIMD experimental</strong> vía <code>simd/archsimd</code>, <code>io.ReadAll</code> es más rápido (menos recrecimientos del buffer), <code>reflect</code> ganó iteradores al estilo <code>range</code>-over-func, y el compilador asigna los <em>backing stores</em> de slices en el stack en bastantes más casos que antes — o sea que allocaciones que ayer contabas hoy pueden no existir. El GC <strong>Green Tea</strong> ya es el default; lo vimos en <a href="../gs2-memoria-gc/lecture.html">GS2</a> y acá vamos a ver cómo aparece en los perfiles.
+</div>
+
+<h2>GS5.1 Benchmarks que no mienten</h2>
+
+<p>Un benchmark en Go es una función <code>BenchmarkXxx(b *testing.B)</code> en un archivo <code>_test.go</code>. El framework la llama con un <code>b.N</code> creciente hasta que el tiempo total es estadísticamente utilizable, y divide.</p>
+
+<pre><code class="lang-go">package parser
+
+import "testing"
+
+func BenchmarkParsear(b *testing.B) {
+    entrada := []byte(`{"id":42,"nombre":"pedido"}`)
+    b.ReportAllocs()                 // agrega B/op y allocs/op a la salida
+    b.ResetTimer()                   // descarta el costo del setup de arriba
+    for i := 0; i &lt; b.N; i++ {
+        Parsear(entrada)
+    }
+}</code></pre>
+
+<pre><code class="lang-bash"># -run=^$ evita correr los tests normales; solo queremos los benchmarks
+go test -run=^$ -bench=BenchmarkParsear -benchmem ./parser/</code></pre>
+
+<pre><code class="lang-bash">goos: linux
+goarch: amd64
+pkg: api/parser
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkParsear-8    3412108    351.4 ns/op    248 B/op    5 allocs/op
+PASS</code></pre>
+
+<p>Se lee así: se ejecutó 3.412.108 veces, cada iteración tardó 351,4 nanosegundos, asignó 248 bytes en 5 allocaciones distintas. Las dos últimas columnas son las que más te van a servir, porque las allocaciones son el insumo del GC y suelen ser el único número que podés bajar de forma predecible.</p>
+
+<h3>El compilador puede borrar tu benchmark entero</h3>
+
+<p>Este es el error número uno, y es silencioso: no falla, te devuelve un número precioso.</p>
+
+<pre><code class="lang-go">func fib(n int) int {
+    if n &lt; 2 { return n }
+    return fib(n-1) + fib(n-2)
+}
+
+// ❌ MAL: el resultado se descarta. fib no tiene efectos laterales,
+// el compilador lo prueba y elimina la llamada.
+func BenchmarkFibMalo(b *testing.B) {
+    for i := 0; i &lt; b.N; i++ {
+        fib(20)
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">BenchmarkFibMalo-8    1000000000    0.2913 ns/op    0 B/op    0 allocs/op</code></pre>
+
+<div class="mistake">
+  <strong>La regla del nanosegundo.</strong> Si un benchmark que hace trabajo real te da menos de ~1 ns/op, o exactamente <code>1000000000</code> iteraciones (el tope que impone <code>testing</code>), el compilador borró el cuerpo. A 3 GHz un ciclo dura 0,33 ns; <code>fib(20)</code> son unas 20.000 llamadas recursivas. No hay universo en el que eso salga en 0,29 ns.
+</div>
+
+<p>La solución clásica es la <strong>variable sumidero</strong> (<em>sink</em>) a nivel de paquete. El compilador no puede probar que nadie fuera del paquete lee una variable exportable ni que el linker no la referencia, así que está obligado a ejecutar el trabajo que la produce:</p>
+
+<pre><code class="lang-go">// Sumidero a nivel de paquete: obliga al compilador a mantener el cálculo.
+var sinkInt int
+
+func BenchmarkFibBien(b *testing.B) {
+    var r int
+    for i := 0; i &lt; b.N; i++ {
+        r = fib(20)          // escribimos en una local...
+    }
+    sinkInt = r              // ...y la publicamos UNA vez, fuera del bucle
+}</code></pre>
+
+<pre><code class="lang-bash">BenchmarkFibBien-8    41982    28437 ns/op    0 B/op    0 allocs/op</code></pre>
+
+<p>28,4 µs. Eso sí es <code>fib(20)</code>. Fijate el detalle de asignar a la local <code>r</code> dentro del bucle y publicar en <code>sinkInt</code> una sola vez afuera: si escribieras directo en la global en cada iteración, estarías midiendo también un store a memoria global por vuelta, que en un benchmark de nanosegundos no es despreciable.</p>
+
+<h3><code>b.Loop</code>: la forma moderna (Go 1.24+)</h3>
+
+<p>Desde Go 1.24 existe <code>b.Loop()</code>, que resuelve el problema de raíz sin sumideros:</p>
+
+<pre><code class="lang-go">func BenchmarkFibLoop(b *testing.B) {
+    datos := cargarFixture()      // el setup NO se cronometra: va antes del Loop
+
+    for b.Loop() {
+        fib(20)                   // el compilador NO puede eliminar esto
+    }
+
+    verificar(datos)              // el teardown TAMPOCO se cronometra
+}</code></pre>
+
+<p><code>b.Loop</code> hace tres cosas que <code>for i := 0; i &lt; b.N; i++</code> no hace:</p>
+
+<table>
+<thead><tr><th>Comportamiento</th><th>Por qué importa</th></tr></thead>
+<tbody>
+<tr><td>Mantiene vivos parámetros y resultados de las llamadas del cuerpo</td><td>Ya no necesitás la variable sumidero: el compilador tiene prohibido borrar el trabajo</td></tr>
+<tr><td>El cronómetro arranca en la primera llamada a <code>b.Loop()</code></td><td><code>b.ResetTimer()</code> desaparece: el setup previo queda fuera automáticamente</td></tr>
+<tr><td>El cuerpo se ejecuta en una sola pasada de medición</td><td>El setup costoso corre una vez, no una vez por cada tanteo de <code>b.N</code></td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Usá <code>b.Loop</code> en todo lo nuevo.</strong> El patrón viejo con <code>b.N</code> sigue funcionando y lo vas a seguir viendo en código existente y en la stdlib, así que tenés que saber leerlo. Pero para escribir, <code>b.Loop</code> elimina de un saque las dos fuentes de benchmarks mentirosos: la eliminación de código muerto y el setup contabilizado.
+</div>
+
+<h3>Los otros controles de <code>testing.B</code></h3>
+
+<pre><code class="lang-go">func BenchmarkComprimir(b *testing.B) {
+    entrada := hacerPayload(1 &lt;&lt; 20)   // 1 MiB
+
+    b.SetBytes(int64(len(entrada)))    // habilita la columna MB/s
+    b.ReportAllocs()
+
+    for b.Loop() {
+        Comprimir(entrada)
+    }
+}
+
+func BenchmarkHandlerParalelo(b *testing.B) {
+    h := nuevoHandler()
+    b.RunParallel(func(pb *testing.PB) {
+        // cada goroutine tiene su propio estado: nada compartido acá
+        req := nuevaRequest()
+        for pb.Next() {
+            h.Servir(req)
+        }
+    })
+}
+
+func BenchmarkConMetricaPropia(b *testing.B) {
+    var fallos int
+    for b.Loop() {
+        if err := Procesar(); err != nil { fallos++ }
+    }
+    // métricas arbitrarias en la salida y en benchstat
+    b.ReportMetric(float64(fallos)/float64(b.N), "fallos/op")
+}</code></pre>
+
+<div class="warn">
+  <strong><code>b.StopTimer()</code> dentro del bucle es una trampa cara.</strong> Parar y arrancar el cronómetro cuesta del orden de cientos de nanosegundos. Si tu operación tarda 300 ns y frenás el reloj en cada iteración para hacer un setup, estás midiendo mayormente el costo de frenar el reloj. Si necesitás setup por iteración, o lo hacés barato, o generás todos los casos por adelantado y los indexás.
+</div>
+
+<h2>GS5.2 <code>benchstat</code>: una corrida no es un resultado</h2>
+
+<p>Una máquina de desarrollo no es un instrumento de medición. Tiene turbo boost que sube y baja según la temperatura, otros procesos, el scheduler del sistema operativo, y —en la nube— vecinos ruidosos en el mismo host físico. La varianza entre corridas idénticas del mismo binario suele estar entre el 2% y el 10%.</p>
+
+<div class="rule">
+  <strong>📌 Si tu "mejora" es menor que la varianza de tu máquina, no medís una mejora: medís tu máquina.</strong> Por eso la unidad mínima de evidencia no es una corrida, son diez, y la conclusión no la sacás vos: la saca una prueba estadística.
+</div>
+
+<pre><code class="lang-bash">go install golang.org/x/perf/cmd/benchstat@latest
+
+# 1. Medí el estado actual, 10 repeticiones
+git stash
+go test -run=^$ -bench=Decodificar -benchmem -count=10 ./api/ &gt; base.txt
+
+# 2. Aplicá UN cambio y volvé a medir
+git stash pop
+go test -run=^$ -bench=Decodificar -benchmem -count=10 ./api/ &gt; nuevo.txt
+
+# 3. Que decida la estadística
+benchstat base.txt nuevo.txt</code></pre>
+
+<pre><code class="lang-bash">goos: linux
+goarch: amd64
+pkg: api
+cpu: AMD EPYC 7763 64-Core Processor
+                 │   base.txt   │              nuevo.txt              │
+                 │    sec/op    │   sec/op     vs base                │
+Decodificar-8      412.4µ ± 2%   361.2µ ± 2%  -12.42% (p=0.000 n=10)
+
+                 │   base.txt   │              nuevo.txt              │
+                 │     B/op     │     B/op      vs base               │
+Decodificar-8     148.2Ki ± 0%   96.4Ki ± 0%   -34.95% (p=0.000 n=10)
+
+                 │   base.txt   │             nuevo.txt              │
+                 │  allocs/op   │  allocs/op   vs base               │
+Decodificar-8      1.842k ± 0%   0.913k ± 0%  -50.43% (p=0.000 n=10)</code></pre>
+
+<p>Cómo se lee, campo por campo:</p>
+
+<table>
+<thead><tr><th>Elemento</th><th>Qué significa</th></tr></thead>
+<tbody>
+<tr><td><code>412.4µ</code></td><td>La <strong>mediana</strong> de las 10 corridas, no el promedio. Es robusta ante un outlier.</td></tr>
+<tr><td><code>± 2%</code></td><td>Dispersión de esas 10 muestras. Si ves <code>± 15%</code>, tu entorno de medición está roto: cerrá el navegador, desactivá el turbo, no midas en un runner de CI compartido.</td></tr>
+<tr><td><code>-12.42%</code></td><td>El cambio de la mediana. Solo se muestra si es estadísticamente significativo.</td></tr>
+<tr><td><code>p=0.000</code></td><td>Probabilidad de ver esta diferencia si en realidad no hubiera ninguna. Por debajo de 0,05 se considera significativo.</td></tr>
+<tr><td><code>n=10</code></td><td>Muestras usadas. Si dice <code>n=8</code> con <code>-count=10</code>, benchstat descartó outliers.</td></tr>
+<tr><td><code>~</code></td><td>No hay evidencia suficiente de diferencia. <strong>No</strong> quiere decir "son iguales": quiere decir "con estos datos no se puede afirmar nada".</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error de interpretación más común es tratar <code>~</code> como "no cambió nada".</strong> Un <code>~</code> con <code>± 9%</code> y <code>n=10</code> es compatible con una mejora real del 4% que no pudiste detectar con ese ruido. Si el cambio te importa, bajá el ruido (máquina dedicada, <code>-benchtime=3s</code>, más repeticiones) antes de concluir. La estadística no te dice la verdad: te dice cuánta confianza merece tu medición.
+</div>
+
+<div class="tip">
+  <strong>Higiene de medición, en orden de impacto:</strong> (1) nada más corriendo en la máquina; (2) <code>-count=10</code> como mínimo; (3) si el resultado se acerca al umbral que te importa, subí a <code>-count=20</code>; (4) en Linux, fijar el governor en <code>performance</code> elimina una fuente enorme de varianza; (5) nunca compares números medidos en máquinas distintas, ni siquiera del mismo modelo.
+</div>
+
+<h2>GS5.3 pprof: los cinco perfiles y qué pregunta contesta cada uno</h2>
+
+<p>Acá es donde la mayoría se queda corta: usan el perfil de CPU para todo. Pero un perfil de CPU responde <em>una</em> pregunta, y si tu problema es de otra clase, va a mostrarte un plano perfectamente nítido del lugar equivocado.</p>
+
+<table>
+<thead><tr><th>Perfil</th><th>Cómo se obtiene</th><th>Pregunta que contesta</th></tr></thead>
+<tbody>
+<tr><td><strong>CPU</strong></td><td><code>-cpuprofile cpu.out</code> · <code>/debug/pprof/profile?seconds=30</code></td><td>¿En qué funciones se quema tiempo de CPU? Muestreo a 100 Hz.</td></tr>
+<tr><td><strong>Heap</strong></td><td><code>-memprofile mem.out</code> · <code>/debug/pprof/heap</code></td><td>Dos preguntas distintas: ¿quién <em>asignó</em> (<code>alloc_space</code>) y quién <em>retiene ahora</em> (<code>inuse_space</code>)?</td></tr>
+<tr><td><strong>goroutine</strong></td><td><code>/debug/pprof/goroutine</code></td><td>¿Cuántas goroutines hay y en qué línea están paradas? Es el detector de fugas.</td></tr>
+<tr><td><strong>block</strong></td><td><code>runtime.SetBlockProfileRate(n)</code> + <code>/debug/pprof/block</code></td><td>¿Dónde se pasa el tiempo <em>bloqueado</em> en canales, <code>WaitGroup</code> o mutex?</td></tr>
+<tr><td><strong>mutex</strong></td><td><code>runtime.SetMutexProfileFraction(n)</code> + <code>/debug/pprof/mutex</code></td><td>¿Qué candado concreto tiene contención y quién lo retuvo?</td></tr>
+</tbody>
+</table>
+
+<h3><code>alloc_space</code> vs <code>inuse_space</code>: la distinción que confunde a todos</h3>
+
+<p>El perfil de heap tiene cuatro vistas y elegir mal es el error clásico de la primera investigación de memoria:</p>
+
+<table>
+<thead><tr><th>Vista</th><th>Qué mide</th><th>Cuándo la querés</th></tr></thead>
+<tbody>
+<tr><td><code>inuse_space</code></td><td>Bytes <strong>vivos</strong> en el instante del snapshot</td><td>Buscás una <strong>fuga</strong> o por qué el RSS del pod no baja</td></tr>
+<tr><td><code>inuse_objects</code></td><td>Cantidad de objetos vivos</td><td>El GC tarda mucho <em>marcando</em>: importa el conteo, no los bytes</td></tr>
+<tr><td><code>alloc_space</code></td><td>Bytes asignados <strong>acumulados desde que arrancó el proceso</strong>, liberados incluidos</td><td>Buscás <strong>presión de GC</strong>: quién genera basura en el camino caliente</td></tr>
+<tr><td><code>alloc_objects</code></td><td>Cantidad total de objetos asignados</td><td>Correlato exacto de la columna <code>allocs/op</code> de tus benchmarks</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El malentendido que hace perder tardes enteras.</strong> Abrís un perfil de heap buscando una fuga, ves <code>alloc_space</code> con <code>bytes.Buffer.grow</code> en 14 GB y creés que encontraste el culpable. No encontraste nada: <code>alloc_space</code> es <em>histórico</em>. Un servicio que lleva tres días arriba asignó y liberó terabytes sin tener ni una fuga. Para fugas se mira <code>inuse_space</code>, y <strong>siempre comparando dos snapshots separados en el tiempo</strong>, no uno solo.
+</div>
+
+<pre><code class="lang-bash"># Fuga: dos snapshots separados, y el diff entre ambos
+curl -s http://127.0.0.1:6060/debug/pprof/heap &gt; h1.pb.gz
+sleep 600
+curl -s http://127.0.0.1:6060/debug/pprof/heap &gt; h2.pb.gz
+
+# -diff_base: mostrá SOLO lo que creció en esos 10 minutos
+go tool pprof -sample_index=inuse_space -diff_base=h1.pb.gz h2.pb.gz</code></pre>
+
+<div class="info">
+  El perfil de heap es <strong>muestreado</strong>: por defecto toma una muestra cada 512 KiB asignados (<code>runtime.MemProfileRate</code>). Eso lo hace casi gratis pero estadístico. Si estás cazando algo chico y esquivo, podés poner <code>runtime.MemProfileRate = 1</code> al arrancar para registrar cada allocación — con un costo de rendimiento enorme, así que es una herramienta de laboratorio, no de producción.
+</div>
+
+<h3>block y mutex: los que hay que encender a mano</h3>
+
+<p>Estos dos vienen apagados porque cuestan. Se habilitan con una fracción de muestreo:</p>
+
+<pre><code class="lang-go">import "runtime"
+
+func init() {
+    // 1 de cada 10.000 eventos de bloqueo. Costo despreciable.
+    runtime.SetMutexProfileFraction(10000)
+    // Muestrear bloqueos que duren más de 1 ms (el valor es en nanosegundos).
+    runtime.SetBlockProfileRate(1_000_000)
+}</code></pre>
+
+<div class="warn">
+  <strong>Un perfil de CPU no ve el tiempo bloqueado.</strong> Si tus goroutines esperan en un canal, en un <code>sync.Mutex</code> o en una syscall de red, el perfil de CPU simplemente no las muestra: no están consumiendo CPU. Un servicio con latencia p99 pésima y perfil de CPU plano es exactamente el caso de <code>block</code> y <code>mutex</code>, o del trace de la sección GS5.6.
+</div>
+
+<h2>GS5.4 Leer un perfil de verdad</h2>
+
+<pre><code class="lang-bash">go test -run=^$ -bench=Handler -cpuprofile=cpu.out -memprofile=mem.out ./api/
+go tool pprof cpu.out</code></pre>
+
+<p>Entrás a un REPL. Los comandos que usás el 95% del tiempo:</p>
+
+<table>
+<thead><tr><th>Comando</th><th>Qué te muestra</th></tr></thead>
+<tbody>
+<tr><td><code>top</code></td><td>Top 10 por tiempo <strong>flat</strong>: el gastado en la función misma, sin sus llamadas</td></tr>
+<tr><td><code>top -cum</code></td><td>Top por tiempo <strong>acumulado</strong>: la función y todo lo que llama. Empezá siempre por acá.</td></tr>
+<tr><td><code>list Nombre</code></td><td>El código fuente de la función con el tiempo <strong>anotado línea por línea</strong>. Es la joya de pprof.</td></tr>
+<tr><td><code>peek Nombre</code></td><td>Quién la llama y a quién llama, con porcentajes</td></tr>
+<tr><td><code>web</code></td><td>Grafo de llamadas en SVG (necesita Graphviz instalado)</td></tr>
+<tr><td><code>granularity=lines</code></td><td>Cambia toda la vista de funciones a líneas</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash">(pprof) top -cum
+Showing nodes accounting for 4.21s, 82.55% of 5.10s total
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      4.87s 95.49%  api.(*Handler).ServirPedidos
+     0.02s  0.39%  0.39%      2.04s 40.00%  encoding/json.Unmarshal
+     0.11s  2.16%  2.55%      1.71s 33.53%  encoding/json.(*decodeState).object
+     0.34s  6.67%  9.22%      0.98s 19.22%  reflect.Value.SetString
+     0.87s 17.06% 26.28%      0.87s 17.06%  runtime.mallocgc
+     0.29s  5.69% 31.97%      0.61s 11.96%  runtime.scanobject</code></pre>
+
+<div class="concept">
+  <strong>💡 Leer esta tabla es una habilidad, no una lectura.</strong> <code>flat</code> alto = el trabajo se hace <em>en</em> esa función; ahí optimizás el algoritmo local. <code>cum</code> alto con <code>flat</code> ~0 = es un embudo, la función solo delega; ahí lo que optimizás es <em>a quién llama</em> o <em>cuántas veces la llamás</em>. Y <code>runtime.mallocgc</code> + <code>runtime.scanobject</code> sumando 29% no es un problema del runtime: es <strong>tu código asignando demasiado</strong>. El GC es el síntoma, nunca la causa.
+</div>
+
+<p>El siguiente paso es bajar a la línea:</p>
+
+<pre><code class="lang-bash">(pprof) list ServirPedidos
+Total: 5.10s
+ROUTINE ======================== api.(*Handler).ServirPedidos
+         0      4.87s (flat, cum) 95.49% of Total
+         .          .     41:   cuerpo, err := io.ReadAll(r.Body)
+         .      140ms     42:   if err != nil { ... }
+         .          .     43:
+         .      2.04s     44:   var p Pedido
+         .          .     45:   if err := json.Unmarshal(cuerpo, &amp;p); err != nil {
+         .          .     46:       http.Error(w, "json inválido", 400)
+         .          .     47:       return
+         .          .     48:   }
+         .      1.98s     49:   filas, err := h.db.Query(ctx, consulta, p.ID)
+         .      710ms     50:   return json.NewEncoder(w).Encode(filas)</code></pre>
+
+<p>Ahí ya no hay nada que interpretar: la línea 44–45 se lleva 2,04 s, la 49 otros 1,98 s. Eso es el mapa, y sobre ese mapa se decide.</p>
+
+<h3>La interfaz web y el flamegraph</h3>
+
+<pre><code class="lang-bash"># Abre un servidor local con flamegraph, grafo, source view y comparaciones
+go tool pprof -http=:8080 cpu.out
+
+# Directamente contra un proceso vivo, sin archivos intermedios
+go tool pprof -http=:8080 http://127.0.0.1:6060/debug/pprof/profile?seconds=30</code></pre>
+
+<div class="analogy">
+  <strong>Cómo leer un flamegraph.</strong> El eje X <strong>no es tiempo</strong>: es proporción, y los hijos están ordenados alfabéticamente. Cada barra es una función, y su ancho es el porcentaje de muestras en las que apareció en la pila. Las barras <em>anchas y planas</em> en la parte de arriba son donde se quema la CPU. Un pico angosto y altísimo es una recursión profunda que no cuesta nada. Buscás mesetas anchas, no torres altas.
+</div>
+
+<h2>GS5.5 <code>net/http/pprof</code> en producción sin abrir un agujero</h2>
+
+<p>Perfilar un servicio vivo, en producción, bajo carga real, es la diferencia entre optimizar el sistema y optimizar tu idea del sistema. El paquete <code>net/http/pprof</code> lo hace con una línea. Y con esa misma línea se publican en internet las pilas internas de tu proceso.</p>
+
+<pre><code class="lang-go">import _ "net/http/pprof"   // ⚠️ el import con guion bajo REGISTRA handlers</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Lo que ese import hace de verdad.</strong> Su <code>init()</code> registra <code>/debug/pprof/</code> y sus rutas hijas <strong>en <code>http.DefaultServeMux</code></strong>. Si tu servidor usa el mux por defecto —directamente, o porque una librería lo hace— acabás de exponer al público: los stacks completos de todas tus goroutines (que revelan rutas de archivos, nombres internos y arquitectura), <code>/debug/pprof/cmdline</code> con los flags del proceso (donde suele haber DSNs y tokens), y <code>/debug/pprof/profile</code>, que es un <strong>vector de denegación de servicio</strong>: cualquiera puede pedir un perfil de 30 segundos, y varios simultáneos degradan el proceso.
+</div>
+
+<p>La forma correcta es un listener separado, atado a loopback, al que se llega por un túnel:</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "net/http"
+    "net/http/pprof"
+    "time"
+)
+
+// muxDebug arma un mux PROPIO: nada toca DefaultServeMux.
+func muxDebug() *http.ServeMux {
+    m := http.NewServeMux()
+    m.HandleFunc("/debug/pprof/", pprof.Index)
+    m.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+    m.HandleFunc("/debug/pprof/profile", pprof.Profile)
+    m.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+    m.HandleFunc("/debug/pprof/trace", pprof.Trace)
+    return m
+}
+
+func main() {
+    // 127.0.0.1 explícito: NO ":6060", que escucha en todas las interfaces.
+    depuracion := &amp;http.Server{
+        Addr:              "127.0.0.1:6060",
+        Handler:           muxDebug(),
+        ReadHeaderTimeout: 5 * time.Second,
+    }
+    go depuracion.ListenAndServe()
+
+    // El servidor público, con su propio mux, sin rastro de pprof.
+    publico := &amp;http.Server{Addr: ":8080", Handler: rutasDeNegocio()}
+    publico.ListenAndServe()
+}</code></pre>
+
+<pre><code class="lang-bash"># Desde tu máquina: túnel SSH contra el loopback del pod/host
+ssh -N -L 6060:127.0.0.1:6060 usuario@servidor-produccion
+
+# En Kubernetes, el equivalente
+kubectl port-forward pod/api-7d9f 6060:6060
+
+# Y ahora perfilás como si fuera local
+go tool pprof -http=:8080 http://127.0.0.1:6060/debug/pprof/profile?seconds=30</code></pre>
+
+<div class="rule">
+  <strong>📌 Si por política de la organización el endpoint tiene que ser accesible por red, entonces necesita autenticación y <em>autorización</em> reales</strong> — no un "está en la VPN" ni un header secreto. Perfilar es una capacidad privilegiada de operaciones y merece el mismo control que cualquier otra: quién sos, y si ese quién tiene permiso para esta acción sobre este recurso. Los modelos concretos (RBAC, ABAC, deny por defecto, el problema de los controles del lado del cliente) están en <a href="../../../../sistemas/Curso-Ciberseguridad/m03-autorizacion/lecture.html">M03 — Autorización</a> del curso de Ciberseguridad. La regla corta para acá: <strong>loopback + túnel por defecto; cualquier otra cosa es una decisión de seguridad que hay que diseñar.</strong>
+</div>
+
+<div class="tip">
+  <strong>Costo real de perfilar en producción.</strong> El perfil de CPU es muestreo a 100 Hz: overhead típico por debajo del 1–2%, seguro de correr en un pod que sirve tráfico. El de heap es prácticamente gratis. Los de <code>block</code> y <code>mutex</code> dependen de la fracción que configures. El <strong>trace</strong> es el más caro: úsalo en ventanas de 3 a 10 segundos, nunca continuo.
+</div>
+
+<h2>GS5.6 El trace de ejecución: lo que pprof no ve</h2>
+
+<p>pprof te dice <em>en qué funciones</em> se gastó CPU. No te dice <strong>por qué una request tardó 400 ms si solo usó 12 ms de CPU</strong>. Para eso está <code>go tool trace</code>, que registra eventos del runtime con marca temporal: cada goroutine que arranca, se bloquea, se despierta, cada pausa de GC, cada syscall.</p>
+
+<pre><code class="lang-go">import (
+    "os"
+    "runtime/trace"
+)
+
+func main() {
+    f, _ := os.Create("trace.out")
+    defer f.Close()
+    trace.Start(f)
+    defer trace.Stop()
+
+    trabajoDeVerdad()
+}</code></pre>
+
+<pre><code class="lang-bash"># Desde un benchmark
+go test -run=^$ -bench=Handler -trace=trace.out ./api/
+
+# De un proceso vivo, ventana corta
+curl -o trace.out 'http://127.0.0.1:6060/debug/pprof/trace?seconds=5'
+
+go tool trace trace.out    # abre la UI en el navegador</code></pre>
+
+<p>Las vistas que resuelven problemas reales:</p>
+
+<table>
+<thead><tr><th>Vista</th><th>Diagnostica</th></tr></thead>
+<tbody>
+<tr><td><strong>Goroutine analysis</strong></td><td>Por goroutine: cuánto estuvo ejecutando, cuánto <em>esperando al scheduler</em>, bloqueada en red, en sync, en GC. Es la descomposición de la latencia.</td></tr>
+<tr><td><strong>Network blocking profile</strong></td><td>Dónde se bloquea esperando I/O. Acá aparece la base de datos que el perfil de CPU no mostraba.</td></tr>
+<tr><td><strong>Synchronization blocking</strong></td><td>Canales y mutex, con la pila de quien esperó</td></tr>
+<tr><td><strong>Scheduler latency profile</strong></td><td>Goroutines <em>listas para correr</em> pero sin P disponible. Si esto es grande, tenés más paralelismo del que la máquina soporta.</td></tr>
+<tr><td><strong>Timeline por P</strong></td><td>Las pausas <em>stop-the-world</em> del GC dibujadas en la línea de tiempo, con su duración exacta</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El caso donde el trace es la única herramienta.</strong> Latencia p99 de 800 ms, p50 de 40 ms, perfil de CPU plano y aburrido. El trace muestra la respuesta en dos minutos: las requests lentas son las que caen dentro de una pausa STW del GC, o las que quedaron encoladas en <em>scheduler latency</em> porque un puñado de goroutines monopolizó los P. Ninguno de esos dos hechos aparece en un perfil de CPU, porque en ambos casos <strong>tu código no estaba consumiendo CPU: estaba esperando.</strong>
+</div>
+
+<pre><code class="lang-go">// Regiones y tareas: anotan el trace con TUS nombres de negocio
+import "runtime/trace"
+
+func (h *Handler) ServirPedidos(w http.ResponseWriter, r *http.Request) {
+    ctx, tarea := trace.NewTask(r.Context(), "ServirPedidos")
+    defer tarea.End()
+
+    var p Pedido
+    trace.WithRegion(ctx, "decodificar", func() {
+        json.NewDecoder(r.Body).Decode(&amp;p)
+    })
+
+    var filas []Fila
+    trace.WithRegion(ctx, "consulta-db", func() {
+        filas, _ = h.db.Query(ctx, consulta, p.ID)
+    })
+
+    trace.WithRegion(ctx, "responder", func() {
+        json.NewEncoder(w).Encode(filas)
+    })
+}</code></pre>
+
+<p>Con eso, la vista <em>User-defined tasks</em> te da la distribución de latencia de <code>ServirPedidos</code> desglosada por región. Ya no adivinás qué parte tarda: lo leés.</p>
+
+<div class="info">
+  Versiones recientes de Go incluyen además un <strong><em>flight recorder</em></strong> en <code>runtime/trace</code>: un buffer circular que mantiene siempre los últimos segundos de trace en memoria, con overhead bajo, y que volcás a disco <em>cuando detectás el problema</em>. Es la respuesta al viejo dilema de "el bug aparece una vez por día y no puedo dejar el trace prendido": lo dejás grabando siempre y guardás solo la ventana que rodea al evento raro.
+</div>
+
+<h2>GS5.7 Optimizaciones que sirven, en orden</h2>
+
+<p>Este orden no es una preferencia estética. Está ordenado por <strong>relación entre ganancia esperada y riesgo introducido</strong>, y saltearse los primeros escalones para ir directo a los últimos es la definición operativa de optimización prematura.</p>
+
+<table>
+<thead><tr><th>#</th><th>Palanca</th><th>Ganancia típica</th><th>Riesgo / costo</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Algoritmo y trabajo evitado</strong> — mejor complejidad, caché, batching, menos round-trips</td><td>10×–1000×</td><td>Medio: cambia semántica, requiere tests</td></tr>
+<tr><td>2</td><td><strong>Menos allocaciones</strong> — preasignar capacidad, reusar buffers, evitar escapes</td><td>1,2×–3×</td><td>Bajo si medís; alto si usás <code>sync.Pool</code> mal</td></tr>
+<tr><td>3</td><td><strong>Menos indirección</strong> — sacar interfaces del camino caliente, valores en vez de punteros</td><td>1,05×–1,4×</td><td>Medio: suele empeorar el diseño</td></tr>
+<tr><td>4</td><td><strong>Evitar copias grandes</strong> — pasar slices, no arrays; <code>io.Copy</code> con buffer reusado</td><td>1,1×–5×</td><td>Bajo, pero cuidado con el aliasing</td></tr>
+<tr><td>5</td><td><strong>Paralelizar</strong> — worker pool, <code>errgroup</code></td><td>Hasta N núcleos</td><td>Alto: carreras, ordenamiento, backpressure</td></tr>
+<tr><td>❌</td><td><strong>Micro-tuning de bucles</strong> — desenrollar a mano, evitar <code>range</code>, reordenar condiciones</td><td>~0% (a veces negativo)</td><td>Alto en legibilidad, nulo en beneficio</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Paralelizar está último por una razón.</strong> Los cuatro primeros escalones <em>reducen el trabajo</em>. Paralelizar no reduce nada: reparte el mismo trabajo entre más núcleos, y encima suma coordinación, no-determinismo y una clase entera de bugs nuevos. Si el trabajo por request es innecesario, paralelizarlo significa desperdiciar en ocho núcleos lo que antes desperdiciabas en uno.
+</div>
+
+<h3>Escalón 1, con números</h3>
+
+<pre><code class="lang-go">// ❌ O(n·m): por cada pedido, recorre todos los usuarios
+func EnriquecerLento(pedidos []Pedido, usuarios []Usuario) {
+    for i := range pedidos {
+        for _, u := range usuarios {
+            if u.ID == pedidos[i].UsuarioID {
+                pedidos[i].Email = u.Email
+                break
+            }
+        }
+    }
+}
+
+// ✅ O(n+m): un índice, y después una búsqueda constante
+func EnriquecerRapido(pedidos []Pedido, usuarios []Usuario) {
+    porID := make(map[int64]string, len(usuarios))   // capacidad exacta: cero rehash
+    for _, u := range usuarios {
+        porID[u.ID] = u.Email
+    }
+    for i := range pedidos {
+        pedidos[i].Email = porID[pedidos[i].UsuarioID]
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">EnriquecerLento-8      184.2m ± 2%
+EnriquecerRapido-8       1.9m ± 1%   -98.97% (p=0.000 n=10)</code></pre>
+
+<p>97× con diez líneas. Ninguna cantidad de <code>sync.Pool</code>, de evitar interfaces ni de SIMD sobre la versión lenta se acerca a eso. Por eso el algoritmo va primero, siempre.</p>
+
+<h3>Escalón 2: menos allocaciones</h3>
+
+<pre><code class="lang-go">// ❌ Cada append que supera la capacidad copia todo el slice a memoria nueva
+func IDsLento(pedidos []Pedido) []int64 {
+    var out []int64                      // capacidad 0: ~log2(n) recrecimientos
+    for _, p := range pedidos {
+        out = append(out, p.ID)
+    }
+    return out
+}
+
+// ✅ Una sola allocación, del tamaño exacto
+func IDsRapido(pedidos []Pedido) []int64 {
+    out := make([]int64, 0, len(pedidos))
+    for _, p := range pedidos {
+        out = append(out, p.ID)
+    }
+    return out
+}</code></pre>
+
+<pre><code class="lang-bash">IDsLento-8     41.8µ ± 2%   357Ki ± 0%   19 allocs/op
+IDsRapido-8    12.1µ ± 1%    80Ki ± 0%    1 allocs/op   -71.05% (p=0.000 n=10)</code></pre>
+
+<div class="warn">
+  <strong>Sobre <code>sync.Pool</code>: es una herramienta afilada, no un acelerador genérico.</strong> Sirve cuando los objetos son grandes, de vida corta y de tamaño parecido — buffers de I/O es el caso de manual. Para objetos chicos suele ser <em>más lento</em> que dejar que el allocator haga su trabajo, porque el pool tiene su propio costo por operación. Y si guardás en el pool un objeto que todavía referencia datos de la request anterior, tenés una fuga de memoria y potencialmente una fuga de datos entre usuarios. Medí siempre antes y después con <code>benchstat</code>.
+</div>
+
+<h3>Escalón 3: menos indirección</h3>
+
+<pre><code class="lang-go">// Una llamada a través de interfaz es indirecta: el compilador no sabe
+// qué implementación es, así que NO puede inlinear ni especializar.
+type Transformador interface{ Transformar(int) int }
+
+func AplicarIface(t Transformador, xs []int) {   // llamada indirecta por elemento
+    for i := range xs { xs[i] = t.Transformar(xs[i]) }
+}
+
+func AplicarFunc(f func(int) int, xs []int) {    // el compilador suele devirtualizar
+    for i := range xs { xs[i] = f(xs[i]) }
+}
+
+func AplicarConcreto(xs []int) {                 // inlineable, sin indirección
+    for i := range xs { xs[i] = xs[i]*2 + 1 }
+}</code></pre>
+
+<div class="mistake">
+  <strong>Este escalón es el que más daño hace mal aplicado.</strong> "Las interfaces son lentas" se convierte en un rediseño que borra la capacidad de testear con dobles y de intercambiar implementaciones, a cambio de un 8% en una función que era el 3% del tiempo total — o sea, 0,24% del sistema. Sacá interfaces del camino caliente <strong>solo</strong> cuando el perfil te muestra esa llamada indirecta como un costo medible y ya agotaste los escalones 1 y 2.
+</div>
+
+<h2>GS5.8 Inlining y bounds check elimination</h2>
+
+<p>Estas dos son las optimizaciones del compilador que más se notan en código numérico y de parsing, y las dos se pueden <em>inspeccionar</em>. Eso las vuelve accionables en vez de folclore.</p>
+
+<h3>Inlining: ver qué decide el compilador</h3>
+
+<pre><code class="lang-bash"># -m imprime las decisiones de inlining y de escape analysis
+go build -gcflags='-m' ./api/ 2&gt;&amp;1 | head -40
+
+# Doble -m: explica POR QUÉ no pudo
+go build -gcflags='-m -m' ./api/ 2&gt;&amp;1 | grep 'cannot inline'</code></pre>
+
+<pre><code class="lang-bash">./pedido.go:14:6: can inline (*Pedido).Total with cost 42 as: ...
+./pedido.go:31:6: cannot inline (*Handler).Servir: function too complex: cost 271 exceeds budget 80
+./pedido.go:44:22: &amp;buf escapes to heap
+./pedido.go:47:12: make([]byte, n) does not escape</code></pre>
+
+<p>Lo que hay que saber para leer esa salida:</p>
+
+<ul>
+  <li>El compilador tiene un <strong>presupuesto</strong> de complejidad (unos 80 "nodos"). Una función que lo excede no se inlinea, punto.</li>
+  <li>Una llamada <strong>a través de una interfaz</strong> no se puede inlinear salvo que el compilador logre <em>devirtualizarla</em>, es decir, probar cuál es el tipo concreto.</li>
+  <li>Inlinear no es solo ahorrarse el <code>CALL</code>: es lo que <strong>habilita todo lo demás</strong>. Con el cuerpo expandido en el sitio de llamada, el compilador puede propagar constantes, eliminar ramas muertas y, sobre todo, probar que un valor no escapa — y entonces asignarlo en el stack en vez del heap.</li>
+  <li><code>does not escape</code> es la línea que más te interesa de todo <code>-m</code>: significa cero trabajo para el GC.</li>
+</ul>
+
+<div class="info">
+  <strong>Go 1.26 mueve esta frontera a tu favor.</strong> El compilador ahora asigna el <em>backing store</em> de slices en el stack en bastantes más casos que antes. Consecuencia práctica: benchmarks que tenías con 3 o 4 <code>allocs/op</code> pueden bajar a 1 o 0 <strong>sin que hayas tocado el código</strong>. Corolario incómodo: si tu proyecto tiene tests que afirman una cantidad exacta de allocaciones, van a romperse al actualizar. Eso es una buena noticia disfrazada de falla.
+</div>
+
+<h3>Bounds check elimination (BCE)</h3>
+
+<p>Go verifica cada indexado de slice. Es lo que hace que un índice fuera de rango sea un panic y no una vulnerabilidad de corrupción de memoria — no es negociable. Lo que sí podés hacer es escribir de forma tal que el compilador <em>pruebe</em> que el índice es válido y elimine la verificación.</p>
+
+<pre><code class="lang-bash">go build -gcflags='-d=ssa/check_bce/debug=1' ./codec/</code></pre>
+
+<pre><code class="lang-bash">./codec.go:22:14: Found IsInBounds
+./codec.go:23:14: Found IsInBounds
+./codec.go:24:14: Found IsInBounds
+./codec.go:25:14: Found IsInBounds</code></pre>
+
+<div class="warn">
+  <strong>La salida es al revés de lo que parece.</strong> <code>Found IsInBounds</code> señala las verificaciones que <strong>quedaron</strong>, o sea las que el compilador <em>no</em> pudo eliminar. Menos líneas en esa salida es mejor. La ausencia de mensajes es el resultado ideal.
+</div>
+
+<pre><code class="lang-go">// ❌ 4 verificaciones: el compilador no sabe nada sobre len(b)
+func LeerU32Lento(b []byte) uint32 {
+    return uint32(b[0]) | uint32(b[1])&lt;&lt;8 | uint32(b[2])&lt;&lt;16 | uint32(b[3])&lt;&lt;24
+}
+
+// ✅ Una sola pista al principio y las 4 desaparecen
+func LeerU32Rapido(b []byte) uint32 {
+    _ = b[3]   // si esto no paniquea, b[0..3] son válidos y el compilador lo sabe
+    return uint32(b[0]) | uint32(b[1])&lt;&lt;8 | uint32(b[2])&lt;&lt;16 | uint32(b[3])&lt;&lt;24
+}
+
+// ✅✅ Mejor todavía: la stdlib ya lo hace, con endianness explícita
+func LeerU32Idiomatico(b []byte) uint32 {
+    return binary.LittleEndian.Uint32(b)
+}</code></pre>
+
+<p>Los tres patrones que ayudan al compilador, en orden de utilidad:</p>
+
+<div class="step"><strong>1. <code>for i := range s</code>.</strong> El compilador sabe por construcción que <code>i</code> está en rango, así que <code>s[i]</code> no lleva verificación. Es la razón más importante para preferir <code>range</code> sobre un contador manual — el opuesto exacto del mito de que <code>range</code> es más lento.</div>
+
+<div class="step"><strong>2. Reslicear una vez arriba.</strong> <code>s = s[:n]</code> al inicio de la función establece un hecho sobre la longitud que el compilador propaga a todos los indexados posteriores.</div>
+
+<div class="step"><strong>3. La pista <code>_ = s[k]</code>.</strong> Fuerza una única verificación al principio y elimina las <code>k</code> siguientes. Es una técnica de <em>último recurso</em>: úsala en un codec o un parser medido, con un comentario que explique qué está haciendo esa línea aparentemente inútil, y nunca en código de negocio.</div>
+
+<div class="mistake">
+  <strong>BCE es un martillo de precisión, no de uso general.</strong> En un handler HTTP que hace una consulta a base de datos, eliminar cuatro bounds checks te ahorra unos nanosegundos sobre una operación de milisegundos: cero por ciento, con costo real en legibilidad. Esto vale la pena en codecs, parsers, criptografía y bucles numéricos apretados. En cualquier otro lugar, es ruido.
+</div>
+
+<h2>GS5.9 SIMD experimental: <code>simd/archsimd</code> (Go 1.26)</h2>
+
+<p>SIMD —<em>Single Instruction, Multiple Data</em>— es la capacidad del procesador de aplicar una operación a un vector entero de valores en una sola instrucción: sumar dieciséis enteros de 32 bits de un golpe en vez de dieciséis sumas. Hasta ahora, en Go, la única forma de acceder a eso era escribir ensamblador a mano en archivos <code>.s</code>, que es exactamente como la stdlib implementa <code>bytes.IndexByte</code>, los hashes de <code>crypto</code> y varios paths calientes más.</p>
+
+<p>Go 1.26 introduce <strong><code>simd/archsimd</code></strong>: tipos vectoriales e intrínsecos expuestos como API de Go, detrás de un <code>GOEXPERIMENT</code>, inicialmente para amd64 (AVX2 / AVX-512).</p>
+
+<pre><code class="lang-bash"># Está detrás de una bandera experimental: no se compila por defecto
+GOEXPERIMENT=simd go build ./vectorial/</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Esto NO va a producción, y la advertencia es literal.</strong> Es material explícitamente experimental: la API puede cambiar o desaparecer sin pasar por la promesa de compatibilidad de Go 1.x; el código queda atado a una arquitectura, con lo cual perdés la compilación cruzada trivial que es media gracia de Go; requiere detección de features de CPU en runtime, porque no todo amd64 tiene AVX-512; y es <strong>trivialmente fácil escribir SIMD más lento que el bucle normal</strong>, porque el costo de cargar y descargar los registros vectoriales se come la ganancia si el arreglo es chico. Estudiálo, mirálo, no lo despliegues.
+</div>
+
+<div class="rule">
+  <strong>📌 Antes de pensar en SIMD, ya deberías haber agotado esto:</strong> ¿está el algoritmo correcto? ¿estás en cero allocaciones en el camino caliente? ¿verificaste con <code>-m</code> que las funciones críticas se inlinean? ¿confirmaste con <code>check_bce</code> que no quedan verificaciones en el bucle? ¿probaste si la stdlib ya trae una versión con ensamblador SIMD de lo que estás por escribir a mano? Si alguna respuesta es "no", ahí está tu próximo commit — y va a rendir más que el SIMD.
+</div>
+
+<p>El valor real de esta novedad no es que la uses mañana: es <strong>estructural</strong>. Que exista una superficie en Go para SIMD significa que la stdlib y las librerías de terceros van a poder acelerar sus caminos calientes sin mantener ensamblador a mano por arquitectura. Vos te vas a beneficiar de eso sin escribir una sola línea de <code>archsimd</code> — que es exactamente como debería ser.</p>
+
+<h2>GS5.10 Cuándo NO optimizar</h2>
+
+<p>La habilidad senior en performance no es saber optimizar: es saber <strong>decir que no</strong> con evidencia en la mano. Estos son los cinco casos en los que la respuesta correcta es dejar el código como está.</p>
+
+<div class="step"><strong>1. El tiempo está en I/O.</strong> Si el trace dice que el 85% de la latencia es espera de base de datos o de un servicio externo, el código Go es <strong>irrelevante</strong>. Podés hacerlo infinitamente rápido y la mejora total sería del 15%. Lo que hay que atacar es la consulta, el índice, la cantidad de round-trips o la caché.</div>
+
+<div class="step"><strong>2. No hay un objetivo numérico.</strong> "Hacerlo más rápido" no es un requisito: es una sensación. "p99 por debajo de 200 ms con 500 rps" sí lo es, y además te dice cuándo parar. Sin número no hay criterio de terminado, y la optimización se vuelve infinita.</div>
+
+<div class="step"><strong>3. El costo está en el tiempo del equipo, no en la máquina.</strong> Un endpoint interno que corre 40 veces por día y tarda 900 ms no tiene un problema de performance. Un endpoint público con 4.000 rps y 90 ms sí. La misma latencia, decisiones opuestas.</div>
+
+<div class="step"><strong>4. La ganancia es menor que la varianza de tu medición.</strong> Si <code>benchstat</code> dice <code>~</code>, no ganaste nada demostrable. Mergear ese cambio agrega complejidad a cambio de una creencia.</div>
+
+<div class="step"><strong>5. Va a expirar sola.</strong> Cada versión de Go trae mejoras en compilador y runtime. El caso de Go 1.26 con las slices en el stack es literal: código que alguien complicó a mano para evitar una allocación puede haber quedado obsoleto y ahora ser solo más difícil de leer, sin ser más rápido.</div>
+
+<div class="analogy">
+  <strong>Ley de Amdahl, en criollo.</strong> Si una parte representa el 40% del tiempo total y la hacés <strong>infinitamente rápida</strong>, el sistema mejora un 40% — nunca más. Si representa el 5%, tu techo absoluto es 5%. Antes de invertir una semana en optimizar algo, mirá qué fracción del total es y calculá tu techo. Muchas veces el cálculo termina la discusión antes de empezar.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el endpoint que responde en 180 ms</h2>
+
+<blockquote><code>POST /pedidos/resumen</code> recibe un JSON de ~140 KB, consulta la base y devuelve un JSON de ~90 KB. p50 = 180 ms, p99 = 410 ms. El SLO exige p50 por debajo de 150 ms. Alguien propone reescribir el handler en otro lenguaje. Antes de eso: medir.</blockquote>
+
+<h3>Paso 1 — Separar CPU de espera</h3>
+
+<p>Este es el paso que casi todo el mundo saltea, y es el que define si el resto del trabajo tiene sentido. Un perfil de CPU no distingue "trabajando" de "esperando". El trace sí.</p>
+
+<pre><code class="lang-bash">curl -o trace.out 'http://127.0.0.1:6060/debug/pprof/trace?seconds=10'
+go tool trace trace.out    # → Goroutine analysis → ServirResumen</code></pre>
+
+<table>
+<thead><tr><th>Estado de la goroutine</th><th>Tiempo (p50)</th><th>%</th></tr></thead>
+<tbody>
+<tr><td>Execution (CPU real)</td><td>96 ms</td><td>53%</td></tr>
+<tr><td>Network wait (driver de la base)</td><td>78 ms</td><td>43%</td></tr>
+<tr><td>Sync block + GC + scheduler</td><td>6 ms</td><td>4%</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>180 ms</strong></td><td>100%</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Este número gobierna todo lo que sigue.</strong> Hay 96 ms de CPU sobre los que podemos trabajar y 78 ms de espera de red que Go no controla. Aunque elimináramos <strong>toda</strong> la CPU del handler, el piso sería 84 ms. Techo de mejora posible: 53%. Eso alcanza de sobra para el SLO de 150 ms, así que la inversión se justifica — pero ahora sabemos exactamente cuánto tenemos para ganar, y cuándo dejar de buscar.
+</div>
+
+<h3>Paso 2 — El perfil de CPU sobre esos 96 ms</h3>
+
+<pre><code class="lang-bash">go tool pprof -http=:8080 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'</code></pre>
+
+<pre><code class="lang-bash">(pprof) top -cum
+      flat  flat%        cum   cum%
+         0     0%      9.41s 98.02%  api.(*Handler).ServirResumen
+     0.04s  0.42%      3.82s 39.79%  encoding/json.Unmarshal
+     0.21s  2.19%      2.30s 23.96%  encoding/json.(*decodeState).object
+     0.38s  3.96%      1.44s 15.00%  reflect.Value.SetMapIndex
+     1.12s 11.66%      1.12s 11.66%  runtime.mallocgc
+     0.44s  4.58%      0.91s  9.48%  runtime.scanobject</code></pre>
+
+<p><code>encoding/json</code> es el <strong>40%</strong> de los 96 ms, o sea ~38 ms. Y el 21% adicional entre <code>mallocgc</code> y <code>scanobject</code> es en buena medida consecuencia del mismo culpable: el decodificador con <code>reflect</code> asigna muchísimo. Techo de esta optimización: ~38 ms de los 180, un 21% del total.</p>
+
+<h3>Paso 3 — Un benchmark aislado y reproducible</h3>
+
+<p>No se optimiza contra producción. Se extrae el payload real a un fixture y se benchmarkea la decodificación sola:</p>
+
+<pre><code class="lang-go">//go:embed testdata/pedido_real.json
+var payloadReal []byte
+
+func BenchmarkDecodificarBase(b *testing.B) {
+    b.SetBytes(int64(len(payloadReal)))
+    b.ReportAllocs()
+    for b.Loop() {
+        var p Resumen
+        if err := json.Unmarshal(payloadReal, &amp;p); err != nil {
+            b.Fatal(err)
+        }
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">go test -run=^$ -bench=Decodificar -benchmem -count=10 ./api/ &gt; base.txt</code></pre>
+
+<h3>Paso 4 — Tres alternativas, medidas contra la misma base</h3>
+
+<pre><code class="lang-go">// A — Streaming: decodificar directo del io.Reader, sin materializar el []byte
+func decodificarStreaming(r io.Reader) (Resumen, error) {
+    var p Resumen
+    err := json.NewDecoder(r).Decode(&amp;p)
+    return p, err
+}
+
+// B — Reusar el buffer de lectura con sync.Pool, y seguir usando Unmarshal
+var poolBuf = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+func decodificarConPool(r io.Reader) (Resumen, error) {
+    buf := poolBuf.Get().(*bytes.Buffer)
+    defer func() { buf.Reset(); poolBuf.Put(buf) }()
+
+    if _, err := buf.ReadFrom(r); err != nil {
+        return Resumen{}, err
+    }
+    var p Resumen
+    err := json.Unmarshal(buf.Bytes(), &amp;p)
+    return p, err
+}
+
+// C — Otra librería, compatible en API con encoding/json
+//     import gojson "github.com/goccy/go-json"
+func decodificarOtraLib(datos []byte) (Resumen, error) {
+    var p Resumen
+    err := gojson.Unmarshal(datos, &amp;p)
+    return p, err
+}</code></pre>
+
+<pre><code class="lang-bash">benchstat base.txt streaming.txt pool.txt otralib.txt</code></pre>
+
+<table>
+<thead><tr><th>Variante</th><th>sec/op</th><th>vs base</th><th>B/op</th><th>allocs/op</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td>Base (<code>ReadAll</code> + <code>Unmarshal</code>)</td><td>412,4 µs ± 2%</td><td>—</td><td>148,2 Ki</td><td>1.842</td><td>Referencia</td></tr>
+<tr><td><strong>A — Streaming <code>Decoder</code></strong></td><td>448,1 µs ± 3%</td><td><strong>+8,66%</strong> (p=0,000)</td><td>152,9 Ki</td><td>1.849</td><td>🔴 <strong>Más lenta</strong></td></tr>
+<tr><td>B — <code>sync.Pool</code> de buffers</td><td>361,2 µs ± 2%</td><td>−12,42% (p=0,000)</td><td>96,4 Ki</td><td>913</td><td>🟡 Mejora modesta</td></tr>
+<tr><td>C — <code>goccy/go-json</code></td><td>168,3 µs ± 2%</td><td>−59,19% (p=0,000)</td><td>61,8 Ki</td><td>402</td><td>🟢 Ganadora</td></tr>
+<tr><td>B + C combinadas</td><td>151,7 µs ± 2%</td><td>−63,21% (p=0,000)</td><td>38,1 Ki</td><td>276</td><td>🟢 Mejor total</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La variante A salió más lenta, y es la más instructiva de las tres.</strong> "Streaming es más eficiente" es cierto <em>en memoria pico</em> y para payloads grandes o de tamaño desconocido. Pero acá el payload son 140 KB que ya llegaron completos: <code>json.Decoder</code> agrega su propio buffering interno y su máquina de estados por token, y sobre datos que ya están en memoria eso es puro overhead. <code>json.Unmarshal</code> sobre un <code>[]byte</code> completo puede recorrer el buffer de una. <strong>Si no hubiéramos medido, habríamos mergeado A convencidos de estar mejorando, y habríamos empeorado el endpoint un 8,7%.</strong>
+</div>
+
+<div class="warn">
+  <strong>Cambiar de librería de JSON no es gratis y hay que decirlo.</strong> Sumás una dependencia de terceros a tu superficie de ataque y a tu mantenimiento; podés heredar diferencias sutiles de comportamiento en casos borde (números grandes, <code>null</code> en tipos no punteros, orden de claves, campos duplicados); y si esa librería queda sin mantener, el problema es tuyo. La forma responsable de mergear esto es <strong>con un test de equivalencia</strong> que decodifique un corpus real con ambas implementaciones y compare los resultados campo por campo. Ese test es parte del PR, no del próximo sprint.
+</div>
+
+<h3>Paso 5 — Verificar en el sistema, no en el benchmark</h3>
+
+<p>El benchmark dice −63% sobre la decodificación. Lo que importa es qué le pasó al endpoint. Se despliega detrás de un feature flag y se vuelve a trazar:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Antes</th><th>Después</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Execution (CPU)</td><td>96 ms</td><td>59 ms</td><td>−37 ms</td></tr>
+<tr><td>Network wait (base de datos)</td><td>78 ms</td><td>78 ms</td><td>sin cambio</td></tr>
+<tr><td>Sync + GC + scheduler</td><td>6 ms</td><td>4 ms</td><td>−2 ms</td></tr>
+<tr><td><strong>p50 total</strong></td><td><strong>180 ms</strong></td><td><strong>141 ms</strong></td><td><strong>−21,7%</strong> ✅ SLO cumplido</td></tr>
+<tr><td>p99</td><td>410 ms</td><td>288 ms</td><td>−29,8%</td></tr>
+</tbody>
+</table>
+
+<p>El p99 mejoró proporcionalmente más que el p50, y eso tiene una explicación: menos allocaciones significa menos ciclos de GC, y las requests que antes caían adentro de una pausa de GC eran justamente las de la cola de la distribución.</p>
+
+<h3>Paso 6 — El perfil final, que dice "pará"</h3>
+
+<pre><code class="lang-bash">(pprof) top -cum
+      flat  flat%        cum   cum%
+         0     0%      5.78s 97.64%  api.(*Handler).ServirResumen
+     0.03s  0.51%      2.94s 49.66%  database/sql.(*DB).QueryContext
+     0.02s  0.34%      0.61s 10.30%  github.com/goccy/go-json.Unmarshal
+     0.29s  4.90%      0.44s  7.43%  runtime.mallocgc
+     0.11s  1.86%      0.19s  3.21%  net/http.(*response).Write</code></pre>
+
+<p>JSON pasó del 40% al 10%. La base de datos es ahora la mitad del perfil de CPU (el driver escaneando filas) <em>además</em> de los 78 ms de espera de red que nunca se movieron. Sumado: de los 141 ms actuales, <strong>~107 ms son la base de datos</strong>.</p>
+
+<div class="rule">
+  <strong>📌 Acá se termina el trabajo de optimización en Go, y esa es la conclusión del ejercicio.</strong> Si volviéramos a bajar el JSON a cero, ganaríamos 14 ms de 141: un 10%, a cambio de complejidad significativa. El siguiente movimiento que rinde no está en Go: es un índice en la consulta, menos round-trips, o una caché delante. <strong>Saber que llegaste a ese punto es tan valioso como el 22% que ganaste</strong>, porque es lo que impide que el equipo gaste el próximo sprint puliendo el 10% mientras el 76% está en otro sistema.
+</div>
+
+<div class="tip">
+  <strong>Lo que se deja escrito para que la decisión no se degrade.</strong> Un benchmark en el repo con el fixture real y un umbral, corriendo en CI con <code>-count=10</code> + <code>benchstat</code> contra un baseline versionado. No para fallar el build ante cualquier ruido — eso genera un test que todos ignoran — sino para <strong>comentar en el PR</strong> cuando una regresión supera el 10% con p&lt;0,05. Sin eso, en cuatro meses alguien agrega un campo, vuelven las 1.800 allocaciones, y nadie se entera hasta que se rompe el SLO.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu benchmark de una función de hashing te da 0,42 ns/op. ¿Qué pasó y cómo lo arreglás?</summary>
+<p>El compilador eliminó el cuerpo del bucle. Como el resultado de la función se descarta y la función no tiene efectos laterales observables, probó que la llamada es código muerto y la borró; lo que medís es un bucle vacío. A 3 GHz un ciclo de reloj dura 0,33 ns, así que cualquier trabajo real es imposible en 0,42 ns — esa es la señal. Las dos soluciones: escribir el resultado en una variable local dentro del bucle y publicarla en una variable sumidero a nivel de paquete <em>una sola vez</em> después del bucle, o —mejor, en Go 1.24+— usar <code>for b.Loop()</code>, que mantiene vivos parámetros y resultados de las llamadas del cuerpo y le prohíbe al compilador esa eliminación.</p></details>
+
+<details><summary>El pod usa 3 GB de RAM y sospechás una fuga. Abrís el perfil de heap y ves <code>bytes.Buffer.grow</code> con 42 GB. ¿Encontraste la fuga?</summary>
+<p>No, y probablemente estás mirando <code>alloc_space</code>, que es <strong>acumulado histórico desde que arrancó el proceso</strong> e incluye todo lo que ya se liberó. 42 GB en un servicio que lleva días arriba puede ser perfectamente sano: dice que ese buffer es un camino caliente que genera basura, lo cual es un dato de presión de GC, no de fuga. Para una fuga se usa <code>inuse_space</code>, que son los bytes vivos en el instante del snapshot, y no se mira un snapshot solo: se toman dos separados en el tiempo y se comparan con <code>-diff_base</code>, porque lo que define una fuga es <em>crecer y no bajar</em>, no ser grande.</p></details>
+
+<details><summary>Latencia p99 de 800 ms, p50 de 40 ms, y el perfil de CPU está plano y sin picos. ¿Qué herramienta usás y qué esperás encontrar?</summary>
+<p><code>go tool trace</code>, porque un perfil de CPU solo muestra tiempo <em>consumiendo CPU</em> y este problema es de tiempo <em>esperando</em> — que es invisible ahí. Las tres causas típicas de esa firma: (1) requests que caen dentro de una pausa stop-the-world del GC, visible en la timeline por P; (2) <em>scheduler latency</em>, goroutines listas para correr sin un P libre, señal de que hay más paralelismo del que la máquina sostiene; (3) contención en un mutex compartido, que el <em>synchronization blocking profile</em> muestra con la pila de quien esperó. Complementariamente, habilitar los perfiles de <code>block</code> y <code>mutex</code> —que vienen apagados— confirma cuál de las tres es.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un benchmark cuyo resultado se descarta puede ser <strong>eliminado entero por el compilador</strong>. La señal es un número por debajo de 1 ns/op. Se arregla con una variable sumidero, o mejor con <code>for b.Loop()</code> (Go 1.24+), que además saca el setup del cronómetro.</li>
+  <li>Una corrida no es evidencia. <code>-count=10</code> más <code>benchstat</code>, y un <code>~</code> significa "sin evidencia suficiente", <strong>no</strong> "sin diferencia".</li>
+  <li>Cinco perfiles, cinco preguntas distintas: <strong>CPU</strong> (dónde se quema), <strong>heap</strong> (quién asigna y quién retiene), <strong>goroutine</strong> (fugas), <strong>block</strong> y <strong>mutex</strong> (dónde se espera). Los dos últimos vienen apagados.</li>
+  <li><code>alloc_space</code> es acumulado histórico → presión de GC. <code>inuse_space</code> es lo vivo ahora → fugas, y siempre comparando dos snapshots con <code>-diff_base</code>.</li>
+  <li><code>top -cum</code> para encontrar el embudo, <code>list</code> para bajar a la línea exacta, <code>-http=:8080</code> para el flamegraph. <code>runtime.mallocgc</code> alto no es un problema del runtime: es tu código asignando.</li>
+  <li><code>net/http/pprof</code> importado con <code>_</code> registra en <code>DefaultServeMux</code>: mux propio, listener en <code>127.0.0.1</code>, acceso por túnel. Si tiene que ir por red, necesita autorización real (<a href="../../../../sistemas/Curso-Ciberseguridad/m03-autorizacion/lecture.html">Ciberseguridad M03</a>).</li>
+  <li><code>go tool trace</code> muestra lo único que pprof no puede: espera de red, contención, latencia del scheduler y pausas de GC. Es la herramienta cuando el perfil de CPU está plano y la latencia no.</li>
+  <li>Orden de las palancas: <strong>algoritmo → allocaciones → indirección → copias → paralelizar</strong>. Micro-tuning de bucles casi nunca. Paralelizar va último porque reparte trabajo, no lo elimina.</li>
+  <li><code>-gcflags='-m'</code> para inlining y escapes; <code>-gcflags='-d=ssa/check_bce/debug=1'</code> para bounds checks (los mensajes son los que <em>quedaron</em>). Valen en codecs y bucles numéricos, no en handlers.</li>
+  <li><strong>Go 1.26</strong>: <code>simd/archsimd</code> es experimental y no va a producción; <code>io.ReadAll</code> más rápido; iteradores en <code>reflect</code>; y el compilador pone más backing stores de slices en el stack, así que tus conteos de allocaciones pueden bajar solos.</li>
+  <li>Si el tiempo está en I/O, el código Go es irrelevante. Medí primero la partición CPU/espera: te da el techo de mejora <em>antes</em> de invertir una semana.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí un benchmark de una función recursiva descartando el resultado y comprobá que da menos de 1 ns/op. Después arreglálo de las dos formas —variable sumidero y <code>b.Loop</code>— y compará los tres números en una tabla. Explicá por qué el primero era imposible.</li>
+  <li>Corré el mismo benchmark, sin cambiar una línea de código, con <code>-count=10</code> dos veces seguidas. Pasá ambas salidas por <code>benchstat</code> y reportá el <code>±</code> y el <code>p</code> obtenidos: esa es la <strong>varianza base de tu máquina</strong>, y ninguna mejora menor a ese número es creíble para vos.</li>
+  <li>Tomá una función tuya que arme un slice con <code>append</code> sin capacidad inicial. Benchmarkeala con <code>-benchmem</code>, agregá <code>make([]T, 0, n)</code> y medí de nuevo con <code>benchstat</code>. Reportá el delta en <code>sec/op</code>, <code>B/op</code> y <code>allocs/op</code>, y verificá con <code>-gcflags='-m'</code> si algo dejó de escapar al heap.</li>
+  <li>Montá <code>net/http/pprof</code> en un servicio tuyo <strong>en un mux separado atado a 127.0.0.1</strong>. Confirmá desde otra máquina que <code>/debug/pprof/</code> no responde en el puerto público, y desde un túnel que sí. Documentá en el README cómo se perfila el servicio.</li>
+  <li>Instrumentá tu handler más lento con <code>trace.NewTask</code> y <code>trace.WithRegion</code>, generá un trace de 10 segundos bajo carga y reportá la partición <em>execution / network wait / sync+GC</em>. Calculá el techo máximo de mejora que tenés optimizando código Go.</li>
+  <li>Elegí una función de parsing o codificación de tu proyecto y corré <code>-gcflags='-d=ssa/check_bce/debug=1'</code>. Contá cuántos <code>Found IsInBounds</code> quedan, aplicá uno de los tres patrones de GS5.8, volvé a contar y —esto es lo importante— medí con <code>benchstat</code> si la diferencia es estadísticamente significativa o pura estética.</li>
+  <li>Tomá dos perfiles de heap de un servicio con 10 minutos de diferencia y corré <code>go tool pprof -sample_index=inuse_space -diff_base=h1 h2</code>. Escribí en tres líneas si hay fuga y en qué línea de código está el crecimiento, o justificá por qué el crecimiento observado es normal.</li>
+</ol>
+
+<section class="quiz" id="quizGS5">
+  <style>
+    #quizGS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS5 .q{margin-bottom:1.5rem}
+    #quizGS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS5 .opt:hover{border-color:var(--accent)}
+    #quizGS5 .opt:disabled{cursor:default}
+    #quizGS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizGS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizGS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS5 .exp.show{display:block}
+    #quizGS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Sospechás una fuga de memoria: el RSS del pod sube y nunca baja. ¿Qué vista del perfil de heap mirás?</p>
+    <button class="opt"><code>alloc_space</code>, porque muestra todo lo que se asignó</button>
+    <button class="opt"><code>alloc_objects</code>, porque cuenta objetos en vez de bytes</button>
+    <button class="opt"><code>inuse_space</code>, comparando dos snapshots separados en el tiempo con <code>-diff_base</code></button>
+    <div class="exp"><code>alloc_space</code> y <code>alloc_objects</code> son <strong>acumulados históricos</strong> desde que arrancó el proceso e incluyen todo lo ya liberado: un servicio sano de varios días muestra decenas de GB ahí sin tener ninguna fuga. Sirven para diagnosticar presión de GC, no retención. Lo que define una fuga es memoria viva que <em>crece y no baja</em>, así que se mira <code>inuse_space</code> y nunca en un snapshot solo: dos capturas separadas y <code>-diff_base</code> para ver exactamente qué creció en esa ventana.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu servicio tiene p99 de 800 ms y p50 de 40 ms, pero el perfil de CPU está plano y sin funciones destacadas. ¿Cuál es la explicación más probable?</p>
+    <button class="opt">El tiempo se va <em>esperando</em> —GC, scheduler, red o mutex— y un perfil de CPU no puede verlo; hace falta <code>go tool trace</code></button>
+    <button class="opt">El perfil de CPU está corrupto: hay que regenerarlo con más segundos</button>
+    <button class="opt">Es normal en Go; el p99 siempre es 20× el p50 por culpa del GC</button>
+    <div class="exp">Un perfil de CPU muestra únicamente muestras tomadas mientras el proceso <strong>consume</strong> CPU. Tiempo bloqueado en un canal, esperando la respuesta de la base, encolado sin un P disponible o adentro de una pausa stop-the-world es tiempo real de latencia que ahí no aparece: por eso el perfil se ve plano mientras el p99 explota. <code>go tool trace</code> descompone la vida de cada goroutine en execution / network wait / sync block / GC, y los perfiles de <code>block</code> y <code>mutex</code> —que vienen apagados y hay que habilitar— confirman cuál de esas causas es.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un trace muestra que el 85% de la latencia de tu endpoint es espera de la base de datos. El perfil de CPU dice que <code>encoding/json</code> es el 40% del tiempo de CPU restante. ¿Qué hacés?</p>
+    <button class="opt">Optimizo el JSON: 40% es mucho y es lo que puedo controlar desde Go</button>
+    <button class="opt">Calculo el techo real —optimizar todo el JSON mejora ~6% del total— y ataco primero la consulta, los índices o los round-trips</button>
+    <button class="opt">Paralelizo el handler con goroutines para que el JSON y la consulta corran juntos</button>
+    <div class="exp">Ley de Amdahl: si la base es el 85%, todo el código Go es el 15%, y el JSON es el 40% de ese 15% — es decir, <strong>6% del total</strong>. Ese 6% es tu techo absoluto aunque hicieras la decodificación infinitamente rápida. La tercera opción tampoco ayuda: el decodificado tiene que terminar antes de poder consultar con esos datos, hay una dependencia real, y paralelizar no reduce trabajo — reparte. El movimiento correcto es salir de Go y mirar la consulta, el índice, la cantidad de round-trips o una caché. Saber cuándo el código Go dejó de ser el problema es parte del trabajo.</div>
+  </div>
+
+  <div class="score" id="scoreGS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con GS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs4-tipos-genericos/lecture.html">← GS4: Tipos y genéricos</a>
+  <a href="../gs6-testing/lecture.html">GS6: Testing serio →</a>
+</nav>
+
+</div>
+</body>
+</html>

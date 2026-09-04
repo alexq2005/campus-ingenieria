@@ -1,0 +1,1299 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS1 — El runtime por dentro: el scheduler GMP · Go Senior</title>
+  <meta name="description" content="Cómo el runtime de Go planifica goroutines: el modelo GMP, GOMAXPROCS y contenedores, work stealing, stacks de 2 KB, preemption asíncrona, handoff de P en syscalls, el netpoller, y cómo diagnosticar fugas de goroutines en producción.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS1</span>
+  <span class="badge">⏱ 50–155 min</span>
+  <span class="badge">🎯 Pre-req: Curso de Go M00–M12</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>GS1 — El runtime por dentro: el scheduler GMP</h1>
+
+<h2>GS1.0 Por qué este módulo</h2>
+
+<p>Escribir <code>go hacerAlgo()</code> es lo más fácil que hay en Go. Es una palabra. No pide un pool, no pide un executor, no pide que declares cuántos hilos querés. Esa facilidad es el mayor logro de diseño del lenguaje y, a la vez, la razón por la que la mayoría de los programadores de Go nunca aprenden qué pasa después de esa palabra.</p>
+
+<p>Y funciona igual, hasta que un día no. Un servicio que andaba bien empieza a consumir memoria de a poco y muere a los cuatro días. Otro tiene 10.000 goroutines vivas y ninguna avanza. Otro escala perfecto en tu notebook de 12 núcleos y va cuatro veces más lento en Kubernetes con el mismo tráfico. Ninguno de esos tres problemas se resuelve leyendo tu código de negocio: se resuelven entendiendo qué hace el runtime con las goroutines que le tirás.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo el comportamiento raro de un programa concurrente en Go se explica con cuatro hechos: <strong>(1)</strong> una goroutine no es un hilo del sistema operativo, es una estructura del runtime con un stack chiquito que crece; <strong>(2)</strong> el paralelismo real está limitado por <code>GOMAXPROCS</code>, no por la cantidad de goroutines; <strong>(3)</strong> una goroutine solo cede el procesador en puntos concretos —y desde Go 1.14 también por la fuerza—; y <strong>(4)</strong> una goroutine bloqueada en un canal que nadie lee no da error, no consume CPU y no se muere nunca: se queda ahí, con toda su memoria. Entendé esos cuatro y el resto se deduce.
+</div>
+
+<p>Vamos a usar <strong>Go 1.26</strong> (febrero de 2026) como referencia, que es el punto donde el runtime consolidó varias cosas que veníamos arrastrando: la detección automática de límites de CPU en contenedores, mejoras en el tracer, y una reducción de alrededor del <strong>30% en el overhead de cgo</strong>. La última publicada al momento de escribir esto es la 1.27.1. Casi todo lo que sigue vale desde 1.14 en adelante; cuando algo dependa de una versión puntual, lo digo.</p>
+
+<pre><code class="lang-go">package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func main() {
+	fmt.Println("goroutines al arrancar:", runtime.NumGoroutine()) // 1
+	fmt.Println("GOMAXPROCS:", runtime.GOMAXPROCS(0))              // núcleos disponibles
+
+	for i := 0; i &lt; 100_000; i++ {
+		go func() { time.Sleep(time.Hour) }()
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	fmt.Println("goroutines ahora:", runtime.NumGoroutine()) // ~100001
+	var m runtime.MemStats
+	runtime.ReadMemStats(&amp;m)
+	fmt.Printf("memoria en stacks: %.1f MB\n", float64(m.StackSys)/1e6)
+}</code></pre>
+
+<p>Cien mil goroutines dormidas cuestan unos pocos cientos de megabytes de stacks y cero CPU. Cien mil hilos del sistema operativo no arrancarían: el kernel te diría que no. Esa asimetría es todo el módulo.</p>
+
+<h2>GS1.1 El modelo GMP: qué es cada letra</h2>
+
+<p>El planificador de Go se llama <strong>GMP</strong> por las tres estructuras que coordina. Las tres existen de verdad en <code>runtime/runtime2.go</code>, y las tres aparecen con esos nombres en cualquier <em>stack trace</em> del runtime, así que conviene tenerlas claras.</p>
+
+<table>
+<thead><tr><th>Letra</th><th>Qué es</th><th>Analogía</th><th>Cuántas hay</th></tr></thead>
+<tbody>
+<tr><td><strong>G</strong> — goroutine</td><td>La unidad de trabajo: un stack, un contador de programa, un estado. Es una estructura en el heap del runtime.</td><td>Una tarea escrita en un papelito</td><td>Millones, sin problema</td></tr>
+<tr><td><strong>M</strong> — machine</td><td>Un hilo real del sistema operativo. Es lo único que la CPU sabe ejecutar.</td><td>Un empleado</td><td>Las que hagan falta (tope 10.000 por defecto)</td></tr>
+<tr><td><strong>P</strong> — processor</td><td>Un permiso para ejecutar código Go, más el contexto que hace falta: cola local de goroutines, caché de memoria, pool de <code>defer</code>.</td><td>Un escritorio con la bandeja de entrada</td><td>Exactamente <code>GOMAXPROCS</code></td></tr>
+</tbody>
+</table>
+
+<p>La regla que gobierna todo: <strong>para ejecutar código Go, un M tiene que tener un P.</strong> No hay excepciones. Si no hay P libre, el M se duerme aunque haya trabajo pendiente y núcleos ociosos.</p>
+
+<pre>
+                    ┌───────────────── runtime ─────────────────┐
+                    │                                           │
+   cola global      │   ┌────── P0 ──────┐   ┌────── P1 ──────┐ │
+   ┌──────────┐     │   │ runnext: G7    │   │ runnext: —     │ │
+   │ G9 G10 … │◄────┼──►│ cola local:    │   │ cola local:    │ │
+   └──────────┘     │   │  G3 G4 G5      │   │  G8            │ │
+      (spill)       │   │ mcache         │   │ mcache         │ │
+                    │   └───────┬────────┘   └───────┬────────┘ │
+                    │           │                    │          │
+                    │        ┌──▼──┐              ┌──▼──┐       │
+                    │        │ M0  │              │ M1  │       │
+                    │        │ (G1)│              │ (G2)│       │
+                    │        └──┬──┘              └──┬──┘       │
+                    └───────────┼────────────────────┼──────────┘
+                             hilo SO              hilo SO
+                                │                    │
+                            ┌───▼────────────────────▼───┐
+                            │      núcleos de la CPU     │
+                            └────────────────────────────┘
+
+   G1 y G2 están CORRIENDO (una por P).
+   G3..G10 están LISTAS, esperando su turno.
+   Las goroutines dormidas en canales no aparecen: no están en ninguna cola.
+</pre>
+
+<p>Ese último renglón del diagrama es el que más gente pasa por alto. Una goroutine bloqueada en un canal <strong>no está en ninguna cola de ejecución</strong>. Está colgada de la estructura del canal, en una lista de espera, invisible para el planificador hasta que alguien la despierte. Por eso una fuga de goroutines no consume CPU: las goroutines fugadas no están esperando turno, están esperando un evento que no va a llegar.</p>
+
+<p>La estructura <code>g</code>, muy simplificada, es más o menos así:</p>
+
+<pre><code class="lang-go">// runtime/runtime2.go — recortado a lo esencial
+type g struct {
+	stack       stack   // [lo, hi): los límites de ESTE stack
+	stackguard0 uintptr // umbral que dispara morestack (y la preemption cooperativa)
+	m           *m      // el M que la está ejecutando, o nil
+	sched       gobuf   // registros guardados: SP, PC, ... para reanudarla
+	atomicstatus uint32 // _Grunnable, _Grunning, _Gsyscall, _Gwaiting, _Gdead
+	goid        uint64
+	waitreason  waitReason // "chan receive", "select", "GC assist wait", ...
+	// ... ~40 campos más
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Cambiar de goroutine es guardar unos registros y cargar otros.</strong> Ese <code>sched gobuf</code> es todo el trabajo del cambio de contexto: se guardan el stack pointer, el program counter y unos pocos registros más, y se saltan. Ocurre <strong>en espacio de usuario</strong>, sin llamar al kernel. Un cambio de contexto entre hilos del SO, en cambio, cruza al kernel, invalida entradas de TLB y ensucia la caché. Ese es el orden de magnitud que separa a las goroutines de los hilos.
+</div>
+
+<p>El <code>waitreason</code> tampoco es decorativo: es exactamente el texto que vas a leer en un dump de goroutines cuando estés diagnosticando una fuga, y en GS1.9 lo vamos a usar para eso.</p>
+
+<h2>GS1.2 Por qué existe P (y por qué te rompe en Kubernetes)</h2>
+
+<p>Si M es el hilo y G es la tarea, la pregunta obvia es para qué hace falta P. Go 1.0 no lo tenía: había un planificador global con un candado global, y no escalaba. P se agregó en Go 1.1 (el diseño de Dmitry Vyukov) por dos razones.</p>
+
+<div class="step"><strong>1. P es el permiso de paralelismo.</strong> Como hay exactamente <code>GOMAXPROCS</code> instancias de P, hay como máximo <code>GOMAXPROCS</code> goroutines ejecutando código Go al mismo tiempo. Eso convierte al paralelismo en algo <em>controlable</em>: aunque tengas 200 hilos vivos por syscalls bloqueantes, solo 8 corren Go simultáneamente.</div>
+
+<div class="step"><strong>2. P es el dueño de las estructuras locales.</strong> Cada P tiene su propia cola de goroutines listas y su propio <code>mcache</code> (la caché de asignación de memoria, que vemos en GS2). Al ser locales a un P, y como solo un M puede tener un P a la vez, <strong>se acceden sin candados</strong>. Sin P, cada asignación de memoria y cada goroutine nueva pelearían por un mutex global.</div>
+
+<pre><code class="lang-go">import "runtime"
+
+n := runtime.GOMAXPROCS(0)  // 0 = solo consultar, no cambiar
+fmt.Println("Ps:", n)
+
+viejo := runtime.GOMAXPROCS(4) // cambiar en caliente y recuperar el valor anterior
+defer runtime.GOMAXPROCS(viejo)
+
+fmt.Println("núcleos que ve el proceso:", runtime.NumCPU())</code></pre>
+
+<div class="info">
+  <code>runtime.NumCPU()</code> y <code>runtime.GOMAXPROCS(0)</code> <strong>no son lo mismo</strong>, aunque suelan coincidir. <code>NumCPU</code> es cuántos procesadores lógicos ve el proceso (respetando la máscara de afinidad de CPU). <code>GOMAXPROCS</code> es cuántos el runtime está dispuesto a usar en paralelo. Confundirlos es el primer paso del bug que sigue.
+</div>
+
+<h3>El problema clásico del contenedor</h3>
+
+<p>Durante años, este fue <em>el</em> bug de rendimiento de Go en Kubernetes, y era invisible porque nada fallaba: simplemente todo andaba peor.</p>
+
+<p>Un pod con <code>resources.limits.cpu: "1"</code> no ve una máquina de 1 núcleo. Ve la máquina entera —64 núcleos, digamos— y el kernel le aplica una cuota vía <em>cgroups</em>: 100 ms de CPU cada 100 ms de período. El runtime de Go, que hasta la 1.24 miraba los núcleos del host, arrancaba con <code>GOMAXPROCS=64</code>.</p>
+
+<pre><code class="lang-bash"># Lo que ve el proceso adentro del contenedor
+$ nproc
+64
+
+# Lo que el cgroup le permite realmente (cgroup v2)
+$ cat /sys/fs/cgroup/cpu.max
+100000 100000      # cuota 100000 µs / período 100000 µs = 1 CPU
+
+# cgroup v1, por si te toca un cluster viejo
+$ cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+100000
+$ cat /sys/fs/cgroup/cpu/cpu.cfs_period_us
+100000</code></pre>
+
+<p>Con <code>GOMAXPROCS=64</code> y una cuota de 1 CPU pasan tres cosas, todas malas:</p>
+
+<ul>
+  <li><strong>Throttling agresivo.</strong> El runtime lanza 64 goroutines a correr en paralelo, se comen la cuota de 100 ms en los primeros milisegundos del período, y el kernel <strong>congela el proceso entero</strong> hasta el período siguiente. Tu latencia p99 se llena de pausas de decenas de milisegundos que no aparecen en ningún perfil de CPU.</li>
+  <li><strong>Trabajo desperdiciado.</strong> 64 Ps significan 64 colas locales, 64 <code>mcache</code>, más trabajo de <em>work stealing</em> y un stop-the-world del GC que tiene que coordinar 64 contextos en vez de 1.</li>
+  <li><strong>Diagnóstico engañoso.</strong> El uso de CPU medido parece bajo (estás congelado la mitad del tiempo) mientras la latencia se dispara.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Desde Go 1.25 el runtime es consciente de los cgroups.</strong> Si tu <code>go.mod</code> declara <code>go 1.25</code> o superior, en Linux el valor por defecto de <code>GOMAXPROCS</code> pasa a ser el mínimo entre los núcleos disponibles y el límite de CPU del cgroup, y además <strong>se actualiza en caliente</strong> si el límite cambia. Es de los arreglos más valiosos que trajo el runtime en años, y no requiere que toques nada más que la directiva <code>go</code>.
+</div>
+
+<pre><code class="lang-go">// go.mod — la directiva importa: activa el comportamiento nuevo
+// module ejemplo/servicio
+// go 1.26
+
+// Y si querés fijarlo vos mismo, sin volver al comportamiento viejo:
+runtime.GOMAXPROCS(4)
+
+// Para volver al default calculado por el runtime (Go 1.25+),
+// incluida la actualización dinámica:
+runtime.SetDefaultGOMAXPROCS()</code></pre>
+
+<p>En proyectos que todavía no pueden mover la directiva <code>go</code>, la solución histórica sigue siendo válida y sigue estando en producción en media industria:</p>
+
+<pre><code class="lang-go">import _ "go.uber.org/automaxprocs" // lee el cgroup y ajusta GOMAXPROCS al importarse
+
+// O, sin dependencias, la variable de entorno en el manifiesto:
+//   env:
+//     - name: GOMAXPROCS
+//       valueFrom:
+//         resourceFieldRef:
+//           resource: limits.cpu</code></pre>
+
+<div class="warn">
+  <strong>El límite de CPU en Kubernetes suele estar en milicores.</strong> Un <code>limits.cpu: "1500m"</code> es 1,5 CPU: <code>GOMAXPROCS</code> tiene que ser un entero, y redondear para abajo (1) desperdicia medio núcleo mientras que redondear para arriba (2) vuelve a exponerte al throttling. El runtime redondea hacia arriba con un piso de 1, que suele ser lo correcto para cargas con I/O, pero si tu servicio es CPU puro medí las dos opciones antes de decidir.
+</div>
+
+<div class="mistake">
+  <strong>El error inverso también existe.</strong> Gente que escuchó "GOMAXPROCS causa problemas" y lo pone en <code>1</code> "por las dudas" en una máquina de 16 núcleos dedicada. Ahí acabás de tirar 15 núcleos a la basura y serializaste todo tu programa. <code>GOMAXPROCS</code> no es una perilla de seguridad: es la respuesta a "¿cuánta CPU tengo realmente?".
+</div>
+
+<h2>GS1.3 Las colas y el work stealing</h2>
+
+<p>Cuando escribís <code>go f()</code>, el runtime crea (o reutiliza de un pool de goroutines muertas) una <code>g</code>, le arma el stack y la pone <strong>en la cola del P que ejecutó el <code>go</code></strong>. No en una cola global. Esa decisión es la que hace barato crear goroutines.</p>
+
+<p>Cada P tiene tres lugares donde puede haber trabajo, y se consultan en este orden:</p>
+
+<table>
+<thead><tr><th>Lugar</th><th>Capacidad</th><th>Sincronización</th><th>Para qué está</th></tr></thead>
+<tbody>
+<tr><td><code>runnext</code></td><td>1 goroutine</td><td>Atómica, sin candado</td><td>La última goroutine puesta lista. Prioriza la localidad de caché: si acabás de despertar a alguien, es muy probable que sus datos estén calientes.</td></tr>
+<tr><td>Cola local (runq)</td><td>256 goroutines</td><td>Buffer circular sin candados (lock-free)</td><td>El grueso del trabajo del P. Se accede sin contención en el caso normal.</td></tr>
+<tr><td>Cola global</td><td>Ilimitada</td><td>Con candado global</td><td>Desborde de las colas locales, goroutines devueltas del netpoller, y trabajo que no tiene P dueño.</td></tr>
+</tbody>
+</table>
+
+<p>Cuando la cola local de un P se llena (256), el runtime hace un <em>spill</em>: <strong>manda la mitad —128 goroutines— a la cola global</strong>, en un solo lote. Así, aunque una goroutine loca cree un millón de goroutines, el costo del candado global se amortiza: se toma una vez cada 128, no una por goroutine.</p>
+
+<p>El corazón del planificador es la función <code>schedule()</code>. Esta es su lógica real, traducida a pseudo-Go legible:</p>
+
+<pre><code class="lang-go">// runtime/proc.go — findRunnable(), muy simplificado
+func findRunnable() *g {
+	// 1. Cada 61 ticks, mirar la cola GLOBAL primero.
+	//    Es la red de seguridad contra la inanición: sin esto, dos goroutines
+	//    que se despiertan mutuamente monopolizan el P para siempre.
+	if p.schedtick%61 == 0 {
+		if g := globalRunqGet(); g != nil {
+			return g
+		}
+	}
+
+	// 2. runnext y cola local (sin candados).
+	if g := runqGet(p); g != nil {
+		return g
+	}
+
+	// 3. Cola global.
+	if g := globalRunqGet(); g != nil {
+		return g
+	}
+
+	// 4. Netpoller: ¿hay sockets listos? (no bloqueante) — ver GS1.7
+	if gs := netpoll(false); gs != nil {
+		return gs
+	}
+
+	// 5. WORK STEALING: robar de otro P, en orden aleatorio, 4 pasadas.
+	for i := 0; i &lt; 4; i++ {
+		for _, otro := range ordenAleatorioDeP() {
+			if g := runqSteal(p, otro); g != nil {
+				return g // se roba LA MITAD de su cola, no una sola
+			}
+		}
+	}
+
+	// 6. Nada que hacer: el P se estaciona, el M se duerme.
+	stopm()
+	return nil
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué el 61.</strong> Es un número primo, elegido para que la revisión de la cola global no entre en resonancia con ningún patrón periódico del programa. Si fuera 64, un programa con un ciclo de trabajo de longitud 64 podría alinearse y saltearse la cola global sistemáticamente. Detalles así, que parecen supersticiosos, son en realidad el resultado de haber visto la inanición ocurrir de verdad.
+</div>
+
+<h3>Por qué el work stealing hace barato tener millones de goroutines</h3>
+
+<p>El robo de trabajo cambia la economía del planificador. En un diseño con cola global única, cada goroutine que se crea, se despierta o se ejecuta toca un candado compartido: con 8 núcleos y trabajo de grano fino, el candado se convierte en el cuello de botella y agregar núcleos <em>empeora</em> el rendimiento.</p>
+
+<p>Con colas locales, el caso normal —crear una goroutine, sacar la siguiente, ponerla lista— no toca ningún candado. El candado global solo aparece en el desborde y en el robo, que son eventos raros. Y el robo se lleva <strong>la mitad</strong> de la cola de la víctima, no una goroutine: así el ladrón no vuelve inmediatamente a robar, y el costo del robo se amortiza sobre muchas unidades de trabajo.</p>
+
+<pre><code class="lang-go">// Un caso donde el balanceo se ve: trabajo MUY desparejo.
+// Una sola goroutine genera todas las tareas; sin robo, un solo P haría todo.
+func main() {
+	tareas := make(chan int, 1024)
+	var wg sync.WaitGroup
+
+	for i := 0; i &lt; 1_000_000; i++ {
+		wg.Add(1)
+		go func(n int) { // todas nacen en la cola del P del main
+			defer wg.Done()
+			tareas &lt;- fib(n % 25)
+		}(i)
+	}
+	wg.Wait()
+	close(tareas)
+}</code></pre>
+
+<div class="tip">
+  Esto explica por qué en Go casi nunca hace falta un <em>worker pool</em> para controlar el paralelismo de CPU: el planificador ya lo hace. Los pools en Go sirven para otra cosa: limitar un recurso externo (conexiones a la base, llamadas a una API con cuota) o acotar la memoria pico. Si escribiste un pool de 8 workers "para no saturar la CPU", estás duplicando el trabajo del runtime, casi siempre peor.
+</div>
+
+<h2>GS1.4 Goroutines vs threads: el stack de 2 KB</h2>
+
+<p>La diferencia estructural entre una goroutine y un hilo del sistema operativo es el stack.</p>
+
+<p>Un hilo de Linux reserva por defecto <strong>8 MB</strong> de espacio virtual para su stack (mirá <code>ulimit -s</code>). Es memoria virtual —no se toca hasta que se usa— pero el tamaño está fijado al crear el hilo y no puede crecer después. Por eso los lenguajes con hilos del SO tienen que elegir entre stacks grandes (poco escalables) y stacks chicos (con riesgo de desbordarse).</p>
+
+<p>Go elige otra cosa: <strong>una goroutine arranca con 2 KB y su stack crece copiándose.</strong></p>
+
+<pre><code class="lang-go">// runtime/stack.go
+// _StackMin = 2048   → el tamaño inicial de todo stack de goroutine
+
+// El compilador inserta un prólogo en cada función que pueda necesitar stack:
+//
+//     if SP &lt; g.stackguard0 {
+//         runtime.morestack()   // no entra: hay que crecer
+//     }
+//
+// morestack() hace, en esencia:
+//   1. reservar un stack nuevo del DOBLE de tamaño
+//   2. copiar el contenido del viejo al nuevo
+//   3. AJUSTAR todos los punteros que apuntaban dentro del stack viejo
+//   4. liberar el viejo y reanudar la ejecución</code></pre>
+
+<p>El paso 3 es el que hace que esto sea posible solo en un lenguaje con recolector de basura preciso: el runtime sabe exactamente qué palabras del stack son punteros, y puede reescribirlas. En C sería imposible.</p>
+
+<pre><code class="lang-go">// Ver el crecimiento en vivo: recursión profunda con marcos grandes.
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func hondo(n int) int {
+	var relleno [1024]byte // fuerza un marco de stack grande
+	_ = relleno
+	if n == 0 {
+		var buf [64]byte
+		runtime.Stack(buf[:], false) // solo para tocar el stack
+		return 0
+	}
+	return hondo(n-1) + 1
+}
+
+func main() {
+	var antes, despues runtime.MemStats
+	runtime.ReadMemStats(&amp;antes)
+	go func() { hondo(20_000) }()
+	// ... esperar y medir StackInuse: vas a ver saltos de potencia de 2
+	runtime.ReadMemStats(&amp;despues)
+	fmt.Println(despues.StackInuse - antes.StackInuse)
+}</code></pre>
+
+<div class="warn">
+  <strong>El stack tiene techo.</strong> Por defecto, 1 GB en 64 bits y 250 MB en 32 bits. Si lo pasás, el programa muere con <code>goroutine stack exceeds 1000000000-byte limit</code> seguido de <code>fatal error: stack overflow</code>, y eso <strong>no es recuperable con <code>recover()</code></strong>: es un fatal error del runtime, no un panic. Casi siempre significa recursión infinita. Se ajusta con <code>debug.SetMaxStack</code>, pero si necesitás ajustarlo, revisá primero el algoritmo.
+</div>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Goroutine</th><th>Hilo del SO (Linux)</th></tr></thead>
+<tbody>
+<tr><td>Stack inicial</td><td><strong>2 KB</strong>, crece copiándose hasta 1 GB</td><td><strong>8 MB</strong> de espacio virtual, fijo</td></tr>
+<tr><td>Costo de creación</td><td>Cientos de nanosegundos (y hay pool de reutilización)</td><td>Decenas de microsegundos: syscall <code>clone</code></td></tr>
+<tr><td>Cambio de contexto</td><td>~decenas de ns: guardar SP/PC en espacio de usuario</td><td>~1–2 µs: entra al kernel, ensucia TLB y cachés</td></tr>
+<tr><td>Quién planifica</td><td>El runtime de Go, cooperativo + preemptivo</td><td>El kernel, preemptivo por quantum</td></tr>
+<tr><td>Cantidad práctica</td><td>Cientos de miles a millones</td><td>Miles, y ya te duele</td></tr>
+<tr><td>Identidad</td><td>No tiene ID accesible desde el lenguaje (a propósito)</td><td>TID visible, afinidad configurable</td></tr>
+<tr><td>Almacenamiento local</td><td>No hay <em>goroutine-local storage</em> (usás <code>context</code>)</td><td>TLS del sistema</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-go">// Medilo vos, que los números de arriba son órdenes de magnitud, no promesas.
+func BenchmarkCrearGoroutine(b *testing.B) {
+	var wg sync.WaitGroup
+	b.ResetTimer()
+	for i := 0; i &lt; b.N; i++ {
+		wg.Add(1)
+		go func() { wg.Done() }()
+	}
+	wg.Wait()
+}
+
+func BenchmarkPingPongCanal(b *testing.B) {
+	ping := make(chan struct{})
+	pong := make(chan struct{})
+	go func() {
+		for range ping {
+			pong &lt;- struct{}{}
+		}
+	}()
+	b.ResetTimer()
+	for i := 0; i &lt; b.N; i++ {
+		ping &lt;- struct{}{}
+		&lt;-pong // dos cambios de contexto por iteración
+	}
+}</code></pre>
+
+<pre><code class="lang-bash">$ go test -bench=. -benchmem -cpu=1,8
+BenchmarkCrearGoroutine       	 5482714	       218.4 ns/op	      24 B/op	       1 allocs/op
+BenchmarkCrearGoroutine-8     	14238104	        84.2 ns/op	      24 B/op	       1 allocs/op
+BenchmarkPingPongCanal        	 3104881	       385.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPingPongCanal-8      	 2011348	       592.7 ns/op	       0 B/op	       0 allocs/op</code></pre>
+
+<div class="info">
+  Fijate en el resultado del ping-pong: <strong>con 8 Ps es más lento que con 1</strong>. Con <code>GOMAXPROCS=1</code> las dos goroutines se turnan en el mismo núcleo y los datos del canal están calientes en la caché. Con 8, cada despertar puede terminar en otro núcleo y hay que traer las líneas de caché. Es un recordatorio útil: <strong>más paralelismo no es más velocidad</strong> cuando el trabajo es comunicación pura.
+</div>
+
+<h2>GS1.5 Cuándo cede una goroutine</h2>
+
+<p>El planificador de Go es <strong>cooperativo con preemption asíncrona de respaldo</strong>. Eso significa que la mayoría de las veces una goroutine cede el P por su cuenta, en puntos que el compilador y el runtime conocen, y solo si se niega demasiado tiempo interviene la fuerza.</p>
+
+<h3>Los puntos de cesión cooperativos</h3>
+
+<table>
+<thead><tr><th>Situación</th><th>Qué pasa con la G</th><th>Qué pasa con el P</th></tr></thead>
+<tbody>
+<tr><td>Operación de canal que no puede completarse (<code>ch &lt;- v</code>, <code>&lt;-ch</code>, <code>select</code> sin caso listo)</td><td><code>_Gwaiting</code>: sale de las colas y se cuelga del canal</td><td>Sigue trabajando con otra G</td></tr>
+<tr><td><code>time.Sleep</code></td><td><code>_Gwaiting</code> en el timer heap</td><td>Sigue</td></tr>
+<tr><td><code>sync.Mutex</code> con contención, <code>WaitGroup.Wait</code>, <code>sync.Cond</code></td><td><code>_Gwaiting</code></td><td>Sigue</td></tr>
+<tr><td>Llamada a función (prólogo con chequeo de stack)</td><td>Puede ceder si hay pedido de preemption</td><td>Sigue</td></tr>
+<tr><td><code>runtime.Gosched()</code></td><td>Vuelve a la cola <strong>global</strong>, lista</td><td>Sigue</td></tr>
+<tr><td>Syscall (ver GS1.6)</td><td><code>_Gsyscall</code>, atada a su M</td><td><strong>Se libera</strong> si tarda</td></tr>
+<tr><td>Asignación de memoria que dispara asistencia del GC</td><td>Puede ceder</td><td>Sigue</td></tr>
+</tbody>
+</table>
+
+<p>Fijate el patrón: en casi todos los casos <strong>la goroutine se bloquea pero el P no</strong>. Ese es el truco central de Go. Un bloqueo en Go es barato porque no arrastra al hilo con él.</p>
+
+<h3>El agujero que existió hasta Go 1.14</h3>
+
+<p>La preemption cooperativa tiene un problema evidente: si una goroutine <em>nunca</em> llama a una función, nunca pasa por el prólogo, y nunca hay oportunidad de sacarla. Este programa colgaba el runtime entero antes de 1.14:</p>
+
+<pre><code class="lang-go">package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func main() {
+	runtime.GOMAXPROCS(1) // un solo P, para verlo claro
+
+	go func() {
+		// Bucle sin llamadas a función, sin canales, sin allocs.
+		// El compilador lo deja como puro cálculo en registros.
+		x := 0
+		for {
+			x++
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("¿llego hasta acá?") // en Go &lt; 1.14 con GOMAXPROCS=1: NO
+	runtime.GC()                     // y esto colgaba para siempre
+}</code></pre>
+
+<p>Peor todavía: el <em>stop-the-world</em> del recolector de basura necesita que <strong>todas</strong> las goroutines lleguen a un punto seguro. Una sola goroutine en un bucle así congelaba el GC del proceso entero. Era un bug real, con reportes de producción, y tardó años en resolverse.</p>
+
+<div class="rule">
+  <strong>📌 Go 1.14 introdujo la preemption asíncrona.</strong> Cuando <code>sysmon</code> —un hilo del runtime que corre sin P y vigila el sistema— detecta que una goroutine lleva más de <strong>10 ms</strong> corriendo sin ceder, le manda una señal al hilo que la ejecuta (<code>SIGURG</code> en Unix). El manejador de señal detiene la goroutine en el punto donde estaba, y el runtime usa los mapas de punteros que emite el compilador para saber qué hay vivo en ese punto exacto. Desde 1.14, ese bucle infinito ya no cuelga nada.
+</div>
+
+<pre><code class="lang-bash"># Ver la preemption asíncrona en acción o descartarla como sospechosa:
+$ GODEBUG=asyncpreemptoff=1 ./miservicio
+
+# Si el programa se comporta distinto con esto puesto, tu problema
+# tiene que ver con preemption. Es una herramienta de DIAGNÓSTICO:
+# nunca la dejes puesta en producción.</code></pre>
+
+<div class="mistake">
+  <strong><code>runtime.Gosched()</code> casi nunca es la solución.</strong> Aparece en código escrito por gente que viene de lenguajes con planificación cooperativa pura, o como parche para un bucle que "no deja correr a los demás". Desde 1.14 eso ya no es necesario. Si <code>Gosched()</code> arregla tu bug, lo que tenés es una condición de carrera enmascarada por el timing, no un problema de planificación — y va a volver en otra máquina.
+</div>
+
+<h2>GS1.6 Syscalls bloqueantes: el handoff de P</h2>
+
+<p>Acá está la pieza que le permite a Go tener una API <em>bloqueante</em> —simple de escribir— con rendimiento <em>asíncrono</em>. Cuando una goroutine hace una llamada al sistema, el M que la ejecuta se va a bloquear en el kernel. Si el P se fuera con él, perderíamos un octavo de nuestro paralelismo por cada lectura de archivo.</p>
+
+<pre>
+   ANTES de la syscall              DURANTE (syscall larga)            DESPUÉS
+   ───────────────────              ────────────────────────           ────────
+   ┌─────┐   ┌─────┐                ┌─────┐   ┌─────┐                  ┌─────┐
+   │ P0  │◄──┤ M0  │                │ P0  │   │ M0  │ bloqueado        │ P0  │◄─ M0
+   │ runq│   │ G1  │                │runq │   │ G1  │ en el kernel     │     │  (si P0
+   └─────┘   └─────┘                └──┬──┘   └─────┘                  └─────┘   sigue
+                                       │                                         libre)
+   G1 llama a read()                   │ handoffp() lo entrega
+   → entersyscall()                 ┌──▼──┐                            si no, G1
+   → P0 pasa a _Psyscall            │ M2  │ (del pool o nuevo)         va a la cola
+                                    │ G3  │ sigue corriendo Go          global y M0
+                                    └─────┘                             se duerme
+</pre>
+
+<p>El mecanismo tiene dos caminos, y la diferencia entre ellos es la clave del rendimiento:</p>
+
+<div class="step"><strong>Camino rápido (syscall corta).</strong> <code>entersyscall()</code> marca el P como <code>_Psyscall</code> pero <strong>no lo suelta</strong>. Si la syscall vuelve rápido, <code>exitsyscall()</code> recupera el mismo P y sigue como si nada. Costo: casi cero. Es el caso de la enorme mayoría de las syscalls.</div>
+
+<div class="step"><strong>Camino lento (syscall larga).</strong> <code>sysmon</code>, que revisa el estado del sistema cada 20 µs a 10 ms según cuán ocupado esté, encuentra un P en <code>_Psyscall</code> desde hace más de ~20 µs y ejecuta <code>handoffp()</code>: le saca el P al M bloqueado y se lo da a otro M —uno ocioso del pool, o uno nuevo—. Cuando la syscall por fin termina, el M original ya no tiene P: intenta conseguir uno libre, y si no hay, deja su goroutine en la cola global y se va a dormir al pool de Ms.</div>
+
+<div class="concept">
+  <strong>💡 Por eso un programa Go puede tener 200 hilos con <code>GOMAXPROCS=8</code>.</strong> Los hilos de más no están ejecutando Go: están estacionados dentro de syscalls bloqueantes. Ver un número alto de hilos en <code>top</code> no es un bug por sí solo — es la firma de una carga con mucha I/O de archivos o mucho cgo. El bug aparece cuando el número <em>crece sin parar</em>.
+</div>
+
+<pre><code class="lang-go">// El techo existe, y morir contra él es feo pero explícito:
+import "runtime/debug"
+
+func main() {
+	debug.SetMaxThreads(10_000) // ese es el default
+	// Al superarlo:
+	//   fatal error: thread exhaustion
+	// No es recuperable. Casi siempre indica miles de syscalls o
+	// llamadas cgo bloqueantes simultáneas.
+}</code></pre>
+
+<pre><code class="lang-bash"># ¿Cuántos hilos tiene realmente mi proceso?
+$ cat /proc/$(pgrep miservicio)/status | grep Threads
+Threads:	214
+
+# ¿Quién los está creando? El perfil threadcreate lo dice.
+$ curl -s localhost:6060/debug/pprof/threadcreate?debug=1 | head -20
+
+# Y en el trace del scheduler, la columna threads:
+$ GODEBUG=schedtrace=1000 ./miservicio 2&gt;&amp;1 | head -3</code></pre>
+
+<h3>Por qué cgo bloquea distinto</h3>
+
+<p>Una llamada a C atraviesa el mismo mecanismo —el runtime la trata como una syscall, así que el P se puede entregar y los demás siguen— pero tiene tres diferencias que importan:</p>
+
+<ul>
+  <li><strong>El código C no se puede preemptar.</strong> No hay prólogos, no hay mapas de punteros, no hay señal que lo pueda interrumpir de forma segura. Mientras estés dentro de C, esa goroutine es intocable.</li>
+  <li><strong>Corre en el stack del sistema, que es fijo.</strong> No hay <code>morestack</code> para C: si tu función C recursiona hondo, se desborda como en cualquier programa C.</li>
+  <li><strong>Cada llamada tiene un costo fijo.</strong> Hay que cambiar de stack, avisarle al runtime, y volver. Es órdenes de magnitud más caro que una llamada a función Go.</li>
+</ul>
+
+<pre><code class="lang-go">/*
+#include &lt;unistd.h&gt;
+#include &lt;stdint.h&gt;
+
+static int64_t sumar(int64_t a, int64_t b) { return a + b; }
+static void dormir_c(unsigned s) { sleep(s); }   // BLOQUEA el hilo, sin remedio
+*/
+import "C"
+
+func BenchmarkLlamadaC(b *testing.B) {
+	for i := 0; i &lt; b.N; i++ {
+		C.sumar(1, 2) // trivial en C; el costo es el cruce, no la suma
+	}
+}
+
+func BenchmarkLlamadaGo(b *testing.B) {
+	for i := 0; i &lt; b.N; i++ {
+		sumarGo(1, 2)
+	}
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Go 1.26 bajó el overhead de cgo alrededor de un 30%.</strong> Es una mejora significativa para código que cruza mucho el borde —bindings de SQLite, de librerías de compresión, de criptografía nativa—, pero <strong>no cambia la estrategia</strong>: una llamada a C sigue costando bastante más que una llamada a Go. La regla de diseño sigue siendo la misma: <em>cruzá el borde pocas veces con mucho trabajo cada vez</em>, nunca muchas veces con poquito. Si estás llamando a C dentro de un bucle de un millón de iteraciones, movete el bucle a C.
+</div>
+
+<pre><code class="lang-go">// ❌ Un millón de cruces
+for _, fila := range filas {
+	C.procesar_una(fila.ptr)
+}
+
+// ✅ Un cruce
+C.procesar_lote(&amp;filas[0], C.int(len(filas)))</code></pre>
+
+<div class="warn">
+  <strong><code>runtime.LockOSThread()</code> es la otra cara de esto.</strong> Ata una goroutine a su M para siempre (hasta el <code>Unlock</code>), porque hay APIs de C que exigen que las llames desde el mismo hilo: OpenGL, la mayoría de los toolkits gráficos, y cualquier cosa que use <em>thread-local storage</em> de C. Es necesario cuando es necesario, pero ese M queda inutilizable para el resto del programa, y si la goroutine termina sin desbloquear, el hilo <strong>se destruye</strong>.
+</div>
+
+<h2>GS1.7 El netpoller: por qué la red no bloquea hilos</h2>
+
+<p>Si las syscalls bloqueantes cuestan un hilo, y un servidor web hace una syscall de lectura por cada conexión, entonces un servidor con 50.000 conexiones necesitaría 50.000 hilos. Eso es exactamente lo que mata a los servidores de modelo <em>thread-per-connection</em>. Go no tiene ese problema, y el motivo es el <strong>netpoller</strong>.</p>
+
+<p>El netpoller es un envoltorio del multiplexor de eventos del sistema operativo, integrado <strong>dentro del planificador</strong>:</p>
+
+<table>
+<thead><tr><th>Sistema</th><th>Mecanismo</th></tr></thead>
+<tbody>
+<tr><td>Linux</td><td><code>epoll</code></td></tr>
+<tr><td>macOS / BSD</td><td><code>kqueue</code></td></tr>
+<tr><td>Windows</td><td>IOCP (puertos de finalización)</td></tr>
+<tr><td>Solaris / illumos</td><td>puertos de eventos</td></tr>
+</tbody>
+</table>
+
+<p>Todo descriptor de red que crea Go se pone en <strong>modo no bloqueante</strong> y se registra en el poller. Entonces, cuando escribís esto:</p>
+
+<pre><code class="lang-go">func manejar(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf) // ← se ve bloqueante...
+		if err != nil {
+			return
+		}
+		if _, err := conn.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func main() {
+	ln, _ := net.Listen("tcp", ":8080")
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go manejar(conn) // una goroutine por conexión, sin miedo
+	}
+}</code></pre>
+
+<p>...lo que pasa realmente es:</p>
+
+<pre><code class="lang-go">// internal/poll/fd_unix.go, la idea:
+func (fd *FD) Read(p []byte) (int, error) {
+	for {
+		n, err := syscall.Read(fd.Sysfd, p)
+		if err == syscall.EAGAIN { // no hay datos todavía
+			// NO bloquea el hilo: aparca la GOROUTINE y le devuelve el M al P.
+			if err := fd.pd.waitRead(fd.isFile); err == nil {
+				continue // el netpoller la despertó: reintentar
+			}
+		}
+		return n, err
+	}
+}
+
+// waitRead termina en gopark(): la goroutine pasa a _Gwaiting
+// con waitReason = "IO wait" y desaparece de las colas de ejecución.</code></pre>
+
+<p>Y del otro lado, el planificador consulta el poller en varios puntos: en <code>findRunnable()</code> (paso 4 de GS1.3), cuando un P se queda sin trabajo antes de dormirse, y desde <code>sysmon</code> si hace más de 10 ms que nadie lo consulta. Cada consulta devuelve la lista de goroutines cuyos sockets ya están listos, y esas goroutines vuelven a las colas de ejecución.</p>
+
+<div class="concept">
+  <strong>💡 Esto es lo que hace especial a la concurrencia de Go.</strong> En Node o en Python asíncrono, para no bloquear hilos tenés que escribir <code>async</code>/<code>await</code> por todos lados, y una sola función bloqueante en el medio te arruina el event loop entero ("function coloring"). En Go, escribís código secuencial común y el runtime hace la conversión por vos: la API es bloqueante, la implementación es un event loop. Un millón de conexiones abiertas cuestan un millón de goroutines dormidas —unos cuantos GB de stacks— y cero hilos extra.
+</div>
+
+<div class="danger">
+  <strong>⚠️ El I/O de archivos regulares NO pasa por el netpoller.</strong> <code>epoll</code> y <code>kqueue</code> no soportan archivos comunes en disco: un archivo "siempre está listo" para el kernel, aunque leerlo implique esperar al disco. Así que un <code>os.File.Read</code> sobre un archivo regular es una <strong>syscall bloqueante de verdad</strong>, y cae en el camino lento de GS1.6: handoff de P y, posiblemente, un hilo nuevo. Los pipes, sockets Unix y terminales sí van por el poller; los archivos no.
+</div>
+
+<pre><code class="lang-go">// Consecuencia práctica: 500 goroutines leyendo 500 archivos del disco
+// pueden crear cientos de hilos del SO. Si eso te importa, acotalo vos:
+sem := make(chan struct{}, 32) // como mucho 32 lecturas de disco en vuelo
+
+for _, ruta := range rutas {
+	wg.Add(1)
+	go func(r string) {
+		defer wg.Done()
+		sem &lt;- struct{}{}        // pedir permiso
+		defer func() { &lt;-sem }() // devolverlo
+		datos, err := os.ReadFile(r)
+		if err != nil {
+			return
+		}
+		procesar(datos)
+	}(ruta)
+}</code></pre>
+
+<div class="tip">
+  Este es uno de los pocos lugares donde un límite de concurrencia explícito en Go está bien justificado, y notá <em>por qué</em>: no es para "no saturar la CPU" —el planificador ya se ocupa— sino para acotar un recurso que el planificador no conoce, que acá es la cantidad de hilos del SO y la profundidad de la cola del disco.
+</div>
+
+<h2>GS1.8 Diagnóstico: ver el scheduler desde afuera</h2>
+
+<p>Todo lo anterior es teoría hasta que lo podés observar en tu proceso. Go trae tres niveles de observabilidad del planificador, de más barato a más caro.</p>
+
+<h3>Nivel 1 — <code>schedtrace</code>: un resumen por segundo</h3>
+
+<pre><code class="lang-bash">$ GODEBUG=schedtrace=1000 ./miservicio
+SCHED 1004ms: gomaxprocs=8 idleprocs=0 threads=27 spinningthreads=1 needspinning=0 idlethreads=18 runqueue=142 [17 22 19 25 21 18 20 24]
+SCHED 2007ms: gomaxprocs=8 idleprocs=0 threads=27 spinningthreads=0 needspinning=1 idlethreads=15 runqueue=389 [31 28 33 30 29 35 27 32]
+SCHED 3011ms: gomaxprocs=8 idleprocs=0 threads=31 spinningthreads=0 needspinning=1 idlethreads=14 runqueue=812 [44 41 47 43 45 40 46 42]</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Qué significa</th><th>Cuándo preocuparte</th></tr></thead>
+<tbody>
+<tr><td><code>gomaxprocs</code></td><td>Cantidad de P</td><td>Si no coincide con el límite de CPU del contenedor (GS1.2)</td></tr>
+<tr><td><code>idleprocs</code></td><td>P sin trabajo</td><td>Alto y sostenido con la app "lenta" = el cuello de botella no es la CPU</td></tr>
+<tr><td><code>threads</code></td><td>Hilos del SO totales</td><td><strong>Si crece monótonamente</strong>: syscalls o cgo bloqueantes acumulándose</td></tr>
+<tr><td><code>spinningthreads</code></td><td>M buscando trabajo para robar</td><td>Constantemente alto = quema de CPU en balanceo, trabajo demasiado fino</td></tr>
+<tr><td><code>runqueue</code></td><td>Largo de la cola global</td><td><strong>Creciendo sin techo</strong>: producís trabajo más rápido de lo que lo consumís</td></tr>
+<tr><td><code>[…]</code></td><td>Largo de cada cola local</td><td>Muy desparejo = mal balanceo; todos altos = saturación real</td></tr>
+</tbody>
+</table>
+
+<p>La traza de arriba es un diagnóstico completo por sí sola: <code>idleprocs=0</code> con <code>runqueue</code> pasando de 142 a 812 en tres segundos significa que el servicio está saturado de CPU y acumulando trabajo. Ninguna optimización de I/O va a ayudar; hace falta más CPU o menos trabajo por pedido.</p>
+
+<pre><code class="lang-bash"># El detalle por G, M y P. Es MUCHÍSIMA salida: para un caso puntual, no para producción.
+$ GODEBUG=schedtrace=1000,scheddetail=1 ./miservicio 2&gt;&amp;1 | head -40
+  P0: status=1 schedtick=8823 syscalltick=41 m=3 runqsize=17 gfreecnt=12
+  M3: p=0 curg=192 mallocing=0 throwing=0 preemptoff= locks=0 dying=0 spinning=false
+  G192: status=2(chan receive) m=3 lockedm=-1</code></pre>
+
+<h3>Nivel 2 — <code>runtime.NumGoroutine()</code>: la métrica que sí o sí exportás</h3>
+
+<pre><code class="lang-go">// Si exportás UNA sola métrica del runtime, que sea esta.
+import (
+	"expvar"
+	"runtime"
+	"time"
+)
+
+func init() {
+	expvar.Publish("goroutines", expvar.Func(func() any {
+		return runtime.NumGoroutine()
+	}))
+}
+
+// Con Prometheus, el collector estándar ya la trae como go_goroutines:
+//   prometheus.MustRegister(collectors.NewGoCollector())
+//
+// La alerta que te salva la vida:
+//   increase(go_goroutines[30m]) &gt; 500 and go_goroutines &gt; 5000</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo que importa no es el valor, es la derivada.</strong> Un servicio con 4.000 goroutines puede estar perfecto (4.000 conexiones abiertas). Un servicio que pasa de 200 a 900 en una hora y nunca baja, tiene una fuga, aunque 900 parezca poco. <strong>Monótona creciente = fuga</strong>, siempre. Alertá sobre la pendiente, no sobre el nivel.
+</div>
+
+<h3>Nivel 3 — el runtime trace: la película completa</h3>
+
+<pre><code class="lang-go">import (
+	"os"
+	"runtime/trace"
+)
+
+func main() {
+	f, err := os.Create("trace.out")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	if err := trace.Start(f); err != nil {
+		panic(err)
+	}
+	defer trace.Stop()
+
+	trabajoDeVerdad() // 2–5 segundos alcanzan y sobran
+}</code></pre>
+
+<pre><code class="lang-bash"># En un servicio con net/http/pprof montado, sin reiniciar nada:
+$ curl -o trace.out 'http://localhost:6060/debug/pprof/trace?seconds=5'
+
+$ go tool trace trace.out
+# Abre el navegador. Las vistas que valen:
+#   · Goroutine analysis  → tiempo de cada goroutine y en qué lo gastó
+#   · Scheduler latency   → cuánto esperan las goroutines LISTAS antes de correr
+#   · Syscall blocking    → qué syscalls bloquean y por cuánto
+#   · Network blocking    → el netpoller en acción
+#   · View trace          → línea de tiempo por P, con el GC superpuesto</code></pre>
+
+<pre><code class="lang-go">// Regiones y tareas propias: el trace se vuelve mucho más útil
+// cuando le ponés tus etiquetas al lado de las del runtime.
+func manejarPedido(ctx context.Context, p *Pedido) error {
+	ctx, tarea := trace.NewTask(ctx, "pedido")
+	defer tarea.End()
+
+	trace.WithRegion(ctx, "validar", func() { validar(p) })
+	trace.WithRegion(ctx, "consultar-db", func() { consultar(ctx, p) })
+	trace.WithRegion(ctx, "serializar", func() { serializar(p) })
+	return nil
+}</code></pre>
+
+<div class="info">
+  Desde Go 1.25 el paquete <code>runtime/trace</code> incluye un <strong>flight recorder</strong>: mantiene una ventana reciente del trace en memoria y te deja volcarla solo cuando pasa algo interesante. Es la respuesta al problema de siempre —"el pico de latencia ocurrió a las 3 de la mañana y no teníamos el trace prendido"—, porque grabar continuamente en producción es caro y no querés hacerlo. Con el flight recorder, disparás el volcado cuando tu propio código detecta un pedido lento.
+</div>
+
+<h3>El dump de goroutines: la herramienta que resuelve fugas</h3>
+
+<pre><code class="lang-bash"># Agregado (lo que querés mirar primero): stacks únicos, con conteo
+$ curl -s 'localhost:6060/debug/pprof/goroutine?debug=1' | head -30
+
+goroutine profile: total 12811
+12483 @ 0x43f0ae 0x44f1c5 0x4c9821 0x7e2b41 0x4712a1
+#	0x4c9820	main.(*Worker).enviar+0x120	/app/internal/fanout.go:42
+#	0x7e2b40	main.(*Worker).procesar+0x2c0	/app/internal/fanout.go:88
+
+  147 @ 0x43f0ae 0x438d97 0x46e3a5 0x4a11c8 0x4712a1
+#	0x4a11c7	net/http.(*conn).serve+0x5e7	/usr/local/go/src/net/http/server.go:2092</code></pre>
+
+<pre><code class="lang-bash"># Detallado: TODAS las goroutines, con estado y CUÁNTO hace que esperan
+$ curl -s 'localhost:6060/debug/pprof/goroutine?debug=2' | head -20
+
+goroutine 48213 [chan send, 247 minutes]:
+main.(*Worker).enviar(0xc0004a2000, {0xc0019e4000, 0x400})
+	/app/internal/fanout.go:42 +0x120
+main.(*Worker).procesar(0xc0004a2000)
+	/app/internal/fanout.go:88 +0x2c0
+created by main.NewWorker in goroutine 51
+	/app/internal/fanout.go:31 +0x94
+
+# Sin servidor pprof: mandale SIGQUIT y dumpea todo antes de morir
+$ GOTRACEBACK=all kill -QUIT $(pgrep miservicio)</code></pre>
+
+<div class="rule">
+  <strong>📌 Las dos cosas que leés en un dump de fuga.</strong> Primero, el <strong>waitReason</strong> entre corchetes: <code>chan send</code>, <code>chan receive</code>, <code>select</code>, <code>semacquire</code>, <code>IO wait</code>, <code>sync.WaitGroup.Wait</code>. Segundo, los <strong>minutos de espera</strong>: cualquier cosa con "247 minutes" en un servicio que reinicia todos los días es, por definición, una fuga. Y el <code>created by ... in goroutine 51</code> del final te dice exactamente quién la lanzó.
+</div>
+
+<h2>GS1.9 Fugas de goroutines: el bug más común de Go en producción</h2>
+
+<p>Una fuga de goroutines es una goroutine que se bloquea esperando algo que no va a pasar nunca. No hay error, no hay log, no hay CPU consumida. Solo memoria que sube: el stack de la goroutine (2 KB como mínimo, y suele haber crecido) más <strong>todo lo que su stack mantiene alcanzable</strong> — que es la parte cara. Si cada goroutine fugada tiene capturado el buffer de un pedido HTTP de 200 KB, mil fugas son 200 MB.</p>
+
+<h3>Causa 1 — Enviar a un canal que nadie lee (la más frecuente)</h3>
+
+<pre><code class="lang-go">// ❌ FUGA. El bug clásico del timeout.
+func consultarConTimeout(url string, d time.Duration) (string, error) {
+	res := make(chan string) // sin buffer
+
+	go func() {
+		res &lt;- consultaLenta(url) // ← si nadie lee, se cuelga PARA SIEMPRE
+	}()
+
+	select {
+	case r := &lt;-res:
+		return r, nil
+	case &lt;-time.After(d):
+		return "", errors.New("timeout") // el caller se va...
+	}
+	// ...y la goroutine de arriba queda bloqueada en el envío, con url,
+	// la conexión y todo lo que capturó, hasta que muera el proceso.
+}</code></pre>
+
+<pre><code class="lang-go">// ✅ Arreglo mínimo: buffer de 1. El envío nunca bloquea.
+func consultarConTimeout(url string, d time.Duration) (string, error) {
+	res := make(chan string, 1) // ← un solo carácter de diferencia
+
+	go func() { res &lt;- consultaLenta(url) }()
+
+	select {
+	case r := &lt;-res:
+		return r, nil
+	case &lt;-time.After(d):
+		return "", errors.New("timeout")
+	}
+}</code></pre>
+
+<pre><code class="lang-go">// ✅✅ Arreglo correcto: context, para cancelar el trabajo de verdad.
+// El buffer evita la fuga de la GOROUTINE, pero el trabajo sigue corriendo
+// y sigue consumiendo la base de datos, la API remota y la CPU.
+func consultarConContexto(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req) // se aborta al cancelar ctx
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	return string(b), err
+}</code></pre>
+
+<h3>Causa 2 — Recibir de un canal que nadie cierra</h3>
+
+<pre><code class="lang-go">// ❌ FUGA: si productor() termina sin cerrar, el range no vuelve nunca.
+func consumidor(ch chan int) {
+	for v := range ch { // bloqueado en "chan receive" hasta el fin de los tiempos
+		procesar(v)
+	}
+}
+
+// ✅ El que ESCRIBE es el que cierra, siempre. Y el que lee, además, mira ctx.
+func productor(ctx context.Context, out chan&lt;- int) {
+	defer close(out) // ← la regla de oro de los canales
+	for i := 0; i &lt; 100; i++ {
+		select {
+		case out &lt;- i:
+		case &lt;-ctx.Done():
+			return
+		}
+	}
+}</code></pre>
+
+<h3>Causa 3 — <code>context</code> sin cancelar y timers sin frenar</h3>
+
+<pre><code class="lang-go">// ❌ FUGA de la goroutine interna del context Y del timer
+func malo(ctx context.Context) {
+	ctx, _ = context.WithTimeout(ctx, 5*time.Second) // cancel descartado: go vet grita
+	tick := time.NewTicker(time.Second)              // nunca se frena
+	for {
+		select {
+		case &lt;-tick.C:
+			trabajar()
+		case &lt;-ctx.Done():
+			return
+		}
+	}
+}
+
+// ✅
+func bueno(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel() // SIEMPRE, incluso si el context ya venció
+
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop() // libera el timer del heap del runtime
+
+	for {
+		select {
+		case &lt;-tick.C:
+			trabajar()
+		case &lt;-ctx.Done():
+			return
+		}
+	}
+}</code></pre>
+
+<div class="warn">
+  <code>time.After(d)</code> dentro de un <code>for</code> crea un timer nuevo en cada vuelta y <strong>ninguno se libera hasta que vence</strong>. En un bucle rápido con una duración larga —<code>time.After(time.Hour)</code> en un loop que da mil vueltas por segundo— eso es una fuga de memoria en el heap de timers, aunque no fuguen goroutines. Dentro de bucles, usá <code>time.NewTimer</code> y frenalo, o un <code>Ticker</code> reutilizado.
+</div>
+
+<h3>Causa 4 — <code>WaitGroup</code> desbalanceado</h3>
+
+<pre><code class="lang-go">// ❌ Si procesar() hace panic y hay un recover más arriba, ese Done() no corre:
+//    Wait() queda esperando para siempre ("sync.WaitGroup.Wait" en el dump).
+go func() {
+	procesar(x)
+	wg.Done()
+}()
+
+// ✅ defer, siempre. Corre aunque haya panic.
+go func() {
+	defer wg.Done()
+	procesar(x)
+}()</code></pre>
+
+<h3>Detectarlas en el test, no en producción</h3>
+
+<pre><code class="lang-go">// go get go.uber.org/goleak
+package fanout
+
+import (
+	"testing"
+
+	"go.uber.org/goleak"
+)
+
+// Un TestMain así cubre TODO el paquete: si cualquier test deja una
+// goroutine viva al terminar, el paquete falla.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		// Las goroutines de fondo legítimas se ignoran explícitamente:
+		goleak.IgnoreTopFunction("github.com/algun/driver.(*pool).reaper"),
+	)
+}
+
+// O por test puntual, cuando querés precisión:
+func TestWorkerNoFuga(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w := NewWorker(ctx)
+	w.Enviar(1)
+	cancel()
+	w.Esperar()
+}</code></pre>
+
+<div class="tip">
+  <code>goleak</code> es de las mejores relaciones costo/beneficio de todo el ecosistema de Go: son cinco líneas por paquete y detecta, en CI, la clase de bug que si no encontrás en un dump de producción a las tres de la mañana. Ponelo en los paquetes que lanzan goroutines, aunque no lo pongas en todos.
+</div>
+
+<h2>GS1.10 Cuándo NO hacer esto</h2>
+
+<p>Todo lo anterior es poderoso y por eso mismo se usa mal. Cuatro casos donde la respuesta correcta es no tocar nada:</p>
+
+<div class="step"><strong>1. No toques <code>GOMAXPROCS</code> sin un límite de CPU que lo justifique.</strong> El default (con <code>go 1.25+</code> en el <code>go.mod</code>) es correcto en máquinas dedicadas y en contenedores. Cambiarlo "para optimizar" sin medir es cómo se pierde la mitad de la capacidad de un servidor. Si lo cambiás, dejá escrito en el código <em>por qué</em> y qué medición lo respalda.</div>
+
+<div class="step"><strong>2. No armes worker pools para acotar el uso de CPU.</strong> El planificador ya lo hace mejor que vos, con robo de trabajo y localidad de caché. Un pool tiene sentido para acotar recursos <em>externos</em>: conexiones a la base, cuota de una API, descriptores de archivo, memoria pico. Si tu justificación es "para no saturar la CPU", el pool sobra.</div>
+
+<div class="step"><strong>3. No dejes trazas prendidas en producción.</strong> <code>schedtrace</code> y el runtime trace tienen costo —el trace completo puede costar del orden de un dígito porcentual de CPU y generar cientos de MB por minuto—. Son herramientas para una investigación acotada. Lo que sí dejás siempre prendido es <code>go_goroutines</code>, que es prácticamente gratis.</div>
+
+<div class="step"><strong>4. No optimices el scheduler si tu problema es I/O.</strong> Si el trace muestra a las goroutines esperando en la base de datos el 95% del tiempo, ninguna cantidad de <code>GOMAXPROCS</code>, pools o <code>Gosched()</code> te va a servir. Es el error más común de todos: mirar el componente que sabés analizar en vez del que está causando el problema.</div>
+
+<div class="mistake">
+  <strong>Y el meta-error:</strong> aprender internals y empezar a escribir código "consciente del scheduler". Go está diseñado para que escribas código secuencial simple y el runtime lo haga rápido. Los internals sirven para <strong>diagnosticar</strong> cuando algo se rompe y para <strong>elegir bien</strong> en las pocas decisiones que importan, no para escribir cada función pensando en Ps y Ms.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el servicio crece de a poco y se muere el jueves"</h2>
+
+<blockquote>Un servicio de ingesta procesa eventos de una cola. Arranca en 180 MB de RSS y sube unos 40 MB por día, constante, sin relación con el tráfico. Al cuarto día toca el límite del pod y Kubernetes lo mata por OOM. Se reinicia, y el ciclo empieza de nuevo. El perfil de heap "no muestra nada raro". ¿Qué está pasando?</blockquote>
+
+<p><strong>Paso 1 — Descartar lo obvio: ¿es el heap o no es el heap?</strong></p>
+
+<pre><code class="lang-bash">$ curl -s 'localhost:6060/debug/pprof/heap' &gt; heap.out
+$ go tool pprof -top heap.out
+Showing nodes accounting for 210MB, 96.4% of 218MB total
+      flat  flat%   sum%        cum   cum%
+     198MB 90.8%  90.8%      198MB 90.8%  main.(*Worker).procesar
+
+$ curl -s 'localhost:6060/debug/pprof/heap?debug=1' | grep -E '^# (Sys|HeapAlloc|StackSys|StackInuse)'
+# HeapAlloc = 218103808
+# StackSys  = 411041792     ← 411 MB de STACKS
+# StackInuse = 409993216
+# Sys       = 743964672</code></pre>
+
+<div class="rule">
+  <strong>📌 Primer hallazgo, y el que cambia toda la investigación.</strong> El heap son 218 MB pero los <strong>stacks</strong> son 411 MB. El perfil de heap "no mostraba nada" porque el problema no está en el heap: está en la memoria de stacks, que solo puede venir de una cosa — demasiadas goroutines. <code>StackSys</code> es la métrica que casi nadie mira y que resuelve esta clase de caso en treinta segundos.
+</div>
+
+<p><strong>Paso 2 — Confirmar con la métrica que ya deberíamos estar exportando.</strong></p>
+
+<pre><code class="lang-bash">$ for i in $(seq 1 6); do
+&gt;   curl -s localhost:6060/debug/vars | jq .goroutines
+&gt;   sleep 600
+&gt; done
+41208
+41883
+42551
+43219
+43902
+44574</code></pre>
+
+<p>Unas 670 goroutines nuevas cada 10 minutos, sin bajar nunca, sin correlación con el tráfico. Es una fuga, y es lineal en el tiempo. A ~10 KB de stack promedio (ya crecidos desde los 2 KB iniciales), 44.000 goroutines explican los 411 MB de <code>StackSys</code> casi exactamente. Los números cierran.</p>
+
+<p><strong>Paso 3 — Preguntarle al dump dónde están bloqueadas.</strong></p>
+
+<pre><code class="lang-bash">$ curl -s 'localhost:6060/debug/pprof/goroutine?debug=1' | head -12
+goroutine profile: total 44574
+
+44102 @ 0x43f0ae 0x40cf85 0x40c9a2 0x4c9821 0x4712a1
+#	0x4c9820	main.(*Worker).emitir+0x120	/app/internal/fanout.go:42
+#	0x4d1a30	main.(*Worker).procesar+0x2c0	/app/internal/fanout.go:88
+
+$ curl -s 'localhost:6060/debug/pprof/goroutine?debug=2' | head -8
+goroutine 51204 [chan send, 1873 minutes]:
+main.(*Worker).emitir(0xc0004a2000, {0xc0019e4000, 0x2000})
+	/app/internal/fanout.go:42 +0x120</code></pre>
+
+<p>44.102 de 44.574 goroutines —el 98,9%— están en el mismo lugar: <code>chan send</code>, en <code>fanout.go:42</code>. Y la más vieja lleva <strong>1873 minutos</strong> esperando, o sea 31 horas. Ya no hay que buscar más: hay que ir a leer esas líneas.</p>
+
+<p><strong>Paso 4 — Leer el código culpable.</strong></p>
+
+<pre><code class="lang-go">// internal/fanout.go — el código que causa la fuga
+
+type Worker struct {
+	salida chan Resultado // sin buffer
+}
+
+func (w *Worker) emitir(r Resultado) {
+	w.salida &lt;- r // línea 42 ← acá están las 44.102
+}
+
+func (w *Worker) procesar(ev Evento) {
+	res := calcular(ev) // captura el payload del evento: ~8 KB cada uno
+	w.emitir(res)       // línea 88
+}
+
+// Y el consumidor, en otro archivo:
+func (s *Servicio) recolectar(ctx context.Context, w *Worker) {
+	for {
+		select {
+		case r := &lt;-w.salida:
+			s.guardar(r)
+		case &lt;-ctx.Done():
+			return // ← ACÁ. El lector se va y nadie avisa a los que escriben.
+		}
+	}
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 El mecanismo completo.</strong> Cada pedido con timeout cancela su <code>ctx</code>, el recolector devuelve, y el canal <code>salida</code> se queda sin lector. Las goroutines de <code>procesar</code> que ya estaban en vuelo llegan a la línea 42, intentan enviar a un canal sin buffer y sin receptor, y se bloquean para siempre. Cada una retiene su stack más el <code>Resultado</code> con el payload de ~8 KB. No consumen CPU, no logean nada, no fallan ningún health check. Solo se acumulan, a razón de unas 670 cada diez minutos, hasta que el pod toca el límite de memoria.
+</div>
+
+<p><strong>Paso 5 — Evaluar las opciones, con su costo.</strong></p>
+
+<table>
+<thead><tr><th>Opción</th><th>Arregla la fuga</th><th>Costo / riesgo</th></tr></thead>
+<tbody>
+<tr><td>Poner buffer al canal (<code>make(chan Resultado, 1024)</code>)</td><td>⚠️ La retrasa, no la arregla</td><td>Con 1025 en vuelo vuelve a bloquear. Esconde el bug y lo hace más difícil de reproducir.</td></tr>
+<tr><td><code>select</code> con <code>default</code> (descartar si no hay lector)</td><td>✅ Sí</td><td><strong>Pierde datos en silencio.</strong> Aceptable para métricas, nunca para eventos de negocio.</td></tr>
+<tr><td><code>select</code> con <code>&lt;-ctx.Done()</code> en el envío</td><td>✅ Sí, correctamente</td><td>Hay que propagar <code>ctx</code> hasta <code>emitir</code>. Es refactor real, y es el arreglo correcto.</td></tr>
+<tr><td>Que el consumidor drene el canal antes de irse</td><td>❌ No</td><td>Carrera: siempre puede llegar un productor después del drenaje.</td></tr>
+<tr><td>Cerrar el canal desde el consumidor</td><td>❌ No, empeora</td><td>Enviar a un canal cerrado hace <strong>panic</strong>. Cierra el que escribe, nunca el que lee.</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 6 — Aplicar el arreglo correcto.</strong></p>
+
+<pre><code class="lang-go">// internal/fanout.go — arreglado
+
+type Worker struct {
+	salida chan Resultado
+}
+
+// emitir ahora respeta la cancelación: o entrega, o se va.
+// Devolver el error del context permite decidir arriba qué hacer.
+func (w *Worker) emitir(ctx context.Context, r Resultado) error {
+	select {
+	case w.salida &lt;- r:
+		return nil
+	case &lt;-ctx.Done():
+		return ctx.Err() // el lector se fue: no nos quedamos esperando
+	}
+}
+
+func (w *Worker) procesar(ctx context.Context, ev Evento) error {
+	res := calcular(ev)
+	if err := w.emitir(ctx, res); err != nil {
+		metricas.DescartadosPorCancelacion.Inc() // visible, no silencioso
+		return err
+	}
+	return nil
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla general que sale de este caso.</strong> <strong>Todo envío o recepción de canal en código de larga vida va dentro de un <code>select</code> con <code>&lt;-ctx.Done()</code>.</strong> Sin excepciones. Un <code>ch &lt;- v</code> desnudo en un servicio es una fuga esperando a que se caiga el consumidor, y el consumidor <em>se va a caer</em> alguna vez: por timeout, por cancelación del cliente, por un panic recuperado, por apagado ordenado.
+</div>
+
+<p><strong>Paso 7 — Escribir el test que impide que vuelva.</strong> Un arreglo sin test es un arreglo que dura hasta la próxima refactorización.</p>
+
+<pre><code class="lang-go">package fanout
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"go.uber.org/goleak"
+)
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
+
+// Reproduce exactamente el escenario de producción:
+// el consumidor se va y quedan productores en vuelo.
+func TestEmitirNoFugaSinConsumidor(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	w := &amp;Worker{salida: make(chan Resultado)} // sin buffer, como en prod
+	ctx, cancel := context.WithCancel(context.Background())
+
+	listo := make(chan struct{})
+	go func() {
+		defer close(listo)
+		// Nadie lee w.salida: sin el arreglo, esto se cuelga para siempre.
+		_ = w.procesar(ctx, Evento{ID: 1})
+	}()
+
+	cancel() // el consumidor se fue
+
+	select {
+	case &lt;-listo:
+		// bien: procesar volvió en vez de quedarse bloqueado
+	case &lt;-time.After(2 * time.Second):
+		t.Fatal("procesar no volvió tras cancelar: la goroutine fugó")
+	}
+}
+
+// Y una guarda cuantitativa, por si alguien reintroduce el patrón en otro lado.
+func TestSinCrecimientoDeGoroutines(t *testing.T) {
+	base := runtime.NumGoroutine()
+
+	for i := 0; i &lt; 1000; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		w := &amp;Worker{salida: make(chan Resultado)}
+		go func() { _ = w.procesar(ctx, Evento{ID: i}) }()
+		cancel()
+	}
+
+	time.Sleep(500 * time.Millisecond) // dejarlas terminar
+	if n := runtime.NumGoroutine(); n &gt; base+10 {
+		t.Fatalf("fuga: %d goroutines al empezar, %d al terminar", base, n)
+	}
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá <code>select</code> con <code>ctx</code>".</strong> Es el método: cuando la memoria sube y el perfil de heap no explica nada, <strong>mirá <code>StackSys</code> y la cantidad de goroutines antes que ninguna otra cosa</strong>. Y una vez encontrada la causa, el arreglo no termina en el código: termina en un test que reproduce el escenario, porque el próximo que toque ese archivo no va a tener este contexto en la cabeza.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu servicio tiene <code>GOMAXPROCS=8</code> y en <code>top</code> ves 180 hilos del sistema operativo. ¿Es un bug?</summary>
+<p>Por sí solo, no. <code>GOMAXPROCS</code> limita cuántas goroutines ejecutan <strong>código Go</strong> en paralelo, no cuántos hilos existe. Cada goroutine que entra en una syscall bloqueante larga —lectura de un archivo regular, una llamada cgo que bloquea— provoca que <code>sysmon</code> le saque el P a su M y se lo dé a otro, que puede ser un hilo nuevo. Con mucha I/O de disco o mucho cgo, 180 hilos con 8 Ps es esperable y correcto.</p>
+<p>Lo que <strong>sí</strong> es un bug es que ese número <strong>crezca sin techo</strong>. Eso significa que estás acumulando syscalls o llamadas C bloqueantes más rápido de lo que terminan, y el destino es <code>fatal error: thread exhaustion</code> al llegar a 10.000. La confirmación se hace con la columna <code>threads</code> de <code>GODEBUG=schedtrace=1000</code> y con el perfil <code>threadcreate</code>; el arreglo suele ser un semáforo que acote la concurrencia de esa operación en particular.</p></details>
+
+<details><summary>¿Por qué una goroutine bloqueada en <code>conn.Read</code> no consume un hilo, pero una bloqueada en <code>os.File.Read</code> sí?</summary>
+<p>Porque los descriptores de red se registran en el <strong>netpoller</strong> (epoll en Linux, kqueue en BSD, IOCP en Windows) y se ponen en modo no bloqueante. Cuando no hay datos, la syscall devuelve <code>EAGAIN</code>, el runtime aparca la goroutine con <code>gopark</code> —pasa a <code>_Gwaiting</code> con motivo "IO wait"— y el M se queda con su P para correr otra goroutine. El planificador consulta el poller periódicamente y despierta a las goroutines cuyos sockets ya tienen datos.</p>
+<p>Los archivos regulares no se pueden poner en epoll: para el kernel un archivo en disco "siempre está listo", aunque leerlo implique esperar al disco. Así que <code>os.File.Read</code> sobre un archivo común es una syscall bloqueante de verdad, y sigue el camino de GS1.6: el M se bloquea, <code>sysmon</code> detecta la demora y hace <code>handoffp</code> del P a otro M, posiblemente creando un hilo. Por eso 500 goroutines leyendo 500 archivos pueden generar cientos de hilos, mientras que 500.000 conexiones TCP no generan ninguno de más.</p></details>
+
+<details><summary>Antes de Go 1.14, este programa colgaba el proceso entero con <code>GOMAXPROCS=1</code>: <code>go func(){ for {} }()</code>. ¿Por qué, y qué cambió?</summary>
+<p>El planificador era puramente cooperativo: una goroutine solo cedía el P en puntos conocidos —operaciones de canal, syscalls, <code>time.Sleep</code>, y sobre todo el prólogo de cada llamada a función, donde el compilador inserta el chequeo contra <code>stackguard0</code>—. Un <code>for {}</code> vacío no tiene ninguno de esos puntos: no llama a nadie, no asigna memoria, no toca canales. Nunca cedía, y con un solo P nada más podía correr.</p>
+<p>El daño real iba más allá de esa goroutine: el <em>stop-the-world</em> del GC necesita que <strong>todas</strong> las goroutines lleguen a un punto seguro, así que una sola en un bucle así congelaba el recolector del proceso entero, incluso con varios Ps.</p>
+<p>Go 1.14 agregó la <strong>preemption asíncrona</strong>: cuando <code>sysmon</code> ve que una goroutine lleva más de 10 ms corriendo sin ceder, le manda <code>SIGURG</code> al hilo que la ejecuta; el manejador la detiene ahí mismo y el runtime usa los mapas de punteros que emite el compilador para saber qué está vivo en ese punto exacto. Se puede desactivar con <code>GODEBUG=asyncpreemptoff=1</code>, pero solo para diagnosticar.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>GMP</strong>: G es la goroutine (una estructura con stack propio), M es un hilo del SO, P es el permiso para ejecutar código Go más las estructuras locales sin candados. Para correr Go, un M necesita un P.</li>
+  <li><strong><code>GOMAXPROCS</code></strong> = cantidad de P = techo de paralelismo real. Desde <strong>Go 1.25</strong>, con <code>go 1.25+</code> en el <code>go.mod</code>, el runtime lee el límite de CPU del cgroup y lo ajusta solo, incluso en caliente. Ese era <em>el</em> bug silencioso de Go en Kubernetes.</li>
+  <li>Cada P tiene <code>runnext</code> (1), cola local (256) y comparte una cola global. El desborde manda 128 goroutines de una a la global, y el <strong>work stealing</strong> roba la mitad de la cola de otro P. Por eso crear goroutines no toca candados y millones de goroutines son viables.</li>
+  <li>Una goroutine arranca con un stack de <strong>2 KB</strong> que crece copiándose y ajustando punteros, hasta 1 GB. Un hilo del SO reserva 8 MB fijos. Ahí está toda la diferencia de escala.</li>
+  <li>La cesión es cooperativa (canales, syscalls, <code>Sleep</code>, prólogos de función) con <strong>preemption asíncrona</strong> vía señal desde <strong>Go 1.14</strong> tras 10 ms sin ceder. Eso arregló los bucles que congelaban el GC.</li>
+  <li>En una syscall larga, <code>sysmon</code> hace <strong>handoff</strong> del P a otro M para que el resto siga. Por eso hay más hilos que Ps. <strong>cgo</strong> pasa por ahí pero no se puede preemptar, corre en stack fijo y tiene costo fijo por llamada — Go 1.26 lo bajó ~30%, pero la regla sigue siendo cruzar el borde pocas veces con mucho trabajo.</li>
+  <li>El <strong>netpoller</strong> (epoll/kqueue/IOCP) es lo que hace que la red bloqueante de Go no bloquee hilos. <strong>Los archivos regulares no entran ahí</strong>: esas lecturas sí son syscalls bloqueantes de verdad.</li>
+  <li>Diagnóstico: <code>go_goroutines</code> siempre prendido (alertá sobre la <em>pendiente</em>), <code>GODEBUG=schedtrace=1000</code> para una foto rápida, <code>go tool trace</code> para la película, y <code>/debug/pprof/goroutine?debug=2</code> para leer el motivo de espera y los minutos bloqueada.</li>
+  <li><strong>Las fugas de goroutines son el bug número uno de Go en producción.</strong> Casi siempre es un envío a un canal sin lector o un <code>context</code> que no se propaga. La regla: en código de larga vida, todo canal se opera dentro de un <code>select</code> con <code>&lt;-ctx.Done()</code>, y <code>goleak</code> lo verifica en CI.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí un programa que lance 1.000.000 de goroutines dormidas y reporte <code>StackSys</code>, <code>StackInuse</code> y <code>NumGoroutine</code>. Calculá los bytes de stack por goroutine y explicá por qué no da exactamente 2048. Después hacé que la mitad ejecute una función recursiva de profundidad 50 y volvé a medir.</li>
+  <li>Corré tu servicio (o cualquier programa con carga) con <code>GODEBUG=schedtrace=1000</code> durante un minuto y armá una tabla con la evolución de <code>runqueue</code>, <code>threads</code> e <code>idleprocs</code>. Determiná con evidencia si está limitado por CPU, por I/O, o por nada.</li>
+  <li>Escribí el benchmark de ping-pong de GS1.4 y corrélo con <code>-cpu=1,2,4,8,16</code>. Graficá ns/op contra <code>GOMAXPROCS</code>, encontrá dónde empieza a empeorar y explicá por qué a partir de ese punto más paralelismo es peor.</li>
+  <li>Reproducí una fuga de goroutines con el patrón de <code>time.After</code> de GS1.9: un handler que hace timeout y deja al productor bloqueado. Dejalo corriendo con carga, capturá <code>/debug/pprof/goroutine?debug=2</code> y mostrá el crecimiento monótono. Después arreglalo con <code>context</code> y demostrá con el mismo dump que dejó de crecer.</li>
+  <li>Instalá <code>goleak</code> en un paquete tuyo que lance goroutines. Si pasa a la primera, rompelo a propósito (sacá un <code>defer cancel()</code>) y verificá que el test lo detecta. Anotá qué <code>IgnoreTopFunction</code> tuviste que agregar y por qué cada uno es legítimo.</li>
+  <li>Compará <code>GOMAXPROCS</code> en un contenedor: corré la misma imagen con <code>docker run --cpus=1</code> y con <code>--cpus=4</code>, imprimiendo <code>runtime.GOMAXPROCS(0)</code> y <code>runtime.NumCPU()</code>. Hacelo con <code>go 1.24</code> y con <code>go 1.26</code> en el <code>go.mod</code> y explicá la diferencia entre las cuatro corridas.</li>
+  <li>Capturá un trace de 5 segundos de un programa con carga real y abrilo con <code>go tool trace</code>. Encontrá en "Scheduler latency" la goroutine que más tiempo pasó <em>lista pero sin correr</em>, y explicá qué le estaba ocupando el P. Agregá <code>trace.WithRegion</code> a tres etapas de tu código y volvé a capturar.</li>
+</ol>
+
+<section class="quiz" id="quizGS1">
+  <style>
+    #quizGS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS1 .q{margin-bottom:1.5rem}
+    #quizGS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS1 .opt:hover{border-color:var(--accent)}
+    #quizGS1 .opt:disabled{cursor:default}
+    #quizGS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizGS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizGS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS1 .exp.show{display:block}
+    #quizGS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. La memoria de tu servicio crece de forma lineal y constante, sin relación con el tráfico, y el perfil de heap no muestra nada anormal. ¿Qué mirás primero?</p>
+    <button class="opt">El perfil de CPU, para encontrar la función que asigna de más</button>
+    <button class="opt"><code>GOGC</code>, porque el recolector debe estar corriendo poco</button>
+    <button class="opt"><code>runtime.NumGoroutine()</code> y <code>StackSys</code>: si las goroutines crecen monótonamente, es una fuga</button>
+    <div class="exp">Un crecimiento lineal e independiente del tráfico, con el heap limpio, apunta a memoria que no está en el heap: los <strong>stacks</strong>. <code>StackSys</code> te lo confirma en un comando, y <code>NumGoroutine</code> creciendo sin bajar nunca es la definición operativa de una fuga de goroutines. El paso siguiente es <code>/debug/pprof/goroutine?debug=2</code>, que te dice el motivo de espera (<code>chan send</code>, <code>chan receive</code>…) y hace cuántos minutos que están bloqueadas.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un pod con <code>limits.cpu: "1"</code> corre en un nodo de 64 núcleos, con un binario compilado con <code>go 1.22</code> en el <code>go.mod</code>. ¿Qué pasa y por qué?</p>
+    <button class="opt"><code>GOMAXPROCS</code> arranca en 64, el proceso se come la cuota del cgroup enseguida y el kernel lo congela: la latencia p99 se llena de pausas</button>
+    <button class="opt">El runtime detecta el límite del cgroup y usa <code>GOMAXPROCS=1</code> automáticamente</button>
+    <button class="opt">Nada especial: el planificador de Go se adapta solo porque los Ps ociosos no consumen nada</button>
+    <div class="exp">Hasta Go 1.24 el runtime miraba los núcleos del <em>host</em>, no la cuota del cgroup, así que arrancaba con <code>GOMAXPROCS=64</code>. El resultado es throttling del kernel —el proceso se congela hasta el próximo período— más el costo extra de 64 colas locales, 64 <code>mcache</code> y un stop-the-world del GC coordinando 64 contextos. La detección automática del límite del cgroup llegó en <strong>Go 1.25</strong> y se activa con la directiva <code>go 1.25</code> o superior en el <code>go.mod</code>; hasta entonces la solución era <code>automaxprocs</code> o la variable de entorno.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una goroutine hace <code>ch &lt;- resultado</code> sobre un canal sin buffer cuyo único lector ya devolvió por timeout. ¿Qué le pasa a esa goroutine?</p>
+    <button class="opt">Recibe un error de canal y termina normalmente</button>
+    <button class="opt">Queda bloqueada para siempre, sin consumir CPU, reteniendo su stack y todo lo que capturó</button>
+    <button class="opt">El runtime la detecta como bloqueada y la termina con un panic de deadlock</button>
+    <div class="exp">Es la fuga clásica y no da ninguna señal: no hay error, no hay log, no hay CPU consumida. La goroutine pasa a <code>_Gwaiting</code> con motivo <code>chan send</code>, sale de todas las colas de ejecución y queda colgada de la estructura del canal, reteniendo su stack más todo lo alcanzable desde él. El <code>fatal error: all goroutines are asleep - deadlock!</code> solo se dispara cuando <strong>todas</strong> las goroutines del proceso están bloqueadas a la vez; con un servidor HTTP corriendo eso no pasa nunca. El arreglo correcto es <code>select</code> con <code>&lt;-ctx.Done()</code> en el envío.</div>
+  </div>
+
+  <div class="score" id="scoreGS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con GS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../gs2-memoria-gc/lecture.html">GS2: Memoria y GC →</a>
+</nav>
+
+</div>
+</body>
+</html>

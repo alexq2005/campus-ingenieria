@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS8 — Observabilidad y operación · Go Senior</title>
+  <meta name="description" content="Logging estructurado con log/slog, correlación por context, las cuatro señales doradas, cardinalidad, runtime/metrics, OpenTelemetry, profiling continuo, contenedores distroless, GOMEMLIMIT y debug en producción.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS8</span>
+  <span class="badge">⏱ 55–150 min</span>
+  <span class="badge">🎯 Pre-req: GS1–GS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>GS8 — Observabilidad y operación</h1>
+
+<h2>GS8.0 Por qué este módulo</h2>
+
+<p>Un binario de Go corriendo en producción es una caja negra particularmente cerrada. En Python te adjuntás con <code>py-spy</code> y ves los stacks del proceso vivo. En Node abrís el inspector. En Java te colgás con JMX y le pedís al runtime lo que quieras. En Go compilaste a <strong>un solo ejecutable estático</strong>, lo metiste en un contenedor que probablemente no tenga ni un shell, y no hay intérprete al que pedirle nada.</p>
+
+<p>Eso no es un defecto: es la misma decisión de diseño que te da un contenedor de 12 MB que arranca en 20 milisegundos y no tiene una superficie de ataque de 300 paquetes de Debian. Pero tiene un corolario que hay que aceptar de entrada.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En Go, <strong>lo que el binario no te cuenta por sí mismo, no lo vas a poder averiguar después</strong>. La observabilidad no es una capa que se agrega cuando hay un incidente: es código que escribís antes, mientras todavía entendés qué está haciendo el sistema. Un servicio sin instrumentar no es "un servicio al que le falta un dashboard": es un servicio del que no vas a poder decir nada cuando te pregunten qué pasó.
+</div>
+
+<p>La contracara es que el runtime de Go, justamente por ser un runtime propio y no una máquina virtual genérica, es <em>excepcionalmente</em> transparente cuando se lo pedís. Go es el único lenguaje mainstream que trae profiling de CPU, de heap, de bloqueo y de contención de mutexes en la librería estándar, listo para producción, con un costo de menos del 2%. Ese es el intercambio: cero introspección desde afuera, primera clase desde adentro.</p>
+
+<p>Vamos a trabajar con cuatro tipos de señal. No son intercambiables y confundirlas es el error más caro de esta disciplina:</p>
+
+<table>
+<thead><tr><th>Señal</th><th>Responde</th><th>Cardinalidad</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td><strong>Métricas</strong></td><td>¿Está pasando? ¿Cuánto? ¿Desde cuándo?</td><td>Baja y acotada</td><td>Barato, constante</td></tr>
+<tr><td><strong>Trazas</strong></td><td>¿Dónde se fue el tiempo de <em>esta</em> request?</td><td>Alta (una por request)</td><td>Caro, se muestrea</td></tr>
+<tr><td><strong>Logs</strong></td><td>¿Qué decidió el código y con qué datos?</td><td>Alta</td><td>Caro de almacenar e indexar</td></tr>
+<tr><td><strong>Profiles</strong></td><td>¿Qué función quema CPU o retiene memoria?</td><td>Agregada por proceso</td><td>Muy barato en Go</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla de oro de la instrumentación.</strong> Las métricas te dicen <strong>que</strong> algo está mal y disparan la alerta. Las trazas te dicen <strong>dónde</strong>. Los logs te dicen <strong>por qué</strong>. Los profiles te dicen <strong>qué línea</strong>. Si tenés las cuatro y correlacionadas entre sí, un incidente dura minutos. Si tenés solo logs, dura horas y termina en "reiniciamos y se arregló".
+</div>
+
+<h2>GS8.1 <code>log/slog</code>: logging estructurado en la stdlib</h2>
+
+<p>Hasta Go 1.21, el logging estructurado significaba elegir una dependencia —<code>logrus</code>, <code>zap</code>, <code>zerolog</code>— y aceptar que cada librería del ecosistema iba a usar otra distinta, o peor, el <code>log.Printf</code> de la stdlib escupiendo strings sin estructura. Desde 1.21 hay <code>log/slog</code> en la librería estándar, y eso cambió el ecosistema: ahora existe un <strong>contrato común</strong> (la interfaz <code>slog.Handler</code>) que cualquier librería puede escribir y cualquier backend puede implementar.</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "log/slog"
+    "os"
+)
+
+func main() {
+    h := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    })
+    slog.SetDefault(slog.New(h))
+
+    slog.Info("servicio iniciado",
+        "puerto", 8080,
+        "version", "1.4.2",
+        "commit", "9f3ac1e",
+    )
+}</code></pre>
+
+<pre><code class="lang-bash">{"time":"2026-09-03T14:02:11.884Z","level":"INFO","msg":"servicio iniciado","puerto":8080,"version":"1.4.2","commit":"9f3ac1e"}</code></pre>
+
+<p>La diferencia con <code>log.Printf("servicio iniciado en el puerto %d", 8080)</code> no es cosmética. En el segundo caso, tu sistema de logs guarda una <strong>cadena de texto</strong> y para responder "¿en qué puerto arrancó?" hay que escribir una expresión regular. En el primero guarda <strong>campos</strong>, y la consulta es <code>puerto = 8080</code>. Cuando tenés 400 millones de líneas por día, esa diferencia decide si el sistema de logs es una herramienta o un cementerio.</p>
+
+<table>
+<thead><tr><th>Handler</th><th>Cuándo</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><code>slog.NewTextHandler</code></td><td>Desarrollo local</td><td>Legible por un humano en la terminal</td></tr>
+<tr><td><code>slog.NewJSONHandler</code></td><td><strong>Siempre en producción</strong></td><td>Lo parsea cualquier colector sin configuración</td></tr>
+<tr><td>Handler propio</td><td>Enriquecer o filtrar</td><td>Agregar trace id, redactar campos, samplear</td></tr>
+</tbody>
+</table>
+
+<h3>Atributos tipados: el detalle que cuesta asignaciones</h3>
+
+<p>La forma <code>"clave", valor</code> es cómoda pero pasa por <code>any</code>, lo que significa una conversión a interfaz y —según el tipo— una asignación en el heap por cada campo. En un endpoint que loguea 6 campos y atiende 20.000 requests por segundo, eso es medible. La forma tipada evita el boxing:</p>
+
+<pre><code class="lang-go">// Cómodo: cada valor se convierte a any.
+slog.Info("pedido creado", "id", id, "cliente", clienteID, "total", total)
+
+// Tipado: sin boxing, y el compilador te avisa si te equivocás de tipo.
+slog.LogAttrs(ctx, slog.LevelInfo, "pedido creado",
+    slog.String("id", id),
+    slog.Int64("cliente", clienteID),
+    slog.Float64("total", total),
+)</code></pre>
+
+<div class="tip">
+  <code>LogAttrs</code> es la variante de bajo costo: recibe <code>[]slog.Attr</code> directamente y no pasa por la ruta variádica de <code>any</code>. Usala en los caminos calientes (por request) y quedate con la forma corta en el arranque, el apagado y los eventos raros. No hace falta convertir todo el código: <strong>el 95% de tus logs no está en un camino caliente</strong>.
+</div>
+
+<p>Para el trabajo realmente caro —serializar un struct grande, calcular un hash, contar elementos— ni siquiera querés construir el atributo si el nivel está apagado. <code>Enabled</code> te lo deja preguntar antes:</p>
+
+<pre><code class="lang-go">log := slog.Default()
+
+if log.Enabled(ctx, slog.LevelDebug) {
+    // Esto solo corre si Debug está activo.
+    log.LogAttrs(ctx, slog.LevelDebug, "estado del cache",
+        slog.Int("entradas", cache.Len()),
+        slog.String("dump", cache.Dump()), // caro: no lo llamamos en vano
+    )
+}</code></pre>
+
+<h3>Grupos y contexto con <code>With</code></h3>
+
+<p>Repetir los mismos cinco campos en cada llamada es ruido y es una fuente de inconsistencias. <code>With</code> devuelve un <em>logger hijo</em> que ya los lleva puestos, y <code>slog.Group</code> los anida para que el JSON quede ordenado:</p>
+
+<pre><code class="lang-go">// Un logger por request: todos los logs que salgan de acá llevan el contexto.
+reqLog := slog.Default().With(
+    slog.String("request_id", rid),
+    slog.Group("http",
+        slog.String("method", r.Method),
+        slog.String("route", r.Pattern),
+    ),
+)
+
+reqLog.Info("procesando")
+reqLog.Warn("reintentando", slog.Int("intento", 2))
+// {"...","msg":"reintentando","request_id":"...","http":{"method":"GET","route":"/pedidos/{id}"},"intento":2}</code></pre>
+
+<div class="info">
+  <code>With</code> no es gratis pero <strong>paga una sola vez</strong>: el handler pre-formatea esos atributos al crear el hijo, no en cada log. Un logger por request creado una vez y pasado hacia abajo es más barato que repetir los campos en veinte llamadas.
+</div>
+
+<h3>Nivel dinámico: cambiar el verbose sin reiniciar</h3>
+
+<p>El nivel de log es la única perilla de observabilidad que vas a querer mover <em>durante</em> un incidente, y reiniciar el proceso para moverla destruye justo el estado que querías mirar. <code>slog.LevelVar</code> es un nivel atómico que se puede cambiar en caliente:</p>
+
+<pre><code class="lang-go">var nivel = new(slog.LevelVar) // arranca en Info (el cero)
+
+func initLog() {
+    h := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{Level: nivel})
+    slog.SetDefault(slog.New(h))
+}
+
+// En el mux administrativo, NUNCA en el público (GS8.9).
+func handlerNivel(w http.ResponseWriter, r *http.Request) {
+    if r.Method == http.MethodGet {
+        fmt.Fprintln(w, nivel.Level())
+        return
+    }
+    var l slog.Level
+    if err := l.UnmarshalText([]byte(r.FormValue("level"))); err != nil {
+        http.Error(w, "nivel inválido", http.StatusBadRequest)
+        return
+    }
+    nivel.Set(l)
+    slog.Warn("nivel de log cambiado en caliente", slog.String("nuevo", l.String()))
+}</code></pre>
+
+<div class="warn">
+  Poné siempre un <strong>temporizador</strong> que devuelva el nivel a <code>Info</code> a los 15 o 30 minutos. El <code>Debug</code> que alguien dejó prendido un viernes es una de las formas más caras y más comunes de quemar el presupuesto del sistema de logs, y encima degrada la latencia del servicio que estabas depurando.
+</div>
+
+<h3>Un handler propio: inyectar el trace id automáticamente</h3>
+
+<p>Acá está la razón principal por la que <code>slog</code> recibe un <code>context.Context</code> en <code>InfoContext</code>, <code>LogAttrs</code> y compañía: el handler puede leer del contexto y agregar atributos que <em>ningún llamador tuvo que escribir</em>. Es el patrón que hace que la correlación de GS8.3 funcione sin disciplina humana.</p>
+
+<pre><code class="lang-go">import (
+    "context"
+    "log/slog"
+    "go.opentelemetry.io/otel/trace"
+)
+
+type ctxHandler struct{ slog.Handler }
+
+func (h ctxHandler) Handle(ctx context.Context, r slog.Record) error {
+    if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+        r.AddAttrs(
+            slog.String("trace_id", sc.TraceID().String()),
+            slog.String("span_id", sc.SpanID().String()),
+        )
+    }
+    if rid, ok := ctx.Value(claveRID{}).(string); ok {
+        r.AddAttrs(slog.String("request_id", rid))
+    }
+    return h.Handler.Handle(ctx, r)
+}
+
+// ⚠️ Sin estos dos, With() y WithGroup() devuelven el handler INTERNO
+//    y tu envoltorio desaparece silenciosamente.
+func (h ctxHandler) WithAttrs(as []slog.Attr) slog.Handler {
+    return ctxHandler{h.Handler.WithAttrs(as)}
+}
+func (h ctxHandler) WithGroup(name string) slog.Handler {
+    return ctxHandler{h.Handler.WithGroup(name)}
+}
+
+func initLog() {
+    base := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{Level: nivel})
+    slog.SetDefault(slog.New(ctxHandler{base}))
+}</code></pre>
+
+<div class="mistake">
+  <strong>El bug de handler más frecuente que vas a escribir.</strong> Embebés <code>slog.Handler</code>, sobreescribís solo <code>Handle</code>, y funciona… hasta que alguien hace <code>log.With("modulo", "pagos")</code>. Ese <code>With</code> llama a <code>WithAttrs</code>, que —al estar solo promovido del embebido— devuelve el handler <em>base</em>, no tu envoltorio. A partir de ahí ese logger hijo deja de agregar el trace id, sin ningún error, sin ningún warning, y el síntoma es "a veces los logs tienen trace_id y a veces no". Sobreescribí siempre <code>WithAttrs</code> y <code>WithGroup</code> reenvolviendo.
+</div>
+
+<div class="mistake">
+  <strong>El otro anti-patrón:</strong> <code>slog.Info(fmt.Sprintf("usuario %s compró %d items", u, n))</code>. Acabás de tirar a la basura todo el beneficio del logging estructurado: volviste a tener un string que hay que parsear con regex, y encima pagás el <code>Sprintf</code> aunque el nivel esté apagado. El mensaje de un log estructurado es una <strong>constante</strong>; lo variable va en los atributos.
+</div>
+
+<h2>GS8.2 Qué loguear y qué no</h2>
+
+<p>La instrumentación mala no es la que falta: es la que <em>sobra</em>. Un servicio que loguea "entrando a ProcesarPedido" y "saliendo de ProcesarPedido" genera un volumen enorme, cuesta plata real, y no te ayuda en nada — eso que querías es una traza, no un log. Estos son los tres tipos de evento que sí valen su costo:</p>
+
+<ul>
+  <li><strong>Eventos de negocio</strong>: pedido creado, pago rechazado <em>con el motivo</em>, usuario suspendido, envío despachado. Son los que te van a pedir en una auditoría o cuando el equipo de producto pregunte "¿cuántas veces pasó X?".</li>
+  <li><strong>Decisiones no obvias</strong>: se usó el cache o no, se eligió el proveedor A o el B, se reintentó y en qué intento anduvo, el circuit breaker se abrió. Son las que explican por qué dos requests idénticas tardaron distinto.</li>
+  <li><strong>Errores con causa</strong>: el error envuelto con toda su cadena, no <code>"algo falló"</code>. Un <code>error</code> de Go bien envuelto con <code>%w</code> ya trae la ruta completa; logueá <code>slog.Any("error", err)</code> y aprovechalo.</li>
+</ul>
+
+<table>
+<thead><tr><th>Nivel</th><th>Criterio operativo</th><th>Ejemplo</th></tr></thead>
+<tbody>
+<tr><td><code>Debug</code></td><td>Solo lo prendés durante una investigación</td><td>Payload de una respuesta upstream rara</td></tr>
+<tr><td><code>Info</code></td><td>El evento le importa a alguien mañana</td><td>Pedido creado, arranque, apagado</td></tr>
+<tr><td><code>Warn</code></td><td>Anduvo, pero degradado o cerca del límite</td><td>Reintento exitoso, cache caído, cuota al 90%</td></tr>
+<tr><td><code>Error</code></td><td><strong>Un humano tiene que mirarlo</strong></td><td>Fallo que el usuario vio; invariante roto</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 <code>Error</code> significa "vení a mirar esto".</strong> Si tu servicio emite 40.000 líneas de nivel <code>Error</code> por día que nadie mira, el nivel <code>Error</code> dejó de significar nada y el día que aparezca uno importante va a estar enterrado. Un error de validación del usuario —mandó un email mal escrito— <strong>no es</strong> un <code>Error</code>: es un <code>Info</code> con el motivo, o directamente una métrica de conteo.
+</div>
+
+<h3>Secretos y datos personales: la regla sin excepciones</h3>
+
+<p>Los logs son la superficie de fuga más subestimada de cualquier sistema. Tienen tres propiedades que los hacen peligrosos: <strong>retención larga</strong> (30, 90, 365 días), <strong>acceso amplio</strong> (todo el equipo, a veces toda la empresa) y <strong>replicación automática</strong> (índices, backups, réplicas de la plataforma de logs, exportaciones a un data lake). Un token que entra en un log no está en un lugar: está en siete.</p>
+
+<div class="danger">
+  <strong>Nunca, bajo ninguna circunstancia, en ningún nivel:</strong> contraseñas, tokens, API keys, cookies de sesión, headers <code>Authorization</code>, números de tarjeta, números de documento, direcciones completas, datos de salud. Ni siquiera "solo en <code>Debug</code> y solo en staging" — staging se convierte en producción con más frecuencia de la que nadie admite. El tratamiento serio del tema está en el módulo <a href="../../../../sistemas/Curso-Ciberseguridad/m07-secretos-supply-chain/lecture.html">M07 — Secretos y supply chain</a> del curso de Ciberseguridad.
+</div>
+
+<p>Go te da una defensa de tipos que la mayoría de los lenguajes no tiene: <code>slog.LogValuer</code>. Si un tipo implementa <code>LogValue()</code>, <code>slog</code> lo llama en vez de serializar el valor crudo — así que la redacción viaja <strong>pegada al tipo</strong> y no depende de que cada programador se acuerde:</p>
+
+<pre><code class="lang-go">type Token string
+
+func (Token) LogValue() slog.Value { return slog.StringValue("[REDACTADO]") }
+
+type Cliente struct {
+    ID       int64
+    Email    string
+    Telefono string
+    Interno  string
+}
+
+// Solo exponemos lo que es seguro y útil para operar.
+func (c Cliente) LogValue() slog.Value {
+    return slog.GroupValue(
+        slog.Int64("id", c.ID),
+        slog.String("email_dominio", dominioDe(c.Email)), // "gmail.com", no la casilla
+    )
+}
+
+func main() {
+    t := Token("sk_live_9a2f...")
+    c := Cliente{ID: 42, Email: "ana@empresa.com", Telefono: "+54911..."}
+
+    slog.Info("autenticado", slog.Any("token", t), slog.Any("cliente", c))
+    // {"msg":"autenticado","token":"[REDACTADO]",
+    //  "cliente":{"id":42,"email_dominio":"empresa.com"}}
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error clásico:</strong> <code>slog.Any("request", req)</code> con el struct entero del request "porque así no me olvido de nada". Funciona perfecto durante seis meses. Después alguien agrega un campo <code>TarjetaCVV</code> a ese struct para una feature nueva, no toca tu código de logging, y a partir de ese deploy estás escribiendo CVVs en un índice retenido 90 días — sin que ningún test falle y sin que ningún linter se queje. <strong>Serializá campos elegidos a mano, o implementá <code>LogValue</code>.</strong> Nunca structs enteros que no controlás.
+</div>
+
+<h2>GS8.3 Correlación: el id que atraviesa todo el sistema</h2>
+
+<p>Un log suelto que dice "consulta lenta: 1.4 s" es casi inútil. El mismo log con <code>trace_id=4bf92f...</code> te deja saltar a la traza completa, ver que esa request venía del checkout, que el usuario esperó 1.6 s en total, y que la consulta lenta fue la única culpable. La correlación es lo que convierte tres pilas de datos separadas en un sistema.</p>
+
+<p>El mecanismo en Go es el <code>context.Context</code> que ya venís pasando desde GS3 y que en GS7 atraviesa todos tus middlewares. El id se genera (o se hereda del header <code>traceparent</code> del W3C) una sola vez, en el borde:</p>
+
+<pre><code class="lang-go">type claveRID struct{} // clave tipada: nunca un string desnudo
+
+func ConRequestID(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        rid := r.Header.Get("X-Request-Id")
+        if rid == "" {
+            rid = uuid.NewString()
+        }
+        ctx := context.WithValue(r.Context(), claveRID{}, rid)
+
+        w.Header().Set("X-Request-Id", rid) // el cliente puede citarlo en el ticket
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}</code></pre>
+
+<div class="warn">
+  La clave del <code>context</code> tiene que ser un <strong>tipo propio no exportado</strong> (<code>type claveRID struct{}</code>). Si usás <code>"request_id"</code> como clave string, cualquier otra librería del binario que use la misma string te pisa el valor, y el compilador no puede avisarte. Es el mismo argumento de GS3, y es la razón por la que <code>context.WithValue</code> acepta <code>any</code> como clave en vez de <code>string</code>.
+</div>
+
+<p>A partir de acá, el <code>ctx</code> viaja hacia abajo y el handler de <code>slog</code> de GS8.1 saca el id solo. El código del repositorio no sabe nada de request ids ni de trazas — solo pasa el <code>ctx</code>, que es lo que ya tenía que hacer para respetar la cancelación:</p>
+
+<pre><code class="lang-go">func (r *RepoPedidos) PorCliente(ctx context.Context, id int64) ([]Pedido, error) {
+    t0 := time.Now()
+    filas, err := r.db.QueryContext(ctx, consultaPorCliente, id)
+    dur := time.Since(t0)
+
+    if dur &gt; 200*time.Millisecond {
+        // Sale con trace_id y request_id sin que este archivo los mencione.
+        slog.WarnContext(ctx, "consulta lenta",
+            slog.String("consulta", "pedidos.por_cliente"),
+            slog.Duration("duracion", dur),
+            slog.Int64("cliente", id),
+        )
+    }
+    if err != nil {
+        return nil, fmt.Errorf("pedidos por cliente %d: %w", id, err)
+    }
+    defer filas.Close()
+    return escanear(filas)
+}</code></pre>
+
+<div class="tip">
+  <strong>Usá siempre las variantes con <code>Context</code></strong>: <code>InfoContext</code>, <code>WarnContext</code>, <code>ErrorContext</code>, <code>LogAttrs</code>. Las versiones sin contexto (<code>slog.Info</code>) le pasan <code>context.Background()</code> al handler, y tu enriquecimiento automático no encuentra nada. Es exactamente el mismo síntoma intermitente que el bug de <code>WithAttrs</code>: logs que a veces tienen trace id y a veces no.
+</div>
+
+<h2>GS8.4 Métricas: las cuatro señales doradas</h2>
+
+<p>Podés instrumentar 300 métricas o podés instrumentar cuatro y dormir tranquilo. El SRE Book de Google llamó <strong>señales doradas</strong> a las cuatro que responden "¿este servicio está sano?" para cualquier sistema con usuarios:</p>
+
+<table>
+<thead><tr><th>Señal</th><th>Qué mide</th><th>En un servicio Go</th></tr></thead>
+<tbody>
+<tr><td><strong>Latencia</strong></td><td>Cuánto tarda una request</td><td>Histograma de duración, separando éxitos de errores</td></tr>
+<tr><td><strong>Tráfico</strong></td><td>Cuánta demanda hay</td><td>Contador de requests por segundo, por ruta</td></tr>
+<tr><td><strong>Errores</strong></td><td>Qué fracción falla</td><td>Contador por código de estado / clase de error</td></tr>
+<tr><td><strong>Saturación</strong></td><td>Qué tan lleno está el recurso escaso</td><td>Conexiones de la pool en uso, goroutines, heap vs <code>GOMEMLIMIT</code>, cola de trabajo</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Separá <strong>latencia de éxitos</strong> de <strong>latencia de errores</strong>. Un servicio que empieza a devolver 500 en 2 ms baja la latencia promedio y el dashboard <em>mejora</em> mientras el servicio se cae. Es una de las formas más traicioneras de que un panel verde mienta.
+</div>
+
+<p>Los tres tipos de instrumento cubren todo lo anterior:</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Semántica</th><th>Se usa para</th></tr></thead>
+<tbody>
+<tr><td><strong>Counter</strong></td><td>Solo sube; se reinicia al reiniciar el proceso</td><td>Requests, errores, bytes, eventos</td></tr>
+<tr><td><strong>Gauge</strong></td><td>Sube y baja; es un valor instantáneo</td><td>Goroutines, conexiones activas, tamaño de cola</td></tr>
+<tr><td><strong>Histograma</strong></td><td>Cuenta observaciones en <em>buckets</em></td><td>Latencias, tamaños de respuesta, filas devueltas</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-go">import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+    reqTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "http_requests_total",
+        Help: "Requests HTTP atendidas.",
+    }, []string{"method", "route", "code"})
+
+    reqDur = promauto.NewHistogramVec(prometheus.HistogramOpts{
+        Name:    "http_request_duration_seconds",
+        Help:    "Duración de las requests HTTP.",
+        Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+    }, []string{"method", "route"})
+
+    enVuelo = promauto.NewGauge(prometheus.GaugeOpts{
+        Name: "http_requests_in_flight",
+        Help: "Requests siendo procesadas ahora mismo.",
+    })
+)</code></pre>
+
+<p>El middleware que las llena es una sola pieza, y hay un detalle en él que decide si tu sistema de métricas sobrevive o no (lo desarmamos en GS8.6):</p>
+
+<pre><code class="lang-go">type capturaCodigo struct {
+    http.ResponseWriter
+    code int
+}
+
+func (c *capturaCodigo) WriteHeader(code int) {
+    c.code = code
+    c.ResponseWriter.WriteHeader(code)
+}
+
+func ConMetricas(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        enVuelo.Inc()
+        defer enVuelo.Dec()
+
+        cw := &amp;capturaCodigo{ResponseWriter: w, code: http.StatusOK}
+        t0 := time.Now()
+        next.ServeHTTP(cw, r)
+        dur := time.Since(t0).Seconds()
+
+        // 🔑 r.Pattern (Go 1.23+) es el PATRÓN de la ruta registrada en el
+        //    ServeMux: "/pedidos/{id}". NO es r.URL.Path, que sería
+        //    "/pedidos/8f3c-..." y crearía una serie por pedido.
+        ruta := r.Pattern
+        if ruta == "" {
+            ruta = "desconocida" // 404: jamás la URL cruda
+        }
+
+        reqDur.WithLabelValues(r.Method, ruta).Observe(dur)
+        reqTotal.WithLabelValues(r.Method, ruta, strconv.Itoa(cw.code)).Inc()
+    })
+}</code></pre>
+
+<h2>GS8.5 Histogramas, percentiles y por qué el promedio miente</h2>
+
+<p>Esta es probablemente la lección más rentable del módulo, así que vale hacer la cuenta con números concretos en lugar de repetir la consigna.</p>
+
+<p>Tenés 10.000 requests en cinco minutos. 9.850 se responden en 38 ms. Las otras 150 tardan 1.520 ms. El promedio es:</p>
+
+<pre><code class="lang-bash">(9850 × 38 ms + 150 × 1520 ms) / 10000
+= (374.300 + 228.000) / 10000
+= 60,2 ms</code></pre>
+
+<p>Sesenta milisegundos. Tu alerta dice "avisame si el promedio supera los 200 ms". Nunca va a sonar. Y sin embargo <strong>150 personas cada cinco minutos —43.200 por día— están esperando un segundo y medio</strong>. El promedio no está roto: está haciendo exactamente lo que un promedio hace, que es dejarse dominar por la masa. La cola pesa 1,5% de las observaciones y por eso no mueve la aguja.</p>
+
+<div class="concept">
+  <strong>💡 Por qué el promedio es estructuralmente inservible para latencia.</strong> Las distribuciones de latencia no son gaussianas: son de cola larga, casi siempre multimodales (el camino con cache y el camino sin cache son dos poblaciones distintas). El promedio de una distribución multimodal describe un valor que <em>no le pasó a nadie</em>. Y como el promedio solo se mueve cuando se mueve la mayoría, una alerta sobre el promedio solo dispara cuando <strong>el servicio ya está roto para todos</strong>.
+</div>
+
+<p>El histograma resuelve esto porque no guarda un número: guarda cuántas observaciones cayeron en cada bucket, y de ahí se estiman percentiles. En Prometheus:</p>
+
+<pre><code class="lang-bash"># p99 de latencia, agregando TODAS las instancias correctamente
+histogram_quantile(
+  0.99,
+  sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# El promedio, para comparar (suma / cantidad)
+  rate(http_request_duration_seconds_sum[5m])
+/ rate(http_request_duration_seconds_count[5m])</code></pre>
+
+<div class="rule">
+  <strong>📌 Los percentiles no se promedian.</strong> Si tenés diez instancias y cada una reporta su p99, el promedio de esos diez p99 <strong>no es</strong> el p99 del servicio — no existe ninguna operación aritmética que lo recupere. Por eso se agregan los <em>buckets</em> (<code>sum by (le)</code>) y recién después se calcula el cuantil. Cualquier dashboard que muestre "promedio del p95 por instancia" está mostrando un número sin significado.
+</div>
+
+<h3>Elegir los buckets</h3>
+
+<p>Un histograma clásico de Prometheus solo puede responder sobre los cortes que definiste. Si tus buckets son <code>[0.1, 0.5, 1, 5]</code> y toda tu latencia real está entre 20 y 60 ms, tu p99 va a decir "menos de 100 ms" y nada más: perdiste resolución donde más la necesitabas. Y al revés, poner 40 buckets multiplica las series por 40.</p>
+
+<div class="tip">
+  Elegí los buckets <strong>alrededor de tu SLO</strong>. Si prometés "el 99% en menos de 300 ms", necesitás cortes densos entre 100 ms y 1 s para poder ver el margen y la degradación. Los <em>native histograms</em> de Prometheus resuelven el problema con buckets exponenciales automáticos y resolución configurable — si tu backend los soporta, es la opción por defecto para métricas nuevas.
+</div>
+
+<h2>GS8.6 Cardinalidad: el label que revienta el sistema de métricas</h2>
+
+<p>Una serie temporal en Prometheus es <strong>una combinación única de nombre y labels</strong>, y cada serie cuesta memoria en el scraper de forma permanente. Tres labels de 4, 10 y 6 valores generan 240 series. Sostenible. Ahora agregá un label con el ID del usuario:</p>
+
+<pre><code class="lang-go">// 💣 Esto tumba el Prometheus del cluster, no solo el tuyo.
+reqDur.WithLabelValues(r.Method, ruta, usuarioID).Observe(dur)</code></pre>
+
+<p>Con 200.000 usuarios activos, 4 métodos y 12 buckets, esa sola línea genera <code>200.000 × 4 × 12 ≈ 9.600.000</code> series, cada una con su etiqueta, su índice invertido y su bloque en memoria. El scraper se queda sin RAM, lo mata el OOM killer, y <strong>se apagan las métricas de todos los servicios que ese Prometheus recolecta</strong>. Es el incidente clásico donde el causante es el equipo que "solo agregó un label para debuggear".</p>
+
+<div class="rule">
+  <strong>📌 Un label es legítimo solo si su conjunto de valores es chico, cerrado y conocido antes de compilar.</strong> Método HTTP: sí (nueve valores). Código de estado: sí. Nombre de la ruta registrada: sí. ID de usuario, ID de pedido, email, URL cruda, mensaje de error, dirección IP, user-agent: <strong>jamás</strong>.
+</div>
+
+<p>El caso más insidioso no es el user id, que es evidente, sino la ruta sin normalizar. <code>r.URL.Path</code> devuelve <code>/pedidos/8f3c1a7e-...</code>: una serie por pedido, para siempre, aunque ese pedido nunca se vuelva a consultar. Por eso el middleware de GS8.4 usa <code>r.Pattern</code>, que desde Go 1.23 te da el patrón registrado en el <code>ServeMux</code> (<code>/pedidos/{id}</code>) sin que tengas que mantener una tabla de expresiones regulares a mano.</p>
+
+<div class="mistake">
+  <strong>Y el 404 es el vector de ataque.</strong> Si etiquetás con la URL cruda y no tenés patrón (porque justamente no matcheó ninguna ruta), cualquiera en internet puede pedir <code>/aaa1</code>, <code>/aaa2</code>, … <code>/aaa999999</code> y crearte un millón de series desde afuera. Etiquetá todo lo que no matcheó como <code>"desconocida"</code>, un valor y nada más. Es una vulnerabilidad de disponibilidad, no solo un problema de prolijidad.
+</div>
+
+<p>Entonces, ¿dónde va la información de alta cardinalidad? En las trazas y en los logs, que están construidos para eso. Y el puente entre los dos mundos son los <strong>exemplars</strong>: el histograma guarda, junto a algunos buckets, el trace id de una request de ejemplo que cayó ahí. Hacés clic en la barra alta del p99 y saltás directo a una traza real que tardó eso.</p>
+
+<pre><code class="lang-go">// El histograma sigue teniendo cardinalidad baja, pero cada bucket
+// puede llevar el trace id de una request concreta que cayó adentro.
+if obs, ok := reqDur.WithLabelValues(r.Method, ruta).(prometheus.ExemplarObserver); ok {
+    sc := trace.SpanContextFromContext(r.Context())
+    if sc.IsValid() {
+        obs.ObserveWithExemplar(dur, prometheus.Labels{
+            "trace_id": sc.TraceID().String(),
+        })
+        return
+    }
+}
+reqDur.WithLabelValues(r.Method, ruta).Observe(dur)</code></pre>
+
+<h2>GS8.7 <code>runtime/metrics</code>: la salud del propio runtime</h2>
+
+<p>Todo lo anterior mide tu aplicación. Falta medir <strong>al runtime que la ejecuta</strong>, que es donde viven la mitad de los problemas de un servicio Go maduro: fugas de goroutines, presión de GC, hambre de CPU. El paquete <code>runtime/metrics</code> es la API estable para eso, y reemplaza a <code>runtime.ReadMemStats</code> —que hace un <em>stop-the-world</em> cada vez que lo llamás, así que ponerlo en un scrape cada 15 segundos degrada la latencia que estabas midiendo.</p>
+
+<pre><code class="lang-go">import "runtime/metrics"
+
+var muestras = []metrics.Sample{
+    {Name: "/sched/goroutines:goroutines"},
+    {Name: "/memory/classes/heap/objects:bytes"},
+    {Name: "/memory/classes/total:bytes"},
+    {Name: "/gc/heap/goal:bytes"},
+    {Name: "/sched/pauses/total/gc:seconds"},   // histograma
+    {Name: "/sched/latencies:seconds"},         // histograma
+    {Name: "/cpu/classes/gc/total:cpu-seconds"},
+}
+
+func leerRuntime() {
+    metrics.Read(muestras)
+    for _, m := range muestras {
+        switch m.Value.Kind() {
+        case metrics.KindUint64:
+            slog.Info("runtime", slog.String("m", m.Name),
+                slog.Uint64("v", m.Value.Uint64()))
+        case metrics.KindFloat64:
+            slog.Info("runtime", slog.String("m", m.Name),
+                slog.Float64("v", m.Value.Float64()))
+        case metrics.KindFloat64Histogram:
+            h := m.Value.Float64Histogram()
+            slog.Info("runtime", slog.String("m", m.Name),
+                slog.Float64("p99", percentil(h, 0.99)))
+        case metrics.KindBad:
+            // La métrica no existe en ESTA versión de Go: ignorala.
+        }
+    }
+}</code></pre>
+
+<div class="warn">
+  Los nombres de <code>runtime/metrics</code> <strong>cambian entre versiones</strong> — se agregan, se deprecan y se reemplazan (por ejemplo <code>/gc/pauses:seconds</code> quedó obsoleta a favor de <code>/sched/pauses/total/gc:seconds</code>). Nunca asumas que un nombre existe: si no está, <code>metrics.Read</code> devuelve <code>KindBad</code> en vez de fallar. Enumerá el catálogo real de tu versión con <code>metrics.All()</code> antes de hardcodear nada.
+</div>
+
+<pre><code class="lang-go">// Descubrí qué expone TU versión de Go, con su descripción.
+for _, d := range metrics.All() {
+    fmt.Printf("%-46s  %s\n", d.Name, d.Description)
+}
+
+// Percentil a partir de un histograma del runtime.
+func percentil(h *metrics.Float64Histogram, q float64) float64 {
+    var total uint64
+    for _, c := range h.Counts {
+        total += c
+    }
+    if total == 0 {
+        return 0
+    }
+    objetivo, acum := uint64(q*float64(total)), uint64(0)
+    for i, c := range h.Counts {
+        acum += c
+        if acum &gt;= objetivo {
+            return h.Buckets[i+1] // borde superior del bucket
+        }
+    }
+    return h.Buckets[len(h.Buckets)-1]
+}</code></pre>
+
+<p>De todo el catálogo, estas son las que valen la pena exportar siempre:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Qué te dice</th><th>Síntoma cuando se dispara</th></tr></thead>
+<tbody>
+<tr><td><code>/sched/goroutines:goroutines</code></td><td>Goroutines vivas</td><td>Crecimiento monótono = <strong>fuga</strong> (GS3)</td></tr>
+<tr><td><code>/memory/classes/heap/objects:bytes</code></td><td>Heap vivo</td><td>Sube y no vuelve = fuga de memoria</td></tr>
+<tr><td><code>/gc/heap/goal:bytes</code></td><td>A qué tamaño apunta el GC</td><td>Comparalo con el límite del contenedor (GS8.12)</td></tr>
+<tr><td><code>/cpu/classes/gc/total:cpu-seconds</code></td><td>CPU consumida por el GC</td><td>&gt;25% del total = presión de asignación (GS2)</td></tr>
+<tr><td><code>/sched/pauses/total/gc:seconds</code></td><td>Pausas stop-the-world</td><td>p99 en milisegundos = revisá GS2</td></tr>
+<tr><td><code>/sched/latencies:seconds</code></td><td>Espera de una goroutine lista hasta correr</td><td><strong>Hambre de CPU</strong>, no un bug tuyo</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 <code>/sched/latencies:seconds</code> es la métrica más subestimada de Go.</strong> Mide cuánto tiempo pasa una goroutine <em>lista para ejecutar</em> antes de que el scheduler (GS1) le dé un P. Si sube sin que tu código haya cambiado, el problema está afuera: throttling de CPU del cgroup, un vecino ruidoso en el nodo, o <code>GOMAXPROCS</code> mal calculado. Es la señal que distingue "mi código se puso lento" de "no me están dando CPU", y esa distinción te ahorra medio día de perfilar el código equivocado.
+</div>
+
+<h2>GS8.8 OpenTelemetry en Go: trazas distribuidas</h2>
+
+<p>Una <strong>traza</strong> es un árbol de <strong>spans</strong>. Cada span es una operación con inicio, fin, atributos, eventos y estado; el span hijo sabe quién es su padre; y toda la traza comparte un <code>trace_id</code>. Cuando una request atraviesa cinco servicios, la traza te muestra los cinco en una sola línea de tiempo, con el tiempo exacto que se comió cada uno.</p>
+
+<pre><code class="lang-go">import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/propagation"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+)
+
+func initTrazas(ctx context.Context, version string) (func(context.Context) error, error) {
+    exp, err := otlptracegrpc.New(ctx) // lee OTEL_EXPORTER_OTLP_ENDPOINT
+    if err != nil {
+        return nil, fmt.Errorf("exporter otlp: %w", err)
+    }
+
+    res, err := resource.New(ctx, resource.WithAttributes(
+        semconv.ServiceName("api-pedidos"),
+        semconv.ServiceVersion(version),
+        semconv.DeploymentEnvironmentName("prod"),
+    ))
+    if err != nil {
+        return nil, fmt.Errorf("resource: %w", err)
+    }
+
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exp),          // NUNCA WithSyncer en producción
+        sdktrace.WithResource(res),
+        sdktrace.WithSampler(sdktrace.ParentBased(
+            sdktrace.TraceIDRatioBased(0.05), // 5% de las trazas raíz
+        )),
+    )
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{}, // W3C traceparent
+        propagation.Baggage{},
+    ))
+    return tp.Shutdown, nil // ⚠️ llamalo en el apagado o perdés el último lote
+}</code></pre>
+
+<div class="danger">
+  Si no llamás a <code>tp.Shutdown(ctx)</code> durante el apagado ordenado (GS7), el <code>BatchSpanProcessor</code> se lleva a la tumba los spans que todavía tenía en el buffer. Justo los del último minuto — o sea, exactamente los del incidente que hizo que el pod se reiniciara.
+</div>
+
+<h3>Propagación entre servicios</h3>
+
+<p>La propagación es lo que hace que la traza sea <em>distribuida</em>: el contexto viaja como el header <code>traceparent</code> del estándar W3C. En Go se resuelve envolviendo el handler de entrada y el transport de salida, sin tocar la lógica:</p>
+
+<pre><code class="lang-go">import "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+// Entrada: extrae el traceparent del header y crea el span raíz local.
+mux := http.NewServeMux()
+mux.Handle("GET /pedidos/{id}", handlerPedido)
+srv := &amp;http.Server{
+    Handler: otelhttp.NewHandler(ConRequestID(ConMetricas(mux)), "api"),
+}
+
+// Salida: inyecta el traceparent en cada request saliente.
+cliente := &amp;http.Client{
+    Transport: otelhttp.NewTransport(http.DefaultTransport),
+    Timeout:   3 * time.Second,
+}</code></pre>
+
+<h3>Instrumentación manual: donde está el significado</h3>
+
+<pre><code class="lang-go">var tracer = otel.Tracer("repo/pedidos")
+
+func (r *RepoPedidos) PorCliente(ctx context.Context, id int64) ([]Pedido, error) {
+    ctx, span := tracer.Start(ctx, "pedidos.por_cliente")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.Int64("cliente.id", id),
+        attribute.String("db.consulta", "pedidos_por_cliente_v2"),
+    )
+
+    filas, err := r.db.QueryContext(ctx, consultaPorCliente, id)
+    if err != nil {
+        span.RecordError(err)
+        span.SetStatus(codes.Error, "consulta falló")
+        return nil, fmt.Errorf("pedidos por cliente %d: %w", id, err)
+    }
+    defer filas.Close()
+
+    ps, err := escanear(filas)
+    // Atributo de alta cardinalidad: acá SÍ, en una métrica NO.
+    span.SetAttributes(attribute.Int("filas.devueltas", len(ps)))
+    return ps, err
+}</code></pre>
+
+<table>
+<thead><tr><th></th><th>Automática (<code>otelhttp</code>, <code>otelsql</code>, <code>otelgrpc</code>)</th><th>Manual</th></tr></thead>
+<tbody>
+<tr><td>Te da</td><td>El esqueleto: HTTP in/out, consultas SQL, gRPC</td><td>El significado del dominio</td></tr>
+<tr><td>Costo</td><td>Tres líneas por proceso</td><td>Una decisión por cada span</td></tr>
+<tr><td>Responde</td><td>"Se fue el tiempo en la base"</td><td>"Se fue recalculando el descuento por el cache frío"</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Un span por función es ruido, no observabilidad.</strong> Una traza con 400 spans de 3 µs cada uno es ilegible, cuesta ancho de banda y almacenamiento, y esconde el span de 1,4 s que sí importaba. Poné un span en cada <strong>I/O</strong> (base, HTTP saliente, cola, cache) y en cada <strong>decisión cara</strong> del dominio. El resto se ve en el profile.
+</div>
+
+<h3>Sampling: por qué el 100% no escala</h3>
+
+<p>Muestrear todo suena bien hasta que hacés la cuenta. A 20.000 requests por segundo con 12 spans por traza y ~400 bytes por span, son ~96 MB/s de telemetría saliendo de tus pods — más ancho de banda del que consume el tráfico real de la aplicación, más el costo de almacenamiento del backend, más la CPU de serializar. Y el 99,9% de esas trazas son idénticas y no las va a mirar nadie.</p>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Dónde decide</th><th>Ventaja</th><th>Límite</th></tr></thead>
+<tbody>
+<tr><td><strong>Head-based</strong> (<code>ParentBased</code> + ratio)</td><td>En el proceso, al crear la traza</td><td>Barato; la decisión se propaga y la traza queda completa</td><td>Decide <em>antes</em> de saber si fue lenta o falló</td></tr>
+<tr><td><strong>Tail-based</strong></td><td>En el collector, con la traza ya armada</td><td>Guardás el 100% de los errores y de los lentos</td><td>El collector tiene que bufferear todos los spans</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  La configuración que funciona en la práctica: <strong>head-based bajo</strong> (1–5%) en los servicios para no ahogar la red, más <strong>tail-based en el collector</strong> con reglas del tipo "guardá todo lo que tenga <code>status=error</code> o <code>duration &gt; 1 s</code>". Terminás con una muestra estadísticamente útil del tráfico normal y con el <em>100% de lo interesante</em>, que es exactamente lo que querías.
+</div>
+
+<h2>GS8.9 Profiling continuo en producción</h2>
+
+<p><code>net/http/pprof</code> es el arma secreta de Go: profiles de CPU, heap, goroutines, bloqueo y contención de mutexes, en un proceso de producción vivo, con un overhead de ~1-2% para CPU (muestrea a 100 Hz) y prácticamente cero para heap (muestrea una de cada 512 KB asignadas). Ningún otro lenguaje mainstream trae esto de fábrica.</p>
+
+<div class="danger">
+  <strong>El error de seguridad más repetido en Go.</strong> <code>import _ "net/http/pprof"</code> registra las rutas <code>/debug/pprof/*</code> en el <code>http.DefaultServeMux</code>. Si tu servidor público usa el mux por defecto —o si algún día alguien cambia <code>mux</code> por <code>nil</code> en el <code>http.Server</code>—, acabás de publicar en internet: (1) <code>/debug/pprof/profile</code>, que bloquea 30 segundos de perfilado por request y sirve como DoS trivial, (2) <code>/debug/pprof/heap</code>, que puede contener fragmentos de datos en memoria, y (3) <code>/debug/pprof/goroutine?debug=2</code>, que expone los stacks completos y por lo tanto tu arquitectura interna.
+</div>
+
+<pre><code class="lang-go">import (
+    "net/http"
+    _ "net/http/pprof" // registra en DefaultServeMux — lo aislamos abajo
+)
+
+// El servidor PÚBLICO usa un mux propio. Nunca nil, nunca el default.
+func servidorPublico(h http.Handler) *http.Server {
+    return &amp;http.Server{Addr: ":8080", Handler: h}
+}
+
+// El servidor ADMIN escucha solo en loopback: dentro del pod y nada más.
+// Se llega con `kubectl port-forward`, no desde la red.
+func servidorAdmin() *http.Server {
+    mux := http.NewServeMux()
+    mux.Handle("/debug/pprof/", http.DefaultServeMux) // pprof, aislado acá
+    mux.Handle("/metrics", promhttp.Handler())
+    mux.HandleFunc("/admin/loglevel", handlerNivel)   // GS8.1
+    mux.HandleFunc("/healthz", vivo)
+    mux.HandleFunc("/readyz", listo)
+    return &amp;http.Server{Addr: "127.0.0.1:6060", Handler: mux}
+}</code></pre>
+
+<h3>Cómo se atrapa una regresión de memoria antes del incidente</h3>
+
+<p>Un profiler continuo (Pyroscope, Parca, Cloud Profiler) toma unos segundos de profile cada minuto de cada pod y guarda la serie histórica, etiquetada por versión. Eso convierte el profiling de una herramienta forense —"el pod ya murió, no tengo nada"— en una herramienta preventiva: podés comparar dos versiones.</p>
+
+<pre><code class="lang-bash"># Un heap profile de un pod vivo, sin reiniciar nada.
+kubectl port-forward pod/api-pedidos-7d9f 6060:6060 &amp;
+go tool pprof -http=:8081 http://localhost:6060/debug/pprof/heap
+
+# El diff entre dos versiones: lo que la nueva agregó respecto de la vieja.
+curl -so v1.4.1.pb.gz http://localhost:6060/debug/pprof/heap   # antes del deploy
+curl -so v1.4.2.pb.gz http://localhost:6060/debug/pprof/heap   # después
+go tool pprof -http=:8081 -base v1.4.1.pb.gz v1.4.2.pb.gz
+
+# Ojo con qué muestra estás mirando:
+#   inuse_space  → memoria VIVA ahora     (fugas)
+#   alloc_space  → TODO lo asignado       (presión de GC, GS2)
+go tool pprof -sample_index=inuse_space v1.4.2.pb.gz</code></pre>
+
+<div class="concept">
+  <strong>💡 La regresión se ve como una diferencia, no como un valor absoluto.</strong> "El servicio usa 380 MB" no significa nada por sí solo. "La v1.4.2 retiene 140 MB más que la v1.4.1 en <code>cache.(*LRU).Put</code>" es un diagnóstico con culpable y con línea. Por eso el profiling continuo etiquetado por versión atrapa la fuga el día del deploy, cuando el cambio todavía tiene un solo commit sospechoso, y no tres semanas después cuando el pod empieza a morir por OOM y hay 200 commits candidatos.
+</div>
+
+<h2>GS8.10 Worked example: el servicio que "a veces va lento"</h2>
+
+<p>Ticket de soporte, textual: <em>"la pantalla de mis pedidos a veces tarda un montón"</em>. Sin más datos. En el dashboard, la latencia promedio del endpoint <code>GET /pedidos</code> marca <strong>60 ms</strong> y está verde. La tasa de errores es 0,00%. No hay nada en los logs de nivel <code>Error</code>. El equipo cerró el ticket dos veces como "no reproducible".</p>
+
+<h3>Paso 1 — Reconocer que el promedio no puede ver esto</h3>
+
+<p>Son los números de GS8.5: 10.000 requests cada cinco minutos, 9.850 en ~38 ms y 150 en ~1.520 ms dan un promedio de 60,2 ms. La alerta está en 200 ms de promedio. <strong>Para que ese promedio llegue a 200 ms harían falta unas 1.300 requests lentas por cada 10.000</strong> — es decir, el problema tendría que ser trece veces peor de lo que ya es antes de que suene el teléfono. Mientras tanto, 43.200 personas por día esperan un segundo y medio.</p>
+
+<h3>Paso 2 — Cambiar el gauge de promedio por un histograma</h3>
+
+<pre><code class="lang-go">// Buckets densos alrededor del SLO ("99% por debajo de 300 ms"),
+// con cola larga para poder VER los outliers en vez de amontonarlos en +Inf.
+var reqDur = promauto.NewHistogramVec(prometheus.HistogramOpts{
+    Name:    "http_request_duration_seconds",
+    Buckets: []float64{
+        .01, .025, .05, .075, .1, .15, .2, .3, .5, .75, 1, 1.5, 2.5, 5,
+    },
+}, []string{"method", "route"})</code></pre>
+
+<p>Un deploy después, el panel cuenta otra historia:</p>
+
+<table>
+<thead><tr><th>Estadístico</th><th>Valor</th><th>Lectura</th></tr></thead>
+<tbody>
+<tr><td>promedio</td><td>60 ms</td><td>Verde. Miente.</td></tr>
+<tr><td>p50</td><td><strong>38 ms</strong></td><td>El caso típico está perfecto</td></tr>
+<tr><td>p95</td><td>180 ms</td><td>Ya se despega</td></tr>
+<tr><td>p99</td><td><strong>1.520 ms</strong></td><td><strong>40× el p50</strong> 🔴</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El cociente p99/p50 es un diagnóstico en sí mismo.</strong> Entre 2× y 5× es una cola sana (GC, jitter de red, variación normal). Arriba de 10× no es ruido: hay <strong>dos poblaciones distintas de requests</strong> conviviendo, y una de ellas hace algo que la otra no hace. La pregunta ya no es "¿por qué el servicio es lento?" sino "¿qué tienen en común el 1% de las requests que se van a la cola?".
+</div>
+
+<h3>Paso 3 — De la métrica a la traza</h3>
+
+<p>Con exemplars (GS8.6) se hace clic en el bucket de 1,5 s y se salta a una traza real. Sin exemplars, se filtra en el backend por duración. En ambos casos aparece el mismo perfil, repetido en las 40 trazas lentas de la última hora:</p>
+
+<pre><code class="lang-bash">Traza 4bf92f3577b34da6a3ce929d0e0e4736 — 1.586 ms
+├── api GET /pedidos/{id}                              1.583 ms
+│   ├── auth.verificar_token                               2 ms
+│   ├── cache.get pedidos:cliente:9182                     1 ms   (miss)
+│   ├── pedidos.por_cliente                            1.541 ms  🔴
+│   │   └── db.query pedidos_por_cliente_v2            1.538 ms  🔴
+│   │       ├── db.rows_devueltas = 48213
+│   │       └── cliente.id = 9182
+│   └── render.json                                       31 ms
+
+Traza de comparación (p50) — 39 ms
+└── pedidos.por_cliente                                    9 ms
+    └── db.rows_devueltas = 112</code></pre>
+
+<p>La traza sola ya resolvió la mitad del problema: <strong>el 97% del tiempo está en una sola consulta</strong>, y esa consulta devuelve 48.213 filas en el caso lento contra 112 en el típico. No es la red, no es el JSON, no es el auth, no es el GC. Sin trazas, ese descarte cuesta una tarde de agregar <code>time.Since</code> a mano por todo el código.</p>
+
+<h3>Paso 4 — De la traza al log, por el trace id</h3>
+
+<pre><code class="lang-bash">$ logcli query '{app="api-pedidos"} |= "4bf92f3577b34da6a3ce929d0e0e4736"'
+
+{"time":"...","level":"INFO","msg":"procesando","request_id":"a91c","trace_id":"4bf92f...",
+ "http":{"method":"GET","route":"/pedidos/{id}"},"cliente":9182}
+{"time":"...","level":"WARN","msg":"consulta lenta","trace_id":"4bf92f...",
+ "consulta":"pedidos.por_cliente","duracion":"1.538s","cliente":9182,"estado":"pendiente"}
+{"time":"...","level":"INFO","msg":"respondido","trace_id":"4bf92f...","code":200,
+ "duracion":"1.586s","filas":48213}</code></pre>
+
+<p>Acá aparece el dato que faltaba y que ninguna métrica podía tener sin reventar de cardinalidad: las requests lentas son las que filtran por <code>estado=pendiente</code> <strong>y</strong> pertenecen a clientes con muchísimos pedidos históricos. Esa es la segunda población.</p>
+
+<h3>Paso 5 — La causa raíz</h3>
+
+<pre><code class="lang-bash">EXPLAIN ANALYZE
+SELECT * FROM pedidos
+WHERE cliente_id = 9182 AND estado = 'pendiente'
+ORDER BY creado_en DESC LIMIT 50;
+
+ Limit  (cost=48211.93..48212.05 rows=50)
+   -&gt;  Sort  (cost=48211.93..48333.44 rows=48604)
+         Sort Key: creado_en DESC
+         Sort Method: external merge  Disk: 9840kB      🔴
+         -&gt;  Seq Scan on pedidos  (cost=0.00..46598.00 rows=48604)
+               Filter: ((cliente_id = 9182) AND (estado = 'pendiente'))
+               Rows Removed by Filter: 3951396          🔴
+ Execution Time: 1538.402 ms
+
+-- El índice compuesto que hacía falta:
+CREATE INDEX CONCURRENTLY idx_pedidos_cliente_estado_fecha
+    ON pedidos (cliente_id, estado, creado_en DESC);</code></pre>
+
+<p>Escaneo secuencial de cuatro millones de filas, más un ordenamiento que no entra en memoria y se va a disco. En los clientes chicos la tabla estaba caliente en el cache de la base y el mismo plan malo tardaba 9 ms — por eso "a veces" andaba bien. El bug siempre estuvo ahí; lo que variaba era cuánto se notaba.</p>
+
+<h3>Paso 6 — El antes y el después</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Antes</th><th>Después</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>promedio</td><td>60 ms</td><td>37 ms</td><td>−38% 🟡</td></tr>
+<tr><td>p50</td><td>38 ms</td><td>36 ms</td><td>−5%</td></tr>
+<tr><td>p95</td><td>180 ms</td><td>44 ms</td><td>−75%</td></tr>
+<tr><td><strong>p99</strong></td><td><strong>1.520 ms</strong></td><td><strong>61 ms</strong></td><td><strong>−96% (25×)</strong> 🔥</td></tr>
+<tr><td>filas escaneadas (p99)</td><td>3.999.999</td><td>112</td><td>—</td></tr>
+<tr><td>usuarios/día esperando &gt;1 s</td><td>43.200</td><td>~0</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Mirá la columna del promedio.</strong> Bajó de 60 a 37 ms: un 38%. Si el único número del dashboard hubiera sido ese, el informe post-fix habría dicho "mejora moderada de latencia" y nadie habría entendido la magnitud. El p99 bajó <strong>25 veces</strong>. El promedio no solo escondió el problema: también habría escondido el arreglo. Es el mismo defecto en las dos direcciones — un estadístico dominado por la masa es ciego a lo que le pasa a la cola, siempre.
+</div>
+
+<h3>Paso 7 — Dejar la alerta correcta</h3>
+
+<pre><code class="lang-bash">- alert: LatenciaP99Alta
+  expr: |
+    histogram_quantile(0.99,
+      sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))
+    ) &gt; 0.3
+  for: 10m
+  labels:   { severity: warning }
+  annotations:
+    summary: "p99 de {{ $labels.route }} sobre el SLO (300 ms)"
+    runbook: "https://wiki/runbooks/latencia-p99"
+
+# ❌ Lo que había antes y nunca disparó:
+#    rate(..._sum[5m]) / rate(..._count[5m]) &gt; 0.2</code></pre>
+
+<div class="rule">
+  <strong>📌 Alertá sobre la experiencia del peor decil, no sobre el centro de la distribución.</strong> Una alerta sobre el promedio solo puede sonar cuando la mayoría ya está sufriendo, o sea cuando el incidente ya es total. Una alerta sobre el p99 suena cuando todavía es un problema de pocos — que es el único momento en que arreglarlo es barato. El <code>for: 10m</code> está para no despertar a nadie por un pico de 30 segundos.
+</div>
+
+<h2>GS8.11 Deploy: el contenedor mínimo</h2>
+
+<p>Acá Go cobra la deuda que generó al principio del módulo. Como compila a un binario estático sin dependencias de runtime, el contenedor no necesita distribución, ni intérprete, ni librerías compartidas. Podés llegar literalmente a <code>FROM scratch</code>: un contenedor cuyo contenido es tu binario y nada más.</p>
+
+<pre><code class="lang-dockerfile">FROM golang:1.26 AS build
+WORKDIR /src
+
+# Capa de dependencias: cachea mientras go.mod/go.sum no cambien.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build \
+      -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /bin/api ./cmd/api
+
+# ── Imagen final ────────────────────────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /bin/api /bin/api
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/bin/api"]</code></pre>
+
+<table>
+<thead><tr><th>Imagen base</th><th>Tamaño</th><th>Trae</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td><code>golang:1.26</code></td><td>~850 MB</td><td>Todo el toolchain</td><td>Solo para la etapa de build</td></tr>
+<tr><td><code>debian:bookworm-slim</code></td><td>~90 MB</td><td>Shell, apt, libc</td><td>Innecesario para un binario estático</td></tr>
+<tr><td><code>alpine:3</code></td><td>~8 MB</td><td>Shell, musl</td><td>Cómodo, pero cuidado con CGO+musl</td></tr>
+<tr><td><code>distroless/static</code></td><td>~2 MB</td><td>Certificados, tzdata, <code>nonroot</code></td><td>🟢 <strong>El default sensato</strong></td></tr>
+<tr><td><code>scratch</code></td><td>0 B</td><td><strong>Nada</strong></td><td>Mínimo absoluto, y tenés que traer todo vos</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El tamaño es lo menos importante de esta tabla.</strong> Lo que realmente ganás con distroless o scratch es <strong>superficie de ataque</strong>: sin shell no hay <code>curl | sh</code> después de una RCE, sin gestor de paquetes no se instala nada, y el escáner de vulnerabilidades pasa de reportar 40 CVEs de paquetes que nunca usaste a reportar cero. Un contenedor con 90 MB de Debian que nunca ejecutás sigue siendo 90 MB de CVEs que tenés que responder en la próxima auditoría.
+</div>
+
+<h3><code>CGO_ENABLED=0</code>: la variable que decide todo</h3>
+
+<p>Con cgo habilitado (el default cuando compilás en Linux con un compilador de C presente), el paquete <code>net</code> usa el <em>resolver</em> de la libc del sistema y <code>os/user</code> lee las funciones de la libc. El binario resultante <strong>enlaza dinámicamente con glibc</strong> y ya no arranca en <code>scratch</code> ni en Alpine (que usa musl): muere con <code>no such file or directory</code>, que es el mensaje de error más desorientador de todo el ecosistema, porque el archivo <em>sí</em> existe — lo que falta es el enlazador dinámico.</p>
+
+<div class="mistake">
+  Si tu contenedor "no encuentra" un binario que ves con tus propios ojos dentro de la imagen, el 95% de las veces es esto: compilaste con cgo, el binario pide <code>/lib64/ld-linux-x86-64.so.2</code>, y la imagen base no lo tiene. Comprobalo con <code>go build</code> y después <code>file ./api</code>: querés leer <code>statically linked</code>, no <code>dynamically linked</code>.
+</div>
+
+<p>Si usás <code>FROM scratch</code> en serio, hay tres cosas que ninguna imagen te va a dar y que Go necesita:</p>
+
+<pre><code class="lang-dockerfile">FROM scratch
+# 1. Certificados raíz: sin esto, TODO cliente HTTPS falla con
+#    "x509: certificate signed by unknown authority".
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# 2. Un usuario no root (scratch no tiene /etc/passwd).
+COPY --from=build /etc/passwd /etc/passwd
+COPY --from=build /bin/api /bin/api
+USER 65534:65534
+ENTRYPOINT ["/bin/api"]</code></pre>
+
+<p>La tercera es la base de zonas horarias: sin <code>/usr/share/zoneinfo</code>, <code>time.LoadLocation("America/Argentina/Buenos_Aires")</code> devuelve error. La solución en Go es embeberla en el binario con un import en blanco — cuesta unos 450 KB y te ahorra un bug que aparece recién el día del cambio de horario:</p>
+
+<pre><code class="lang-go">import _ "time/tzdata" // embebe la base IANA dentro del binario</code></pre>
+
+<h3>Compilación cruzada</h3>
+
+<p>El toolchain de Go compila para otras plataformas sin instalar nada: es una variable de entorno. Esto es lo que hace que un pipeline de CI corriendo en x86 pueda publicar binarios ARM sin emulación.</p>
+
+<pre><code class="lang-bash"># Linux ARM64 (Graviton, Ampere, un Mac con Docker)
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o dist/api-linux-arm64 ./cmd/api
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/api-linux-amd64 ./cmd/api
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o dist/api-macos-arm64 ./cmd/api
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/api.exe          ./cmd/api
+
+go tool dist list | head        # todas las combinaciones soportadas
+file dist/api-linux-amd64       # verificá: "statically linked"</code></pre>
+
+<div class="info">
+  <strong>Qué hace cada flag.</strong> <code>-trimpath</code> saca las rutas absolutas de tu máquina del binario (reproducibilidad, y no filtrás <code>/home/ana/proyectos/...</code> en los stack traces). <code>-w</code> descarta la información DWARF y <code>-s</code> la tabla de símbolos: juntas ahorran ~30% del tamaño. Los <strong>profiles siguen siendo legibles</strong> porque pprof simboliza con la <code>pclntab</code>, que el runtime necesita para los stack traces y no se puede sacar. Lo que sí perdés es depurar cómodo con <code>dlv</code> y analizar core dumps — si tu operación depende de eso, no uses <code>-s -w</code>.
+</div>
+
+<h3>Healthchecks: liveness, readiness, startup</h3>
+
+<pre><code class="lang-go">var listoParaTrafico atomic.Bool
+
+// LIVENESS: ¿el proceso está vivo? Nada más. Si falla, te matan y reinician.
+func vivo(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+}
+
+// READINESS: ¿puedo atender AHORA? Si falla, te sacan del balanceador
+// pero NO te matan.
+func listo(w http.ResponseWriter, r *http.Request) {
+    if !listoParaTrafico.Load() {
+        http.Error(w, "apagándose", http.StatusServiceUnavailable)
+        return
+    }
+    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+    defer cancel()
+    if err := db.PingContext(ctx); err != nil {
+        http.Error(w, "base no disponible", http.StatusServiceUnavailable)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+}</code></pre>
+
+<div class="danger">
+  <strong>El liveness NUNCA debe tocar la base de datos.</strong> Es el error que convierte una caída de la base en una caída total e irrecuperable: la base se pone lenta → todos los liveness fallan → Kubernetes mata <em>todos</em> los pods a la vez → arrancan todos juntos → abren todas las conexiones de golpe contra una base que ya estaba en problemas → vuelven a fallar. Un <em>crashloop</em> de todo el servicio provocado por la sonda que debía protegerlo. El liveness responde 200 si el proceso no está en deadlock. Punto.
+</div>
+
+<p>El apagado ordenado (GS7) usa la misma bandera: al recibir <code>SIGTERM</code> ponés <code>listoParaTrafico</code> en <code>false</code>, esperás unos segundos a que el balanceador te saque de rotación, y recién ahí llamás a <code>srv.Shutdown(ctx)</code> y a <code>tp.Shutdown(ctx)</code>. Si apagás el servidor de inmediato, las requests que ya estaban en vuelo se cortan y el usuario ve un 502 en cada deploy.</p>
+
+<h2>GS8.12 <code>GOMEMLIMIT</code> y los límites del contenedor</h2>
+
+<p>Este es el OOM más común de Go en Kubernetes, y no es un bug: es una consecuencia lógica de cómo funciona el GC.</p>
+
+<p>El recolector de Go decide cuándo correr según <code>GOGC</code>, que por defecto vale 100 y significa <em>"esperá a que el heap se duplique respecto del heap vivo del último ciclo"</em> (GS2). Es una política puramente <strong>relativa</strong>: el runtime no sabe, y por diseño nunca supo, cuánta memoria hay disponible en la máquina o en el cgroup.</p>
+
+<pre><code class="lang-bash">Pod con limits.memory = 512Mi
+Heap vivo tras el último GC = 400 MB
+GOGC=100  →  el GC apunta a correr cuando el heap llegue a 800 MB
+
+El heap crece: 400 → 450 → 500 → 512 → 💀
+El kernel manda SIGKILL al llegar al límite del cgroup.
+El GC nunca llegó a correr. No hay panic. No hay log. No hay stack.
+kubectl describe pod → Last State: Terminated · Reason: OOMKilled · Exit Code: 137</code></pre>
+
+<div class="danger">
+  Un <code>OOMKilled</code> es <strong>SIGKILL</strong>: no es capturable, no ejecuta <code>defer</code>, no vacía buffers, no escribe una línea. Tu último log es de tres segundos antes del final y no dice nada. Por eso este fallo tiene fama de "el pod se reinicia solo y no hay forma de saber por qué" — la única evidencia está afuera del proceso.
+</div>
+
+<p><code>GOMEMLIMIT</code> (desde Go 1.19) es la pieza que faltaba: un <strong>límite blando</strong> de memoria total gestionada por el runtime. A medida que el uso se acerca al límite, el GC corre cada vez más seguido para no cruzarlo. No es un límite duro —si tu working set real no entra, no hay magia posible— pero convierte un <code>SIGKILL</code> silencioso en una degradación visible.</p>
+
+<pre><code class="lang-go">import (
+    "runtime/debug"
+    "github.com/KimMachineGun/automemlimit/memlimit" // lee el cgroup por vos
+)
+
+func init() {
+    // Opción A: la librería lee el límite del cgroup (v1 y v2) y aplica 90%.
+    memlimit.SetGoMemLimitWithOpts(
+        memlimit.WithRatio(0.9),
+        memlimit.WithProvider(memlimit.FromCgroup),
+    )
+
+    // Opción B: a mano, si vos ya conocés el límite.
+    // debug.SetMemoryLimit(int64(float64(limiteBytes) * 0.9))
+
+    slog.Info("límite de memoria del runtime",
+        slog.Int64("gomemlimit_bytes", debug.SetMemoryLimit(-1))) // -1 solo lee
+}</code></pre>
+
+<table>
+<thead><tr><th></th><th><code>GOGC</code></th><th><code>GOMEMLIMIT</code></th></tr></thead>
+<tbody>
+<tr><td>Naturaleza</td><td>Relativa (% de crecimiento)</td><td>Absoluta (bytes)</td></tr>
+<tr><td>Optimiza</td><td>El intercambio CPU/memoria</td><td>No cruzar el techo</td></tr>
+<tr><td>Sabe del contenedor</td><td>No</td><td>Sí, si vos se lo decís</td></tr>
+<tr><td>Recomendación</td><td>Dejalo en 100</td><td><strong>Seteá siempre ~90% del límite</strong></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>No pongas <code>GOGC=off</code> con <code>GOMEMLIMIT</code> salvo que sepas exactamente qué estás haciendo.</strong> Con <code>GOGC</code> apagado, el límite pasa a ser el <em>único</em> disparador del GC. Si el heap vivo real llega a rozar el límite, el GC entra en una espiral: corre, no libera casi nada, vuelve a correr. Go se protege con un tope del 50% de CPU para el recolector, así que el resultado no es un crash sino algo peor de diagnosticar: <strong>el servicio queda vivo y respondiendo a la mitad de velocidad, para siempre</strong>. El 10% de margen del ejemplo existe justamente para no llegar ahí.
+</div>
+
+<h3>El primo del problema: <code>GOMAXPROCS</code></h3>
+
+<p>Históricamente, <code>GOMAXPROCS</code> se inicializaba con la cantidad de CPUs <em>de la máquina</em>. Un pod con <code>limits.cpu: 2</code> corriendo en un nodo de 64 núcleos arrancaba con 64 P (GS1): 64 goroutines corriendo en paralelo contra una cuota que solo alcanza para dos, el planificador CFS del kernel estrangulando el proceso cada período de 100 ms, y latencias de cola espantosas sin ninguna causa visible en el código. La solución de la industria fue la librería <code>automaxprocs</code> de Uber.</p>
+
+<div class="tip">
+  <strong>Desde Go 1.25 el runtime tiene esto en cuenta solo</strong>: lee el límite de CPU del cgroup y ajusta <code>GOMAXPROCS</code> en consecuencia (y lo re-ajusta si el límite cambia en caliente). En Go 1.26 sigue siendo el comportamiento por defecto. La letra chica: el comportamiento se activa según la directiva <code>go</code> de tu <code>go.mod</code>, así que un módulo que todavía declara <code>go 1.21</code> compilado con el toolchain nuevo <strong>no</strong> lo obtiene. Verificalo en runtime —<code>runtime.GOMAXPROCS(0)</code> o <code>/sched/gomaxprocs:threads</code>— y logueá el valor al arrancar; es config que se cree y no se verifica.
+</div>
+
+<div class="info">
+  El <strong>Green Tea GC</strong>, que en Go 1.26 es el recolector por defecto (GS2), mejora la localidad del marcado y suele bajar el costo de CPU del GC en cargas con muchos objetos chicos. No cambia nada de esta sección: la política de <em>cuándo</em> correr sigue siendo <code>GOGC</code> + <code>GOMEMLIMIT</code>, y el kernel sigue matando al proceso que cruza el límite del cgroup.
+</div>
+
+<h2>GS8.13 Debug en producción</h2>
+
+<h3><code>GOTRACEBACK</code>: cuánto te cuenta el runtime cuando se muere</h3>
+
+<table>
+<thead><tr><th>Valor</th><th>Qué imprime al entrar en pánico</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><code>none</code></td><td>Nada de stacks</td><td>Casi nunca</td></tr>
+<tr><td><code>single</code> (default)</td><td>Solo la goroutine que entró en pánico</td><td>CLIs</td></tr>
+<tr><td><code>all</code></td><td><strong>Todas</strong> las goroutines de usuario</td><td>🟢 <strong>Servidores</strong></td></tr>
+<tr><td><code>system</code></td><td>Además las del runtime y los frames internos</td><td>Bugs raros del runtime</td></tr>
+<tr><td><code>crash</code></td><td>Como <code>system</code> + aborta con <code>SIGABRT</code> → core dump</td><td>Cuando necesitás el estado de la memoria</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 En un servidor, poné <code>GOTRACEBACK=all</code>.</strong> El default (<code>single</code>) te muestra la goroutine que murió, pero en un servicio concurrente la causa suele estar en <em>otra</em>: la que tomó el mutex y no lo soltó, la que quedó bloqueada en un canal sin lector, la que está esperando una respuesta que nunca va a llegar. Con <code>single</code> ves el síntoma; con <code>all</code> ves el sistema.
+</div>
+
+<h3>Volcar los stacks sin matar el proceso</h3>
+
+<p>Mandarle <code>SIGQUIT</code> a un proceso Go imprime todos los stacks… y lo mata. Cuando el pod está colgado pero vivo y querés mirar sin perderlo, el patrón limpio es una señal propia:</p>
+
+<pre><code class="lang-go">func dumpEnSIGUSR1() {
+    c := make(chan os.Signal, 1)
+    signal.Notify(c, syscall.SIGUSR1)
+    go func() {
+        for range c {
+            // debug=2 imprime los stacks completos, formato panic.
+            _ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
+            slog.Warn("volcado de goroutines por SIGUSR1",
+                slog.Int("goroutines", runtime.NumGoroutine()))
+        }
+    }()
+}
+
+// kubectl exec pod/api-pedidos-7d9f -- kill -USR1 1
+// (o, mejor todavía: GET http://127.0.0.1:6060/debug/pprof/goroutine?debug=2)</code></pre>
+
+<h3>Checklist: el pod se reinició y nadie sabe por qué</h3>
+
+<p>Este es el procedimiento, en orden. El primer paso es siempre el mismo y casi nadie lo hace primero:</p>
+
+<pre><code class="lang-bash"># 1. La causa la sabe el kubelet, no tus logs.
+kubectl describe pod api-pedidos-7d9f | sed -n '/Last State/,/Restart Count/p'
+#   Last State:  Terminated
+#     Reason:    OOMKilled
+#     Exit Code: 137
+
+# 2. Los logs del contenedor ANTERIOR, no del actual.
+kubectl logs api-pedidos-7d9f --previous --tail=200
+
+# 3. ¿Fue la sonda? Los eventos lo dicen.
+kubectl get events --field-selector involvedObject.name=api-pedidos-7d9f</code></pre>
+
+<table>
+<thead><tr><th>Exit code</th><th>Señal</th><th>Causa típica</th><th>Dónde mirar</th></tr></thead>
+<tbody>
+<tr><td><strong>137</strong></td><td>SIGKILL (9)</td><td><code>OOMKilled</code> o desalojo del nodo</td><td>Heap del profiler continuo; <code>GOMEMLIMIT</code> (GS8.12)</td></tr>
+<tr><td><strong>143</strong></td><td>SIGTERM (15)</td><td>Apagado normal — <em>o</em> tardó más que el <code>terminationGracePeriod</code></td><td>Duración de tu <code>Shutdown</code> (GS7)</td></tr>
+<tr><td><strong>139</strong></td><td>SIGSEGV (11)</td><td>cgo, <code>unsafe</code>, o corrupción de memoria</td><td>Core dump con <code>GOTRACEBACK=crash</code></td></tr>
+<tr><td><strong>2</strong></td><td>—</td><td>Panic no recuperado</td><td><code>kubectl logs --previous</code>: el traceback está ahí</td></tr>
+<tr><td><strong>1</strong></td><td>—</td><td>Falla al arrancar: config, puerto ocupado, migración</td><td>Las primeras 20 líneas del log</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El caso más frustrante: no hay nada.</strong> Exit 137, cero logs útiles, y el proceso murió sin decir palabra — porque <code>SIGKILL</code> no se puede capturar. La única salida es <strong>evidencia recolectada antes</strong>: el heap del profiler continuo del minuto anterior, la serie de <code>/memory/classes/total:bytes</code>, la de goroutines. Si no las tenías puestas antes del incidente, la respuesta honesta es "no sé", y la acción correcta no es adivinar sino instrumentar y esperar a que vuelva a pasar.
+</div>
+
+<h3>Los pánicos que sí podés capturar</h3>
+
+<pre><code class="lang-go">func ConRecover(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            rec := recover()
+            if rec == nil {
+                return
+            }
+            if rec == http.ErrAbortHandler {
+                panic(rec) // contrato de net/http: este NO se captura
+            }
+
+            // El stack es lo único irrecuperable: capturalo SIEMPRE.
+            stack := string(debug.Stack())
+
+            span := trace.SpanFromContext(r.Context())
+            span.SetStatus(codes.Error, "panic")
+            span.RecordError(fmt.Errorf("panic: %v", rec))
+
+            slog.ErrorContext(r.Context(), "panic recuperado en handler",
+                slog.Any("panic", rec),
+                slog.String("route", r.Pattern),
+                slog.String("stack", stack),
+            )
+            panicsTotal.WithLabelValues(r.Pattern).Inc()
+
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusInternalServerError)
+            fmt.Fprintf(w, `{"error":"interno","request_id":%q}`, ridDe(r.Context()))
+        }()
+        next.ServeHTTP(w, r)
+    })
+}</code></pre>
+
+<div class="mistake">
+  <strong>Un <code>recover()</code> sin stack es peor que no tener <code>recover()</code>.</strong> El servicio sobrevive, el usuario recibe un 500 limpio, y vos te quedaste con un log que dice <code>panic: runtime error: index out of range</code> sin una sola línea de dónde. El pánico solo lleva el stack en el momento del <code>recover</code>: si no llamás a <code>debug.Stack()</code> ahí adentro, esa información se pierde para siempre. Y agregá siempre el contador: un servicio que "anda bien" pero recupera 900 pánicos por hora es un servicio roto con un vendaje.
+</div>
+
+<h2>GS8.14 Cierre del track</h2>
+
+<p>Recorriste ocho módulos que, juntos, son el mapa de lo que separa a alguien que escribe Go de alguien que puede sostener Go en producción:</p>
+
+<table>
+<thead><tr><th>Módulo</th><th>La idea que te llevás</th></tr></thead>
+<tbody>
+<tr><td><strong>GS1</strong> Runtime y scheduler</td><td>G, M y P: por qué una goroutine cuesta 2 KB y un hilo 1 MB</td></tr>
+<tr><td><strong>GS2</strong> Memoria y GC</td><td>Escape analysis, <code>GOGC</code>, y por qué asignar menos vale más que optimizar</td></tr>
+<tr><td><strong>GS3</strong> Concurrencia</td><td><code>context</code>, cancelación, y que toda goroutine necesita una forma de terminar</td></tr>
+<tr><td><strong>GS4</strong> Tipos y genéricos</td><td>Interfaces chicas, y genéricos donde agregan valor y no donde lucen</td></tr>
+<tr><td><strong>GS5</strong> Performance</td><td>Medir antes de optimizar; el benchmark que miente y el que no</td></tr>
+<tr><td><strong>GS6</strong> Testing</td><td>Tests de tabla, fuzzing, <code>-race</code>, y tests que fallan por la razón correcta</td></tr>
+<tr><td><strong>GS7</strong> Servicios</td><td>Middlewares, timeouts, apagado ordenado, resiliencia</td></tr>
+<tr><td><strong>GS8</strong> Observabilidad</td><td>Que el sistema te cuente qué le pasó, antes de que se lo tengas que preguntar</td></tr>
+</tbody>
+</table>
+
+<h3>Qué estudiar después</h3>
+
+<ul>
+  <li><strong>Leé la stdlib.</strong> El código de <code>net/http</code>, <code>sync</code>, <code>context</code> y <code>database/sql</code> es de los mejores ejemplos de Go idiomático que existen, está comentado como documentación y ya lo tenés instalado. <code>go doc -src sync.Once</code> y empezá por ahí.</li>
+  <li><strong>Seguí las propuestas.</strong> Las decisiones de diseño de Go se discuten en público en los issues con la etiqueta <em>proposal</em>. Leer una discusión completa —qué se propuso, qué se rechazó y con qué argumento— enseña más sobre diseño de lenguajes que cualquier libro.</li>
+  <li><strong>Sistemas distribuidos.</strong> Idempotencia, exactly-once (y por qué no existe), consistencia eventual, el patrón outbox, backpressure. Es el próximo cuello de botella de tu carrera, y Go es el idioma en el que se escribe la mayoría de esa infraestructura.</li>
+  <li><strong>eBPF.</strong> Observabilidad del kernel sin instrumentar la aplicación: latencia de syscalls, tráfico de red, perfiles del sistema entero. Cilium, Pixie y Parca son Go.</li>
+  <li><strong>Escribí un intérprete o un compilador chico.</strong> Es el mejor ejercicio para consolidar todo el track: parsing, árboles, gestión de memoria, y una excusa perfecta para usar genéricos y perfilar en serio.</li>
+  <li><strong>Contribuí.</strong> El proyecto Go acepta contribuciones y el proceso de revisión es exigente y educativo. Empezá por documentación o por un <em>good first issue</em> en una librería del ecosistema.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 Lo que realmente define al senior.</strong> No es saber más features del lenguaje: es poder <strong>explicar por qué el sistema se comportó como se comportó, con evidencia</strong>. Todo este track apuntó a eso. El scheduler explica por qué el throughput no sube; el GC explica por qué la latencia tiene picos; los tests explican por qué el cambio es seguro; y la observabilidad es lo que convierte todo lo anterior en algo que podés demostrar a las tres de la mañana en vez de intuir. La diferencia entre "creo que es la base" y "el p99 de la consulta subió 40× a las 02:14 y acá está la traza" es la única que importa.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu dashboard muestra latencia promedio de 60 ms, plana y verde. Los usuarios se quejan de lentitud. ¿Qué mirás primero y por qué?</summary>
+<p>El histograma, y dentro de él la relación entre p50 y p99. El promedio está dominado por la masa de requests rápidas: si el 98,5% tarda 38 ms y el 1,5% tarda 1.520 ms, el promedio da 60 ms y no se mueve, aunque decenas de miles de personas por día esperen más de un segundo. Un cociente p99/p50 por encima de 10× no es "ruido en la cola": es la firma de <strong>dos poblaciones distintas de requests</strong>, una de las cuales hace algo que la otra no. A partir de ahí la pregunta correcta deja de ser "por qué el servicio es lento" y pasa a ser "qué tienen en común las requests de la cola" — y eso lo responde una traza, no una métrica.</p></details>
+
+<details><summary>Tu pod muere con exit code 137 y no hay absolutamente nada en los logs. ¿Qué pasó y cómo lo prevenís?</summary>
+<p>137 = 128 + 9 = <code>SIGKILL</code>: el kernel lo mató por cruzar el límite de memoria del cgroup (<code>OOMKilled</code>). No hay logs porque <code>SIGKILL</code> no se captura: no corren los <code>defer</code>, no se vacían los buffers, no se escribe nada. La causa de fondo es que <code>GOGC</code> es una política <em>relativa</em> —correr cuando el heap se duplica— y el runtime no conoce el límite del contenedor: con 400 MB de heap vivo, el GC apunta a 800 MB aunque el pod tenga 512 MB. La prevención es <code>GOMEMLIMIT</code> al ~90% del límite del contenedor, que hace que el GC se vuelva agresivo antes de cruzar el techo. Y como la evidencia solo existe <em>antes</em> del kill, necesitás profiling continuo y las series de <code>/memory/classes/total:bytes</code> ya funcionando: después del reinicio no hay nada que recuperar.</p></details>
+
+<details><summary>Un compañero agrega el ID de usuario como label de una métrica "para poder filtrar por cliente". ¿Cuál es el problema y dónde va ese dato?</summary>
+<p>Cada combinación única de labels es una serie temporal permanente en el scraper. Con 200.000 usuarios activos, 4 métodos y 12 buckets de histograma son ~9,6 millones de series: el Prometheus se queda sin memoria, lo mata el OOM killer, y con él se caen las métricas de <em>todos</em> los servicios que recolectaba. Los labels tienen que tener un conjunto de valores chico, cerrado y conocido antes de compilar. El dato de alta cardinalidad va a las <strong>trazas</strong> (como atributo del span) y a los <strong>logs</strong> (como campo estructurado), que están diseñados para eso. El puente entre ambos mundos son los <em>exemplars</em>: el histograma guarda el trace id de una request de ejemplo por bucket, así hacés clic en el p99 y saltás a una traza real sin haber creado una sola serie extra. Y ojo con el caso hermano: etiquetar con <code>r.URL.Path</code> en vez de <code>r.Pattern</code> permite que cualquiera desde internet te cree series infinitas pidiendo URLs inexistentes.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Un binario Go no se puede inspeccionar desde afuera: <strong>la observabilidad es código que escribís antes</strong>, no una capa que agregás durante el incidente. A cambio, el runtime es excepcionalmente transparente cuando se lo pedís.</li>
+  <li><strong><code>log/slog</code></strong> (stdlib desde 1.21) da logging estructurado sin dependencias. Un handler propio que lee el <code>context</code> inyecta el trace id automáticamente — y hay que sobreescribir <code>WithAttrs</code> y <code>WithGroup</code> o el envoltorio desaparece en silencio.</li>
+  <li>Logueá <strong>eventos de negocio, decisiones y errores con causa</strong>. Nunca secretos ni PII: los logs se retienen meses, los ve todo el equipo y se replican solos. Usá <code>LogValuer</code> para que la redacción viaje pegada al tipo.</li>
+  <li>Las <strong>cuatro señales doradas</strong> —latencia, tráfico, errores, saturación— cubren "¿está sano?" para cualquier servicio. Separá siempre latencia de éxitos de latencia de errores.</li>
+  <li><strong>El promedio de latencia es estructuralmente ciego a la cola.</strong> Usá histogramas y alertá sobre el p99. Los percentiles no se promedian entre instancias: se agregan los buckets con <code>sum by (le)</code> y recién ahí se calcula el cuantil.</li>
+  <li><strong>Cardinalidad</strong>: un label solo si su conjunto de valores es chico, cerrado y conocido de antemano. La alta cardinalidad va a trazas y logs; los <em>exemplars</em> son el puente.</li>
+  <li><strong><code>runtime/metrics</code></strong> expone la salud del runtime sin el <em>stop-the-world</em> de <code>ReadMemStats</code>. <code>/sched/latencies:seconds</code> distingue "mi código se puso lento" de "no me están dando CPU".</li>
+  <li><strong>OpenTelemetry</strong>: instrumentación automática para el esqueleto, manual para el significado. Head-based bajo en el servicio + tail-based en el collector para conservar el 100% de errores y lentos.</li>
+  <li><strong>pprof en un mux administrativo aparte</strong>, jamás en el público — <code>import _ "net/http/pprof"</code> registra en el <code>DefaultServeMux</code>. El profiling continuo atrapa una regresión de memoria comparando versiones el día del deploy.</li>
+  <li><strong>Deploy</strong>: multistage + <code>CGO_ENABLED=0</code> + distroless o <code>scratch</code>. Con <code>scratch</code> traé los certificados raíz y embebé <code>time/tzdata</code>. El liveness nunca toca la base de datos.</li>
+  <li><strong><code>GOMEMLIMIT</code> al ~90% del límite del contenedor</strong> evita el OOM más común de Go en Kubernetes. Desde Go 1.25 el runtime ajusta <code>GOMAXPROCS</code> según el cgroup, pero depende de la directiva <code>go</code> del módulo: verificalo en runtime.</li>
+  <li><strong>Debug en producción</strong>: <code>GOTRACEBACK=all</code> en servidores, el exit code dice la causa (137 OOM, 143 SIGTERM, 139 SIGSEGV, 2 panic), y un <code>recover()</code> sin <code>debug.Stack()</code> destruye la única evidencia que existía.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li><strong>Handler de <code>slog</code>.</strong> Escribí un handler propio que agregue <code>trace_id</code> desde el contexto y además samplee los logs de nivel <code>Info</code> al 10% (uno de cada diez) dejando pasar el 100% de <code>Warn</code> y <code>Error</code>. Probá con un test que <code>logger.With("k","v").Info(...)</code> siga agregando el trace id — si tu test pasa sin que hayas escrito <code>WithAttrs</code>, el test está mal.</li>
+  <li><strong>Redacción por tipos.</strong> Tomá un struct de request de un proyecto tuyo, implementale <code>LogValue()</code> exponiendo solo campos seguros, y escribí un test que serialice el log a JSON y falle si aparece cualquiera de las palabras <code>password</code>, <code>token</code> o <code>authorization</code>. Ese test es tu red contra el campo que alguien agregue en seis meses.</li>
+  <li><strong>El promedio vs el p99.</strong> Escribí un generador de carga que produzca una distribución bimodal (95% en 20 ms, 5% en 1.200 ms) contra un servidor instrumentado con histograma. Graficá promedio, p50, p95 y p99 en el mismo panel. Después subí la cola al 8% y anotá cuánto se movió cada estadístico. ¿Cuál habría disparado una alerta primero?</li>
+  <li><strong>Cardinalidad medida.</strong> Instrumentá un servicio con un label derivado de <code>r.URL.Path</code>, pegale 5.000 URLs distintas y contá las series resultantes con <code>curl localhost:6060/metrics | grep -c http_request</code>. Migralo a <code>r.Pattern</code> y repetí. Documentá los dos números.</li>
+  <li><strong>Salud del runtime.</strong> Exportá a Prometheus las seis métricas de la tabla de GS8.7 (incluido el p99 de <code>/sched/latencies:seconds</code>). Después corré el proceso con <code>docker run --cpus=0.5</code> bajo carga y mirá qué le pasa a esa latencia de scheduling. Escribí en una línea qué la distingue de una regresión de tu código.</li>
+  <li><strong>Traza completa.</strong> Armá dos servicios Go donde A llama a B, instrumentalos con <code>otelhttp</code> y un collector local, y verificá que ambos aparezcan en la misma traza. Después rompé la propagación a propósito (creá el <code>http.Client</code> sin el transport de otel) y observá qué ves en el backend: dos trazas huérfanas en vez de una.</li>
+  <li><strong>OOM controlado.</strong> Contenerizá un servicio con <code>limits.memory: 256Mi</code> y una fuga deliberada. Corrélo primero sin <code>GOMEMLIMIT</code> (documentá el exit code y qué quedó en los logs) y después con <code>GOMEMLIMIT=230MiB</code>. Compará: qué falla, cuándo, y cuánta evidencia te dejó cada configuración.</li>
+</ol>
+
+<section class="quiz" id="quizGS8">
+  <style>
+    #quizGS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS8 .q{margin-bottom:1.5rem}
+    #quizGS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS8 .opt:hover{border-color:var(--accent)}
+    #quizGS8 .opt:disabled{cursor:default}
+    #quizGS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizGS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizGS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS8 .exp.show{display:block}
+    #quizGS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. El p50 de tu endpoint es 38 ms y el p99 es 1.520 ms. ¿Qué te dice ese cociente de 40×?</p>
+    <button class="opt">Es normal: toda distribución de latencia tiene cola larga por el GC</button>
+    <button class="opt">Hay dos poblaciones de requests distintas y hay que encontrar qué hace una que la otra no</button>
+    <button class="opt">El histograma tiene mal elegidos los buckets y hay que agregar más cortes</button>
+    <div class="exp">Una cola sana está entre 2× y 5× — eso sí es GC, jitter de red y variación normal. Un 40× no es ruido: significa que un subconjunto de requests recorre un camino de código, un plan de consulta o un estado de cache completamente distinto al del caso típico. La pregunta útil deja de ser "por qué el servicio es lento" y pasa a ser "qué tienen en común las requests de la cola", y eso lo responde una traza filtrada por duración, no una métrica agregada.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu pod de Go muere con exit code 137 y no hay nada en los logs. ¿Cuál es la causa y la mitigación correcta?</p>
+    <button class="opt">Un panic no recuperado: hay que agregar un middleware de recover</button>
+    <button class="opt">El apagado tardó más que el terminationGracePeriod: hay que acortar el Shutdown</button>
+    <button class="opt">OOMKilled: el GC no conoce el límite del cgroup — hay que setear GOMEMLIMIT al ~90%</button>
+    <div class="exp">137 es 128+9, o sea <code>SIGKILL</code>: el kernel mató el proceso por cruzar el límite de memoria del cgroup. No hay logs porque <code>SIGKILL</code> no se captura ni corre los <code>defer</code>. La raíz es que <code>GOGC</code> es relativo ("correr cuando el heap se duplique") y el runtime no sabe cuánta memoria le dio el contenedor: con 400 MB vivos apunta a 800 MB aunque el pod tenga 512 MB. <code>GOMEMLIMIT</code> al ~90% del límite hace que el GC se vuelva agresivo antes del techo. Un panic sería exit 2 con traceback visible, y un apagado lento sería 143.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Querés poder filtrar la latencia por cliente para investigar un caso puntual. ¿Cuál es el diseño correcto?</p>
+    <button class="opt">Dejar la métrica con labels de baja cardinalidad y poner el cliente como atributo del span, con exemplars uniendo ambos</button>
+    <button class="opt">Agregar un label <code>cliente_id</code> al histograma, pero solo para los clientes premium</button>
+    <button class="opt">Agregar el label y compensar bajando la cantidad de buckets del histograma a tres</button>
+    <div class="exp">Cada combinación de labels es una serie temporal permanente en el scraper: un ID de cliente multiplica las series por la cantidad de clientes y termina tumbando el Prometheus —y con él las métricas de todos los demás servicios—. Reducir buckets o filtrar por segmento no cambia la naturaleza del problema, solo cuánto tarda en explotar. El dato de alta cardinalidad va donde está diseñado para vivir: atributos del span en las trazas y campos estructurados en los logs. Los <em>exemplars</em> hacen de puente sin crear una sola serie extra: el histograma guarda el trace id de una request de ejemplo por bucket.</div>
+  </div>
+
+  <div class="score" id="scoreGS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track Go Senior.' : '  — repasá las que fallaste y cerrá el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs7-servicios/lecture.html">← GS7: Servicios en producción</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

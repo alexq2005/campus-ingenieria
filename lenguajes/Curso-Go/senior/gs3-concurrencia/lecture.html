@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS3 — Concurrencia avanzada: patrones y el memory model · Go Senior</title>
+  <meta name="description" content="El memory model de Go y la relación happens-before, qué ve y qué no ve el race detector, canales a fondo, select, context, las primitivas de sync, patrones con código completo, deadlocks, fugas de goroutines y tests con goleak.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS3</span>
+  <span class="badge">⏱ 50–150 min</span>
+  <span class="badge">🎯 Pre-req: GS1</span>
+  <span class="badge">⚡ Concurrencia</span>
+</div>
+
+<article>
+
+<h1>GS3 — Concurrencia avanzada: patrones y el memory model</h1>
+
+<h2>GS3.0 Por qué este módulo</h2>
+
+<p>El curso base te enseñó a lanzar una goroutine, a pasar valores por un canal y a esperar con un <code>WaitGroup</code>. Con eso escribís programas concurrentes que funcionan. Este módulo es sobre la otra categoría: <strong>los programas concurrentes que funcionan 999 veces y fallan la número mil</strong>, en producción, un martes a las 3 de la mañana, y que cuando los corrés localmente para reproducir el problema andan perfecto.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En código concurrente, <em>“lo probé y anda”</em> no es evidencia de nada. Un programa con una carrera de datos puede dar el resultado correcto durante meses porque el planificador nunca eligió el orden malo. La única forma de tener confianza es razonar sobre <strong>qué le garantiza el lenguaje</strong> (el memory model), instrumentar lo que la máquina sí puede verificar (<code>-race</code>, <code>goleak</code>, timeouts en los tests) y usar <strong>patrones donde el caso patológico sea imposible por construcción</strong>, no improbable.
+</div>
+
+<p>Vamos a usar <strong>Go 1.26</strong> como referencia. Es una versión importante para este tema porque varias cosas que durante años se enseñaron como “trampas eternas” dejaron de serlo: la captura de la variable del loop se arregló en <strong>1.22</strong>, los timers dejaron de filtrar memoria en <strong>1.23</strong>, y <code>WaitGroup</code> ganó un método <code>Go</code> en <strong>1.25</strong> que elimina de raíz dos de los errores más comunes. Vas a tener que saber igual por qué existían: te vas a encontrar con repos cuyo <code>go.mod</code> declara una versión vieja y compilan con la semántica vieja aunque los compiles con el toolchain nuevo.</p>
+
+<div class="info">
+  Este módulo asume GS1 (runtime y scheduler): que sabés qué es un M, un P y una G, y por qué una goroutine bloqueada no consume CPU pero sí memoria. Si necesitás el modelo mental de cómo el scheduler decide qué corre, volvé un momento a <a href="../gs1-runtime-scheduler/lecture.html">GS1</a>.
+</div>
+
+<h2>GS3.1 El memory model: qué te garantiza Go y qué no</h2>
+
+<p>El <em>memory model</em> de Go es un documento corto y aburrido que define exactamente una cosa: <strong>bajo qué condiciones una lectura en una goroutine tiene garantizado ver el valor escrito por otra goroutine</strong>. Fuera de esas condiciones, el compilador y la CPU tienen permiso para reordenar, cachear en un registro, o directamente eliminar tu código.</p>
+
+<p>Empecemos con el programa que parece correcto y no lo es. Este es el error de concurrencia más común del mundo, en todos los lenguajes:</p>
+
+<pre><code class="lang-go">package main
+
+import "fmt"
+
+var mensaje string
+var listo bool
+
+func main() {
+	go func() {
+		mensaje = "hola"   // (1)
+		listo = true       // (2)
+	}()
+
+	for !listo {           // (3) espera activa
+	}
+	fmt.Println(mensaje)   // (4) ¿imprime "hola"?
+}</code></pre>
+
+<p>Las tres cosas que pueden salir mal, y ninguna es un bug del runtime:</p>
+
+<ol>
+  <li><strong>El loop puede no terminar nunca.</strong> Nada en (3) sincroniza con nada. El compilador tiene permiso para leer <code>listo</code> una sola vez, guardarlo en un registro y compilar el <code>for</code> como un bucle infinito. Es una optimización legal: dentro de esa goroutine, nadie escribe <code>listo</code>.</li>
+  <li><strong>Puede imprimir la cadena vacía.</strong> Aunque (3) observe <code>listo == true</code>, no hay ninguna garantía de que la escritura de <code>mensaje</code> sea visible. El compilador puede reordenar (1) y (2) porque son independientes entre sí, y la CPU también.</li>
+  <li><strong>Puede funcionar perfecto un millón de veces.</strong> En x86, con <code>go build</code> sin optimizaciones agresivas, es muy probable que ande. Y ahí es donde te clava: en el servidor ARM de producción, con otra versión del compilador, deja de andar.</li>
+</ol>
+
+<div class="danger">
+  <strong>El error de razonamiento fatal es este:</strong> “lo corrí mil veces y siempre dio bien, entonces no hay carrera”. En concurrencia, la ausencia de síntoma no es ausencia de bug. El único argumento válido es <em>“existe una relación happens-before entre la escritura y la lectura”</em>. Si no la podés nombrar, no existe.
+</div>
+
+<h3>Happens-before, en criollo</h3>
+
+<p>La relación <em>happens-before</em> es un orden parcial entre eventos. Si el evento A <em>happens-before</em> el evento B, entonces todo lo que A escribió en memoria es visible para B. La palabra clave es <strong>parcial</strong>: dos eventos en goroutines distintas, sin una operación de sincronización entre medio, <strong>no están ordenados</strong>, y el lenguaje no promete nada sobre ellos.</p>
+
+<p>Go define un puñado de operaciones que crean esas aristas. Esta tabla es, literalmente, el conjunto completo de herramientas que tenés:</p>
+
+<table>
+  <thead>
+    <tr><th>Operación</th><th>Garantía</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Dentro de una goroutine</td><td>El orden del programa se respeta <em>desde el punto de vista de esa goroutine</em>. El compilador puede reordenar mientras nadie más mire.</td></tr>
+    <tr><td><code>go f()</code></td><td>Todo lo que hiciste antes del <code>go</code> es visible dentro de <code>f</code>.</td></tr>
+    <tr><td>Envío por canal</td><td>El envío <em>happens-before</em> que la recepción correspondiente termine.</td></tr>
+    <tr><td>Canal sin buffer</td><td>Además: la <em>recepción</em> happens-before que el envío retorne. Es un encuentro, sincroniza en los dos sentidos.</td></tr>
+    <tr><td><code>close(ch)</code></td><td>El cierre happens-before una recepción que devuelva el valor cero por canal cerrado.</td></tr>
+    <tr><td><code>mu.Unlock()</code></td><td>Happens-before el siguiente <code>mu.Lock()</code> que tenga éxito.</td></tr>
+    <tr><td><code>wg.Done()</code></td><td>Todos los <code>Done</code> happen-before que <code>wg.Wait()</code> retorne.</td></tr>
+    <tr><td><code>once.Do(f)</code></td><td>El retorno de <code>f</code> happens-before que cualquier otro <code>Do</code> retorne.</td></tr>
+    <tr><td><code>sync/atomic</code></td><td>Secuencialmente consistente: un <code>Store</code> happens-before el <code>Load</code> que observa ese valor.</td></tr>
+  </tbody>
+</table>
+
+<p>Con esa tabla en la mano, arreglar el programa de arriba es elegir una arista. La versión con canal es la más idiomática y la que mejor documenta la intención:</p>
+
+<pre><code class="lang-go">var mensaje string
+listo := make(chan struct{})
+
+go func() {
+	mensaje = "hola"
+	close(listo)        // el cierre sincroniza
+}()
+
+&lt;-listo                 // recibir del canal cerrado crea el happens-before
+fmt.Println(mensaje)    // garantizado: "hola"</code></pre>
+
+<p>La versión con <code>atomic</code> también es correcta —los atómicos de Go son secuencialmente consistentes— pero la espera activa sigue siendo una mala idea: te quema un core entero:</p>
+
+<pre><code class="lang-go">import "sync/atomic"
+
+var listo atomic.Bool
+var mensaje string
+
+go func() {
+	mensaje = "hola"
+	listo.Store(true)      // Store con semántica de release
+}()
+
+for !listo.Load() {        // Load con semántica de acquire
+}
+fmt.Println(mensaje)       // correcto, pero el for te come un núcleo</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de bolsillo.</strong> Antes de dar por buena cualquier lectura de una variable compartida, contestá en voz alta: <em>“¿qué operación de la tabla ordena esta lectura respecto de la escritura?”</em>. Si la respuesta es “ninguna, pero en la práctica la goroutine escribe primero”, tenés un bug. Puede tardar dos años en manifestarse.
+</div>
+
+<h3>El caso que engaña a todos: el doble chequeo</h3>
+
+<p>Este patrón aparece en cachés e inicializaciones perezosas escritas por gente con experiencia. Y está roto:</p>
+
+<pre><code class="lang-go">var mu sync.Mutex
+var cliente *Cliente
+
+func Obtener() *Cliente {
+	if cliente != nil {        // lectura SIN candado ← carrera
+		return cliente
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if cliente == nil {
+		cliente = nuevoCliente()   // el puntero puede publicarse
+	}                              // antes de que el objeto esté completo
+	return cliente
+}</code></pre>
+
+<p>El problema no es solamente la carrera sobre el puntero: es que otra goroutine puede ver un puntero <strong>no nulo</strong> a un objeto <strong>a medio construir</strong>, porque nada ordena la escritura de los campos internos respecto de la escritura del puntero. La solución no es agregar más chequeos, es usar la primitiva que existe exactamente para esto:</p>
+
+<pre><code class="lang-go">// Go 1.21+: OnceValue devuelve una función que ejecuta el init una sola vez
+var Obtener = sync.OnceValue(func() *Cliente {
+	return nuevoCliente()
+})
+
+// equivalente clásico, si necesitás manejar un error:
+var (
+	once    sync.Once
+	cliente *Cliente
+	errIni  error
+)
+
+func ObtenerConError() (*Cliente, error) {
+	once.Do(func() { cliente, errIni = nuevoClienteConError() })
+	return cliente, errIni
+}</code></pre>
+
+<h2>GS3.2 El race detector: tu único testigo, y lo que no ve</h2>
+
+<p>El detector de carreras de Go está construido sobre ThreadSanitizer y hace algo conceptualmente simple: mientras el programa corre, mantiene metadatos sobre cada acceso a memoria y sobre las aristas happens-before que se van creando, y grita cuando encuentra dos accesos al mismo byte, al menos uno de escritura, <strong>sin arista entre ellos</strong>. No adivina, no hace análisis estático, no tiene falsos positivos: si te reporta una carrera, la carrera está.</p>
+
+<pre><code class="lang-bash"># las tres formas de activarlo
+go run -race ./cmd/servidor
+go test -race ./...
+go build -race -o bin/servidor ./cmd/servidor   # binario instrumentado, para staging</code></pre>
+
+<p>Una salida real se lee de arriba hacia abajo: qué acceso, en qué goroutine, en qué línea, y dónde nació esa goroutine.</p>
+
+<pre><code class="lang-bash">==================
+WARNING: DATA RACE
+Write at 0x00c000126010 by goroutine 7:
+  main.main.func1()
+      /app/main.go:14 +0x38
+
+Previous read at 0x00c000126010 by main goroutine:
+  main.main()
+      /app/main.go:18 +0x8c
+
+Goroutine 7 (running) created at:
+  main.main()
+      /app/main.go:12 +0x7a
+==================
+Found 1 data race(s)
+exit status 66</code></pre>
+
+<div class="tip">
+  <strong>Configuralo con <code>GORACE</code>.</strong> <code>GORACE="halt_on_error=1"</code> aborta en la primera carrera (útil en CI para que el log no tenga 400 reportes del mismo bug). <code>history_size=7</code> agranda el buffer de historia por goroutine cuando los stacks salen incompletos, a costa de bastante memoria.
+</div>
+
+<h3>Lo que el race detector NO detecta</h3>
+
+<p>Acá está la parte que separa a quien usa la herramienta de quien confía ciegamente en ella. Son cuatro limitaciones y las cuatro te van a morder:</p>
+
+<div class="mistake">
+  <strong>1. Solo ve lo que se ejecutó.</strong> No analiza el código: instrumenta accesos reales. Si tu test no ejerce la rama donde está la carrera, o si el planificador nunca hizo correr las dos goroutines cerca, no hay reporte. Un <code>-race</code> verde significa <em>“en esta ejecución no hubo carreras”</em>, no <em>“el programa no tiene carreras”</em>.
+</div>
+
+<div class="mistake">
+  <strong>2. Solo detecta <em>data races</em>, no <em>race conditions</em>.</strong> Son cosas distintas. Una carrera de datos es un acceso concurrente sin sincronizar. Una condición de carrera es un bug de lógica por el orden de las operaciones. El código de abajo no tiene ni una sola carrera de datos —todos los accesos están protegidos— y pierde incrementos alegremente:
+</div>
+
+<pre><code class="lang-go">// Cada método toma el candado. -race no dice absolutamente nada.
+func (c *Contador) Incr(k string) {
+	v := c.Get(k)      // Lock ... Unlock
+	c.Set(k, v+1)      // Lock ... Unlock   ← entre medio, otro pudo incrementar
+}
+
+// correcto: una sola sección crítica, la operación completa es atómica
+func (c *Contador) IncrOK(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[k]++
+}</code></pre>
+
+<div class="mistake">
+  <strong>3. No detecta deadlocks ni fugas de goroutines.</strong> Un pool que se cuelga porque nadie drena un canal es, para el detector, un programa perfectamente sincronizado. De hecho <em>lo es</em>: está bloqueado, y bloquearse es sincronización. Para eso están el dump de goroutines (GS3.9) y <code>goleak</code> (GS3.10).
+</div>
+
+<div class="mistake">
+  <strong>4. Cuesta caro.</strong> El binario instrumentado usa del orden de 2× a 20× más CPU y unas 5× a 10× más memoria, y hay un techo de goroutines simultáneas que puede rastrear. No es para producción a escala completa, aunque un canario instrumentado sea una idea excelente.
+</div>
+
+<h3>Por qué va en CI sí o sí</h3>
+
+<p>Como el detector solo ve el schedule que ocurrió, la única forma de aumentar la probabilidad de encontrar la carrera es <strong>correr muchas veces, en máquinas distintas, con paralelismo distinto</strong>. Eso es exactamente lo que te da CI y no te da tu notebook:</p>
+
+<pre><code class="lang-bash"># en el pipeline de PRs: rápido, con timeout para que un cuelgue falle en vez de colgar
+go test -race -timeout 120s ./...
+
+# nocturno: repeticiones y variación del paralelismo, que es lo que cambia el schedule
+go test -race -count=20 -timeout 30m ./internal/pool/...
+GOMAXPROCS=1 go test -race -count=20 ./internal/pool/...   # schedules distintos
+GOMAXPROCS=32 go test -race -count=20 ./internal/pool/...</code></pre>
+
+<div class="rule">
+  <strong>📌 Sin <code>-race</code> en CI, tu suite de tests concurrentes no está probando concurrencia: está probando que el código no explota en el único orden que tu máquina eligió hoy.</strong> Y agregá siempre <code>-timeout</code>: un test que se cuelga sin timeout deja el runner colgado media hora; con timeout, Go mata el test e imprime el dump completo de goroutines, que es justo el diagnóstico que necesitás.
+</div>
+
+<h2>GS3.3 Canales, a fondo</h2>
+
+<p>Un canal es tres cosas a la vez: un mecanismo de transferencia de datos, un mecanismo de sincronización, y un mecanismo de control de flujo. La mayoría de los bugs de canales vienen de olvidarse de las últimas dos.</p>
+
+<h3>Sin buffer vs con buffer: es una decisión de acoplamiento</h3>
+
+<pre><code class="lang-go">a := make(chan int)      // sin buffer: encuentro. El envío espera al receptor.
+b := make(chan int, 100) // con buffer: el envío retorna mientras haya lugar.</code></pre>
+
+<p>La diferencia práctica no es de rendimiento, es de <strong>acoplamiento temporal y de backpressure</strong>:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Sin buffer</th><th>Con buffer N</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Acoplamiento</td><td>Total: el productor avanza al ritmo del consumidor</td><td>Parcial: se desacoplan hasta N elementos</td></tr>
+    <tr><td>Backpressure</td><td>Inmediata y perfecta</td><td>Diferida: recién cuando se llena</td></tr>
+    <tr><td>Sincronización</td><td>En los dos sentidos (el envío sabe que se recibió)</td><td>Solo en un sentido</td></tr>
+    <tr><td>Si el consumidor muere</td><td>El productor se bloquea al toque: te enterás</td><td>El productor sigue N mensajes más y después se bloquea</td></tr>
+    <tr><td>Costo de un pico de carga</td><td>Latencia</td><td>Memoria (N mensajes vivos)</td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Cómo elegir el tamaño del buffer.</strong> No hay un número mágico y “por las dudas 1000” es la peor respuesta. Solo tres justificaciones válidas: <strong>(a) 0</strong>, cuando querés backpressure exacta y saber que el otro lado recibió; <strong>(b) 1</strong>, para desacoplar un paso sin acumular nada —el caso típico del canal de errores, para que el envío nunca bloquee al que reporta; <strong>(c) N medido</strong>, cuando conocés el tamaño del lote o la ráfaga que querés absorber. Un buffer grande no arregla un consumidor lento: convierte una caída en un problema de memoria y te retrasa el momento en que te enterás.
+</div>
+
+<h3>Quién cierra: nunca el receptor</h3>
+
+<p>Las reglas de cierre son inflexibles porque violarlas es un <em>panic</em>, no un error:</p>
+
+<ul>
+  <li>Enviar a un canal cerrado: <strong>panic</strong>.</li>
+  <li>Cerrar un canal ya cerrado: <strong>panic</strong>.</li>
+  <li>Cerrar un canal <code>nil</code>: <strong>panic</strong>.</li>
+  <li>Recibir de un canal cerrado: devuelve el valor cero al instante, todas las veces que quieras. Sin panic.</li>
+</ul>
+
+<p>De ahí sale la única regla que hace falta recordar: <strong>cierra el que envía, y solo si es el único que envía</strong>. El receptor jamás cierra, porque no puede saber si alguien está por enviar. Con varios productores, ninguno puede cerrar por su cuenta: hace falta un coordinador.</p>
+
+<pre><code class="lang-go">// N productores, un canal. El cierre lo hace una goroutine que espera a todos.
+func productores(n int) &lt;-chan int {
+	out := make(chan int)
+	var wg sync.WaitGroup
+
+	for id := range n {
+		wg.Go(func() {              // Go 1.25: Add(1) + defer Done() implícitos
+			for i := range 100 {
+				out &lt;- id*100 + i
+			}
+		})
+	}
+
+	go func() {
+		wg.Wait()      // cuando el último productor terminó...
+		close(out)     // ...recién ahí se puede cerrar
+	}()
+
+	return out
+}</code></pre>
+
+<div class="warn">
+  Fijate que el <code>close</code> vive en su propia goroutine. Si escribieras <code>wg.Wait(); close(out)</code> en línea antes del <code>return</code>, la función se bloquearía para siempre: los productores no pueden avanzar hasta que alguien reciba, y nadie va a recibir hasta que la función retorne el canal.
+</div>
+
+<p>Y prestá atención al tipo de retorno: <code>&lt;-chan int</code>, un canal <strong>de solo recepción</strong>. Es la forma de que el compilador te garantice que el que consume no puede ni enviar ni cerrar. Los tipos direccionales (<code>chan&lt;- T</code> para solo envío, <code>&lt;-chan T</code> para solo recepción) son documentación ejecutable: usalos siempre en las firmas.</p>
+
+<h3>El canal <code>nil</code>: apagar una rama del <code>select</code></h3>
+
+<p>Un canal <code>nil</code> bloquea para siempre, tanto al enviar como al recibir. Suena a bug y es, en realidad, una herramienta preciosa: dentro de un <code>select</code>, una rama sobre un canal <code>nil</code> nunca se elige. Es decir, <strong>asignarle <code>nil</code> a una variable de canal desactiva esa rama</strong>. El caso de uso canónico es multiplexar dos fuentes hasta que ambas se agoten:</p>
+
+<pre><code class="lang-go">func merge(a, b &lt;-chan int) &lt;-chan int {
+	out := make(chan int)
+
+	go func() {
+		defer close(out)
+		for a != nil || b != nil {     // seguimos mientras quede alguna viva
+			select {
+			case v, ok := &lt;-a:
+				if !ok {
+					a = nil            // se agotó: apagamos esta rama
+					continue           // sin nil, este case se elegiría infinitas veces
+				}
+				out &lt;- v
+			case v, ok := &lt;-b:
+				if !ok {
+					b = nil
+					continue
+				}
+				out &lt;- v
+			}
+		}
+	}()
+
+	return out
+}</code></pre>
+
+<div class="danger">
+  <strong>Sin el truco del <code>nil</code>, este código es un bucle caliente.</strong> Un canal cerrado está <em>siempre listo para recibir</em>: si <code>a</code> se cierra y dejás la rama activa, el <code>select</code> la elige constantemente devolviendo ceros, y te comés un núcleo al 100% sin producir nada. Es una de las formas más comunes de que un servicio Go pase de 2% a 100% de CPU sin ningún cambio de tráfico.
+</div>
+
+<h2>GS3.4 <code>select</code>: default, timeouts y multiplexado</h2>
+
+<p>El <code>select</code> bloquea hasta que una de sus ramas pueda avanzar. Si hay varias listas, <strong>elige una al azar</strong> — no en orden, no la primera: al azar, deliberadamente, para evitar que una rama muy activa mate de hambre a las demás. De ahí salen tres patrones.</p>
+
+<p><strong>Uno: <code>default</code> convierte el <code>select</code> en no bloqueante.</strong> Si ninguna rama está lista, se ejecuta el <code>default</code> y se sigue de largo:</p>
+
+<pre><code class="lang-go">// enviar sin bloquear nunca: si el buffer está lleno, descartamos
+select {
+case metricas &lt;- m:
+default:
+	descartadas.Add(1)   // preferimos perder una métrica antes que frenar el request
+}
+
+// recibir sin bloquear: "¿hay algo?"
+select {
+case v := &lt;-ch:
+	usar(v)
+default:
+	// no había nada, seguimos
+}</code></pre>
+
+<div class="warn">
+  <strong>Un <code>select</code> con <code>default</code> adentro de un <code>for</code> sin espera es una espera activa.</strong> Si escribís <code>for { select { case ...: default: } }</code> vas a girar a máxima velocidad quemando CPU. Si necesitás sondear, sondeá con un <code>time.Ticker</code>; si necesitás esperar, sacá el <code>default</code> y dejá que el <code>select</code> bloquee, que es gratis.
+</div>
+
+<p><strong>Dos: timeouts.</strong> El clásico es <code>time.After</code>, pero en código nuevo el timeout casi siempre debería venir del <code>context</code>, porque así se propaga:</p>
+
+<pre><code class="lang-go">select {
+case r := &lt;-resultados:
+	return r, nil
+case &lt;-time.After(2 * time.Second):
+	return Resultado{}, errors.New("timeout esperando resultado")
+}
+
+// mejor: el deadline viene de arriba y se propaga a todo lo que llames
+select {
+case r := &lt;-resultados:
+	return r, nil
+case &lt;-ctx.Done():
+	return Resultado{}, ctx.Err()
+}</code></pre>
+
+<div class="info">
+  <strong>Dato 2026:</strong> hasta Go 1.22, un <code>time.After</code> adentro de un loop mantenía vivo el timer hasta que se disparaba, y era una fuente real de consumo de memoria en bucles calientes; la receta era usar <code>time.NewTimer</code> y llamar a <code>Stop</code>. Desde <strong>Go 1.23</strong> los timers que nadie referencia se pueden recolectar antes de dispararse, así que esa fuga desapareció. Reusar un <code>Timer</code> con <code>Reset</code> sigue siendo útil por costo de asignación en loops muy calientes, pero ya no es obligatorio por memoria.
+</div>
+
+<p><strong>Tres: prioridad.</strong> Como la elección es al azar, no podés decir “atendé la cancelación antes que el trabajo”. Se emula con dos <code>select</code> anidados: uno no bloqueante que solo mira la rama prioritaria, y después el bloqueante:</p>
+
+<pre><code class="lang-go">for {
+	// prioridad absoluta: si ya nos cancelaron, ni miramos el trabajo
+	select {
+	case &lt;-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	select {
+	case t, ok := &lt;-tareas:
+		if !ok {
+			return nil
+		}
+		procesar(t)
+	case &lt;-ctx.Done():
+		return ctx.Err()
+	}
+}</code></pre>
+
+<h2>GS3.5 <code>context</code>: cancelación en árbol</h2>
+
+<p>Un <code>context.Context</code> es un nodo de un árbol que propaga <strong>cancelación hacia abajo</strong>. Cancelar un padre cancela a todos sus descendientes; cancelar un hijo no toca al padre. Eso es el 90% de lo que hace, y el resto —los valores— es la parte que más se usa mal.</p>
+
+<pre><code class="lang-go">ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()                    // SIEMPRE, aunque haya timeout
+
+// hijo con un deadline más corto: se cancela antes que el padre
+ctxDB, cancelDB := context.WithTimeout(ctx, 800*time.Millisecond)
+defer cancelDB()
+
+filas, err := db.QueryContext(ctxDB, "SELECT ...")</code></pre>
+
+<div class="rule">
+  <strong>📌 El <code>defer cancel()</code> no es opcional ni siquiera con <code>WithTimeout</code>.</strong> El nodo hijo queda registrado en el padre hasta que se cancela o vence; si el padre vive mucho (por ejemplo, el contexto de un servidor de larga vida) y vos creás hijos sin cancelarlos, acumulás nodos y timers. <code>go vet</code> tiene un chequeo (<code>lostcancel</code>) que detecta el caso obvio; corrélo.
+</div>
+
+<h3>Propagar bien: el contexto tiene que llegar hasta el syscall</h3>
+
+<p>Un contexto que no se consulta es decoración. Cancelar solo funciona si <strong>cada operación bloqueante del camino</strong> lo mira: los <code>select</code>, los loops largos, y las llamadas de red y de base de datos en su variante <code>...Context</code>.</p>
+
+<pre><code class="lang-go">func Sincronizar(ctx context.Context, ids []int) error {
+	for i, id := range ids {
+		// un loop de CPU largo también tiene que rendirse: chequeamos cada tanto
+		if i%256 == 0 {
+			select {
+			case &lt;-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", urlDe(id), nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)   // se aborta si cancelan el ctx
+		if err != nil {
+			return fmt.Errorf("id %d: %w", id, err)
+		}
+		resp.Body.Close()
+	}
+	return nil
+}</code></pre>
+
+<h3>Herramientas modernas que casi nadie usa</h3>
+
+<pre><code class="lang-go">// 1.20: cancelar con una causa, y recuperarla después
+ctx, cancel := context.WithCancelCause(context.Background())
+cancel(fmt.Errorf("el usuario cerró la pestaña"))
+// ctx.Err()          -&gt; context.Canceled  (genérico, poco útil en logs)
+// context.Cause(ctx) -&gt; "el usuario cerró la pestaña"
+
+// 1.21: correr algo cuando el contexto se cancela, sin dejar una goroutine esperando
+stop := context.AfterFunc(ctx, func() { conn.Close() })
+defer stop()
+
+// 1.21: trabajo de limpieza que NO debe morir con el request
+go auditar(context.WithoutCancel(ctx), evento)   // conserva los valores, pierde el deadline</code></pre>
+
+<h3>Los antipatrones</h3>
+
+<div class="mistake">
+  <strong>1. Guardar el contexto en un struct.</strong> <code>type Servicio struct { ctx context.Context }</code> mezcla el ciclo de vida de un request con el de un objeto que vive para siempre. El resultado son bugs donde un request cancelado mata trabajo de otro, o donde el timeout del primer request queda pegado a todos. El contexto se pasa como <strong>primer parámetro</strong>, se llama <code>ctx</code>, y no se guarda. La excepción reconocida son los structs que <em>representan</em> un request (como <code>http.Request</code>, que lo lleva adentro y expone <code>WithContext</code>).
+</div>
+
+<div class="mistake">
+  <strong>2. Usar <code>WithValue</code> para pasar dependencias.</strong> El logger, el pool de conexiones y el cliente HTTP son dependencias: van por el constructor o por parámetro, con tipos verificados en compilación. <code>WithValue</code> es para datos <em>de alcance del request</em> —trace ID, usuario autenticado, locale— y siempre con una clave de un tipo propio no exportado, nunca un <code>string</code>:
+</div>
+
+<pre><code class="lang-go">type claveUsuario struct{}   // tipo privado: nadie puede colisionar con tu clave
+
+func ConUsuario(ctx context.Context, u *Usuario) context.Context {
+	return context.WithValue(ctx, claveUsuario{}, u)
+}
+
+func UsuarioDe(ctx context.Context) (*Usuario, bool) {
+	u, ok := ctx.Value(claveUsuario{}).(*Usuario)
+	return u, ok
+}</code></pre>
+
+<div class="mistake">
+  <strong>3. Aceptar un contexto y no usarlo nunca.</strong> Es peor que no aceptarlo: le miente al que llama, que cree que puede cancelar. Si tu función no puede cancelarse, no recibas <code>ctx</code>.
+</div>
+
+<div class="mistake">
+  <strong>4. Pasar <code>context.TODO()</code> o <code>Background()</code> desde adentro.</strong> Corta el árbol: a partir de ahí, la cancelación de arriba no llega. <code>TODO()</code> es un marcador temporal para migraciones, no un valor por defecto.
+</div>
+
+<h2>GS3.6 Las primitivas de <code>sync</code>: cuándo cada una</h2>
+
+<pre><code class="lang-go">// WaitGroup — esperar a que N goroutines terminen.
+// Go 1.25 agregó el método Go, que hace Add(1) y defer Done() por vos.
+var wg sync.WaitGroup
+for _, u := range urls {
+	wg.Go(func() { descargar(u) })
+}
+wg.Wait()
+
+// Forma clásica, la que vas a ver en todo el código existente:
+for _, u := range urls {
+	wg.Add(1)                      // Add SIEMPRE fuera de la goroutine
+	go func() {
+		defer wg.Done()            // Done SIEMPRE con defer
+		descargar(u)
+	}()
+}
+wg.Wait()</code></pre>
+
+<pre><code class="lang-go">// Mutex — sección crítica corta. Ponele defer al Unlock siempre.
+type Cache struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (c *Cache) Incr(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()      // sobrevive a un return temprano y a un panic
+	c.m[k]++
+}
+
+// atomic — contadores y flags. Tipos genéricos desde 1.19: nada de int64 sueltos.
+type Metricas struct {
+	pedidos atomic.Int64
+	config  atomic.Pointer[Config]   // swap de configuración sin candado
+}
+
+func (m *Metricas) Contar() { m.pedidos.Add(1) }
+func (m *Metricas) Recargar(c *Config) { m.config.Store(c) }</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Primitiva</th><th>Usala cuando</th><th>Costo típico</th><th>Trampa</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>WaitGroup</code></td><td>Esperás a N goroutines y no te importa el resultado</td><td>Despreciable</td><td><code>Add</code> adentro de la goroutine; copiarlo por valor</td></tr>
+    <tr><td><code>Mutex</code></td><td>Sección crítica corta sobre estado compartido</td><td>~20 ns sin contención</td><td>No es reentrante: <code>Lock</code> dos veces = deadlock</td></tr>
+    <tr><td><code>RWMutex</code></td><td>Muchos lectores <strong>y</strong> secciones de lectura largas</td><td>Puede ser <em>más lento</em> que <code>Mutex</code></td><td><code>RLock</code> anidado se puede trabar si entra un escritor</td></tr>
+    <tr><td><code>Once</code>/<code>OnceValue</code></td><td>Inicialización perezosa</td><td>Un <code>Load</code> atómico en el camino rápido</td><td>Si <code>f</code> hace panic, se considera hecha</td></tr>
+    <tr><td><code>atomic.*</code></td><td>Un contador, un flag, cambiar un puntero entero</td><td>~5 ns</td><td>No sirve para invariantes entre varias variables</td></tr>
+    <tr><td><code>sync.Map</code></td><td>Claves escritas una vez y leídas mucho, o particionadas por goroutine</td><td>Gana solo en ese patrón</td><td>Sin tipos: <code>any</code> por todos lados. Un <code>map</code> + <code>Mutex</code> suele ganar</td></tr>
+    <tr><td>Canal</td><td>Transferís propiedad de un dato u orquestás etapas</td><td>~100 ns por operación</td><td>Usarlo como candado glorificado</td></tr>
+  </tbody>
+</table>
+
+<h3>Por qué <code>RWMutex</code> a veces es más lento que <code>Mutex</code></h3>
+
+<p>La intuición dice que si mil goroutines solo leen, dejarlas entrar a todas a la vez tiene que ser más rápido. En la práctica, con secciones críticas cortas, suele ser al revés. La razón es de hardware: <code>RLock</code> y <code>RUnlock</code> <strong>escriben</strong> —incrementan y decrementan un contador de lectores— y ese contador vive en una línea de caché compartida. Cada lector que entra invalida esa línea en el caché de todos los demás núcleos. Con una sección crítica de 20 nanosegundos, el costo del ping-pong de caché supera al beneficio de dejar entrar a varios a la vez.</p>
+
+<pre><code class="lang-go">func BenchmarkMutex(b *testing.B) {
+	var mu sync.Mutex
+	m := map[string]int{"k": 1}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			mu.Lock()
+			_ = m["k"]        // lectura cortita: nanosegundos
+			mu.Unlock()
+		}
+	})
+}
+
+func BenchmarkRWMutex(b *testing.B) {
+	var mu sync.RWMutex
+	m := map[string]int{"k": 1}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			mu.RLock()
+			_ = m["k"]
+			mu.RUnlock()
+		}
+	})
+}</code></pre>
+
+<pre><code class="lang-bash">go test -bench=Mutex -cpu=1,4,16 -benchtime=2s ./...
+# con -cpu=1 son casi iguales; con -cpu=16 y sección corta, el RWMutex
+# se queda atrás por contención de la línea de caché del contador de lectores</code></pre>
+
+<div class="rule">
+  <strong>📌 Elegí <code>RWMutex</code> solo si podés justificar dos cosas a la vez:</strong> que los lectores son muchos <em>y</em> que la sección de lectura dura microsegundos o más (parsear, recorrer una estructura grande, serializar). Para leer un campo o mirar un mapa, <code>Mutex</code>. Y ante la duda, corré el benchmark con <code>-cpu</code> variable: es de las pocas decisiones de concurrencia que se responden en dos minutos con datos.
+</div>
+
+<div class="danger">
+  <strong>Trampa del <code>RWMutex</code>:</strong> no es reentrante ni siquiera para lectores. Si una goroutine tiene <code>RLock</code> y adentro llama a una función que hace otro <code>RLock</code>, y entre las dos llega un escritor, se traba: el escritor espera a que salgan los lectores, y el segundo <code>RLock</code> espera al escritor (para que los escritores no mueran de hambre). Deadlock, y aparece solo bajo carga.
+</div>
+
+<h2>GS3.7 Cuándo un mutex le gana a un canal</h2>
+
+<p>El proverbio de Go es famoso: <em>“Don't communicate by sharing memory; share memory by communicating.”</em> (Rob Pike). Es un buen consejo de diseño y una pésima regla absoluta. La documentación del propio paquete <code>sync</code> es explícita en que hay casos donde el candado es lo correcto — y el caso más claro es el más simple: proteger un dato.</p>
+
+<p>Comparemos las dos implementaciones de un contador compartido. Con canal, necesitás una goroutine servidora viva y un protocolo de pedidos:</p>
+
+<pre><code class="lang-go">// Contador "idiomático CSP": correcto, y una mala idea.
+type ContadorCSP struct {
+	incr   chan struct{}
+	leer   chan chan int
+	cerrar chan struct{}
+}
+
+func NuevoCSP() *ContadorCSP {
+	c := &amp;ContadorCSP{
+		incr:   make(chan struct{}),
+		leer:   make(chan chan int),
+		cerrar: make(chan struct{}),
+	}
+	go func() {                        // una goroutine viva para siempre
+		n := 0
+		for {
+			select {
+			case &lt;-c.incr:
+				n++
+			case resp := &lt;-c.leer:
+				resp &lt;- n
+			case &lt;-c.cerrar:
+				return                 // y si te olvidás de cerrar: fuga
+			}
+		}
+	}()
+	return c
+}
+
+func (c *ContadorCSP) Incr() { c.incr &lt;- struct{}{} }
+func (c *ContadorCSP) Leer() int {
+	resp := make(chan int)             // una asignación por lectura
+	c.leer &lt;- resp
+	return &lt;-resp
+}</code></pre>
+
+<pre><code class="lang-go">// La versión que vas a querer mantener dentro de un año.
+type Contador struct {
+	n atomic.Int64
+}
+
+func (c *Contador) Incr() { c.n.Add(1) }
+func (c *Contador) Leer() int64 { return c.n.Load() }</code></pre>
+
+<p>La segunda versión es unas dos décimas de nanosegundo contra unos cientos, no tiene goroutine que se pueda filtrar, no tiene ciclo de vida que administrar, y entra en cuatro líneas. La primera existe únicamente porque alguien tomó “compartí memoria comunicando” como mandamiento.</p>
+
+<div class="concept">
+  <strong>💡 El criterio que sí funciona.</strong> Preguntate qué estás moviendo. <strong>Canal</strong> cuando transferís <em>propiedad</em> de un dato de una goroutine a otra, cuando coordinás <em>etapas</em> de un pipeline, cuando necesitás <em>backpressure</em>, o cuando la señal es “terminé” / “cancelá”. <strong>Mutex o atomic</strong> cuando protegés <em>estado</em> que varias goroutines leen y escriben en el lugar: contadores, cachés, mapas de sesiones, configuración. El canal orquesta; el candado custodia.
+</div>
+
+<h2>GS3.8 Patrones, con código completo</h2>
+
+<h3>Worker pool con límite</h3>
+
+<pre><code class="lang-go">// N workers consumen del mismo canal. Es el patrón más usado y el que
+// más se rompe: mirá GS3.12 para ver cómo se cuelga esta forma ingenua.
+func Pool(tareas []Tarea, workers int) []Resultado {
+	in := make(chan Tarea)
+	out := make(chan Resultado, len(tareas))
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Go(func() {
+			for t := range in {        // termina solo cuando in se cierra
+				out &lt;- hacer(t)
+			}
+		})
+	}
+
+	go func() {
+		defer close(in)
+		for _, t := range tareas {
+			in &lt;- t
+		}
+	}()
+
+	wg.Wait()
+	close(out)
+
+	res := make([]Resultado, 0, len(tareas))
+	for r := range out {
+		res = append(res, r)
+	}
+	return res
+}</code></pre>
+
+<h3>Fan-out / fan-in</h3>
+
+<pre><code class="lang-go">// Fan-out: una fuente, K consumidores en paralelo.
+// Fan-in: K canales de salida, uno solo de entrada al siguiente paso.
+func fanIn(canales ...&lt;-chan Resultado) &lt;-chan Resultado {
+	out := make(chan Resultado)
+	var wg sync.WaitGroup
+
+	for _, c := range canales {
+		wg.Go(func() {
+			for v := range c {
+				out &lt;- v
+			}
+		})
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}</code></pre>
+
+<h3>Pipeline con cancelación</h3>
+
+<pre><code class="lang-go">// Regla del pipeline: TODA etapa que envía tiene que poder rendirse.
+// Un "out &lt;- v" pelado es una fuga de goroutine esperando a pasar.
+func generar(ctx context.Context, ns ...int) &lt;-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for _, n := range ns {
+			select {
+			case out &lt;- n:
+			case &lt;-ctx.Done():
+				return           // el consumidor se fue: nos vamos también
+			}
+		}
+	}()
+	return out
+}
+
+func cuadrado(ctx context.Context, in &lt;-chan int) &lt;-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in {
+			select {
+			case out &lt;- n * n:
+			case &lt;-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func usar() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()                       // al salir, todas las etapas se desarman
+
+	for v := range cuadrado(ctx, generar(ctx, 1, 2, 3, 4, 5)) {
+		fmt.Println(v)
+		if v &gt; 9 {
+			break                        // salida temprana: el defer cancel limpia
+		}
+	}
+}</code></pre>
+
+<h3>Semáforo con canal buffered</h3>
+
+<pre><code class="lang-go">// Limitar concurrencia sin pool: N fichas en un canal.
+// Sirve cuando las tareas ya están lanzadas y solo querés poner un techo.
+func DescargarTodo(ctx context.Context, urls []string, max int) error {
+	sem := make(chan struct{}, max)
+	var wg sync.WaitGroup
+
+	for _, u := range urls {
+		select {
+		case sem &lt;- struct{}{}:          // tomar ficha (bloquea si hay max en vuelo)
+		case &lt;-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+
+		wg.Go(func() {
+			defer func() { &lt;-sem }()     // devolver la ficha SIEMPRE
+			descargar(ctx, u)
+		})
+	}
+
+	wg.Wait()
+	return nil
+}</code></pre>
+
+<h3><code>errgroup</code> con contexto: el que vas a usar el 80% de las veces</h3>
+
+<pre><code class="lang-go">import "golang.org/x/sync/errgroup"
+
+func Recolectar(ctx context.Context, urls []string) ([]Doc, error) {
+	g, ctx := errgroup.WithContext(ctx)   // ojo: sombrea ctx a propósito
+	g.SetLimit(16)                        // techo de concurrencia, sin semáforo a mano
+
+	docs := make([]Doc, len(urls))        // cada goroutine escribe SU índice:
+	for i, u := range urls {              // no hace falta candado
+		g.Go(func() error {
+			d, err := bajar(ctx, u)
+			if err != nil {
+				return fmt.Errorf("%s: %w", u, err)
+			}
+			docs[i] = d
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err                   // devuelve el PRIMER error no nulo
+	}
+	return docs, nil
+}</code></pre>
+
+<div class="tip">
+  <strong>Tres detalles de <code>errgroup</code> que valen oro.</strong> <strong>(1)</strong> <code>WithContext</code> devuelve un contexto que se cancela apenas la primera goroutine devuelve error: el resto se entera y abandona. <strong>(2)</strong> <code>Wait</code> guarda solo el primer error; si necesitás todos, acumulá vos con <code>errors.Join</code>. <strong>(3)</strong> <code>SetLimit(n)</code> hace que <code>g.Go</code> bloquee cuando hay <code>n</code> en vuelo, así que reemplaza al semáforo — pero cuidado con llamar a <code>g.Go</code> desde adentro de otra goroutine del mismo grupo, porque podés trabarte contra tu propio límite.
+</div>
+
+<div class="info">
+  Escribir <code>docs[i] = d</code> desde varias goroutines no es una carrera: cada una toca un índice distinto de un slice ya dimensionado, y son posiciones de memoria diferentes. Sí lo sería <code>docs = append(docs, d)</code>, porque <code>append</code> lee y escribe la cabecera del slice. Es una distinción que <code>-race</code> confirma en el acto.
+</div>
+
+<h2>GS3.9 Deadlocks, livelocks y cómo se ven en un dump</h2>
+
+<p>Go tiene un detector de deadlocks en el runtime, pero con una limitación enorme: <strong>solo dispara si absolutamente todas las goroutines están bloqueadas</strong>. En un programa de juguete lo ves:</p>
+
+<pre><code class="lang-go">func main() {
+	ch := make(chan int)   // sin buffer
+	ch &lt;- 1                // nadie recibe
+	fmt.Println(&lt;-ch)
+}
+// fatal error: all goroutines are asleep - deadlock!</code></pre>
+
+<div class="danger">
+  <strong>En un servicio real ese mensaje no aparece nunca.</strong> Alcanza con que exista un <code>http.Server</code> escuchando, un <code>Ticker</code> de métricas o una goroutine del recolector de basura para que el runtime concluya que “algo puede avanzar”. Tu handler queda colgado, las goroutines se acumulan, la memoria sube... y el proceso sigue vivo y reportando <em>healthy</em>. Un deadlock parcial no se ve: se diagnostica.
+</div>
+
+<h3>Sacar y leer el dump de goroutines</h3>
+
+<pre><code class="lang-bash"># 1) Señal QUIT al proceso: imprime el stack de TODAS las goroutines y aborta
+kill -QUIT $(pgrep mi-servicio)         # en la terminal, Ctrl+\ hace lo mismo
+
+# 2) Sin matar el proceso, si tenés net/http/pprof enchufado
+curl -s 'http://localhost:6060/debug/pprof/goroutine?debug=2' &gt; dump.txt
+
+# 3) Contar por estado: la foto que te dice dónde está todo el mundo trabado
+grep -c 'chan send'    dump.txt
+grep -c 'chan receive' dump.txt
+grep -c 'semacquire'   dump.txt
+grep -c 'select'       dump.txt
+
+# 4) En un test que se cuelga, el timeout imprime el dump gratis
+go test -timeout 30s ./internal/pool/</code></pre>
+
+<p>Lo que buscás en el dump son tres cosas: el <strong>estado</strong> entre corchetes, los <strong>minutos</strong> que lleva en ese estado, y la <strong>línea</strong> exacta. Una goroutine con <code>[chan send, 14 minutes]</code> te está diciendo el bug con nombre y apellido:</p>
+
+<pre><code class="lang-bash">goroutine 1 [chan send, 14 minutes]:
+main.Procesar({0xc0000b2000, 0x2710, 0x2710}, 0x8)
+	/app/pool.go:31 +0x1f4
+main.main()
+	/app/main.go:12 +0x8f
+
+goroutine 34 [semacquire, 14 minutes]:
+sync.runtime_Semacquire(0xc0000a4018)
+	/usr/local/go/src/runtime/sema.go:71 +0x25
+sync.(*WaitGroup).Wait(0xc0000a4010)
+	/usr/local/go/src/sync/waitgroup.go:118 +0x48</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Estado en el dump</th><th>Qué significa</th><th>Causa típica</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>chan send</code></td><td>Esperando enviar</td><td>Nadie drena el canal, o el consumidor murió</td></tr>
+    <tr><td><code>chan receive</code></td><td>Esperando recibir</td><td>Nadie cerró el canal, o el productor se colgó</td></tr>
+    <tr><td><code>semacquire</code></td><td>Esperando un candado o un <code>WaitGroup</code></td><td><code>Done</code> que nunca se llamó; <code>Unlock</code> salteado en un return temprano</td></tr>
+    <tr><td><code>select</code></td><td>En un <code>select</code> sin ninguna rama lista</td><td>Todos los canales del <code>select</code> están muertos</td></tr>
+    <tr><td><code>IO wait</code></td><td>Esperando red</td><td>Falta un timeout o un contexto con deadline</td></tr>
+    <tr><td><code>sync.Cond.Wait</code></td><td>Esperando una señal</td><td>Un <code>Signal</code> perdido; casi siempre conviene un canal</td></tr>
+  </tbody>
+</table>
+
+<h3>Las cinco causas que cubren casi todo</h3>
+
+<ol>
+  <li><strong>Orden de candados invertido.</strong> La goroutine A toma <code>mu1</code> y pide <code>mu2</code>; la B toma <code>mu2</code> y pide <code>mu1</code>. Se arregla definiendo un <strong>orden total</strong> de adquisición (por ejemplo, siempre por ID ascendente) y respetándolo en todo el paquete.</li>
+  <li><strong>Enviar a un canal que ya nadie lee.</strong> El worked example de GS3.12 es exactamente esto.</li>
+  <li><strong><code>Unlock</code> salteado.</strong> Un <code>return</code> de error entre el <code>Lock</code> y el <code>Unlock</code>. Por eso <code>defer mu.Unlock()</code> va inmediatamente después del <code>Lock</code>, siempre.</li>
+  <li><strong><code>WaitGroup</code> con cuentas rotas.</strong> Un <code>Add</code> de más, o un <code>Done</code> que se saltea por un <code>return</code> temprano: <code>Wait</code> no vuelve nunca.</li>
+  <li><strong><code>RLock</code> recursivo</strong> con un escritor esperando, como vimos en GS3.6.</li>
+</ol>
+
+<h3>Livelock: peor que un deadlock</h3>
+
+<p>Un livelock es un sistema donde todo el mundo está ocupadísimo y nadie progresa. Con un deadlock el proceso al menos se queda quieto y se nota; con un livelock la CPU está al 100%, las métricas parecen sanas y el throughput es cero. El patrón clásico son dos goroutines que se ceden el paso educadamente:</p>
+
+<pre><code class="lang-go">// LIVELOCK: los dos sueltan y reintentan al mismo ritmo, para siempre.
+for {
+	mu1.Lock()
+	if !mu2.TryLock() {          // TryLock existe desde Go 1.18
+		mu1.Unlock()
+		continue                 // reintento inmediato, en sincronía con el otro
+	}
+	break
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Todo reintento necesita backoff con jitter.</strong> Si dos actores reintentan con el mismo período, se sincronizan y no salen nunca. Un <code>time.Sleep</code> de unos microsegundos aleatorios rompe la simetría. Y si podés evitar el reintento con un orden total de candados, mejor todavía: el livelock deja de ser posible en vez de ser improbable.
+</div>
+
+<h2>GS3.10 Fugas de goroutines y cómo testearlas</h2>
+
+<p>En GS1 vimos el costo: cada goroutine arranca con un stack chico pero crece, y mantiene vivo todo lo que su closure referencia. Una fuga de goroutines es, en la práctica, una fuga de memoria con un multiplicador. Y la causa número uno es siempre la misma: <strong>una goroutine bloqueada en un canal que nadie va a tocar</strong>.</p>
+
+<pre><code class="lang-go">// FUGA. El clásico absoluto.
+func Consultar(url string) &lt;-chan string {
+	ch := make(chan string)          // SIN buffer
+	go func() {
+		ch &lt;- pedidoLento(url)       // si nadie recibe, esta goroutine vive para siempre
+	}()
+	return ch
+}
+
+func Llamador() (string, error) {
+	select {
+	case r := &lt;-Consultar("https://api.ejemplo.com"):
+		return r, nil
+	case &lt;-time.After(100 * time.Millisecond):
+		return "", errors.New("timeout")   // ← nos vamos y abandonamos el canal
+	}
+}</code></pre>
+
+<p>Cada timeout deja una goroutine bloqueada eternamente, reteniendo la respuesta HTTP, el buffer y todo el closure. Con 50 requests por segundo y un 2% de timeouts, son 86.400 goroutines fugadas por día. Hay dos arreglos, y conviene aplicar los dos:</p>
+
+<pre><code class="lang-go">// Arreglo 1: buffer de 1. El envío nunca bloquea, aunque nadie reciba.
+func Consultar(url string) &lt;-chan string {
+	ch := make(chan string, 1)       // ← el único cambio
+	go func() {
+		ch &lt;- pedidoLento(url)       // retorna siempre; el canal lo recoge el GC
+	}()
+	return ch
+}
+
+// Arreglo 2, el correcto de verdad: que el trabajo mismo se pueda cancelar.
+func Consultar(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	// ... el deadline del ctx aborta el pedido de red; no queda nada colgado
+}</code></pre>
+
+<h3>Un test que detecta la fuga: <code>goleak</code></h3>
+
+<p><code>go.uber.org/goleak</code> compara el conjunto de goroutines antes y después de tus tests y falla si quedaron de más. Es una línea de código y encuentra una clase entera de bugs:</p>
+
+<pre><code class="lang-go">package pool_test
+
+import (
+	"testing"
+
+	"go.uber.org/goleak"
+)
+
+// Opción A: verificar al final de TODO el paquete de tests.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		// las goroutines de fondo legítimas se ignoran explícitamente
+		goleak.IgnoreTopFunction("database/sql.(*DB).connectionOpener"),
+	)
+}
+
+// Opción B: verificar test por test, que da mejor localización del culpable.
+func TestConsultar_TimeoutNoDejaGoroutines(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	_, err := Llamador()
+	if err == nil {
+		t.Fatal("esperaba timeout")
+	}
+	// con el código con fuga, acá falla: "found unexpected goroutines"
+}</code></pre>
+
+<div class="tip">
+  <strong>Sin dependencias, la versión pobre funciona bastante bien:</strong> guardá <code>runtime.NumGoroutine()</code> al empezar, dale al final unos milisegundos de gracia (las goroutines tardan un instante en morir) y compará. Es menos preciso que <code>goleak</code>, no te dice quién quedó viva, pero atrapa la fuga masiva.
+</div>
+
+<div class="info">
+  <strong>Dato 2026:</strong> desde Go 1.25 existe <code>testing/synctest</code> en la biblioteca estándar (fue experimental en 1.24). Corre tu test en una “burbuja” con <strong>tiempo falso</strong>: los <code>Sleep</code> y los timers avanzan instantáneamente cuando todas las goroutines de la burbuja están bloqueadas, y <code>synctest.Wait</code> espera a que se aquieten. Un test de timeouts que tardaba 30 segundos reales pasa a tardar microsegundos y deja de ser flaky. Para código con <code>context.WithTimeout</code> y reintentos, cambia la vida.
+</div>
+
+<h2>GS3.11 Errores clásicos que sobreviven a la revisión de código</h2>
+
+<h3>La variable del loop (arreglado en 1.22, pero tenés que entenderlo)</h3>
+
+<pre><code class="lang-go">// Hasta Go 1.21, esto imprimía tres veces el último elemento (o basura).
+for _, v := range []string{"a", "b", "c"} {
+	go func() {
+		fmt.Println(v)      // todas las goroutines capturan LA MISMA variable
+	}()
+}</code></pre>
+
+<p>La causa era la semántica del <code>for</code>: la variable <code>v</code> se declaraba <strong>una sola vez</strong> para todo el loop y se le reasignaba el valor en cada iteración. Las closures capturan variables, no valores, así que las tres goroutines miraban la misma casilla de memoria — y encima con una carrera de datos, porque el loop escribía mientras ellas leían. La receta era pasarla como argumento (<code>go func(v string){...}(v)</code>) o hacer un <code>v := v</code> al principio del cuerpo.</p>
+
+<p><strong>Go 1.22 cambió la semántica</strong>: ahora las variables del <code>for</code> son <em>por iteración</em>, y el código de arriba imprime <code>a</code>, <code>b</code>, <code>c</code>. Dos razones para que igual lo sepas:</p>
+
+<ol>
+  <li>El cambio está condicionado por la versión declarada en <code>go.mod</code>. Un módulo que dice <code>go 1.21</code> compila con la semántica <strong>vieja</strong> incluso con el toolchain 1.26. Vas a mantener repos así.</li>
+  <li>La clase de bug no desapareció. Solo se arregló la variable <em>del loop</em>; cualquier otra variable compartida por closures sigue rota:</li>
+</ol>
+
+<pre><code class="lang-go">// SIGUE MAL en Go 1.26: la variable no es del loop, es de afuera.
+buf := make([]byte, 0, 1024)
+for i := range 3 {
+	buf = append(buf, byte(i))
+	go func() {
+		procesar(buf)        // carrera: todas ven el mismo slice, que muta
+	}()
+}</code></pre>
+
+<h3><code>wg.Add</code> adentro de la goroutine</h3>
+
+<pre><code class="lang-go">// MAL: hay una carrera entre Add y Wait.
+var wg sync.WaitGroup
+for _, t := range tareas {
+	go func() {
+		wg.Add(1)            // puede ejecutarse DESPUÉS de que Wait ya volvió
+		defer wg.Done()
+		hacer(t)
+	}()
+}
+wg.Wait()                    // puede retornar con el contador en 0: no espera nada
+
+// BIEN (clásico):            // MEJOR (Go 1.25):
+for _, t := range tareas {    for _, t := range tareas {
+	wg.Add(1)                     wg.Go(func() { hacer(t) })
+	go func() {               }
+		defer wg.Done()       wg.Wait()
+		hacer(t)
+	}()
+}
+wg.Wait()</code></pre>
+
+<p>El bug es sutil porque <em>casi siempre anda</em>: si lanzar la goroutine es más rápido que llegar al <code>Wait</code>, el contador sube a tiempo. Bajo carga, o con <code>GOMAXPROCS=1</code>, o en una máquina más lenta, <code>Wait</code> vuelve enseguida y el programa sigue de largo con trabajo a medio hacer. Es de los bugs que producen datos incompletos en vez de errores.</p>
+
+<h3>Los otros tres del podio</h3>
+
+<pre><code class="lang-go">// 1. Olvidarse el defer en Done: si hacer() hace panic o hay un return
+//    temprano, el contador nunca baja y Wait se cuelga para siempre.
+go func() {
+	hacer(t)
+	wg.Done()        // ← MAL. Va como: defer wg.Done()
+}()
+
+// 2. Pasar el WaitGroup por valor: se copia el struct y el Done es sobre
+//    la copia. go vet lo detecta (copylocks); corré go vet en CI.
+func trabajar(wg sync.WaitGroup) { defer wg.Done() }   // MAL
+func trabajar(wg *sync.WaitGroup) { defer wg.Done() }  // BIEN
+
+// 3. Unlock sin defer, con un return de error en el medio.
+func (c *Cache) Set(k string, v int) error {
+	c.mu.Lock()
+	if k == "" {
+		return errors.New("clave vacía")   // ← el candado queda tomado PARA SIEMPRE
+	}
+	c.m[k] = v
+	c.mu.Unlock()
+	return nil
+}</code></pre>
+
+<h2>GS3.12 Worked example: el pool que se cuelga una vez cada mil</h2>
+
+<p>Este es el caso completo, tal como se vive. Un servicio de ingesta procesa lotes de 10.000 tareas con un pool de 8 workers. Funciona hace meses. Desde hace unos días, un lote cada tanto no termina nunca: la métrica de lotes completados se queda quieta, la de memoria sube despacio, y el <em>health check</em> sigue en verde porque el HTTP server responde perfecto.</p>
+
+<h3>Paso 1 — El código</h3>
+
+<pre><code class="lang-go">func Procesar(tareas []Tarea, workers int) error {
+	in := make(chan Tarea)
+	errc := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Go(func() {
+			for t := range in {
+				if err := hacer(t); err != nil {
+					select {
+					case errc &lt;- err:      // reportamos el primero
+					default:               // los demás se descartan
+					}
+					return                 // ← acá está el bug
+				}
+			}
+		})
+	}
+
+	for _, t := range tareas {
+		in &lt;- t                            // ← acá se manifiesta
+	}
+	close(in)
+	wg.Wait()
+
+	select {
+	case err := &lt;-errc:
+		return err
+	default:
+		return nil
+	}
+}</code></pre>
+
+<p>Leelo con los ojos de la revisión de código: cada worker consume del canal, reporta el primer error sin bloquear, y sale. El productor envía todo y cierra. El <code>WaitGroup</code> está bien usado. El canal de errores tiene buffer 1 y un <code>default</code> para no trabarse. <strong>Todo parece correcto</strong>, y por eso pasó la revisión.</p>
+
+<h3>Paso 2 — <code>-race</code>, y sale limpio</h3>
+
+<pre><code class="lang-bash">$ go test -race -count=50 ./internal/ingesta/
+ok  	ejemplo/internal/ingesta	18.442s
+
+$ go test -race -count=50 -cpu=1,4,16 ./internal/ingesta/
+ok  	ejemplo/internal/ingesta	52.907s</code></pre>
+
+<p>Cincuenta corridas, tres configuraciones de paralelismo, cero reportes. Y tiene todo el sentido del mundo: <strong>no hay ninguna carrera de datos</strong>. No hay una sola variable compartida sin sincronizar; toda la comunicación pasa por canales y por el <code>WaitGroup</code>. El race detector está haciendo su trabajo bien. El bug es de otra especie.</p>
+
+<div class="rule">
+  <strong>📌 Momento de aprendizaje.</strong> Un <code>-race</code> limpio sobre un programa que se cuelga es <em>información</em>, no un callejón sin salida: te descarta toda una familia de causas y te dice dónde mirar. Un programa bloqueado está, por definición, perfectamente sincronizado. Lo que sigue es el dump.
+</div>
+
+<h3>Paso 3 — El dump lo canta</h3>
+
+<pre><code class="lang-bash">$ curl -s 'http://localhost:6060/debug/pprof/goroutine?debug=2' &gt; dump.txt
+$ grep -c 'ingesta.Procesar.func'  dump.txt      # workers vivos
+0
+$ grep -A3 'chan send' dump.txt | head -6
+goroutine 118 [chan send, 27 minutes]:
+ejemplo/internal/ingesta.Procesar({0xc0004a2000, 0x2710, 0x2710}, 0x8)
+	/app/internal/ingesta/pool.go:24 +0x1f4</code></pre>
+
+<p>Ahí está todo: <strong>cero workers vivos</strong> y el productor llevando 27 minutos parado en la línea 24, que es el <code>in &lt;- t</code>. La secuencia real fue:</p>
+
+<div class="step">
+  <strong>1.</strong> La tarea 40 falló (un timeout del servicio de abajo). Ese worker mandó el error a <code>errc</code> y ejecutó su <code>return</code>.<br>
+  <strong>2.</strong> Como el error era sistémico —el servicio de abajo estaba caído— las siguientes tareas también fallaron. Uno por uno, los 8 workers hicieron <code>return</code>.<br>
+  <strong>3.</strong> El productor iba por la tarea 51 de 10.000. El canal <code>in</code> no tiene buffer y ya no queda nadie que reciba: <code>in &lt;- t</code> se bloquea para siempre.<br>
+  <strong>4.</strong> <code>close(in)</code> y <code>wg.Wait()</code> nunca se ejecutan. La función no retorna. El lote queda a medias, sin error, sin log, sin nada.<br>
+  <strong>5.</strong> El runtime no grita “deadlock” porque el <code>http.Server</code> del <code>pprof</code> y el ticker de métricas están vivos y sanos.
+</div>
+
+<div class="danger">
+  <strong>La causa raíz en una frase:</strong> <em>el consumidor tiene derecho a rendirse, pero el productor no tiene forma de enterarse.</em> Cualquier pipeline donde una punta puede irse y la otra no puede abandonar tiene este bug latente. Y como solo se dispara cuando hay un error temprano <strong>y</strong> quedan muchas tareas por enviar, en desarrollo con 20 tareas de prueba no aparece jamás.
+</div>
+
+<h3>Paso 4 — La reescritura</h3>
+
+<p>El arreglo no es agregarle buffer al canal (eso solo corre el problema 100 tareas más adelante). Es darle al productor una forma de rendirse, y hacerlo con la herramienta que ya trae esa semántica adentro:</p>
+
+<pre><code class="lang-go">import "golang.org/x/sync/errgroup"
+
+func Procesar(ctx context.Context, tareas []Tarea, workers int) error {
+	g, ctx := errgroup.WithContext(ctx)
+	in := make(chan Tarea)
+
+	// Productor: ahora puede abandonar.
+	g.Go(func() error {
+		defer close(in)                 // pase lo que pase, el canal se cierra
+		for _, t := range tareas {
+			select {
+			case in &lt;- t:
+			case &lt;-ctx.Done():
+				return nil              // alguien falló: nos retiramos en silencio
+			}
+		}
+		return nil
+	})
+
+	// Consumidores: al devolver error, errgroup cancela ctx por nosotros.
+	for range workers {
+		g.Go(func() error {
+			for t := range in {
+				if err := hacer(ctx, t); err != nil {
+					return fmt.Errorf("tarea %d: %w", t.ID, err)
+				}
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()                     // devuelve el primer error real
+}</code></pre>
+
+<p>Por qué esto ya no se puede colgar, punto por punto:</p>
+
+<ul>
+  <li>Cuando un worker devuelve error, <code>errgroup</code> <strong>cancela el contexto</strong> automáticamente.</li>
+  <li>El productor está en un <code>select</code> con <code>ctx.Done()</code>: sale, y su <code>defer close(in)</code> cierra el canal.</li>
+  <li>Los workers que seguían vivos terminan su <code>range in</code> de forma natural cuando el canal se cierra. Nadie queda bloqueado.</li>
+  <li><code>g.Wait()</code> devuelve el <strong>primer</strong> error registrado, que es el del worker —la causa real— y no el <code>context.Canceled</code> que vino después. Por eso el productor devuelve <code>nil</code> al cancelarse: para no ensuciar el diagnóstico si por casualidad llega primero.</li>
+  <li>Como <code>hacer</code> ahora recibe <code>ctx</code>, las tareas en vuelo también abortan en vez de terminar trabajo que ya no le importa a nadie.</li>
+</ul>
+
+<h3>Paso 5 — El test que impide que vuelva</h3>
+
+<p>Un arreglo sin test es una anécdota. Este test falla con el código viejo y pasa con el nuevo, y encima protege contra la fuga de goroutines:</p>
+
+<pre><code class="lang-go">package ingesta
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"go.uber.org/goleak"
+)
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
+
+func TestProcesar_ErrorTempranoNoSeCuelga(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	// La clave: MUCHAS tareas y el error MUY al principio.
+	// Es la única combinación que reproduce el bug.
+	tareas := make([]Tarea, 10_000)
+	for i := range tareas {
+		tareas[i] = Tarea{ID: i}
+	}
+	hacer = func(ctx context.Context, t Tarea) error {
+		if t.ID == 40 {
+			return errors.New("falla inyectada")
+		}
+		return nil
+	}
+
+	err := Procesar(context.Background(), tareas, 8)
+	if err == nil {
+		t.Fatal("esperaba el error de la tarea 40")
+	}
+}</code></pre>
+
+<pre><code class="lang-bash"># Con el código viejo: el test no falla, se CUELGA. El timeout lo convierte
+# en una falla legible, con el dump completo de goroutines de regalo.
+$ go test -race -timeout 30s ./internal/ingesta/
+panic: test timed out after 30s
+
+goroutine 22 [chan send, 1 minutes]:
+ejemplo/internal/ingesta.Procesar(...)
+	/app/internal/ingesta/pool.go:24
+FAIL	ejemplo/internal/ingesta	30.019s
+
+# Con el código nuevo:
+$ go test -race -count=10 -timeout 30s ./internal/ingesta/
+ok  	ejemplo/internal/ingesta	2.884s</code></pre>
+
+<div class="rule">
+  <strong>📌 Las tres lecciones del ejercicio.</strong> <strong>(1)</strong> <code>-race</code> limpio no es luz verde: cubre carreras de datos, no bloqueos ni fugas. <strong>(2)</strong> Todo test de concurrencia necesita <code>-timeout</code>, porque convierte un cuelgue silencioso en una falla con diagnóstico incluido. <strong>(3)</strong> El test tiene que reproducir la <em>forma</em> del problema de producción —muchas tareas, error temprano—, no una versión chiquita y cómoda: con 20 tareas, este bug no existe.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Corrés <code>go test -race</code> cincuenta veces sobre un pool que en producción se cuelga, y siempre pasa. ¿Qué concluís?</summary>
+<p>Que el bug no es una carrera de datos, y eso descarta media investigación. El detector solo reporta accesos concurrentes sin sincronizar sobre la misma memoria; un programa bloqueado está sincronizado por definición. El paso siguiente es el dump de goroutines (<code>SIGQUIT</code>, <code>/debug/pprof/goroutine?debug=2</code>, o el que imprime <code>go test -timeout</code>), buscando estados <code>chan send</code>, <code>chan receive</code> o <code>semacquire</code> con muchos minutos encima. Ojo con el otro lado de la moneda: cincuenta corridas limpias tampoco prueban que <em>no haya</em> carreras — solo que en esos cincuenta schedules no aparecieron.</p></details>
+
+<details><summary>Tenés cuatro goroutines enviando al mismo canal. ¿Quién lo cierra?</summary>
+<p>Ninguna de las cuatro por su cuenta: cerrar un canal ya cerrado es panic, y enviar a un canal cerrado también. La solución estándar es un <code>WaitGroup</code> al que cada productor le hace <code>Done</code> al terminar, más una goroutine aparte que hace <code>wg.Wait()</code> y recién ahí <code>close(ch)</code>. Esa goroutine cerradora tiene que vivir en su propia goroutine, no en línea antes de devolver el canal, o la función se bloquea a sí misma. Y el receptor <strong>nunca</strong> cierra: no tiene forma de saber si alguien está por enviar.</p></details>
+
+<details><summary>Un compañero cambió un <code>Mutex</code> por un <code>RWMutex</code> "porque hay muchos más lectores que escritores" y el servicio empeoró. ¿Por qué?</summary>
+<p>Porque <code>RLock</code> y <code>RUnlock</code> también <em>escriben</em>: modifican un contador de lectores compartido que vive en una línea de caché. Cada lector que entra o sale invalida esa línea en todos los demás núcleos, y con secciones críticas de decenas de nanosegundos ese ping-pong cuesta más que la exclusión mutua que estás evitando. <code>RWMutex</code> rinde cuando la sección de lectura es larga (microsegundos o más), no cuando es "leer un campo del mapa". La respuesta correcta es medirlo: un <code>b.RunParallel</code> con <code>-cpu=1,4,16</code> resuelve la discusión en dos minutos.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>memory model</strong> es la única fuente de verdad: si no podés nombrar la operación (canal, mutex, <code>WaitGroup</code>, <code>Once</code>, <code>atomic</code>) que ordena una escritura respecto de una lectura, tenés un bug aunque el programa ande.</li>
+  <li><strong><code>-race</code> va en CI, con <code>-count</code> y <code>GOMAXPROCS</code> variados.</strong> Detecta carreras de datos reales, sin falsos positivos, pero <em>solo en el schedule que se ejecutó</em>, y no ve condiciones de carrera lógicas, deadlocks ni fugas.</li>
+  <li><strong>Sin buffer</strong> es acoplamiento total y backpressure perfecta; <strong>con buffer</strong> cambia latencia por memoria. Elegí 0, 1 o un N que puedas justificar.</li>
+  <li><strong>Cierra el que envía</strong>, y solo si es el único. Con varios productores, <code>WaitGroup</code> más una goroutine cerradora. Un canal <code>nil</code> desactiva su rama del <code>select</code>: es la forma correcta de drenar dos fuentes sin quemar un núcleo.</li>
+  <li><strong><code>context</code></strong> se pasa como primer parámetro, se consulta en todo lugar que bloquee y se cancela con <code>defer cancel()</code>. Nunca se guarda en un struct ni se usa para inyectar dependencias.</li>
+  <li><strong>El canal orquesta, el candado custodia.</strong> Para proteger un contador o un mapa, <code>Mutex</code> o <code>atomic</code>; <code>RWMutex</code> solo con secciones de lectura largas, y midiendo.</li>
+  <li><strong>Toda goroutine necesita una salida garantizada.</strong> Si envía, que sea con <code>select</code> sobre <code>ctx.Done()</code> o con buffer suficiente; si recibe, que el canal se cierre siempre. <code>goleak</code> convierte eso en un test.</li>
+  <li><strong>Go 1.26:</strong> la variable del loop se arregló en 1.22 (pero el <code>go.mod</code> viejo mantiene la semántica vieja), los timers dejaron de filtrar en 1.23, <code>wg.Go</code> llegó en 1.25 y <code>testing/synctest</code> hace deterministas los tests con tiempo.</li>
+  <li><strong>Un test concurrente sin <code>-timeout</code> no es un test:</strong> es una forma de colgar el pipeline.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí el programa del flag <code>listo</code> de GS3.1 y corrélo con <code>go run</code> y con <code>go run -race</code>, en tu máquina y con <code>GOMAXPROCS=1</code>. Documentá en qué combinaciones se cuelga, en cuáles imprime vacío y en cuáles anda. Después arreglalo de tres formas distintas (canal, mutex, atomic) y explicá qué arista happens-before aporta cada una.</li>
+  <li>Tomá el ejemplo del contador con <code>Get</code> + <code>Set</code> de GS3.2 y demostrá con un test que pierde incrementos, aunque <code>-race</code> pase limpio. Usá 100 goroutines haciendo 1.000 incrementos cada una y compará el total contra 100.000.</li>
+  <li>Implementá <code>merge</code> para <em>N</em> canales (no dos) manteniendo el truco del <code>nil</code>, y escribí un test que verifique que la goroutine interna termina cuando todas las fuentes se cierran. Verificalo con <code>goleak</code>.</li>
+  <li>Escribí los dos benchmarks de <code>Mutex</code> vs <code>RWMutex</code> de GS3.6 y corrélos con <code>-cpu=1,2,4,8,16</code>. Armá una tabla con <em>tus</em> números y encontrá el largo de sección crítica (metele un <code>time.Sleep</code> o un cálculo) a partir del cual el <code>RWMutex</code> empieza a ganar.</li>
+  <li>Reproducí la fuga de <code>Consultar</code> de GS3.10: hacé 10.000 llamadas con timeout, imprimí <code>runtime.NumGoroutine()</code> antes y después, y después arreglala con buffer 1 y con contexto. Agregá el test de <code>goleak</code> que la habría atrapado.</li>
+  <li>Tomá el pool roto de GS3.12, hacelo colgar de verdad en tu máquina y sacá vos el dump con <code>kill -QUIT</code>. Identificá en el dump la línea exacta del <code>chan send</code> y contá cuántas goroutines quedaron en cada estado.</li>
+  <li>Reescribí un worker pool tuyo (o el de GS3.8) con <code>errgroup</code> + <code>SetLimit</code> y agregale un test que inyecte un error en la tarea 40 de 10.000, con <code>-race -count=10 -timeout 30s</code> y <code>goleak</code>. Ese test es el entregable.</li>
+</ol>
+
+<section class="quiz" id="quizGS3">
+  <style>
+    #quizGS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS3 .q{margin-bottom:1.5rem}
+    #quizGS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS3 .opt:hover{border-color:var(--accent)}
+    #quizGS3 .opt:disabled{cursor:default}
+    #quizGS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizGS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizGS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS3 .exp.show{display:block}
+    #quizGS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu worker pool se cuelga en producción, pero <code>go test -race -count=50</code> pasa limpio. ¿Qué conclusión es la correcta?</p>
+    <button class="opt">El bug no existe: si <code>-race</code> pasa 50 veces, el código concurrente es correcto</button>
+    <button class="opt">El bug no es una carrera de datos; hay que mirar el dump de goroutines buscando <code>chan send</code> o <code>semacquire</code></button>
+    <button class="opt">Falta correr <code>-race</code> con más goroutines para que el detector encuentre el deadlock</button>
+    <div class="exp">El race detector reporta accesos concurrentes sin sincronizar sobre la misma memoria. Un programa bloqueado en un canal está, por definición, perfectamente sincronizado: no hay nada que reportar. Deadlocks, fugas de goroutines y condiciones de carrera lógicas (como un <code>Get</code> seguido de un <code>Set</code>, cada uno con su candado) le son invisibles. El diagnóstico correcto es el dump —<code>SIGQUIT</code>, <code>/debug/pprof/goroutine?debug=2</code>, o el que imprime <code>go test -timeout</code>— leyendo el estado y los minutos de cada goroutine.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Cambiás un <code>sync.Mutex</code> por un <code>sync.RWMutex</code> en una caché con 95% de lecturas de un solo campo, y el throughput baja. ¿Por qué?</p>
+    <button class="opt">Porque <code>RWMutex</code> solo funciona bien si hay más escritores que lectores</button>
+    <button class="opt">Porque <code>RWMutex</code> hace copias del dato protegido para cada lector</button>
+    <button class="opt">Porque <code>RLock</code>/<code>RUnlock</code> escriben un contador compartido: con secciones críticas cortas, la contención de esa línea de caché cuesta más de lo que ahorra</button>
+    <div class="exp">Tomar el candado de lectura no es gratis: incrementa y decrementa un contador de lectores que vive en una línea de caché compartida, y cada operación la invalida en el resto de los núcleos. Si la sección crítica dura decenas de nanosegundos, ese ping-pong domina el costo. <code>RWMutex</code> rinde cuando las lecturas son largas —microsegundos o más— y numerosas. Se resuelve midiendo con <code>b.RunParallel</code> y <code>-cpu=1,4,16</code>, no discutiendo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Un pipeline tiene una etapa que hace <code>out &lt;- v</code> dentro de un <code>for</code>, sin <code>select</code>. El consumidor de aguas abajo corta con un <code>break</code> al encontrar lo que buscaba. ¿Qué pasa?</p>
+    <button class="opt">La goroutine de la etapa queda bloqueada para siempre en el envío: es una fuga de goroutine</button>
+    <button class="opt">El runtime detecta el deadlock y aborta el proceso con un mensaje claro</button>
+    <button class="opt">Nada: el recolector de basura libera la goroutine cuando ve que nadie referencia el canal</button>
+    <div class="exp">Es la fuga clásica de pipeline. Nadie va a recibir nunca más, así que el <code>out &lt;- v</code> se bloquea eternamente, y esa goroutine mantiene vivo todo lo que su closure referencia. El runtime no grita "deadlock" porque hay otras goroutines corriendo, y el GC no puede recolectar una goroutine bloqueada. Por eso la regla del pipeline es que <strong>toda etapa que envía tiene que poder rendirse</strong>: <code>select</code> con <code>ctx.Done()</code> en cada envío, y <code>defer cancel()</code> del lado del consumidor. <code>goleak</code> convierte esa regla en un test.</div>
+  </div>
+
+  <div class="score" id="scoreGS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con GS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs2-memoria-gc/lecture.html">← GS2: Memoria y GC</a>
+  <a href="../gs4-tipos-genericos/lecture.html">GS4: Tipos y genéricos →</a>
+</nav>
+
+</div>
+</body>
+</html>

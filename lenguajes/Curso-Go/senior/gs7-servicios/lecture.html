@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS7 — Servicios en producción: HTTP, gRPC y resiliencia · Go Senior</title>
+  <meta name="description" content="El router de net/http desde 1.22, timeouts de servidor y cliente, pool de conexiones, middlewares, graceful shutdown, backoff con jitter, circuit breaker, límite de concurrencia, idempotencia, gRPC y la estructura de un servicio Go real.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS7</span>
+  <span class="badge">⏱ 45–130 min</span>
+  <span class="badge">🎯 Pre-req: GS3</span>
+  <span class="badge">🌐 Servicios</span>
+</div>
+
+<article>
+
+<h1>GS7 — Servicios en producción: HTTP, gRPC y resiliencia</h1>
+
+<h2>GS7.0 Por qué este módulo</h2>
+
+<p>Go es el lenguaje de la nube por una razón poco romántica: levantar un servidor HTTP son cinco líneas, no lleva dependencias, compila a un binario estático y arranca en milisegundos. Docker, Kubernetes, Prometheus, etcd, Terraform y Traefik están escritos en Go, y todos empezaron con un <code>http.ListenAndServe</code>.</p>
+
+<p>El problema es que esa facilidad crea una ilusión peligrosa. Hacer un servidor es trivial. Hacer uno que <strong>aguante</strong> —que sobreviva a que su base de datos se ponga lenta, a que un cliente abra 10.000 conexiones y no mande nada, a un deploy en el medio de un pico, a que un servicio de abajo devuelva 503 durante cuarenta minutos— no lo es. Y la distancia entre las dos cosas casi nunca es un problema de Go: es un puñado de decisiones de configuración que nadie tomó porque el valor por defecto <em>parecía</em> razonable.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Un servicio no se cae porque su código sea lento. Se cae porque <strong>no tiene límites</strong>. Sin límite de tiempo, sin límite de concurrencia, sin límite de reintentos, cualquier degradación de una dependencia se convierte en consumo de recursos ilimitado en tu proceso. Todo lo que sigue —timeouts, semáforos, circuit breakers, rate limits— es la misma idea repetida en distintas capas: <em>poné una cota, y decidí vos qué pasa cuando se toca</em>.
+</div>
+
+<p>Vamos a trabajar sobre <strong>Go 1.26</strong>. Buena parte de lo que antes justificaba traer un framework hoy está en la biblioteca estándar: el router con patrones de método y comodines llegó en <strong>1.22</strong>, <code>http.ResponseController</code> en 1.20, <code>context.WithoutCancel</code> y <code>WithTimeoutCause</code> en 1.21, <code>math/rand/v2</code> —sin semilla y sin candado global— en 1.22. Si tu mapa mental de <code>net/http</code> es el de 2019, está desactualizado en las partes que importan.</p>
+
+<h2>GS7.1 El router de la stdlib: qué cambió en 1.22</h2>
+
+<p>Hasta Go 1.21, <code>http.ServeMux</code> hacía una sola cosa: matchear prefijos de path. No entendía métodos, no extraía parámetros y no tenía noción de especificidad. Por eso <em>todo el mundo</em> instalaba <code>gorilla/mux</code> o <code>chi</code>: no por las features exóticas, sino para poder escribir <code>GET /users/{id}</code>.</p>
+
+<p>Desde 1.22 el mux de la stdlib entiende patrones con método y comodines:</p>
+
+<pre><code class="lang-go">mux := http.NewServeMux()
+
+// Método + comodín. El valor se lee con r.PathValue.
+mux.HandleFunc("GET /items/{id}", getItem)
+mux.HandleFunc("PUT /items/{id}", putItem)
+mux.HandleFunc("DELETE /items/{id}", deleteItem)
+mux.HandleFunc("POST /items", createItem)
+
+// Comodín "hasta el final": captura el resto del path, barras incluidas.
+mux.HandleFunc("GET /files/{path...}", serveFile)
+
+// {$} = coincidencia EXACTA con "/", no con todo lo que empiece en "/".
+mux.HandleFunc("GET /{$}", home)
+
+// Sin método: matchea cualquiera.
+mux.Handle("/metrics", promhttp.Handler())</code></pre>
+
+<pre><code class="lang-go">func getItem(w http.ResponseWriter, r *http.Request) {
+    id := r.PathValue("id")       // string, siempre; validá vos el formato
+    if id == "" {
+        http.Error(w, "id requerido", http.StatusBadRequest)
+        return
+    }
+    // ...
+}</code></pre>
+
+<p>Hay tres reglas que conviene tener presentes porque cambian el comportamiento respecto del mux viejo:</p>
+
+<ul>
+  <li><strong>Gana el patrón más específico</strong>, no el que registraste primero. <code>/items/{id}</code> le gana a <code>/items/</code>, y <code>/items/especial</code> le gana a <code>/items/{id}</code>. Si dos patrones son ambiguos —ninguno es más específico que el otro— el mux <strong>panickea al registrarlos</strong>, no en runtime. Es un error de arranque, que es exactamente donde querés que aparezca.</li>
+  <li>Registrar <code>GET</code> también registra <code>HEAD</code> automáticamente.</li>
+  <li>Si un path matchea un patrón pero con otro método, el mux responde <strong>405 Method Not Allowed</strong> con el header <code>Allow</code> correcto. Antes daba 404.</li>
+</ul>
+
+<div class="mistake">
+  <strong>El error que se hereda del mux viejo.</strong> <code>mux.HandleFunc("/admin/", h)</code> —con barra final— sigue significando "todo lo que empiece con <code>/admin/</code>", y <code>mux.HandleFunc("/", h)</code> sigue siendo un catch-all de todo el sitio. Si querés la raíz y solo la raíz, es <code>"GET /{$}"</code>. Más de un endpoint de debug quedó expuesto por confiar en que <code>"/"</code> significaba "la home".
+</div>
+
+<h2>GS7.2 stdlib vs frameworks: la tabla honesta</h2>
+
+<p>La pregunta correcta no es "cuál es mejor" sino "qué me da esto que la stdlib no, y cuánto me cuesta". Con el router de 1.22 la respuesta cambió para la mayoría de los servicios.</p>
+
+<table>
+  <thead>
+    <tr><th>Opción</th><th>Qué aporta</th><th>Costo</th><th>Cuándo elegirla</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>net/http</strong> (stdlib)</td>
+      <td>Router con método y comodines, middlewares como <code>func(http.Handler) http.Handler</code>, cero dependencias, compatibilidad garantizada por la promesa de Go 1</td>
+      <td>Escribís vos los helpers de JSON, el binding y el chain de middlewares (~100 líneas, una vez)</td>
+      <td><strong>El default.</strong> APIs internas, microservicios, cualquier cosa donde el equipo mantenga el código más de un año</td>
+    </tr>
+    <tr>
+      <td><strong>chi</strong></td>
+      <td><code>http.Handler</code> puro: cualquier middleware de la stdlib sirve. Sub-routers, grupos, middlewares listos (RequestID, RealIP, Recoverer)</td>
+      <td>Una dependencia chica y estable</td>
+      <td>Cuando tenés muchos grupos de rutas anidados con middlewares distintos, o querés migrar desde gorilla sin reescribir handlers</td>
+    </tr>
+    <tr>
+      <td><strong>gin</strong></td>
+      <td>Ergonomía: binding y validación de structs, render de JSON/XML, un ecosistema grande de middlewares</td>
+      <td><strong>No usa <code>http.Handler</code>:</strong> introduce <code>*gin.Context</code>. Tus handlers dejan de ser portables y de testearse con <code>httptest</code> a secas</td>
+      <td>Prototipos rápidos, CRUD con mucho binding repetitivo, o un equipo que ya lo domina</td>
+    </tr>
+    <tr>
+      <td><strong>echo</strong></td>
+      <td>Similar a gin, con mejor manejo de errores centralizado y binding declarativo</td>
+      <td>Mismo lock-in de contexto propio</td>
+      <td>Igual que gin: preferencia de equipo, no una necesidad técnica</td>
+    </tr>
+    <tr>
+      <td><strong>fiber</strong></td>
+      <td>Números de benchmark altos (usa fasthttp, no <code>net/http</code>)</td>
+      <td>Fuera del ecosistema <code>net/http</code>: no hay HTTP/2 nativo, ni middlewares estándar, ni <code>httptest</code></td>
+      <td>Casi nunca. El cuello de botella de tu API es la base de datos, no el parser de HTTP</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio real.</strong> El framework que respeta <code>http.Handler</code> (stdlib, chi) te deja cambiar de opinión: tus handlers, tus middlewares y tus tests siguen funcionando si migrás. El que impone su propio contexto convierte a cada handler en código específico del framework. Esa es la diferencia que vas a sentir en el año tres, no los nanosegundos del router.
+</div>
+
+<h2>GS7.3 Timeouts del servidor: la sección que salva servicios</h2>
+
+<p>Si de este módulo te llevás una sola cosa, que sea esta. <code>http.ListenAndServe(":8080", mux)</code> crea un <code>http.Server</code> con <strong>todos los timeouts en cero</strong>, y cero significa "sin límite". Un cliente puede abrir una conexión, mandar <code>GET / HTTP</code> y quedarse ahí para siempre. Tu proceso mantiene la conexión, el file descriptor y la goroutine, indefinidamente.</p>
+
+<pre><code class="lang-go">// ❌ Lo que sale en todos los tutoriales.
+log.Fatal(http.ListenAndServe(":8080", mux))
+// Sin ReadHeaderTimeout: mil conexiones lentas te consumen mil FDs
+// y mil goroutines. Eso es Slowloris, un ataque de 2009 que sigue
+// funcionando contra servicios Go escritos con el ejemplo de la doc.</code></pre>
+
+<p>La versión que va a producción define el server explícitamente:</p>
+
+<pre><code class="lang-go">srv := &amp;http.Server{
+    Addr:    ":8080",
+    Handler: root,                       // el mux con todos los middlewares
+
+    // Tiempo máximo para recibir los headers. Es el que corta Slowloris.
+    // Debe ser corto: nadie tarda 5 s en mandar 400 bytes de headers.
+    ReadHeaderTimeout: 5 * time.Second,
+
+    // Headers + body completo. Subilo solo en endpoints de upload,
+    // y mejor por request (ver más abajo) que globalmente.
+    ReadTimeout: 15 * time.Second,
+
+    // Desde que se terminan de leer los headers hasta que se termina
+    // de escribir la respuesta. Acota el handler entero.
+    WriteTimeout: 30 * time.Second,
+
+    // Cuánto vive una conexión keep-alive ociosa esperando otro request.
+    IdleTimeout: 120 * time.Second,
+
+    // Cota dura al tamaño de headers (default 1 MB).
+    MaxHeaderBytes: 1 &lt;&lt; 20,
+
+    // Que los logs internos del server vayan a tu logger, no a stderr pelado.
+    ErrorLog: log.New(logWriter{}, "", 0),
+}
+
+if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
+    log.Fatalf("servidor caído: %v", err)
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Campo</th><th>Qué acota</th><th>Default</th><th>Valor sano</th><th>Si lo dejás en 0</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ReadHeaderTimeout</code></td><td>Recibir la request line + headers</td><td>∞ (usa ReadTimeout)</td><td>5 s</td><td>Slowloris: conexiones abiertas para siempre</td></tr>
+    <tr><td><code>ReadTimeout</code></td><td>Headers + body</td><td>∞</td><td>15–30 s</td><td>Un upload lento te retiene recursos sin fin</td></tr>
+    <tr><td><code>WriteTimeout</code></td><td>Ejecución del handler + escritura</td><td>∞</td><td>30 s</td><td>Un handler colgado nunca libera la conexión</td></tr>
+    <tr><td><code>IdleTimeout</code></td><td>Keep-alive ocioso</td><td>usa ReadTimeout</td><td>60–120 s</td><td>Miles de conexiones ociosas acumuladas</td></tr>
+    <tr><td><code>MaxHeaderBytes</code></td><td>Tamaño de headers</td><td>1 MB</td><td>1 MB</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<h3>El caso incómodo: streaming, SSE y WebSockets</h3>
+
+<p><code>WriteTimeout</code> es global y por lo tanto choca con cualquier respuesta larga: un Server-Sent Events que dura una hora se corta a los 30 segundos. La solución vieja era poner <code>WriteTimeout: 0</code> y quedarse sin protección en todo el servicio. Desde Go 1.20 hay una respuesta mejor: ajustar el deadline <strong>por request</strong>.</p>
+
+<pre><code class="lang-go">func streamEvents(w http.ResponseWriter, r *http.Request) {
+    rc := http.NewResponseController(w)
+
+    // Este request en particular no tiene deadline de escritura.
+    if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+        http.Error(w, "streaming no soportado", http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+
+    for {
+        select {
+        case &lt;-r.Context().Done():   // el cliente cerró: salimos
+            return
+        case ev := &lt;-events:
+            fmt.Fprintf(w, "data: %s\n\n", ev)
+            if err := rc.Flush(); err != nil {
+                return               // conexión rota
+            }
+        }
+    }
+}</code></pre>
+
+<div class="tip">
+  <code>http.ResponseController</code> también resuelve el otro problema histórico: si un middleware envuelve el <code>ResponseWriter</code> para capturar el status code, la envoltura suele <em>perder</em> las interfaces <code>Flusher</code> y <code>Hijacker</code>, y el streaming deja de andar. El controller busca un método <code>Unwrap() http.ResponseWriter</code> en tu envoltura y llega al writer real. Implementalo siempre que envuelvas.
+</div>
+
+<h3>Cota al body: la que casi nadie pone</h3>
+
+<pre><code class="lang-go">func createItem(w http.ResponseWriter, r *http.Request) {
+    // 1 MB máximo. Sin esto, un POST de 4 GB se te va entero a memoria
+    // cuando el decoder de JSON lo materialice.
+    r.Body = http.MaxBytesReader(w, r.Body, 1&lt;&lt;20)
+
+    dec := json.NewDecoder(r.Body)
+    dec.DisallowUnknownFields()   // campo de más = error, no silencio
+
+    var in ItemInput
+    if err := dec.Decode(&amp;in); err != nil {
+        var maxErr *http.MaxBytesError
+        if errors.As(err, &amp;maxErr) {
+            http.Error(w, "body demasiado grande", http.StatusRequestEntityTooLarge)
+            return
+        }
+        http.Error(w, "JSON inválido", http.StatusBadRequest)
+        return
+    }
+    // ...
+}</code></pre>
+
+<h2>GS7.4 El cliente: <code>http.DefaultClient</code> no tiene timeout</h2>
+
+<p>Este es el bug que tumbó producción en todas las empresas que usan Go, sin excepción. Mirá la definición:</p>
+
+<pre><code class="lang-go">// net/http/client.go
+var DefaultClient = &amp;Client{}   // Timeout: 0  →  SIN LÍMITE</code></pre>
+
+<p>Y ahora mirá el código que todos escribimos alguna vez:</p>
+
+<pre><code class="lang-go">// ❌ Todas estas llamadas usan DefaultClient. Ninguna tiene timeout.
+resp, err := http.Get("http://inventario/stock/42")
+resp, err := http.Post(url, "application/json", body)
+resp, err := http.DefaultClient.Do(req)</code></pre>
+
+<p>Si <code>inventario</code> acepta la conexión TCP pero nunca responde —está vivo, pero trabado en un lock de base de datos, o el kernel aceptó el <em>backlog</em> mientras el proceso agoniza— tu goroutine se queda ahí. Para siempre. No hay error, no hay log, no hay métrica que se dispare sola. Simplemente cada request que entra suma una goroutine que nunca sale.</p>
+
+<div class="danger">
+  <strong>⚠️ La aritmética de la caída.</strong> Por la <strong>Ley de Little</strong>, la cantidad de requests en vuelo es <em>L = λ × W</em>: tasa de llegada por tiempo de servicio. A 500 req/s con una latencia normal de 20 ms tenés <strong>10 requests en vuelo</strong>. Si la dependencia pasa a tardar 8 segundos, son <strong>4.000</strong>. Si nunca responde, W es infinito y L crece sin techo: 30.000 goroutines al minuto, cada una con su stack, sus buffers de request y respuesta y su conexión. La memoria sube, el GC trabaja más, todo se pone más lento, el health check empieza a fallar, el orquestador te mata el pod y su tráfico se reparte entre los que quedan. Eso es una cascada, y empezó por un campo sin setear.
+</div>
+
+<h2>GS7.5 <code>http.Client</code> bien configurado</h2>
+
+<p>Un cliente de producción se define una vez, a nivel de paquete, con transport propio:</p>
+
+<pre><code class="lang-go">var inventarioClient = &amp;http.Client{
+    // Cota TOTAL: DNS + conexión + TLS + envío + espera + lectura del body.
+    // Es la red de seguridad, no el mecanismo principal (ver abajo).
+    Timeout: 5 * time.Second,
+
+    Transport: &amp;http.Transport{
+        Proxy: http.ProxyFromEnvironment,
+        DialContext: (&amp;net.Dialer{
+            Timeout:   2 * time.Second,     // establecer TCP
+            KeepAlive: 30 * time.Second,
+        }).DialContext,
+
+        // Pool de conexiones: lo que evita un handshake por request.
+        MaxIdleConns:        200,
+        MaxIdleConnsPerHost: 100,   // ⚠️ el default es 2
+        MaxConnsPerHost:     200,   // cota dura de conexiones simultáneas
+        IdleConnTimeout:     90 * time.Second,
+
+        TLSHandshakeTimeout:   3 * time.Second,
+        ExpectContinueTimeout: 1 * time.Second,
+        ResponseHeaderTimeout: 3 * time.Second,  // esperar el primer byte
+        ForceAttemptHTTP2:     true,
+    },
+}</code></pre>
+
+<div class="mistake">
+  <strong>El default que arruina el rendimiento:</strong> <code>http.DefaultTransport</code> tiene <code>MaxIdleConnsPerHost = 2</code>. Con 200 requests concurrentes al mismo host, 198 conexiones se crean y se cierran en cada ciclo. El resultado es handshake TLS por request, decenas de miles de sockets en <code>TIME_WAIT</code> y, en cargas altas, <strong>agotamiento de puertos efímeros</strong>: el sistema deja de poder abrir conexiones salientes y todo falla con <code>cannot assign requested address</code>. Si tu servicio le pega fuerte a un host, subí <code>MaxIdleConnsPerHost</code>.
+</div>
+
+<div class="mistake">
+  <strong>El otro error clásico:</strong> crear un <code>&amp;http.Client{}</code> nuevo <em>dentro</em> de cada request. Cada cliente nuevo trae su propio Transport, y el Transport es el que tiene el pool. Un cliente por request significa <strong>cero reuso de conexiones</strong> y, además, una fuga: los transports viejos retienen sus conexiones ociosas hasta que el GC los junte. El cliente es un objeto de larga vida, seguro para uso concurrente. Uno por dependencia, a nivel de paquete o inyectado.
+</div>
+
+<h3>El body que hay que cerrar <em>y drenar</em></h3>
+
+<pre><code class="lang-go">resp, err := inventarioClient.Do(req)
+if err != nil {
+    return err          // ⚠️ con err != nil, resp es nil: NO hagas defer antes
+}
+defer func() {
+    // Drenar antes de cerrar: si quedan bytes sin leer, la conexión NO
+    // vuelve al pool, se cierra. Con CopyN acotamos por si el server
+    // mandó 2 GB que no nos interesan.
+    io.CopyN(io.Discard, resp.Body, 64&lt;&lt;10)
+    resp.Body.Close()
+}()
+
+if resp.StatusCode != http.StatusOK {
+    return fmt.Errorf("inventario devolvió %d", resp.StatusCode)
+}
+return json.NewDecoder(resp.Body).Decode(out)</code></pre>
+
+<div class="warn">
+  La fuga clásica es el <code>return</code> temprano por status code: cerrás el body pero nunca lo leíste, así que la conexión se descarta en vez de reutilizarse. En un servicio que chequea status en cada llamada, eso convierte el pool en decorativo. Y la variante peor es no cerrar nada: la conexión queda tomada hasta que el GC corra el finalizador, lo cual puede no pasar nunca en un proceso que no presiona memoria.
+</div>
+
+<h3>Timeout global vs contexto por request</h3>
+
+<p><code>Client.Timeout</code> es una red de seguridad, no el mecanismo fino. Cubre todo el intercambio incluida la lectura del body, así que si vence a mitad de una descarga te da un error parcial raro. Lo que querés en un servicio es que el <strong>contexto del request entrante</strong> gobierne la llamada saliente:</p>
+
+<pre><code class="lang-go">func (s *Service) Stock(ctx context.Context, id string) (int, error) {
+    // Presupuesto propio para esta dependencia, siempre menor que el
+    // del request entrante. Si el contexto padre ya venció, esto falla ya.
+    ctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/stock/"+id, nil)
+    if err != nil {
+        return 0, err
+    }
+    // ... Do, drenar, decodificar
+}</code></pre>
+
+<h2>GS7.6 Middlewares: la firma y el límite</h2>
+
+<p>Go no necesita un tipo <code>Middleware</code>: la firma idiomática es una función que recibe un handler y devuelve otro. Eso es todo, y por eso los middlewares de chi funcionan con la stdlib y viceversa.</p>
+
+<pre><code class="lang-go">type Middleware func(http.Handler) http.Handler
+
+// Chain aplica en orden de lectura: el primero es el más externo.
+func Chain(h http.Handler, ms ...Middleware) http.Handler {
+    for i := len(ms) - 1; i &gt;= 0; i-- {
+        h = ms[i](h)
+    }
+    return h
+}</code></pre>
+
+<pre><code class="lang-go">func RequestID(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        id := r.Header.Get("X-Request-ID")
+        if id == "" {
+            id = uuid.NewString()
+        }
+        w.Header().Set("X-Request-ID", id)
+        ctx := context.WithValue(r.Context(), ctxKeyReqID{}, id)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+func Recover(logger *slog.Logger) Middleware {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            defer func() {
+                if rec := recover(); rec != nil {
+                    // http.ErrAbortHandler es intencional: no es un bug.
+                    if rec == http.ErrAbortHandler {
+                        panic(rec)
+                    }
+                    logger.Error("panic en handler",
+                        "err", rec,
+                        "stack", string(debug.Stack()),
+                        "req_id", reqIDFrom(r.Context()),
+                        "path", r.URL.Path)
+                    http.Error(w, "error interno", http.StatusInternalServerError)
+                }
+            }()
+            next.ServeHTTP(w, r)
+        })
+    }
+}</code></pre>
+
+<pre><code class="lang-go">// El orden importa: lo de afuera envuelve a lo de adentro.
+root := Chain(mux,
+    RequestID,              // 1º: todo lo demás quiere el id
+    Recover(logger),        // 2º: atrapa panics de auth y del handler
+    Logging(logger),        // 3º: mide lo que realmente se ejecuta
+    Metrics(reg),
+    MaxBody(1&lt;&lt;20),
+    Auth(verifier),         // último: ya hay id, logs y recovery
+)</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué va en un middleware y qué no.</strong> Va lo <em>transversal y agnóstico del dominio</em>: request id, recovery, logging, métricas, tracing, CORS, límite de body, autenticación (¿quién sos?), rate limiting, compresión. <strong>No</strong> va la autorización fina (¿podés tocar <em>este</em> recurso?, que depende de datos que el middleware no tiene), la validación específica de un endpoint, ni nada que necesite tipos del dominio. La señal de que te pasaste es cuando el middleware empieza a leer y re-serializar el body, o a hacer un <code>switch</code> por path: eso es un handler mal ubicado.
+</div>
+
+<h2>GS7.7 Graceful shutdown (y por qué en Kubernetes no alcanza)</h2>
+
+<p>Cuando el orquestador te manda SIGTERM, el default de Go es morir en el acto: los requests en vuelo se cortan a la mitad, sus transacciones quedan colgando y el cliente ve una conexión rota. <code>Shutdown</code> resuelve la parte del proceso:</p>
+
+<pre><code class="lang-go">func run(ctx context.Context) error {
+    ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+    defer stop()
+
+    srv := newServer(...)
+
+    errCh := make(chan error, 1)
+    go func() {
+        if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
+            errCh &lt;- err
+        }
+    }()
+
+    select {
+    case err := &lt;-errCh:
+        return err                     // no pudo ni arrancar
+    case &lt;-ctx.Done():
+        logger.Info("señal recibida, drenando")
+    }
+
+    // 1. Dejar de decir que estamos listos. El balanceador tarda en enterarse.
+    health.SetReady(false)
+    time.Sleep(5 * time.Second)
+
+    // 2. Ahora sí: dejar de aceptar, esperar a los que están en vuelo.
+    shCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(shCtx); err != nil {
+        logger.Warn("shutdown forzado", "err", err)
+        srv.Close()
+    }
+
+    // 3. Recién ahora cerrar lo de abajo: DB, colas, flush de trazas.
+    return closeDeps(shCtx)
+}</code></pre>
+
+<p>El <code>time.Sleep</code> del paso 1 parece un hack y es, en realidad, la parte más importante. En Kubernetes, cuando un pod entra en <em>Terminating</em> pasan <strong>dos cosas en paralelo, sin coordinación</strong>: el kubelet manda SIGTERM al contenedor, y el controlador de endpoints le avisa a kube-proxy, al Ingress y a los service meshes que ese pod ya no recibe tráfico. La segunda es una propagación distribuida que tarda segundos. Si vos cerrás el listener apenas llega SIGTERM, durante esos segundos el balanceador sigue mandándote requests y el cliente recibe <em>connection refused</em>: errores 502 en cada deploy, achacados eternamente a "la red".</p>
+
+<div class="warn">
+  <strong>Números que tienen que cerrar.</strong> <code>terminationGracePeriodSeconds</code> (default 30 s) debe ser mayor que <em>sleep + timeout de Shutdown</em>. Con 5 + 20 = 25 s vas justo; poné 40. Si se vence, el kubelet manda SIGKILL y perdés todo lo que estabas drenando. Y ojo: <code>Shutdown</code> <strong>no espera a conexiones <em>hijacked</em></strong> —WebSockets, streams de larga vida—; esas las tenés que rastrear vos y avisarles con <code>srv.RegisterOnShutdown</code>.
+</div>
+
+<h2>GS7.8 Contexto por request: cancelación hasta la base de datos</h2>
+
+<p>En <a href="../gs3-concurrencia/lecture.html">GS3</a> vimos <code>context</code> como mecanismo de cancelación. En un servicio es, además, la única forma de que un cliente que se fue deje de costarte plata. <code>r.Context()</code> se cancela solo cuando el cliente cierra la conexión, y esa cancelación tiene que viajar hacia abajo:</p>
+
+<pre><code class="lang-go">func (r *Repo) Buscar(ctx context.Context, q string) ([]Item, error) {
+    // QueryContext manda un cancel al servidor de la base cuando ctx muere:
+    // Postgres aborta la query. Con Query() a secas, la query sigue corriendo
+    // en el servidor aunque nadie vaya a leer el resultado.
+    rows, err := r.db.QueryContext(ctx, `SELECT id, nombre FROM items WHERE nombre ILIKE $1`, q)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    // ...
+}</code></pre>
+
+<div class="danger">
+  <strong>Por qué esto es un vector de caída y no una prolijidad.</strong> Un usuario impaciente recarga cinco veces una búsqueda pesada. Sin propagación de contexto, esas cinco queries siguen ocupando conexiones del pool y CPU de la base <em>aunque nadie espere la respuesta</em>. El pool se agota, el resto de los endpoints —que no tienen nada que ver— empiezan a fallar por <code>context deadline exceeded</code> pidiendo una conexión, y a los treinta segundos tenés un incidente completo originado en un botón de refresh.
+</div>
+
+<p>El caso inverso también existe: trabajo que <em>debe</em> sobrevivir al request. Un evento de auditoría no se puede perder porque el cliente cerró el navegador. Desde Go 1.21:</p>
+
+<pre><code class="lang-go">func handler(w http.ResponseWriter, r *http.Request) {
+    // ... responder rápido ...
+
+    // Conserva los valores (request id, trazas) pero NO la cancelación.
+    bg := context.WithoutCancel(r.Context())
+    bg, cancel := context.WithTimeout(bg, 10*time.Second)
+    go func() {
+        defer cancel()
+        if err := auditor.Registrar(bg, ev); err != nil {
+            logger.Error("auditoría perdida", "err", err)
+        }
+    }()
+}</code></pre>
+
+<div class="tip">
+  Al depurar, <code>context.Cause(ctx)</code> (1.20+) te dice <em>por qué</em> murió el contexto, no solo que murió. Con <code>context.WithTimeoutCause(ctx, d, errors.New("presupuesto de inventario agotado"))</code> el log deja de decir "context deadline exceeded" —el error más inútil de Go en producción— y pasa a nombrar la etapa exacta que se pasó de tiempo.
+</div>
+
+<h2>GS7.9 Reintentos: exponencial, con jitter, y con presupuesto</h2>
+
+<p>Reintentar es lo primero que se le ocurre a todo el mundo y también la forma más rápida de convertir una degradación en una caída. Un reintento inmediato duplica la carga sobre un servicio que ya no da abasto. Tres reintentos la cuadruplican.</p>
+
+<pre><code class="lang-go">func conBackoff(ctx context.Context, intentos int, fn func(context.Context) error) error {
+    const base = 100 * time.Millisecond
+    const techo = 5 * time.Second
+
+    var err error
+    for i := 0; i &lt; intentos; i++ {
+        if err = fn(ctx); err == nil {
+            return nil
+        }
+        if !esReintentable(err) || i == intentos-1 {
+            return err
+        }
+
+        // Exponencial acotado...
+        espera := min(base&lt;&lt;i, techo)
+        // ...y "full jitter": un valor aleatorio ENTRE 0 y la espera.
+        espera = time.Duration(rand.Int64N(int64(espera)))
+
+        select {
+        case &lt;-ctx.Done():
+            return context.Cause(ctx)   // el presupuesto manda sobre el retry
+        case &lt;-time.After(espera):
+        }
+    }
+    return err
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué el jitter no es un detalle.</strong> Imaginate 2.000 clientes cuyas llamadas fallan todas en el mismo segundo porque el servicio se reinició. Con backoff exponencial <em>puro</em>, los 2.000 esperan exactamente 100 ms y vuelven a pegar <strong>en el mismo milisegundo</strong>. El servicio que estaba levantándose recibe 2.000 requests simultáneos y se cae de nuevo. Repetís a los 200 ms, a los 400 ms: una onda periódica que impide la recuperación para siempre. El jitter reparte esos 2.000 reintentos de forma uniforme en la ventana y el pico se aplana. Sin jitter, <strong>tu política de reintentos es un ataque de denegación de servicio coordinado contra tu propia infraestructura</strong>.
+</div>
+
+<pre><code class="lang-go">func esReintentable(err error) bool {
+    if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+        return false                 // el presupuesto ya se acabó
+    }
+    var he *HTTPError
+    if errors.As(err, &amp;he) {
+        switch he.Status {
+        case 429, 502, 503, 504:
+            return true              // sobrecarga o falla transitoria
+        }
+        return false                 // 4xx: reintentar no cambia nada
+    }
+    var ne net.Error
+    return errors.As(err, &amp;ne)       // errores de red: sí
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Regla</th><th>Por qué</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Solo operaciones idempotentes</td><td>Un POST reintentado puede cobrar dos veces (ver GS7.12)</td></tr>
+    <tr><td>Solo errores reintentables</td><td>Reintentar un 400 es gastar cuota para recibir el mismo 400</td></tr>
+    <tr><td>Respetá <code>Retry-After</code></td><td>El servidor te está diciendo cuándo volver; ignorarlo es adivinar peor</td></tr>
+    <tr><td>Presupuesto de reintentos</td><td>Cota global (p. ej. 10% de los requests). Sin ella, en una falla total <strong>cuadruplicás</strong> el tráfico</td></tr>
+    <tr><td>Nunca reintentes en cada capa</td><td>3 capas con 3 reintentos = 27 llamadas por un request. Elegí <strong>una</strong> capa</td></tr>
+    <tr><td>El contexto gana siempre</td><td>Si el presupuesto del request se acabó, no hay reintento que valga</td></tr>
+  </tbody>
+</table>
+
+<h2>GS7.10 Circuit breaker: dejar de golpear al que está caído</h2>
+
+<p>El reintento asume que la falla es transitoria. Cuando no lo es —la dependencia está caída hace diez minutos— cada request tuyo gasta un timeout completo, ocupa una goroutine durante todo ese tiempo y le suma carga a un servicio que está tratando de levantarse. El circuit breaker corta ese ciclo con tres estados:</p>
+
+<ul>
+  <li><strong>Cerrado</strong> — todo pasa. Se cuentan fallas en una ventana móvil.</li>
+  <li><strong>Abierto</strong> — se superó el umbral: todo falla <em>al instante</em>, sin tocar la red. Cero latencia, cero goroutines retenidas, cero carga sobre la dependencia.</li>
+  <li><strong>Semiabierto</strong> — pasado el tiempo de espera, dejamos pasar unas pocas pruebas. Si andan, cierra; si no, vuelve a abrir.</li>
+</ul>
+
+<pre><code class="lang-go">var cb = gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{
+    Name:        "inventario",
+    MaxRequests: 3,                 // pruebas permitidas en semiabierto
+    Interval:    30 * time.Second,  // ventana de conteo
+    Timeout:     10 * time.Second,  // cuánto queda abierto antes de probar
+    ReadyToTrip: func(c gobreaker.Counts) bool {
+        ratio := float64(c.TotalFailures) / float64(c.Requests)
+        return c.Requests &gt;= 20 &amp;&amp; ratio &gt;= 0.6   // mínimo de muestras + %
+    },
+    OnStateChange: func(name string, from, to gobreaker.State) {
+        logger.Warn("breaker cambió", "dep", name, "de", from, "a", to)
+        breakerState.WithLabelValues(name).Set(float64(to))
+    },
+})
+
+body, err := cb.Execute(func() ([]byte, error) {
+    return llamarInventario(ctx, id)
+})
+if errors.Is(err, gobreaker.ErrOpenState) {
+    return cacheODegradado(id)      // plan B, no un 500
+}</code></pre>
+
+<div class="mistake">
+  <strong>El breaker sin timeout no sirve para nada.</strong> Un breaker cuenta <em>fallas</em>. Si la dependencia no falla sino que <em>tarda</em> —acepta la conexión y no responde— nunca hay una falla que contar, el breaker se queda cerrado y las goroutines se siguen apilando exactamente igual. El timeout es lo que <strong>convierte lentitud en falla</strong>, que es lo único que un breaker sabe medir. Por eso el orden de instalación es siempre: primero timeout, después breaker.
+</div>
+
+<div class="mistake">
+  <strong>Umbral por ratio, nunca por conteo absoluto, y siempre con mínimo de muestras.</strong> "Abrir tras 5 fallas" en un servicio de 10.000 rps abre el breaker con una tasa de error del 0,05%. Y un ratio sin mínimo abre con 1 falla de 1 request en un endpoint de bajo tráfico. Necesitás las dos condiciones.
+</div>
+
+<h2>GS7.11 Límite de concurrencia y rate limiting</h2>
+
+<p>El timeout acota <em>cuánto dura</em> cada request. El límite de concurrencia acota <em>cuántos hay a la vez</em>, que es la otra mitad de la Ley de Little. Es el patrón <em>bulkhead</em>: si el mamparo aguanta, la inundación de un compartimento no hunde el barco.</p>
+
+<pre><code class="lang-go">type Limitada struct {
+    sem chan struct{}       // buffer = concurrencia máxima
+    cli *http.Client
+}
+
+func NewLimitada(max int) *Limitada {
+    return &amp;Limitada{sem: make(chan struct{}, max), cli: inventarioClient}
+}
+
+func (l *Limitada) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+    // El presupuesto se chequea primero: un select con `default` nunca
+    // bloquea, así que mezclar ahí el caso ctx.Done() elige al azar.
+    if ctx.Err() != nil {
+        return nil, context.Cause(ctx)
+    }
+    select {
+    case l.sem &lt;- struct{}{}:
+        defer func() { &lt;-l.sem }()
+    default:
+        // Sin cupo: fallar YA es mejor que encolar. Una cola sin límite
+        // es una fuga de memoria con pasos extra.
+        return nil, ErrSaturado
+    }
+    return l.cli.Do(req)
+}</code></pre>
+
+<p>Del lado de entrada, <code>golang.org/x/time/rate</code> implementa <em>token bucket</em>: una tasa sostenida más un colchón de ráfaga.</p>
+
+<pre><code class="lang-go">// 100 req/s sostenidos, tolerando ráfagas de 200.
+var global = rate.NewLimiter(rate.Limit(100), 200)
+
+func RateLimit(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !global.Allow() {                  // no bloquea: acepta o rechaza
+            w.Header().Set("Retry-After", "1")
+            http.Error(w, "demasiadas solicitudes", http.StatusTooManyRequests)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}</code></pre>
+
+<pre><code class="lang-go">// Por cliente, con expiración: sin la limpieza, el mapa crece para siempre.
+type PorCliente struct {
+    mu    sync.Mutex
+    lims  map[string]*entrada
+    r     rate.Limit
+    burst int
+}
+type entrada struct {
+    lim   *rate.Limiter
+    visto time.Time
+}
+
+func (p *PorCliente) Get(key string) *rate.Limiter {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    e, ok := p.lims[key]
+    if !ok {
+        e = &amp;entrada{lim: rate.NewLimiter(p.r, p.burst)}
+        p.lims[key] = e
+    }
+    e.visto = time.Now()
+    return e.lim
+}
+
+func (p *PorCliente) Limpiar(maxEdad time.Duration) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    for k, e := range p.lims {
+        if time.Since(e.visto) &gt; maxEdad {
+            delete(p.lims, k)
+        }
+    }
+}</code></pre>
+
+<div class="info">
+  <code>Allow()</code> rechaza al instante — es lo que querés en el borde HTTP. <code>Wait(ctx)</code> bloquea hasta que haya token o el contexto muera — sirve para <em>salida</em>, cuando vos controlás el ritmo con el que le pegás a una API de terceros y preferís esperar antes que fallar. Elegir mal el método es transformar un rate limit en una cola invisible.
+</div>
+
+<h2>GS7.12 Idempotencia: el requisito que los reintentos imponen</h2>
+
+<p>Un reintento no distingue "la operación falló" de "la operación funcionó pero la respuesta se perdió". Desde el cliente ambas cosas son el mismo timeout. Por eso, <strong>en cuanto habilitás reintentos estás obligando a que la operación sea idempotente</strong>: repetirla N veces tiene que dar el mismo resultado que ejecutarla una. Si no, el segundo intento de <code>POST /pagos</code> cobra de nuevo.</p>
+
+<table>
+  <thead>
+    <tr><th>Operación</th><th>¿Idempotente?</th><th>Cómo hacerla idempotente</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>GET</code>, <code>HEAD</code></td><td>Sí por definición</td><td>—</td></tr>
+    <tr><td><code>PUT /items/42</code> con estado completo</td><td>Sí</td><td>—</td></tr>
+    <tr><td><code>DELETE /items/42</code></td><td>Sí (el segundo da 404 o 204)</td><td>Devolver 204 siempre, no 404</td></tr>
+    <tr><td><code>POST /pagos</code></td><td><strong>No</strong></td><td>Header <code>Idempotency-Key</code> + índice único</td></tr>
+    <tr><td><code>POST /contador/incrementar</code></td><td><strong>No</strong></td><td>Rediseñar: mandar el valor esperado, no el delta</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="lang-go">func (s *Pagos) Crear(ctx context.Context, key string, p Pago) (Recibo, error) {
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return Recibo{}, err
+    }
+    defer tx.Rollback()
+
+    // La clave se inserta en la MISMA transacción que el efecto.
+    // El índice único es lo que hace atómica la garantía; un "chequear
+    // y después insertar" tiene una ventana de carrera entre las dos.
+    _, err = tx.ExecContext(ctx,
+        `INSERT INTO idempotencia (clave, creado) VALUES ($1, now())`, key)
+    if isUniqueViolation(err) {
+        tx.Rollback()
+        return s.reciboGuardado(ctx, key)   // ya se procesó: devolvemos lo mismo
+    }
+    if err != nil {
+        return Recibo{}, err
+    }
+
+    rec, err := s.cobrar(ctx, tx, p)
+    if err != nil {
+        return Recibo{}, err
+    }
+    if err := s.guardarRecibo(ctx, tx, key, rec); err != nil {
+        return Recibo{}, err
+    }
+    return rec, tx.Commit()
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La clave la genera el cliente, no el servidor</strong>, y la mantiene <em>a través de los reintentos del mismo intento lógico</em>. Si el cliente genera una clave nueva en cada retry, no sirvió de nada. Guardá también la respuesta asociada a la clave, con un TTL (24–72 h): el reintento tardío tiene que recibir el mismo recibo, no un 409 que el cliente no sabe interpretar.
+</div>
+
+<h2>GS7.13 gRPC: cuándo conviene y cuánto cuesta</h2>
+
+<p>gRPC es RPC sobre HTTP/2 con contratos en Protocol Buffers y código generado. La ganancia técnica es real: serialización binaria (3–10× más chica que JSON), multiplexación de muchas llamadas sobre una conexión, streaming bidireccional de primera clase, y —lo más subestimado— <strong>los deadlines viajan en el protocolo</strong>. Si el cliente pone 200 ms, ese presupuesto llega al servidor como header <code>grpc-timeout</code> y se propaga a las llamadas que ese servidor haga a su vez. En REST eso lo tenés que cablear a mano en cada salto.</p>
+
+<pre><code class="lang-go">// inventario/v1/inventario.proto
+syntax = "proto3";
+package inventario.v1;
+
+service Inventario {
+  rpc ObtenerStock(ObtenerStockRequest) returns (ObtenerStockResponse);
+  rpc VigilarStock(VigilarStockRequest) returns (stream StockEvent);
+}
+
+message ObtenerStockRequest { string item_id = 1; }
+message ObtenerStockResponse {
+  int32 cantidad = 1;
+  string deposito = 2;
+  // reserved 3;  // ← números retirados: NUNCA se reutilizan
+}</code></pre>
+
+<pre><code class="lang-go">// Interceptor: el equivalente a un middleware HTTP.
+func LoggingUnary(logger *slog.Logger) grpc.UnaryServerInterceptor {
+    return func(ctx context.Context, req any, info *grpc.UnaryServerInfo,
+        handler grpc.UnaryHandler) (any, error) {
+
+        inicio := time.Now()
+        resp, err := handler(ctx, req)
+        logger.Info("rpc",
+            "metodo", info.FullMethod,
+            "codigo", status.Code(err).String(),
+            "ms", time.Since(inicio).Milliseconds())
+        return resp, err
+    }
+}
+
+srv := grpc.NewServer(
+    grpc.ChainUnaryInterceptor(RecoverUnary(), LoggingUnary(logger), AuthUnary(v)),
+    grpc.KeepaliveParams(keepalive.ServerParameters{
+        MaxConnectionAge:      30 * time.Minute,  // fuerza rebalanceo
+        MaxConnectionAgeGrace: 5 * time.Minute,
+    }),
+)</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Criterio</th><th>REST + JSON</th><th>gRPC</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Cliente en navegador</td><td>Nativo</td><td>Necesita grpc-web o Connect + proxy</td></tr>
+    <tr><td>Contrato</td><td>OpenAPI, opcional y a menudo desactualizado</td><td>El <code>.proto</code> es la fuente de verdad, con codegen</td></tr>
+    <tr><td>Tamaño / CPU</td><td>Texto, parseo caro</td><td>Binario, 3–10× menos bytes</td></tr>
+    <tr><td>Streaming</td><td>SSE o WebSockets, a mano</td><td>4 modos nativos, tipados</td></tr>
+    <tr><td>Deadlines</td><td>Los propagás vos</td><td>Van en el protocolo, extremo a extremo</td></tr>
+    <tr><td>Depuración</td><td><code>curl</code>, cualquier navegador, cualquier proxy</td><td><code>grpcurl</code> + reflection; el payload no se lee a ojo</td></tr>
+    <tr><td>Balanceo de carga</td><td>L4 alcanza</td><td>Conexiones HTTP/2 largas: <strong>requiere L7 o balanceo del lado del cliente</strong></td></tr>
+    <tr><td>Tooling / CI</td><td>Ninguno</td><td><code>protoc</code>/<code>buf</code>, plugins, chequeo de compatibilidad</td></tr>
+    <tr><td>Caché HTTP</td><td>Estándar y gratis</td><td>No aplica</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla práctica.</strong> gRPC para <strong>servicio a servicio interno</strong> con alto volumen, muchos lenguajes y contratos que cambian seguido. REST para <strong>APIs públicas, navegadores y cualquier consumidor que no controlás</strong>. Muchos equipos terminan con las dos cosas: gRPC adentro, un gateway REST en el borde. Si querés el contrato tipado sin el costo operativo de HTTP/2, mirá <strong>Connect-RPC</strong>: mismos <code>.proto</code>, pero habla HTTP/1.1 y se puede <code>curl</code>ear.
+</div>
+
+<div class="warn">
+  <strong>La trampa del balanceo.</strong> gRPC abre <em>una</em> conexión HTTP/2 y multiplexa todo ahí. Un balanceador L4 la asigna a un backend y ahí se queda: si escalás de 3 a 30 réplicas, los clientes existentes le siguen pegando a las 3 originales. Se resuelve con balanceo del lado del cliente (<code>round_robin</code> + resolver DNS), con un proxy L7 o con <code>MaxConnectionAge</code> para forzar reconexiones periódicas. Es el problema número uno de gRPC en Kubernetes y no da ningún error: solo ves réplicas nuevas que no reciben tráfico.
+</div>
+
+<h2>GS7.14 Errores en el borde: no filtrar internals</h2>
+
+<p>El patrón más común de la primera versión de cualquier API Go es también una fuga de información:</p>
+
+<pre><code class="lang-go">// ❌ Le manda al cliente el mensaje crudo del driver.
+if err != nil {
+    http.Error(w, err.Error(), http.StatusInternalServerError)
+    return
+}
+// El cliente recibe algo así:
+// pq: relation "usuarios_internos" does not exist  (host db-prod-3.interno:5432)</code></pre>
+
+<p>Ahí acabás de regalar el motor de base de datos, nombres de tablas, hostnames internos y, con un poco de suerte para el atacante, un fragmento de la query. Es exactamente el <em>Security Misconfiguration</em> del <a href="../../../../sistemas/Curso-Ciberseguridad/m04-owasp-web/lecture.html">M04 del curso de Ciberseguridad</a>: el mensaje de error como herramienta de reconocimiento. La regla es simple y no tiene excepciones: <strong>el detalle va al log con un identificador; al cliente le va una categoría más ese identificador</strong>.</p>
+
+<pre><code class="lang-go">var (
+    ErrNoEncontrado = errors.New("no encontrado")
+    ErrConflicto    = errors.New("conflicto de versión")
+    ErrNoAutorizado = errors.New("no autorizado")
+)
+
+type APIError struct {
+    Code    string `json:"code"`
+    Message string `json:"message"`
+    ReqID   string `json:"request_id"`
+}
+
+func responderError(w http.ResponseWriter, r *http.Request, err error) {
+    reqID := reqIDFrom(r.Context())
+
+    status, code, msg := http.StatusInternalServerError, "internal", "error interno"
+    switch {
+    case errors.Is(err, ErrNoEncontrado):
+        status, code, msg = http.StatusNotFound, "not_found", "recurso inexistente"
+    case errors.Is(err, ErrConflicto):
+        status, code, msg = http.StatusConflict, "conflict", "el recurso cambió"
+    case errors.Is(err, ErrNoAutorizado):
+        status, code, msg = http.StatusForbidden, "forbidden", "sin permisos"
+    case errors.Is(err, context.DeadlineExceeded):
+        status, code, msg = http.StatusGatewayTimeout, "timeout", "tiempo agotado"
+    }
+
+    // El detalle completo va acá, nunca al cliente.
+    logger.Error("request fallido", "err", err, "req_id", reqID,
+        "path", r.URL.Path, "status", status)
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(APIError{Code: code, Message: msg, ReqID: reqID})
+}</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Situación</th><th>Código</th><th>Nota</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>JSON malformado, tipo equivocado</td><td>400</td><td>El cliente puede arreglarlo</td></tr>
+    <tr><td>Sin credenciales o inválidas</td><td>401</td><td>Requiere header <code>WWW-Authenticate</code></td></tr>
+    <tr><td>Autenticado pero sin permiso</td><td>403</td><td>Si revelar la existencia ya es una filtración, devolvé <strong>404</strong></td></tr>
+    <tr><td>Sintaxis válida, semántica imposible</td><td>422</td><td>"fecha de fin anterior al inicio"</td></tr>
+    <tr><td>Choque de estado / versión</td><td>409</td><td>Escritura concurrente, clave duplicada</td></tr>
+    <tr><td>Rate limit</td><td>429</td><td>Siempre con <code>Retry-After</code></td></tr>
+    <tr><td>Bug propio</td><td>500</td><td>Mensaje genérico + request id, nada más</td></tr>
+    <tr><td>Sobrecarga / breaker abierto</td><td>503</td><td>Es reintentable: decilo con <code>Retry-After</code></td></tr>
+    <tr><td>Dependencia no respondió a tiempo</td><td>504</td><td>Distinguilo del 500: cambia el diagnóstico</td></tr>
+  </tbody>
+</table>
+
+<h2>GS7.15 Configuración: fallar al arrancar, no en la primera request</h2>
+
+<p>El anti-patrón que más incidentes silenciosos genera es leer configuración desde adentro del código de negocio:</p>
+
+<pre><code class="lang-go">// ❌ Este error aparece a las tres de la mañana, en el único endpoint
+// que nadie probó después del deploy.
+func (s *Service) enviar(ctx context.Context, m Mensaje) error {
+    url := os.Getenv("NOTIFY_URL")   // vacío en producción, nadie se enteró
+    ...
+}</code></pre>
+
+<p>La configuración se lee, se valida y se congela <strong>una vez, en el arranque</strong>. Si falta algo, el proceso no arranca. Un pod que no levanta se ve en el primer minuto del deploy; un endpoint roto puede tardar semanas en descubrirse.</p>
+
+<pre><code class="lang-go">type Config struct {
+    Addr            string
+    DatabaseURL     string
+    NotifyURL       string
+    InventarioURL   string
+    ShutdownTimeout time.Duration
+    MaxInflight     int
+    LogLevel        slog.Level
+}
+
+func Load() (Config, error) {
+    c := Config{
+        Addr:            getenv("ADDR", ":8080"),
+        DatabaseURL:     os.Getenv("DATABASE_URL"),
+        NotifyURL:       os.Getenv("NOTIFY_URL"),
+        InventarioURL:   os.Getenv("INVENTARIO_URL"),
+        ShutdownTimeout: getdur("SHUTDOWN_TIMEOUT", 20*time.Second),
+        MaxInflight:     getint("MAX_INFLIGHT", 100),
+    }
+
+    var faltan []string
+    for k, v := range map[string]string{
+        "DATABASE_URL":   c.DatabaseURL,
+        "NOTIFY_URL":     c.NotifyURL,
+        "INVENTARIO_URL": c.InventarioURL,
+    } {
+        if v == "" {
+            faltan = append(faltan, k)
+        }
+    }
+    if len(faltan) &gt; 0 {
+        sort.Strings(faltan)
+        // Todas las que faltan de una: no de a una por deploy.
+        return c, fmt.Errorf("faltan variables de entorno: %s", strings.Join(faltan, ", "))
+    }
+    if _, err := url.Parse(c.InventarioURL); err != nil {
+        return c, fmt.Errorf("INVENTARIO_URL inválida: %w", err)
+    }
+    if c.MaxInflight &lt; 1 {
+        return c, errors.New("MAX_INFLIGHT debe ser &gt;= 1")
+    }
+    return c, nil
+}</code></pre>
+
+<div class="tip">
+  Logueá la config resuelta al arrancar, <strong>con los secretos redactados</strong>. La mitad de los incidentes de "está usando la config equivocada" se resuelven en diez segundos con esa línea de log. Y validá también lo <em>alcanzable</em>: un ping a la base y un chequeo de resolución DNS de cada dependencia, con timeout, antes de decir "ready". Es la diferencia entre un pod que falla el arranque y uno que arranca sano para fallar en el primer request real.
+</div>
+
+<h2>GS7.16 Estructura de un servicio Go real</h2>
+
+<pre><code class="lang-bash">servicio/
+├── cmd/
+│   ├── api/main.go          # binario HTTP: solo cableado
+│   └── worker/main.go       # otro binario, mismo internal/
+├── internal/
+│   ├── config/config.go     # Load() + Validate()
+│   ├── http/                # handlers, router, middlewares
+│   │   ├── server.go
+│   │   ├── items.go
+│   │   └── middleware.go
+│   ├── items/               # DOMINIO: entidades y reglas, sin HTTP ni SQL
+│   │   ├── item.go
+│   │   └── service.go
+│   ├── postgres/            # implementación del repositorio
+│   └── inventario/          # cliente de la dependencia externa
+├── migrations/
+├── api/openapi.yaml
+├── go.mod
+└── Makefile</code></pre>
+
+<p>Los dos puntos que importan:</p>
+
+<p><strong><code>cmd/</code> arma, no decide.</strong> <code>main</code> debe ser lo más chico posible y, sobre todo, testeable: la convención es un <code>run(ctx) error</code> con toda la lógica y un <code>main</code> de cuatro líneas.</p>
+
+<pre><code class="lang-go">func main() {
+    if err := run(context.Background()); err != nil {
+        fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+        os.Exit(1)
+    }
+}
+
+func run(ctx context.Context) error {
+    cfg, err := config.Load()
+    if err != nil {
+        return err                       // no arranca: perfecto
+    }
+    logger := newLogger(cfg.LogLevel)
+
+    db, err := postgres.Open(ctx, cfg.DatabaseURL)
+    if err != nil {
+        return fmt.Errorf("conectando a la base: %w", err)
+    }
+    defer db.Close()
+
+    // Dependencias explícitas hacia abajo. Sin globals, sin init().
+    repo := postgres.NewItems(db)
+    inv := inventario.New(cfg.InventarioURL, inventario.WithBreaker(), inventario.WithLimit(100))
+    svc := items.NewService(repo, inv, logger)
+    srv := httpapi.NewServer(cfg, svc, logger)
+
+    return srv.Run(ctx)                  // incluye el graceful shutdown
+}</code></pre>
+
+<p><strong><code>internal/</code> no es una convención: es una regla del compilador.</strong> Un paquete que esté debajo de un directorio llamado <code>internal</code> solo puede ser importado por código cuya raíz sea el <em>padre</em> de ese <code>internal</code>. Si alguien de otro módulo intenta importarlo, no recibe un comentario en el code review: recibe un error de compilación.</p>
+
+<pre><code class="lang-bash">$ go build ./...
+package otroproyecto/x imports github.com/vos/servicio/internal/items:
+        use of internal package github.com/vos/servicio/internal/items not allowed</code></pre>
+
+<div class="rule">
+  <strong>📌 Poné todo en <code>internal/</code> por defecto.</strong> Lo que está afuera es API pública de tu módulo, y una vez que alguien la importa ya no la podés cambiar sin romperlo. Sacá un paquete de <code>internal/</code> solo cuando decidís explícitamente sostenerlo. Y sobre <code>pkg/</code>: no aporta nada que <code>internal/</code> o la raíz no den ya; es un patrón heredado de otros ecosistemas. Nombrá los paquetes por lo que <em>son</em> (<code>items</code>, <code>postgres</code>, <code>inventario</code>), nunca por su capa (<code>utils</code>, <code>helpers</code>, <code>common</code>, <code>models</code>): esos nombres crecen sin límite porque nada queda afuera de su definición.
+</div>
+
+<h2>GS7.17 Worked Example: la caída en cascada</h2>
+
+<p><strong>El sistema.</strong> <code>checkout</code> (12 réplicas, 500 req/s en total, 2 vCPU y 512 MB por pod) llama a <code>inventario</code> en cada request. En operación normal <code>inventario</code> responde en 20 ms y el p99 de checkout es 40 ms.</p>
+
+<p><strong>El incidente.</strong> Un martes a las 14:07, <code>inventario</code> pierde un índice tras una migración. Sus queries pasan de 15 ms a 8 segundos. No devuelve errores: acepta la conexión y contesta, tarde. A las 14:09, <code>checkout</code> empieza a devolver 502 en <em>todos</em> sus endpoints, incluidos los que no tocan inventario. A las 14:11 los pods entran en <code>CrashLoopBackOff</code>. Inventario, mientras tanto, sigue vivo y respondiendo.</p>
+
+<p><strong>El código.</strong> Lo que había en el cliente era esto:</p>
+
+<pre><code class="lang-go">func stock(id string) (int, error) {
+    resp, err := http.Get("http://inventario/stock/" + id)   // DefaultClient
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    var out struct{ Cantidad int }
+    return out.Cantidad, json.NewDecoder(resp.Body).Decode(&amp;out)
+}</code></pre>
+
+<p><strong>El diagnóstico.</strong> Tres señales, en este orden:</p>
+
+<pre><code class="lang-bash"># 1. Goroutines: la métrica que grita antes que ninguna otra.
+$ curl -s localhost:6060/debug/pprof/goroutine?debug=1 | head -5
+goroutine profile: total 31482
+28901 @ 0x43e5c5 0x4a1f0d 0x4a3b21 ...
+#       net/http.(*persistConn).roundTrip
+#       net/http.(*Transport).RoundTrip
+#       checkout/internal/inventario.stock
+
+# 2. Memoria: el heap crece de forma monótona, sin picos de GC que lo bajen.
+$ kubectl top pod -l app=checkout
+NAME              CPU    MEMORY
+checkout-7d9-abc  1890m  487Mi     # límite: 512Mi
+
+# 3. Eventos: la confirmación.
+$ kubectl get events --field-selector reason=OOMKilling
+14:11:03  Pod checkout-7d9-abc  Container checkout OOMKilled (exit 137)</code></pre>
+
+<p>28.901 goroutines bloqueadas en <code>roundTrip</code>. La cuenta cierra con la Ley de Little: 500 req/s × ~58 s acumulados = ~29.000 en vuelo. Cada una retiene stack, buffers y una conexión. El heap crece hasta el límite del contenedor y el kernel mata el proceso. Cuando <code>checkout-abc</code> muere, sus 500 req/s se reparten entre los 11 pods restantes, que llegan al límite <em>más rápido</em>. Eso es la cascada: no la causó inventario, la causó la ausencia de un límite en checkout.</p>
+
+<h3>Solución por capas, midiendo cada una</h3>
+
+<p><strong>Capa 1 — Timeout en el cliente.</strong> Un cambio de tres líneas:</p>
+
+<pre><code class="lang-go">var invClient = &amp;http.Client{
+    Timeout:   800 * time.Millisecond,
+    Transport: transportProduccion(),   // con MaxIdleConnsPerHost decente
+}
+
+func stock(ctx context.Context, id string) (int, error) {
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://inventario/stock/"+id, nil)
+    resp, err := invClient.Do(req)
+    ...
+}</code></pre>
+
+<p>Ahora W está acotado en 0,8 s, así que L = 500 × 0,8 = <strong>400 goroutines</strong> como máximo, sin importar cuánto empeore inventario. El endpoint de checkout sigue fallando —inventario no responde, no hay magia— pero <strong>el proceso sobrevive</strong>: la memoria se estabiliza, los health checks pasan, los otros endpoints atienden normal y el pod no se reinicia. El incidente pasa de "checkout caído" a "checkout con una funcionalidad degradada", que es una página de guardia distinta.</p>
+
+<p><strong>Capa 2 — Límite de concurrencia (bulkhead).</strong> Un semáforo de 100 sobre las llamadas a inventario. Con cupo lleno se responde al instante con un error de saturación. Las goroutines quedan en 100 en vez de 400, y —lo más importante— las conexiones del pool de Postgres que esos handlers tenían tomadas quedan libres: los endpoints que sí funcionan dejan de competir por recursos con los que están muriendo.</p>
+
+<p><strong>Capa 3 — Circuit breaker.</strong> Con el timeout convirtiendo lentitud en falla, el breaker por fin tiene algo que contar: tras 20 fallas con ratio ≥ 0,6, abre. La latencia del camino roto cae de 800 ms a microsegundos, así que el request de checkout responde rápido con su plan B (último stock cacheado) en vez de gastar el presupuesto entero del usuario. E inventario deja de recibir 500 req/s y pasa a recibir 3 pruebas cada 10 segundos, lo cual le da margen real para recuperarse.</p>
+
+<table>
+  <thead>
+    <tr><th>Configuración</th><th>Goroutines pico</th><th>RSS</th><th>p99 checkout</th><th>Otros endpoints</th><th>Resultado</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Normal (sin incidente)</td><td>60</td><td>92 MB</td><td>40 ms</td><td>OK</td><td>—</td></tr>
+    <tr><td>Incidente, sin protecciones</td><td>28.901 y subiendo</td><td>487 MB</td><td>∞</td><td><strong>caídos</strong></td><td>🔴 OOMKill en 4 min, cascada</td></tr>
+    <tr><td>+ Timeout 800 ms</td><td>400</td><td>138 MB</td><td>800 ms (error)</td><td>OK</td><td>🟢 <strong>sobrevive: el 80% del arreglo</strong></td></tr>
+    <tr><td>+ Límite 100</td><td>100</td><td>104 MB</td><td>800 ms / fail-fast</td><td>OK, sin contención</td><td>🟢 aísla el daño</td></tr>
+    <tr><td>+ Circuit breaker</td><td>&lt; 10</td><td>95 MB</td><td>3 ms (degradado)</td><td>OK</td><td>🟢 UX aceptable + deja recuperarse</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La moraleja tiene dos partes.</strong> Primera: <strong>el timeout solo resuelve el 80%</strong>. Es tres líneas, no tiene dependencias, no requiere una biblioteca ni una decisión de arquitectura, y es la diferencia entre un incidente y una caída. Las capas 2 y 3 mejoran la calidad de la degradación; la capa 1 es la que evita que te mueras. Segunda: <strong>el orden no es negociable</strong>. Un breaker sin timeout no cuenta nada porque no hay fallas, solo lentitud. Un límite de concurrencia sin timeout retrasa el OOM pero no lo evita, porque los slots nunca se liberan. Timeout → límite → breaker.
+</div>
+
+<div class="info">
+  La parte que este módulo no cubre es cómo te enterás <em>a las 14:07 y no a las 14:11</em>. La métrica que había que tener graficada es <code>go_goroutines</code>, y la alerta es "creciendo de forma monótona durante 2 minutos" — es el indicador más barato y más predictivo que existe en un servicio Go. Eso, más trazas para ver en qué salto se va el tiempo, es <a href="../gs8-observabilidad/lecture.html">GS8</a>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un circuit breaker no habría evitado la caída de checkout si no se agregaba antes el timeout?</summary>
+<p>Porque un breaker cuenta <strong>fallas</strong>, y en ese incidente <em>no había fallas</em>: inventario aceptaba las conexiones y respondía, solo que tarde. Sin timeout, cada llamada quedaba pendiente indefinidamente, nunca devolvía un error, y el contador del breaker se quedaba en cero mientras las goroutines se apilaban exactamente igual. El timeout es lo que traduce "lento" a "falló", que es el único lenguaje que un breaker entiende. Por eso el orden de instalación es timeout primero, después límite de concurrencia, después breaker: cada capa depende de que la anterior exista.</p></details>
+
+<details><summary>En Kubernetes, ¿por qué llamar a <code>srv.Shutdown()</code> apenas llega SIGTERM produce 502 en cada deploy?</summary>
+<p>Porque el SIGTERM y la baja del pod de los endpoints del Service ocurren <strong>en paralelo y sin coordinación</strong>. El kubelet te manda la señal en el instante en que el controlador de endpoints empieza a propagar la novedad a kube-proxy, al Ingress y al service mesh, y esa propagación tarda segundos. Si cerrás el listener en el milisegundo cero, durante esa ventana el balanceador sigue enviándote tráfico y cada request nuevo rebota con <em>connection refused</em>. La secuencia correcta es: marcar el readiness como no-listo, esperar unos 5 segundos a que el balanceador se entere, y recién ahí llamar a <code>Shutdown</code> — asegurándote de que <code>terminationGracePeriodSeconds</code> sea mayor que la espera más el timeout de drenado.</p></details>
+
+<details><summary>Habilitás reintentos con backoff en el cliente de pagos. ¿Qué cambió del lado del servidor?</summary>
+<p>Que el servidor ahora <strong>debe</strong> ser idempotente para esa operación, porque un timeout del cliente no distingue "no se procesó" de "se procesó y se perdió la respuesta". El segundo intento de un <code>POST /pagos</code> sin protección cobra dos veces. La solución es una <code>Idempotency-Key</code> generada por el cliente y estable a lo largo de los reintentos del mismo intento lógico, insertada con un índice único <em>dentro de la misma transacción</em> que produce el efecto: si la inserción viola la restricción, la operación ya ocurrió y se devuelve el recibo guardado en vez de volver a cobrar. Chequear-y-después-insertar en dos pasos no sirve: tiene una ventana de carrera justo en el medio.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Desde <strong>1.22</strong> el <code>ServeMux</code> de la stdlib entiende <code>GET /items/{id}</code>, <code>{path...}</code> y <code>{$}</code>, gana el patrón más específico y los conflictos panickean al registrar. Para la mayoría de los servicios, ya no hace falta un framework.</li>
+  <li><code>http.ListenAndServe</code> deja <strong>todos los timeouts en cero</strong>. Un server de producción setea <code>ReadHeaderTimeout</code>, <code>ReadTimeout</code>, <code>WriteTimeout</code> e <code>IdleTimeout</code>; para streaming se ajusta el deadline por request con <code>http.ResponseController</code>.</li>
+  <li><code>http.DefaultClient</code> <strong>no tiene timeout</strong>. Es la causa raíz más común de caídas por cascada en Go. Cliente propio, timeout, <code>MaxIdleConnsPerHost</code> por encima del default de 2, y <code>NewRequestWithContext</code> para que mande el presupuesto del request.</li>
+  <li>El <code>resp.Body</code> se <strong>drena y se cierra</strong>. Cerrar sin leer descarta la conexión en vez de devolverla al pool.</li>
+  <li>Middleware es <code>func(http.Handler) http.Handler</code>. Ahí va lo transversal; la lógica de dominio va en el handler o en el servicio.</li>
+  <li>Graceful shutdown = readiness en falso → esperar a que el balanceador se entere → <code>Shutdown(ctx)</code> → cerrar dependencias. Con <code>terminationGracePeriodSeconds</code> más grande que la suma.</li>
+  <li>El contexto del request viaja hasta la base con <code>QueryContext</code>. Un request abandonado que sigue quemando CPU y conexiones es un vector de caída, no una prolijidad.</li>
+  <li>Reintentos: exponencial <strong>con jitter</strong> (sin jitter creás una estampida sincronizada contra el servicio que se está recuperando), solo en errores reintentables, solo en operaciones idempotentes, con presupuesto y en una sola capa.</li>
+  <li>El breaker necesita el timeout para tener fallas que contar. Umbral por <em>ratio</em> con mínimo de muestras, nunca por conteo absoluto.</li>
+  <li>Reintentos ⇒ idempotencia: <code>Idempotency-Key</code> del cliente + índice único en la misma transacción que el efecto.</li>
+  <li>gRPC adentro (contratos, streaming, deadlines propagados); REST en el borde. El costo real es tooling, depuración y balanceo de HTTP/2.</li>
+  <li>Nunca <code>http.Error(w, err.Error(), 500)</code>: detalle al log con request id, categoría al cliente, código de estado correcto.</li>
+  <li>La config se valida al arrancar y el proceso no levanta si falta algo. <code>cmd/</code> cablea, <code>internal/</code> es una garantía del <em>compilador</em>, no una convención.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Levantá un servicio con <code>http.ListenAndServe</code> y atacalo con un cliente que abra 500 conexiones y mande un byte de header por segundo (Slowloris). Medí file descriptors (<code>lsof -p</code>) y goroutines. Agregá <code>ReadHeaderTimeout: 5s</code> y repetí la medición. Documentá los dos números.</li>
+  <li>Escribí un servidor falso que acepte la conexión y nunca responda (<code>select{}</code> dentro del handler). Pegale desde un cliente con <code>http.Get</code> a 200 req/s durante un minuto y graficá <code>runtime.NumGoroutine()</code>. Después poné <code>Timeout: 500ms</code> y verificá que la curva se aplane en el valor que predice la Ley de Little.</li>
+  <li>Comprobá el efecto del pool: hacé 10.000 requests con <code>MaxIdleConnsPerHost</code> en 2 y en 100, contando conexiones nuevas con <code>httptrace.ClientTrace.ConnectStart</code>. Compará tiempo total y cantidad de handshakes.</li>
+  <li>Implementá <code>conBackoff</code> con y sin jitter. Simulá 1.000 clientes que fallan en el mismo instante y graficá reintentos por intervalo de 10 ms en ambos casos. Mostrá el pico que desaparece.</li>
+  <li>Poné un breaker sobre una dependencia que <em>tarda</em> 30 s en vez de fallar. Verificá que nunca se abre. Agregá el timeout y verificá que ahora sí. Escribí el test que deja esa relación documentada.</li>
+  <li>Hacé idempotente un <code>POST /pagos</code> con <code>Idempotency-Key</code> e índice único. Escribí un test que lance 50 goroutines con la <em>misma</em> clave simultáneamente y afirme que se creó exactamente un pago y que las 50 respuestas son idénticas.</li>
+  <li>Tomá un servicio HTTP tuyo y expandilo a gRPC: un <code>.proto</code>, el server generado, un interceptor de logging y un cliente. Medí bytes en la red con <code>tcpdump</code> y latencia p99 contra la versión JSON, con el mismo payload.</li>
+  <li>Implementá el <code>run(ctx) error</code> completo del GS7.16 con graceful shutdown y escribí un test de integración que arranque el servidor, dispare un request lento, mande SIGTERM y afirme que ese request <strong>terminó bien</strong> antes de que el proceso salga.</li>
+</ol>
+
+<section class="quiz" id="quizGS7">
+  <style>
+    #quizGS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS7 .q{margin-bottom:1.5rem}
+    #quizGS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS7 .opt:hover{border-color:var(--accent)}
+    #quizGS7 .opt:disabled{cursor:default}
+    #quizGS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizGS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizGS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS7 .exp.show{display:block}
+    #quizGS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu servicio recibe 400 req/s y le pega a una dependencia que dejó de responder (acepta la conexión, no contesta nunca). Usás <code>http.Get</code>. ¿Qué pasa y por qué?</p>
+    <button class="opt">Los requests fallan de a poco con <code>connection timeout</code> y el servicio se degrada de forma controlada</button>
+    <button class="opt">Las goroutines se acumulan sin techo porque <code>http.DefaultClient</code> no tiene timeout, y el proceso termina en OOM</button>
+    <button class="opt">Go cancela automáticamente las llamadas cuando detecta que la goroutine lleva mucho tiempo bloqueada</button>
+    <div class="exp"><code>DefaultClient</code> es <code>&amp;Client{}</code>, con <code>Timeout: 0</code>, que significa "sin límite". Por la Ley de Little, con el tiempo de servicio tendiendo a infinito la cantidad de requests en vuelo crece sin techo: 400/s × 60 s = 24.000 goroutines al minuto, cada una con su stack, sus buffers y su conexión. La memoria sube hasta el límite del contenedor, el runtime no cancela nada por su cuenta, y el kernel mata el proceso. El arreglo son tres líneas: un <code>http.Client</code> propio con <code>Timeout</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Agregás reintentos con backoff exponencial sin jitter. Tu dependencia se reinicia y 2.000 clientes fallan en el mismo segundo. ¿Cuál es la consecuencia?</p>
+    <button class="opt">Ninguna relevante: el backoff exponencial ya separa los reintentos lo suficiente</button>
+    <button class="opt">Los reintentos se pierden porque todos usan el mismo valor de espera y el runtime los deduplica</button>
+    <button class="opt">Los 2.000 reintentan en el mismo milisegundo y tumban de nuevo al servicio que estaba levantándose, en una onda que se repite en cada nivel del backoff</button>
+    <div class="exp">El backoff exponencial separa <em>intentos sucesivos de un mismo cliente</em>, pero no separa a los clientes <em>entre sí</em>: si todos fallaron en t0 y todos esperan exactamente 100 ms, todos vuelven en t0+100 ms. El servicio que estaba arrancando recibe el pico completo y se cae otra vez, y el ciclo se repite a los 200 ms, a los 400 ms. El <em>full jitter</em> —esperar un valor aleatorio entre 0 y la ventana calculada— reparte esos reintentos de forma uniforme y aplana el pico. Sin jitter, tu política de reintentos es una denegación de servicio coordinada contra tu propia infraestructura.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu handler devuelve <code>http.Error(w, err.Error(), 500)</code> y el error viene del driver de Postgres. ¿Cuál es el problema principal?</p>
+    <button class="opt">Filtra internals al cliente —motor, tablas, hostnames— y le regala reconocimiento a un atacante; el detalle va al log con un request id y al cliente le va una categoría</button>
+    <button class="opt">Que 500 no es el código correcto: para errores de base de datos corresponde 503</button>
+    <button class="opt">Que <code>http.Error</code> no setea <code>Content-Type</code> y el cliente no puede parsear la respuesta</button>
+    <div class="exp">El mensaje crudo del driver puede incluir el motor, el nombre de la tabla, el host interno y hasta un pedazo de la query: es exactamente el <em>Security Misconfiguration</em> del M04 de Ciberseguridad, el error como herramienta de reconocimiento. El patrón correcto es mapear errores de dominio a códigos con <code>errors.Is</code>/<code>errors.As</code>, loguear el detalle completo junto al request id, y devolverle al cliente una categoría estable más ese id para que soporte pueda correlacionar. Y sí, el código importa —504 si venció una dependencia, 503 si estás sobrecargado— pero es secundario frente a la filtración.</div>
+  </div>
+
+  <div class="score" id="scoreGS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con GS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs6-testing/lecture.html">← GS6: Testing serio</a>
+  <a href="../gs8-observabilidad/lecture.html">GS8: Observabilidad y operación →</a>
+</nav>
+
+</div>
+</body>
+</html>

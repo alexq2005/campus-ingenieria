@@ -1,0 +1,1466 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS5 — Unsafe correcto: invariantes, UB y FFI · Rust Senior</title>
+  <meta name="description" content="Qué habilita realmente unsafe, cómo se construye una safety boundary, el catálogo de Undefined Behavior, punteros crudos y provenance, MaybeUninit, Miri, unsafe impl Send/Sync, FFI con C y cuándo NO usar unsafe. Rust 1.95, edición 2024.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS5</span>
+  <span class="badge">⏱ 55–170 min</span>
+  <span class="badge">🎯 Pre-req: RuS1</span>
+  <span class="badge">⚠️ Unsafe</span>
+</div>
+
+<article>
+
+<h1>RuS5 — Unsafe correcto: invariantes, UB y FFI</h1>
+
+<h2>RuS5.0 Por qué este módulo</h2>
+
+<p>Hay una frase que circula en foros, en respuestas de Stack Overflow y en más de un code review: <em>"metelo en un <code>unsafe</code> y listo"</em>. Esa frase describe mal lo que pasa. <code>unsafe</code> no es un interruptor que apaga las reglas. No desactiva el borrow checker, no relaja los lifetimes, no permite mutar detrás de una referencia compartida, no convierte el código en C.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> <code>unsafe</code> <strong>no te da permisos: te transfiere obligaciones</strong>. Es una anotación que dice, literalmente: <em>"acá hay invariantes que el compilador ya no puede verificar, y yo, el autor, me hago cargo de mantenerlos"</em>. El conjunto de reglas que hay que respetar es <strong>exactamente el mismo</strong> con y sin <code>unsafe</code>. Lo único que cambia es quién las chequea.
+</div>
+
+<p>La consecuencia práctica de entenderlo así es enorme. Si <code>unsafe</code> fuera un permiso, la pregunta de diseño sería "¿me alcanza con este permiso?". Como es una obligación, la pregunta correcta es otra: <strong>"¿puedo enunciar por escrito el invariante del que me estoy haciendo cargo, y puedo garantizar que ningún uso de esta API lo rompa?"</strong>. Si no podés escribir esa frase, no estás listo para escribir el bloque.</p>
+
+<p>Empecemos por desarmar el mito más común. Este código no compila, y el <code>unsafe</code> no ayuda en nada:</p>
+
+<pre><code class="lang-rust">fn main() {
+    let mut v = vec![1, 2, 3];
+    unsafe {
+        let primero = &amp;v[0];   // préstamo compartido, vive hasta el println
+        v.push(4);             // ERROR: cannot borrow `v` as mutable
+        println!("{primero}");
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable
+ --&gt; src/main.rs:5:9
+  |
+4 |         let primero = &amp;v[0];
+  |                        - immutable borrow occurs here
+5 |         v.push(4);
+  |         ^^^^^^^^^ mutable borrow occurs here
+6 |         println!("{primero}");
+  |                    ------- immutable borrow later used here</code></pre>
+
+<div class="rule">
+  <strong>📌 Dentro de un bloque <code>unsafe</code>, el 95% de Rust sigue siendo exactamente igual.</strong> Ownership, borrowing, lifetimes, <code>Drop</code>, chequeo de tipos, exhaustividad de <code>match</code>: todo intacto. <code>unsafe</code> agrega cinco capacidades puntuales y nada más. Esa lista es corta y hay que sabérsela de memoria.
+</div>
+
+<h2>RuS5.1 Qué habilita exactamente <code>unsafe</code></h2>
+
+<p>La lista completa, sin excepciones, es esta:</p>
+
+<ol>
+  <li><strong>Desreferenciar un puntero crudo</strong> (<code>*const T</code> o <code>*mut T</code>).</li>
+  <li><strong>Llamar a una función o método marcado <code>unsafe</code></strong> — incluidas las funciones de un bloque <code>extern</code>.</li>
+  <li><strong>Implementar un trait <code>unsafe</code></strong> (<code>Send</code>, <code>Sync</code>, <code>GlobalAlloc</code>, <code>Allocator</code>, ...).</li>
+  <li><strong>Acceder o modificar un <code>static mut</code></strong>.</li>
+  <li><strong>Leer un campo de una <code>union</code></strong>.</li>
+</ol>
+
+<p>Nada más. Ni un ítem más. Es útil verlo escrito en código, porque muestra lo acotado que es el permiso:</p>
+
+<pre><code class="lang-rust">static mut CONTADOR: u32 = 0;
+
+union Bits {
+    entero: u32,
+    flotante: f32,
+}
+
+unsafe fn peligrosa() -&gt; u8 { 42 }
+
+unsafe trait DeclaroAlgoQueNoSePuedeVerificar {}
+struct Marcador;
+unsafe impl DeclaroAlgoQueNoSePuedeVerificar for Marcador {}
+
+fn main() {
+    let x = 10i32;
+    let p: *const i32 = &amp;x;
+
+    unsafe {
+        let _1 = *p;                              // (1) desreferenciar
+        let _2 = peligrosa();                     // (2) llamar unsafe fn
+        // (3) el `unsafe impl` de arriba
+        CONTADOR += 1;                            // (4) static mut (ver más abajo)
+        let b = Bits { entero: 0x4048_F5C3 };
+        let _3 = b.flotante;                      // (5) leer campo de union
+    }
+}</code></pre>
+
+<div class="info">
+  Fijate en el punto (3): <code>unsafe trait</code> y <code>unsafe impl</code> no tienen nada que ver con punteros. Un trait es <code>unsafe</code> cuando <em>otro</em> código va a confiar ciegamente en una promesa que el compilador no puede comprobar. <code>Send</code> promete "es seguro mover esto a otro hilo". <code>Sync</code> promete "es seguro compartir <code>&amp;T</code> entre hilos". Quien implementa, promete; quien usa, confía.
+</div>
+
+<h3>La edición 2024 endureció el terreno</h3>
+
+<p>Si venís de código escrito para la edición 2018 o 2021, hay cuatro cambios de la <strong>edición 2024</strong> (estable desde Rust 1.85, y el default de <code>cargo new</code> en <strong>Rust 1.95</strong>) que afectan directo a este módulo.</p>
+
+<p><strong>Primero:</strong> el cuerpo de una <code>unsafe fn</code> ya <em>no</em> es un bloque <code>unsafe</code> implícito. El lint <code>unsafe_op_in_unsafe_fn</code> pasó a <em>warn</em> por defecto:</p>
+
+<pre><code class="lang-rust">// Edición 2021: compilaba sin decir nada.
+// Edición 2024: warning `unsafe_op_in_unsafe_fn`.
+pub unsafe fn leer(p: *const u8) -&gt; u8 {
+    *p                    // ⚠️ operación unsafe sin bloque explícito
+}
+
+// Forma correcta en edición 2024:
+pub unsafe fn leer_ok(p: *const u8) -&gt; u8 {
+    // SAFETY: el contrato de esta función exige que `p` sea válido para
+    // lectura de 1 byte y esté correctamente alineado. Lo delegamos al llamador.
+    unsafe { *p }
+}</code></pre>
+
+<p>El cambio parece burocrático y no lo es. Antes, una <code>unsafe fn</code> de 80 líneas era un bloque <code>unsafe</code> gigante donde <em>cualquier</em> línea podía ser la peligrosa. Ahora las operaciones riesgosas están marcadas una por una y cada una puede tener su justificación al lado. Auditar deja de ser leer 80 líneas y pasa a ser leer tres.</p>
+
+<p><strong>Segundo:</strong> los bloques <code>extern</code> ahora se declaran <code>unsafe extern</code>, y se puede marcar como <code>safe</code> a los ítems que realmente lo son:</p>
+
+<pre><code class="lang-rust">unsafe extern "C" {
+    // Llamarla puede violar invariantes: el llamador se hace cargo.
+    fn strlen(s: *const core::ffi::c_char) -&gt; usize;
+
+    // Esta no toca punteros ni estado global: es segura de llamar.
+    safe fn abs(x: core::ffi::c_int) -&gt; core::ffi::c_int;
+}
+
+fn main() {
+    let n = abs(-7);              // sin bloque unsafe: está marcada `safe`
+    println!("{n}");
+}</code></pre>
+
+<p><strong>Tercero:</strong> ciertos atributos que afectan el enlazado pasaron a exigir el envoltorio <code>unsafe(...)</code>, porque un símbolo con nombre fijo puede colisionar con otro y romper el programa entero:</p>
+
+<pre><code class="lang-rust">// Edición 2021: #[no_mangle]
+// Edición 2024:
+#[unsafe(no_mangle)]
+pub extern "C" fn sumar(a: i32, b: i32) -&gt; i32 {
+    a + b
+}
+
+// Ídem para #[unsafe(export_name = "...")] y #[unsafe(link_section = "...")]</code></pre>
+
+<p><strong>Cuarto</strong>, y es el que más código viejo rompe: <strong>tomar una referencia a un <code>static mut</code> es un error</strong> en la edición 2024 (el lint <code>static_mut_refs</code> pasó a <em>deny</em>). El motivo es que es prácticamente imposible garantizar que no exista otra referencia viva al mismo <code>static</code>, y dos <code>&amp;mut</code> simultáneos son UB inmediato:</p>
+
+<pre><code class="lang-rust">static mut BUFFER: [u8; 16] = [0; 16];
+
+fn mal() {
+    unsafe {
+        let r = &amp;mut BUFFER;      // ❌ error en edición 2024: static_mut_refs
+        r[0] = 1;
+    }
+}
+
+// Alternativas reales, en orden de preferencia:
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
+static CONTADOR: AtomicU32 = AtomicU32::new(0);          // 1. atómico
+static ESTADO: Mutex&lt;Vec&lt;u8&gt;&gt; = Mutex::new(Vec::new());   // 2. Mutex
+
+fn bien() {
+    CONTADOR.fetch_add(1, Ordering::Relaxed);
+    ESTADO.lock().unwrap().push(7);
+}</code></pre>
+
+<div class="mistake">
+  <strong>Error clásico de principiante avanzado:</strong> "necesito un contador global, uso <code>static mut</code> con <code>unsafe</code>". Casi nunca hace falta. Un <code>AtomicU32</code> es <em>más rápido</em> que un contador con candado, es safe, y no tiene ningún invariante que mantener a mano. El <code>static mut</code> quedó como un artefacto histórico casi sin usos legítimos fuera del arranque de un binario <code>no_std</code>.
+</div>
+
+<h2>RuS5.2 La safety boundary: la idea central del diseño</h2>
+
+<p>Acá está el concepto que separa el <code>unsafe</code> de un profesional del <code>unsafe</code> de alguien que está peleando con el compilador. Se llama <strong>safety boundary</strong> (frontera de seguridad) y se enuncia así:</p>
+
+<div class="rule">
+  <strong>📌 El <code>unsafe</code> se encapsula adentro de una API <code>safe</code> cuyo contrato sea <em>imposible</em> de violar desde afuera.</strong> Si existe alguna secuencia de llamadas —por más rebuscada que sea— que use solo funciones públicas <code>safe</code> y provoque UB, tu API está rota. No "es responsabilidad del usuario": está <strong>rota</strong>.
+</div>
+
+<p>Ese es el criterio que usa la librería estándar. <code>Vec</code> está lleno de punteros crudos, aritmética de punteros y memoria no inicializada, y sin embargo <code>Vec</code> es una API <code>safe</code>: no hay forma de causar UB usando <code>push</code>, <code>pop</code>, indexado y <code>iter()</code>. Todo el peso de mantener el invariante <em>"los primeros <code>len</code> elementos del buffer están inicializados y <code>len &lt;= capacity</code>"</em> vive adentro del tipo.</p>
+
+<p>El ejemplo canónico de por qué esto es un ejercicio de diseño y no de sintaxis es <code>split_at_mut</code>. Queremos partir un slice en dos mitades mutables. El borrow checker no puede aceptarlo porque no sabe razonar sobre índices disjuntos:</p>
+
+<pre><code class="lang-rust">// Esto NO compila: dos préstamos mutables del mismo slice.
+fn partir(s: &amp;mut [i32], medio: usize) -&gt; (&amp;mut [i32], &amp;mut [i32]) {
+    (&amp;mut s[..medio], &amp;mut s[medio..])
+}</code></pre>
+
+<p>La implementación real usa <code>unsafe</code>, pero el punto es <em>dónde</em> lo pone y qué chequea antes:</p>
+
+<pre><code class="lang-rust">use std::slice;
+
+pub fn partir(s: &amp;mut [i32], medio: usize) -&gt; (&amp;mut [i32], &amp;mut [i32]) {
+    let largo = s.len();
+    let ptr = s.as_mut_ptr();
+
+    // El chequeo que hace que el unsafe de abajo sea correcto SIEMPRE.
+    assert!(medio &lt;= largo, "medio ({medio}) fuera de rango ({largo})");
+
+    // SAFETY: `medio &lt;= largo` por el assert de arriba, así que ambos rangos
+    // caen dentro de la asignación de `s`. Los rangos [0, medio) y
+    // [medio, largo) son DISJUNTOS, por lo que los dos `&amp;mut` resultantes
+    // nunca aliasan el mismo elemento. Los lifetimes salientes están atados
+    // al de `s` por la firma, así que no pueden sobrevivirlo.
+    unsafe {
+        (
+            slice::from_raw_parts_mut(ptr, medio),
+            slice::from_raw_parts_mut(ptr.add(medio), largo - medio),
+        )
+    }
+}</code></pre>
+
+<p>Mirá la estructura, porque es una plantilla que vas a repetir siempre:</p>
+
+<div class="step">
+  <strong>1.</strong> Se valida en <em>runtime</em> lo que el compilador no puede validar en tiempo de compilación (el <code>assert!</code>).<br>
+  <strong>2.</strong> Se escribe un comentario <code>// SAFETY:</code> que enuncia, punto por punto, <em>por qué</em> se cumple cada requisito de la operación unsafe.<br>
+  <strong>3.</strong> El bloque <code>unsafe</code> es lo más chico posible: solo las dos llamadas peligrosas.<br>
+  <strong>4.</strong> La firma pública es <code>safe</code> y sus lifetimes atan el resultado al input, de modo que el compilador impide el uso-después-de-liberar aunque el interior sea crudo.
+</div>
+
+<h3>El comentario <code>// SAFETY:</code> no es decorativo</h3>
+
+<p>Es la convención universal del ecosistema — la librería estándar la exige en cada bloque, y <code>clippy::undocumented_unsafe_blocks</code> la puede volver obligatoria en tu crate. Un buen <code>// SAFETY:</code> responde tres preguntas: <em>¿qué requiere la operación?</em>, <em>¿por qué se cumple acá?</em>, <em>¿qué código de este archivo podría romperlo si cambia?</em>.</p>
+
+<pre><code class="lang-bash"># Cargo.toml — hacer que el comentario sea obligatorio en todo el crate
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"</code></pre>
+
+<div class="warn">
+  <strong>Un <code>// SAFETY:</code> que dice "es seguro porque funciona" no es un comentario de safety: es una confesión.</strong> Si al escribirlo no podés nombrar el invariante concreto, es señal de que todavía no entendés por qué tu código anda, y estás a un refactor de distancia de que deje de andar.
+</div>
+
+<h3>Cuándo la frontera <em>no</em> puede cerrarse</h3>
+
+<p>A veces el contrato depende de algo que la función no puede verificar. En ese caso la API se expone como <code>unsafe fn</code> — y eso es correcto, no un fracaso. Lo que <strong>no</strong> es aceptable es exponer una función <code>safe</code> cuyo mal uso cause UB:</p>
+
+<pre><code class="lang-rust">pub struct BufferCrudo {
+    datos: Vec&lt;u8&gt;,
+    inicializados: usize,
+}
+
+impl BufferCrudo {
+    /// # Safety
+    /// El llamador debe garantizar que los primeros `n` bytes del buffer
+    /// fueron efectivamente escritos (por ejemplo, por una syscall de lectura).
+    /// Pasar un `n` mayor a lo escrito expone memoria no inicializada: UB.
+    pub unsafe fn declarar_inicializados(&amp;mut self, n: usize) {
+        debug_assert!(n &lt;= self.datos.capacity());
+        self.inicializados = n;
+    }
+
+    // Esta sí es safe: no hay forma de usarla mal.
+    pub fn leidos(&amp;self) -&gt; &amp;[u8] {
+        &amp;self.datos[..self.inicializados]
+    }
+}</code></pre>
+
+<div class="tip">
+  <strong>Regla de oro para la documentación:</strong> toda <code>unsafe fn</code> pública lleva una sección <code>/// # Safety</code> en su docstring listando las precondiciones. Es tan estándar que <code>clippy::missing_safety_doc</code> te lo reclama solo.
+</div>
+
+<h2>RuS5.3 Undefined Behavior: por qué no es "un bug"</h2>
+
+<p>Acá está la parte que a mucha gente le cuesta, y es la más importante de todo el módulo. <strong>Undefined Behavior no es un error de programa. Es un error de <em>razonamiento</em> sobre el programa.</strong></p>
+
+<p>Un bug común —un índice mal calculado, un <code>off-by-one</code>— produce un resultado incorrecto pero <em>determinado</em>: si lo ejecutás mil veces con la misma entrada, obtenés la misma respuesta equivocada mil veces. Podés depurarlo con <code>println!</code>, podés reproducirlo, podés escribir un test que falle.</p>
+
+<p>UB es otra cosa. El compilador optimiza <strong>asumiendo que el UB nunca ocurre</strong>. Cuando ocurre, las conclusiones que sacó el optimizador pasan a ser falsas, y el código generado puede hacer literalmente cualquier cosa: borrar la rama que "no podía pasar", reordenar escrituras, o convertir un bucle en un salto incondicional. El síntoma aparece a 400 líneas del origen, cambia según el nivel de optimización, y desaparece cuando agregás un <code>println!</code> para investigarlo.</p>
+
+<div class="danger">
+  <strong>⚠️ UB no es "va a crashear". UB es "el compilador tenía permiso de asumir que esto no pasaba, y construyó el binario sobre esa suposición".</strong> Un programa con UB que hoy funciona perfecto puede romperse mañana por subir una versión menor del compilador, por activar LTO, o por que alguien agregó una función en otro archivo y cambió las decisiones de inlining. No es un bug latente: es un binario cuyo significado nunca estuvo definido.
+</div>
+
+<p>La demostración clásica en Rust, adaptada del ejemplo que usa el propio <em>Rustonomicon</em>:</p>
+
+<pre><code class="lang-rust">fn cuantos(x: bool) -&gt; u32 {
+    // El compilador SABE que un `bool` solo puede valer 0 o 1.
+    // Por eso este match es exhaustivo con dos brazos y elimina todo lo demás.
+    match x {
+        true =&gt; 1,
+        false =&gt; 0,
+    }
+}
+
+fn main() {
+    let byte: u8 = 3;                       // NO es 0 ni 1
+    // SAFETY: mentira. Esto es UB: creamos un `bool` con un valor inválido.
+    let b: bool = unsafe { std::mem::transmute(byte) };
+    println!("{}", cuantos(b));             // ¿1? ¿0? ¿3? ¿basura? Indefinido.
+}</code></pre>
+
+<p>Con <code>-C opt-level=0</code> ese programa suele imprimir <code>1</code>. Con <code>-C opt-level=3</code> puede imprimir cualquier cosa, incluida una lectura fuera de rango si el <code>match</code> se compiló como una tabla de saltos indexada por el valor del booleano. Ninguno de los dos resultados es "el correcto": el programa no tiene comportamiento definido.</p>
+
+<h2>RuS5.4 El catálogo de UB en Rust</h2>
+
+<p>La lista oficial vive en el <a href="https://doc.rust-lang.org/reference/behavior-considered-undefined.html">Reference</a>, pero en la práctica seis casos explican casi todo lo que vas a encontrar. Vale la pena tenerlos como checklist mental cada vez que escribís un bloque.</p>
+
+<h3>1. Referencia colgante (dangling)</h3>
+
+<pre><code class="lang-rust">fn colgante() -&gt; &amp;'static i32 {
+    let x = 42;
+    let p: *const i32 = &amp;x;
+    // SAFETY: falsa. `x` muere al terminar la función; el puntero queda colgado.
+    unsafe { &amp;*p }        // UB: referencia a memoria liberada
+}                          // ← `x` se destruye acá</code></pre>
+
+<p>El caso hostil de verdad no es este —es demasiado obvio— sino el que aparece cuando guardás un puntero a un elemento de un <code>Vec</code> y después el <code>Vec</code> crece: la reasignación mueve todo el buffer y tu puntero apunta a memoria liberada.</p>
+
+<h3>2. Aliasing de <code>&amp;mut</code></h3>
+
+<p>Una referencia <code>&amp;mut T</code> promete ser <strong>única</strong>. No "es la única que se usa": es la única que <em>existe</em>. Violarlo es UB aunque nunca escribas por las dos:</p>
+
+<pre><code class="lang-rust">fn aliasing_mutable() {
+    let mut x = 10i32;
+    let p = &amp;mut x as *mut i32;
+
+    unsafe {
+        let a = &amp;mut *p;
+        let b = &amp;mut *p;   // ❌ UB: dos &amp;mut vivos a la misma dirección
+        *a += 1;
+        *b += 1;           // el optimizador puede fusionar, reordenar o borrar
+        println!("{x}");
+    }
+}</code></pre>
+
+<div class="info">
+  Este es el UB que <strong>más se cuela sin darse cuenta</strong>, porque no rompe nada visible en <code>debug</code>. Es también el que <code>Miri</code> detecta mejor, gracias al modelo experimental de <em>Stacked Borrows</em> (y su sucesor <em>Tree Borrows</em>) que discutimos en RuS5.7.
+</div>
+
+<h3>3. Leer memoria no inicializada</h3>
+
+<pre><code class="lang-rust">use std::mem::MaybeUninit;
+
+fn no_inicializado() {
+    // ❌ UB instantáneo: `assume_init` afirma que ya se escribió, y es mentira.
+    let x: i32 = unsafe { MaybeUninit::uninit().assume_init() };
+    println!("{x}");
+}</code></pre>
+
+<p>"Leer basura" suena inofensivo si venís de C. En Rust no lo es: un valor no inicializado no es "un número al azar", es un valor <strong>sin ningún valor</strong>, y compararlo consigo mismo puede dar <code>false</code> porque el optimizador está autorizado a materializarlo dos veces distinto.</p>
+
+<h3>4. Desalineación</h3>
+
+<pre><code class="lang-rust">fn desalineado() {
+    let bytes: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let p = bytes.as_ptr();
+
+    unsafe {
+        // `u32` requiere alineación de 4. `p.add(1)` casi seguro no la cumple.
+        let malo = *(p.add(1) as *const u32);      // ❌ UB
+        println!("{malo}");
+
+        // Forma correcta si de verdad necesitás leer sin alineación:
+        let bueno = (p.add(1) as *const u32).read_unaligned();
+        println!("{bueno}");
+    }
+}</code></pre>
+
+<h3>5. Invariantes de tipo rotas</h3>
+
+<p>Cada tipo tiene un conjunto de bit-patterns válidos, y salirse de él es UB aunque nunca uses el valor:</p>
+
+<pre><code class="lang-rust">use std::num::NonZeroU32;
+
+unsafe fn invariantes_rotas() {
+    let _a: bool = std::mem::transmute(2u8);          // bool ∉ {0, 1}
+    let _b: char = std::mem::transmute(0xD800u32);    // surrogate UTF-16
+    let _c: NonZeroU32 = std::mem::transmute(0u32);   // cero en un NonZero
+    let _d: &amp;i32 = std::mem::transmute(0usize);       // referencia nula
+    // Los cuatro son UB en el instante de la creación, sin leer nada.
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El UB de valores inválidos ocurre al <em>construir</em> el valor, no al usarlo.</strong> Es una diferencia crucial: no alcanza con "no lo toco". Si creaste un <code>bool</code> que vale 2, el programa ya está indefinido, aunque la variable se descarte en la línea siguiente.
+</div>
+
+<h3>6. Data race</h3>
+
+<pre><code class="lang-rust">// Con `unsafe impl Sync` sobre un tipo que NO lo es, podés reintroducir
+// exactamente la clase de bug que Rust elimina de fábrica.
+struct MiCelda(std::cell::UnsafeCell&lt;u64&gt;);
+unsafe impl Sync for MiCelda {}          // ⚠️ promesa falsa: sin sincronización
+
+// Dos hilos escribiendo el mismo u64 sin atómicos ni candado = data race = UB.
+// No es "resultado impredecible": es indefinido, y el optimizador lo aprovecha.</code></pre>
+
+<p>Hay dos casos que la gente cree que son UB y <strong>no lo son</strong>, y conviene tenerlos claros para no perder tiempo: el <em>overflow</em> de enteros (es un pánico en debug y aritmética envolvente en release — un bug, no UB) y las fugas de memoria (<code>mem::forget</code> es una función <code>safe</code>: filtrar memoria es feo, no indefinido).</p>
+
+<h2>RuS5.5 Punteros crudos, provenance y <code>NonNull</code></h2>
+
+<p>Un puntero crudo (<code>*const T</code>, <code>*mut T</code>) es la herramienta base. Crearlo y hacer aritmética con él es <code>safe</code>; desreferenciarlo no:</p>
+
+<pre><code class="lang-rust">fn punteros() {
+    let mut x = 5i32;
+
+    let p_lectura: *const i32 = &amp;x;         // safe
+    let p_escritura: *mut i32 = &amp;mut x;     // safe
+    let p_invalido = 0xdead_beef_usize as *mut i32;   // safe crearlo (!)
+
+    unsafe {
+        println!("{}", *p_lectura);         // unsafe: desreferenciar
+        *p_escritura = 6;
+        // *p_invalido = 7;                 // esto sí sería UB
+    }
+
+    // Métodos útiles que evitan escribir el `*` a mano:
+    unsafe {
+        let v = p_lectura.read();           // copia el valor
+        p_escritura.write(v * 2);           // escribe sin correr el Drop viejo
+        assert!(!p_lectura.is_null());
+        if let Some(r) = p_lectura.as_ref() { println!("{r}"); }
+    }
+}</code></pre>
+
+<h3>Provenance: por qué un puntero no es un número</h3>
+
+<p>Este es el punto donde Rust se separa fuerte de la intuición de C. En Rust —y en el modelo de memoria que usa LLVM— un puntero <strong>no es solo una dirección</strong>: lleva asociada una <em>provenance</em>, que es el permiso de acceder a un rango específico de memoria, derivado de la asignación de la que salió. Dos punteros con la misma dirección numérica pueden tener provenance distinta, y usar el equivocado es UB aunque el número coincida.</p>
+
+<pre><code class="lang-rust">fn provenance() {
+    let mut a = [0u8; 4];
+    let mut b = [0u8; 4];
+
+    let pa = a.as_mut_ptr();
+    let pb = b.as_mut_ptr();
+
+    // Aunque por casualidad `pa.add(4) == pb`, escribir a través de
+    // `pa.add(4)` es UB: la provenance de `pa` cubre solo los 4 bytes de `a`.
+    unsafe {
+        // *pa.add(4) = 1;   // ❌ fuera del rango que `pa` tiene permitido
+        *pb = 1;             // ✅ el puntero correcto para tocar `b`
+    }
+    println!("{a:?} {b:?}");
+}</code></pre>
+
+<p>Desde <strong>Rust 1.84</strong> hay una API estable para trabajar con esto explícitamente, la <em>strict provenance</em>. La regla es: si necesitás la dirección como número, pedila con <code>addr()</code>; si necesitás reconstruir un puntero a partir de un número, tenés que declarar de dónde sale la provenance:</p>
+
+<pre><code class="lang-rust">fn strict_provenance() {
+    let x = 42u64;
+    let p: *const u64 = &amp;x;
+
+    // Dirección como entero, SIN perder ni robar provenance: safe.
+    let direccion: usize = p.addr();
+    println!("alineado a 8: {}", direccion % 8 == 0);
+
+    // Manipular los bits bajos manteniendo la provenance del original (tagged pointers):
+    let etiquetado = p.map_addr(|a| a | 0b1);
+    let limpio = etiquetado.map_addr(|a| a &amp; !0b1);
+    // SAFETY: `limpio` conserva la provenance de `p`, que apunta a `x` vivo.
+    unsafe { assert_eq!(*limpio, 42); }
+
+    // Si de verdad necesitás ida y vuelta por entero (FFI, hardware):
+    let expuesta = p.expose_provenance();
+    let recuperado: *const u64 = std::ptr::with_exposed_provenance(expuesta);
+    unsafe { assert_eq!(*recuperado, 42); }
+}</code></pre>
+
+<div class="warn">
+  <strong>Por eso "castear punteros" no es lo mismo que en C.</strong> En C, <code>(int*)(uintptr_t)p</code> es idiomático y funciona. En Rust, <code>p as usize as *const i32</code> compila pero borra la información que Miri y el optimizador necesitan; con <code>-Zmiri-strict-provenance</code> te lo marca como error. Usá <code>addr()</code>, <code>map_addr()</code> y <code>with_exposed_provenance()</code> según qué querés expresar.
+</div>
+
+<h3><code>NonNull</code>: el puntero crudo que se comporta</h3>
+
+<p><code>NonNull&lt;T&gt;</code> es un <code>*mut T</code> con dos ventajas: garantiza que no es nulo (lo que permite la optimización de nicho — <code>Option&lt;NonNull&lt;T&gt;&gt;</code> ocupa lo mismo que un puntero) y es <em>covariante</em> en <code>T</code>, que es lo que querés casi siempre al construir estructuras de datos:</p>
+
+<pre><code class="lang-rust">use std::ptr::NonNull;
+use std::marker::PhantomData;
+
+pub struct MiCaja&lt;T&gt; {
+    ptr: NonNull&lt;T&gt;,
+    _marca: PhantomData&lt;T&gt;,   // le dice al compilador que "poseemos" un T
+}
+
+impl&lt;T&gt; MiCaja&lt;T&gt; {
+    pub fn new(valor: T) -&gt; Self {
+        let bruto = Box::into_raw(Box::new(valor));
+        // SAFETY: `Box::into_raw` nunca devuelve null.
+        let ptr = unsafe { NonNull::new_unchecked(bruto) };
+        Self { ptr, _marca: PhantomData }
+    }
+
+    pub fn get(&amp;self) -&gt; &amp;T {
+        // SAFETY: el puntero salió de un Box vivo que solo libera nuestro Drop,
+        // y el lifetime del &amp;T resultante está atado al de &amp;self.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl&lt;T&gt; Drop for MiCaja&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        // SAFETY: reconstruimos exactamente el Box que creamos en `new`,
+        // y esto corre una sola vez porque Drop corre una sola vez.
+        unsafe { drop(Box::from_raw(self.ptr.as_ptr())); }
+    }
+}</code></pre>
+
+<div class="mistake">
+  <strong>El <code>PhantomData&lt;T&gt;</code> no es adorno.</strong> Sin él, el compilador no sabe que <code>MiCaja&lt;T&gt;</code> es dueña de un <code>T</code>, y el <em>drop check</em> puede permitir órdenes de destrucción que dejen referencias colgadas. Es el ejemplo perfecto de cómo el <code>unsafe</code> te obliga a re-declarar a mano cosas que en código safe el compilador deduce solo.
+</div>
+
+<h2>RuS5.6 <code>MaybeUninit</code>: memoria que todavía no es un valor</h2>
+
+<p>Cuando escribís una estructura de datos que reserva memoria antes de llenarla —un <code>Vec</code>, un buffer circular, un arena allocator— necesitás una forma de decir "acá hay espacio para un <code>T</code>, pero todavía no hay un <code>T</code>". Ese tipo es <code>MaybeUninit&lt;T&gt;</code>.</p>
+
+<p>Antes existía <code>mem::uninitialized::&lt;T&gt;()</code>, y está <strong>deprecado desde Rust 1.39</strong> por una razón que vale la pena entender: su firma era una mentira de tipos. Devolvía un <code>T</code>, así que el compilador creía que tenía un valor válido, y si <code>T</code> tenía invariantes (un <code>bool</code>, una referencia, un <code>NonZeroU32</code>) el UB ocurría en el instante de la llamada. Además, si algo entre la creación y la inicialización hacía pánico, se corría el <code>Drop</code> de un valor que nunca existió:</p>
+
+<pre><code class="lang-rust">use std::mem::MaybeUninit;
+
+// ❌ La API vieja: `mem::uninitialized()` era UB para casi todo T.
+// let mut v: Vec&lt;u8&gt; = unsafe { std::mem::uninitialized() };
+
+// ✅ La API correcta: el tipo dice la verdad.
+fn inicializar() -&gt; String {
+    let mut espacio: MaybeUninit&lt;String&gt; = MaybeUninit::uninit();
+
+    // `write` inicializa SIN correr el Drop del contenido anterior
+    // (correcto: no hay contenido anterior).
+    espacio.write(String::from("hola"));
+
+    // SAFETY: acabamos de escribir un String válido en `espacio` y no hubo
+    // ningún camino de salida entre la escritura y esta línea.
+    unsafe { espacio.assume_init() }
+}</code></pre>
+
+<p>El patrón que más vas a usar es el de un arreglo o buffer parcialmente inicializado. La sutileza está en el <em>drop en caso de pánico</em>:</p>
+
+<pre><code class="lang-rust">use std::mem::MaybeUninit;
+
+fn construir_arreglo&lt;F&gt;(mut f: F) -&gt; [String; 4]
+where
+    F: FnMut(usize) -&gt; String,
+{
+    // SAFETY: un arreglo de MaybeUninit no requiere inicialización;
+    // `MaybeUninit&lt;T&gt;` es válido con cualquier patrón de bits.
+    let mut arr: [MaybeUninit&lt;String&gt;; 4] = unsafe { MaybeUninit::uninit().assume_init() };
+
+    for (i, hueco) in arr.iter_mut().enumerate() {
+        hueco.write(f(i));
+        // ⚠️ Si `f` hace pánico en i == 2, los strings 0 y 1 quedan sin
+        // liberarse. Es una FUGA, no UB. En código de producción esto se
+        // resuelve con un guard que lleve la cuenta y los libere en su Drop.
+    }
+
+    // SAFETY: el loop escribió las 4 posiciones y terminó sin salir por pánico.
+    unsafe { std::mem::transmute::&lt;_, [String; 4]&gt;(arr) }
+}</code></pre>
+
+<div class="tip">
+  Para leer un slice parcialmente inicializado sin transmutar a mano, mirá <code>MaybeUninit::slice_assume_init_ref</code> y <code>Vec::spare_capacity_mut</code>, que te da directamente un <code>&amp;mut [MaybeUninit&lt;T&gt;]</code> de la capacidad libre. Es lo que usa el propio <code>Read::read_buf</code> para llenar buffers sin pagar el costo de ponerlos en cero primero.
+</div>
+
+<h2>RuS5.7 Miri: el detector de UB</h2>
+
+<p>Hasta acá el módulo te pidió razonar. Miri te deja <strong>verificar</strong>. Es un intérprete del MIR (la representación intermedia de Rust) que ejecuta tu programa manteniendo, para cada puntero, su provenance, su rango válido y una pila de permisos. Cuando una operación viola las reglas, para y te dice exactamente cuál.</p>
+
+<pre><code class="lang-bash">rustup +nightly component add miri
+cargo +nightly miri test                  # corre toda la suite bajo Miri
+cargo +nightly miri run                   # corre el binario
+cargo +nightly miri test -- aliasing      # solo los tests que matcheen</code></pre>
+
+<p>El caso didáctico perfecto es un test que pasa en verde y esconde UB. Este código se ve razonable: se saca un puntero de lectura del buffer y se escribe a través de él.</p>
+
+<pre><code class="lang-rust">pub struct Celda {
+    datos: Vec&lt;u64&gt;,
+}
+
+impl Celda {
+    pub fn set(&amp;mut self, i: usize, v: u64) {
+        // El bug: `as_ptr()` produce un puntero de SOLO LECTURA.
+        // Castearlo a *mut no le agrega el permiso de escritura.
+        let p = self.datos.as_ptr() as *mut u64;
+        // SAFETY: falsa. El índice está bien; el permiso, no.
+        unsafe { p.add(i).write(v); }
+    }
+}
+
+#[test]
+fn test_set() {
+    let mut c = Celda { datos: vec![0; 4] };
+    c.set(2, 99);
+    assert_eq!(c.datos[2], 99);          // ✅ pasa: `cargo test` da verde
+}</code></pre>
+
+<pre><code class="lang-bash">$ cargo test
+running 1 test
+test test_set ... ok
+test result: ok. 1 passed; 0 failed
+
+$ cargo +nightly miri test
+error: Undefined Behavior: attempting a write access using &lt;3184&gt; at
+       alloc1729[0x10], but that tag only grants SharedReadOnly permission
+       for this location
+  --&gt; src/lib.rs:9:18
+   |
+ 9 |         unsafe { p.add(i).write(v); }
+   |                  ^^^^^^^^^^^^^^^^^ this error occurs as part of an access
+   |                  at alloc1729[0x10..0x18]
+   |
+   = help: this indicates a potential bug in the program: it performed an
+           invalid operation, but the Stacked Borrows rules it violated are
+           still experimental
+error: aborting due to 1 previous error</code></pre>
+
+<p>El arreglo es de un carácter, y es exactamente el tipo de detalle que ningún test detecta:</p>
+
+<pre><code class="lang-rust">pub fn set(&amp;mut self, i: usize, v: u64) {
+    assert!(i &lt; self.datos.len());
+    let p = self.datos.as_mut_ptr();      // ✅ puntero con permiso de escritura
+    // SAFETY: `i &lt; len` por el assert, y `as_mut_ptr` deriva de `&amp;mut self`,
+    // así que el puntero tiene permiso de escritura sobre toda la asignación.
+    unsafe { p.add(i).write(v); }
+}</code></pre>
+
+<h3>Configurar Miri para que sea más estricto</h3>
+
+<pre><code class="lang-bash"># Provenance estricta: prohíbe int-to-pointer casts sin declarar.
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test
+
+# Tree Borrows: el modelo de aliasing más nuevo, más permisivo con
+# patrones legítimos y más preciso con los ilegítimos.
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test
+
+# Semilla distinta: cambia el orden de scheduling de los hilos para
+# sacar a la luz data races que dependen del entrelazado.
+MIRIFLAGS="-Zmiri-seed=42" cargo +nightly miri test</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La limitación que define cómo usás Miri: solo ve lo que ejecutás.</strong> Miri no es análisis estático, es un intérprete. Un UB en una rama que ningún test recorre es invisible para Miri. Y corre entre <strong>50 y 400 veces más lento</strong> que el binario nativo, así que la suite completa puede tardar minutos u horas. La consecuencia práctica es la contraria a la intuitiva: <strong>la calidad de tu cobertura de tests determina la calidad de tu verificación de UB</strong>. Miri no reemplaza escribir tests: los vuelve mucho más valiosos.
+</div>
+
+<p>Las otras limitaciones a tener presentes: Miri <strong>no puede ejecutar la mayoría del código FFI</strong> (llamar a una función de C compilada queda fuera de su alcance, salvo el soporte experimental de <code>-Zmiri-native-lib</code>); no modela el comportamiento exacto de instrucciones SIMD específicas de la plataforma; y su modelo de aliasing —Stacked Borrows / Tree Borrows— es <em>experimental</em>: en casos muy raros puede marcar como error un patrón que el equipo de opsem termine declarando legal. En la práctica, cuando Miri se queja, el 99% de las veces tenés un bug real.</p>
+
+<div class="tip">
+  Poné Miri en CI, pero <strong>no en el pipeline que bloquea cada push</strong>. El patrón usual es un job nocturno sobre los tests de los módulos que tienen <code>unsafe</code>, más una corrida obligatoria en cualquier PR que toque un archivo con bloques <code>unsafe</code>. Así pagás el costo de tiempo solo donde importa.
+</div>
+
+<h2>RuS5.8 <code>unsafe impl Send</code> y <code>unsafe impl Sync</code></h2>
+
+<p><code>Send</code> y <code>Sync</code> son <em>auto traits</em>: el compilador los implementa solo si todos los campos del tipo los tienen. Escribir <code>unsafe impl</code> a mano significa que estás pasando por encima de esa deducción, y lo que prometés es muy concreto:</p>
+
+<ul>
+  <li><strong><code>Send</code></strong>: es seguro <em>mover</em> un valor de este tipo a otro hilo. Se rompe cuando el tipo depende de estado atado al hilo actual (un <code>MutexGuard</code> de pthread, un handle de GUI, un TLS).</li>
+  <li><strong><code>Sync</code></strong>: es seguro que dos hilos tengan <code>&amp;T</code> al mismo tiempo. Equivale a decir que <code>&amp;T</code> es <code>Send</code>. Se rompe cuando hay mutabilidad interior sin sincronización.</li>
+</ul>
+
+<p>El caso legítimo típico es un tipo que guarda un puntero crudo —que por definición no es <code>Send</code> ni <code>Sync</code>— pero cuya lógica sí garantiza la seguridad:</p>
+
+<pre><code class="lang-rust">use std::ptr::NonNull;
+
+/// Puntero a un bloque asignado por nosotros, del que somos dueños únicos.
+pub struct BloquePropio {
+    ptr: NonNull&lt;u8&gt;,
+    largo: usize,
+}
+
+// SAFETY: `BloquePropio` es el dueño EXCLUSIVO de la asignación a la que
+// apunta `ptr`: no existe otro alias en el proceso, y la memoria no está
+// atada a ningún hilo (viene del allocator global). Mover el valor a otro
+// hilo mueve también la propiedad de la asignación, así que es seguro.
+unsafe impl Send for BloquePropio {}
+
+// SAFETY: la API pública solo expone `&amp;[u8]` a través de `&amp;self` y no
+// ofrece NINGUNA vía de mutación mediante referencia compartida. Por lo
+// tanto dos hilos con `&amp;BloquePropio` solo pueden leer, y leer en paralelo
+// memoria inmutable no es una carrera.
+unsafe impl Sync for BloquePropio {}
+
+impl BloquePropio {
+    pub fn como_slice(&amp;self) -&gt; &amp;[u8] {
+        // SAFETY: `ptr` es válido para `largo` bytes inicializados mientras
+        // viva `self`, y el lifetime del slice está atado a `&amp;self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.largo) }
+    }
+}</code></pre>
+
+<div class="mistake">
+  <strong>El anti-patrón que hay que saber reconocer en un review:</strong> alguien pelea con "<code>*mut T</code> cannot be sent between threads safely", encuentra en un blog que <code>unsafe impl Send</code> lo calla, lo pega, compila, y sigue. Acaba de firmar una garantía sobre un tipo cuya lógica no analizó. Si en el <code>unsafe impl</code> no hay un <code>// SAFETY:</code> que explique <em>qué</em> hace que el acceso concurrente sea seguro, en el review se rechaza. Sin excepciones.
+</div>
+
+<div class="info">
+  Existe la operación inversa y es <code>safe</code>: quitar <code>Send</code>/<code>Sync</code> agregando un campo <code>PhantomData&lt;*const ()&gt;</code> o <code>PhantomData&lt;std::rc::Rc&lt;()&gt;&gt;</code>. Se usa cuando tu tipo <em>parece</em> thread-safe por sus campos pero no lo es por su lógica. Restringir nunca requiere <code>unsafe</code>; ampliar, siempre.
+</div>
+
+<h2>RuS5.9 FFI: hablar con C</h2>
+
+<p>La interoperabilidad con C es, por lejos, el motivo más común y más legítimo para escribir <code>unsafe</code>. El compilador no puede saber nada sobre lo que hace una función compilada en otro lenguaje, así que toda llamada es un salto al vacío que vos tenés que respaldar.</p>
+
+<h3>Declarar y llamar</h3>
+
+<p>Supongamos esta librería C:</p>
+
+<pre><code class="lang-c">// suma.c
+#include &lt;stddef.h&gt;
+
+int sumar(int a, int b) {
+    return a + b;
+}
+
+size_t contar_no_cero(const int *datos, size_t n) {
+    size_t total = 0;
+    for (size_t i = 0; i &lt; n; i++) {
+        if (datos[i] != 0) total++;
+    }
+    return total;
+}</code></pre>
+
+<p>Del lado de Rust, en edición 2024:</p>
+
+<pre><code class="lang-rust">use core::ffi::{c_int, c_void};
+
+#[link(name = "suma")]
+unsafe extern "C" {
+    safe fn sumar(a: c_int, b: c_int) -&gt; c_int;
+    fn contar_no_cero(datos: *const c_int, n: usize) -&gt; usize;
+}
+
+/// Wrapper safe: acá está la safety boundary.
+pub fn contar(datos: &amp;[c_int]) -&gt; usize {
+    // SAFETY: `datos.as_ptr()` es válido para `datos.len()` elementos
+    // inicializados y correctamente alineados, y la función de C solo LEE
+    // ese rango (verificado en su implementación). No retiene el puntero
+    // después de retornar, así que no hay riesgo de dangling.
+    unsafe { contar_no_cero(datos.as_ptr(), datos.len()) }
+}</code></pre>
+
+<h3><code>#[repr(C)]</code>: el layout no es negociable</h3>
+
+<p>Rust <strong>no garantiza</strong> el orden de los campos de un <code>struct</code>: el compilador puede reordenarlos para minimizar el padding, y puede cambiar de criterio entre versiones. Si un struct cruza la frontera FFI, necesita un layout definido:</p>
+
+<pre><code class="lang-rust">#[repr(C)]                       // layout idéntico al de C
+pub struct Punto {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]                       // enums con discriminante de tamaño C
+pub enum Estado {
+    Ok = 0,
+    ErrorIo = 1,
+    ErrorParseo = 2,
+}
+
+#[repr(transparent)]             // mismo layout que su único campo
+pub struct Handle(*mut core::ffi::c_void);
+
+// ❌ Sin repr(C), pasar esto a C es UB: el layout es "lo que decida rustc".
+pub struct PuntoRust { pub x: f64, pub y: f64 }</code></pre>
+
+<p>La otra mitad del problema son los tipos que <strong>no</strong> tienen equivalente en C. Un <code>&amp;str</code> es un fat pointer (dirección + largo), un <code>Vec&lt;T&gt;</code> son tres palabras, un <code>Option&lt;T&gt;</code> genérico no tiene layout garantizado, y un trait object es un puntero doble. Ninguno de esos cruza la frontera tal cual:</p>
+
+<table>
+  <thead>
+    <tr><th>Tipo de C</th><th>Tipo de Rust</th><th>Nota</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>int</code></td><td><code>core::ffi::c_int</code></td><td>No asumas <code>i32</code>: depende de la plataforma</td></tr>
+    <tr><td><code>char *</code></td><td><code>*mut c_char</code> + <code>CStr</code></td><td>Terminado en NUL, no lleva largo</td></tr>
+    <tr><td><code>void *</code></td><td><code>*mut c_void</code></td><td>Opaco por diseño</td></tr>
+    <tr><td><code>size_t</code></td><td><code>usize</code></td><td>Coinciden en todas las plataformas soportadas</td></tr>
+    <tr><td><code>struct Foo</code></td><td><code>#[repr(C)] struct Foo</code></td><td>Obligatorio el <code>repr</code></td></tr>
+    <tr><td><code>Foo *</code> (nullable)</td><td><code>Option&lt;NonNull&lt;Foo&gt;&gt;</code></td><td>Mismo tamaño que el puntero</td></tr>
+    <tr><td>— (no existe)</td><td><code>&amp;str</code>, <code>Vec&lt;T&gt;</code>, <code>dyn Trait</code></td><td>Hay que descomponerlos a mano</td></tr>
+  </tbody>
+</table>
+
+<h3>Strings: <code>CStr</code>, <code>CString</code> y el puntero colgado</h3>
+
+<p>Un <code>String</code> de Rust es UTF-8 con largo explícito y <em>puede contener bytes NUL</em>. Un string de C es una secuencia terminada en NUL sin largo. La conversión nunca es gratis, y el error clásico es este:</p>
+
+<pre><code class="lang-rust">use std::ffi::{CStr, CString};
+use core::ffi::c_char;
+
+unsafe extern "C" {
+    fn imprimir(s: *const c_char);
+}
+
+fn mal() {
+    // ❌ EL ERROR CLÁSICO. El CString temporal se destruye al terminar
+    // ESTA sentencia, así que `p` queda colgado antes de usarse.
+    let p = CString::new("hola").unwrap().as_ptr();
+    unsafe { imprimir(p); }        // UB: use-after-free
+}
+
+fn bien() {
+    // ✅ El CString vive en una variable con nombre, así que sobrevive
+    // hasta el final del scope.
+    let c = CString::new("hola").unwrap();
+    // SAFETY: `c` sigue viva en este scope, así que `c.as_ptr()` apunta a
+    // una cadena terminada en NUL válida durante toda la llamada.
+    unsafe { imprimir(c.as_ptr()); }
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Este bug compila sin un solo warning y anda "bien" en la mayoría de las corridas</strong>, porque la memoria recién liberada casi siempre todavía contiene los bytes viejos. Falla en producción, bajo carga, cuando el allocator reutiliza el bloque. Miri lo detecta al instante. Es el ejemplo número uno de por qué correr FFI bajo tests con Miri —cuando es posible— o al menos con ASan, no es opcional.
+</div>
+
+<p>En la dirección de lectura, convertir un <code>char *</code> que viene de C exige asumir cosas que solo vos podés saber:</p>
+
+<pre><code class="lang-rust">use std::ffi::CStr;
+use core::ffi::c_char;
+
+/// # Safety
+/// `p` debe ser no nulo, apuntar a una secuencia de bytes terminada en NUL,
+/// y esa memoria debe permanecer válida e inmutable durante toda la llamada.
+pub unsafe fn leer_c_string(p: *const c_char) -&gt; Result&lt;String, std::str::Utf8Error&gt; {
+    // SAFETY: precondiciones delegadas al llamador por el contrato de arriba.
+    let cstr = unsafe { CStr::from_ptr(p) };
+    cstr.to_str().map(|s| s.to_owned())    // copia: no retenemos el puntero
+}</code></pre>
+
+<h3>¿Quién libera la memoria?</h3>
+
+<p>Es la pregunta que hay que responder <strong>antes</strong> de escribir una línea de FFI, y la respuesta correcta es siempre la misma: <strong>libera quien asignó, con el allocator que usó</strong>. El allocator de Rust y el <code>malloc</code> de C son distintos; pasarle a <code>free()</code> un puntero salido de un <code>Box</code> es UB, y liberar con <code>Box::from_raw</code> algo que asignó <code>malloc</code> también.</p>
+
+<pre><code class="lang-rust">use std::ffi::CString;
+use core::ffi::c_char;
+
+/// Entrega a C una cadena asignada por Rust. C debe devolverla
+/// a `cadena_liberar` — NUNCA a free().
+#[unsafe(no_mangle)]
+pub extern "C" fn cadena_crear(n: u32) -&gt; *mut c_char {
+    let s = format!("valor = {n}");
+    match CString::new(s) {
+        Ok(c) =&gt; c.into_raw(),          // cede la propiedad al llamador
+        Err(_) =&gt; std::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `p` debe ser exactamente un puntero devuelto por `cadena_crear` que no
+/// haya sido liberado todavía. Pasar cualquier otra cosa es UB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cadena_liberar(p: *mut c_char) {
+    if p.is_null() { return; }
+    // SAFETY: por el contrato, `p` salió de `CString::into_raw`.
+    unsafe { drop(CString::from_raw(p)); }
+}</code></pre>
+
+<h3>Pánicos y ABI</h3>
+
+<p>Desde <strong>Rust 1.81</strong>, si un pánico intenta desenrollarse fuera de una función <code>extern "C"</code>, el proceso <strong>aborta</strong> en vez de caer en UB. Es una mejora enorme, pero abortar sigue siendo un mal resultado para una librería: lo correcto es atrapar el pánico y traducirlo a un código de error.</p>
+
+<pre><code class="lang-rust">use std::panic::{catch_unwind, AssertUnwindSafe};
+use core::ffi::c_int;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn procesar(datos: *const u8, n: usize) -&gt; c_int {
+    let resultado = catch_unwind(AssertUnwindSafe(|| {
+        if datos.is_null() { return -1; }
+        // SAFETY: el contrato documentado exige `datos` válido para `n` bytes.
+        let slice = unsafe { std::slice::from_raw_parts(datos, n) };
+        slice.iter().filter(|b| **b != 0).count() as c_int
+    }));
+
+    match resultado {
+        Ok(v) =&gt; v,
+        Err(_) =&gt; -2,        // el pánico se convierte en código de error
+    }
+}</code></pre>
+
+<div class="info">
+  Si necesitás que las excepciones de C++ o los pánicos de Rust <em>sí</em> crucen la frontera (por ejemplo, entre dos crates de Rust enlazados dinámicamente), existe la ABI <code>extern "C-unwind"</code>, estabilizada en Rust 1.71. Es un caso especializado: la opción por defecto sigue siendo atrapar y traducir.
+</div>
+
+<h3>Generar los bindings en vez de escribirlos</h3>
+
+<p>Escribir a mano las declaraciones de una librería de 300 funciones es una fuente infinita de errores silenciosos: un <code>c_int</code> donde iba <code>c_long</code> no da error de compilación, da corrupción de memoria. Para eso están las dos herramientas del ecosistema:</p>
+
+<pre><code class="lang-bash"># bindgen: headers de C  →  declaraciones de Rust
+cargo add --build bindgen
+bindgen /usr/include/sqlite3.h -o src/bindings.rs
+
+# cbindgen: código de Rust  →  header de C (la dirección inversa)
+cargo install cbindgen
+cbindgen --crate mi_lib --output include/mi_lib.h</code></pre>
+
+<pre><code class="lang-rust">// build.rs — regenerar los bindings en cada compilación
+fn main() {
+    println!("cargo:rustc-link-lib=sqlite3");
+    println!("cargo:rerun-if-changed=wrapper.h");
+
+    let bindings = bindgen::Builder::default()
+        .header("wrapper.h")
+        .allowlist_function("sqlite3_.*")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("no se pudieron generar los bindings");
+
+    let salida = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    bindings.write_to_file(salida.join("bindings.rs")).unwrap();
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La arquitectura estándar del ecosistema son dos crates.</strong> Un crate <code>-sys</code> (por ejemplo <code>libsqlite3-sys</code>) que contiene <em>solo</em> los bindings crudos generados por bindgen, y un crate de alto nivel (<code>rusqlite</code>) que envuelve todo eso en una API safe e idiomática. Esa separación es justamente una safety boundary hecha paquete: todo el <code>unsafe</code> vive de un lado, y el usuario final nunca lo ve.
+</div>
+
+<h2>RuS5.10 Exponer Rust a otros lenguajes</h2>
+
+<p>La dirección inversa —Rust como el motor rápido dentro de una app escrita en otro lenguaje— es hoy uno de los usos más frecuentes del lenguaje, y la razón por la que muchos equipos lo adoptan sin migrar nada.</p>
+
+<p>El caso más maduro es Python. Ya lo viste desde el otro lado en el track de Python Senior: <a href="../../../Curso-Python/senior/ps8-produccion/lecture.html">PS8 — Producción</a> cubre el empaquetado y despliegue de extensiones nativas. Desde Rust, la herramienta es <strong>PyO3</strong>, y lo interesante para este módulo es que <em>vos no escribís el <code>unsafe</code></em>: la macro lo genera y lo audita por vos.</p>
+
+<pre><code class="lang-rust">use pyo3::prelude::*;
+
+/// Calcula la distancia de Levenshtein. Desde Python se ve como una
+/// función normal; el marshalling de tipos lo genera la macro.
+#[pyfunction]
+fn distancia(a: &amp;str, b: &amp;str) -&gt; PyResult&lt;usize&gt; {
+    let (n, m) = (a.chars().count(), b.chars().count());
+    let mut fila: Vec&lt;usize&gt; = (0..=m).collect();
+
+    for (i, ca) in a.chars().enumerate() {
+        let mut previo = fila[0];
+        fila[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let costo = usize::from(ca != cb);
+            let nuevo = (fila[j + 1] + 1)
+                .min(fila[j] + 1)
+                .min(previo + costo);
+            previo = fila[j + 1];
+            fila[j + 1] = nuevo;
+        }
+    }
+    let _ = n;
+    Ok(fila[m])
+}
+
+#[pymodule]
+fn textotools(m: &amp;Bound&lt;'_, PyModule&gt;) -&gt; PyResult&lt;()&gt; {
+    m.add_function(wrap_pyfunction!(distancia, m)?)?;
+    Ok(())
+}</code></pre>
+
+<pre><code class="lang-bash">pip install maturin
+maturin develop --release      # compila e instala en el venv activo
+python -c "import textotools; print(textotools.distancia('kitten','sitting'))"
+# 3</code></pre>
+
+<p>El resto del panorama, para que sepas qué buscar según el destino:</p>
+
+<table>
+  <thead>
+    <tr><th>Destino</th><th>Herramienta</th><th>Quién escribe el <code>unsafe</code></th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Python</td><td><code>pyo3</code> + <code>maturin</code></td><td>La macro (auditada por el proyecto)</td></tr>
+    <tr><td>C / C++</td><td><code>cbindgen</code> + <code>extern "C"</code></td><td><strong>Vos</strong></td></tr>
+    <tr><td>C++ (bidireccional)</td><td><code>cxx</code></td><td>El generador, con chequeo en ambos lados</td></tr>
+    <tr><td>JavaScript / navegador</td><td><code>wasm-bindgen</code></td><td>La macro</td></tr>
+    <tr><td>Node.js nativo</td><td><code>napi-rs</code></td><td>La macro</td></tr>
+    <tr><td>Java / Kotlin</td><td><code>jni</code></td><td><strong>Vos</strong> (JNI es crudo)</td></tr>
+    <tr><td>Swift / Kotlin móvil</td><td><code>uniffi</code></td><td>El generador (desde un IDL)</td></tr>
+  </tbody>
+</table>
+
+<div class="tip">
+  Fijate la columna de la derecha: <strong>elegir una herramienta que genere el <code>unsafe</code> por vos es una decisión de seguridad, no de comodidad</strong>. Un generador que usan miles de proyectos tiene su código crudo auditado por gente que se dedica a eso; tu <code>extern "C"</code> escrito a las apuradas un viernes, no.
+</div>
+
+<h2>RuS5.11 Cuándo NO usar unsafe (la sección más importante)</h2>
+
+<p>Si te quedás con una sola idea de todo el módulo, que sea esta: <strong>la enorme mayoría de los <code>unsafe</code> que se escriben no hacían falta</strong>. Hay una alternativa segura, y suele ser tan rápida que la diferencia no se mide.</p>
+
+<p>Estas son las cuatro excusas que aparecen en los code reviews, con su reemplazo:</p>
+
+<table>
+  <thead>
+    <tr><th>"Necesito unsafe porque..."</th><th>Alternativa segura</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>...tengo que evitar el chequeo de límites</td><td>Iteradores, <code>chunks_exact</code>, <code>zip</code>: el compilador elimina el chequeo solo</td></tr>
+    <tr><td>...necesito dos referencias mutables al mismo <code>Vec</code></td><td><code>split_at_mut</code>, <code>iter_mut</code>, <code>get_disjoint_mut</code></td></tr>
+    <tr><td>...necesito mutabilidad interior</td><td><code>Cell</code>, <code>RefCell</code>, <code>Mutex</code>, <code>RwLock</code>, atómicos</td></tr>
+    <tr><td>...tengo una estructura cíclica / grafo</td><td>Índices en un <code>Vec</code> (<em>arena</em>), o <code>Rc</code>/<code>Weak</code></td></tr>
+    <tr><td>...necesito un global mutable</td><td><code>OnceLock</code>, <code>LazyLock</code>, atómicos, <code>Mutex</code> estático</td></tr>
+  </tbody>
+</table>
+
+<p>El primer caso merece una demostración, porque es el que se repite más. La creencia es que indexar cuesta caro por el chequeo de límites y que <code>get_unchecked</code> lo arregla:</p>
+
+<pre><code class="lang-rust">// ❌ La versión "optimizada" con unsafe
+pub fn sumar_unsafe(a: &amp;[f32], b: &amp;[f32]) -&gt; f32 {
+    let mut total = 0.0;
+    for i in 0..a.len() {
+        // SAFETY: dudosa — depende de que b.len() &gt;= a.len(), que NO se chequea.
+        total += unsafe { *a.get_unchecked(i) * *b.get_unchecked(i) };
+    }
+    total
+}
+
+// ✅ La versión segura: `zip` le prueba al compilador que los índices son
+// válidos, así que genera el MISMO código máquina y encima vectoriza mejor.
+pub fn sumar_safe(a: &amp;[f32], b: &amp;[f32]) -&gt; f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}</code></pre>
+
+<p>La versión safe no solo iguala a la unsafe: en muchos casos <strong>la supera</strong>, porque un iterador le da a LLVM garantías estructurales sobre el recorrido que un bucle con índices no le da. Y de paso, la versión unsafe tiene un bug de seguridad real: si <code>b</code> es más corto que <code>a</code>, lee fuera de rango.</p>
+
+<h3>La performance hay que medirla, no suponerla</h3>
+
+<div class="rule">
+  <strong>📌 Un <code>unsafe</code> justificado por rendimiento y sin benchmark adjunto es un <code>unsafe</code> injustificado.</strong> El orden es siempre: escribir la versión segura, medirla con un benchmark reproducible, perfilar para saber dónde se va el tiempo, y recién ahí —si el hotspot está confirmado y la mejora es sustancial— evaluar unsafe. Si hiciste los pasos en otro orden, no estás optimizando: estás adivinando con riesgo.
+</div>
+
+<h3>El costo que nadie contabiliza</h3>
+
+<p>Supongamos que medís y el <code>unsafe</code> te da un 30% real en un hotspot real. Sigue faltando la otra mitad de la ecuación, la que no aparece en el benchmark:</p>
+
+<ul>
+  <li><strong>Cada PR que toca ese archivo necesita un revisor que entienda el modelo de memoria.</strong> En un equipo de ocho personas, eso puede ser una o dos. Se convierte en un cuello de botella permanente.</li>
+  <li><strong>El invariante es global al módulo, no local al bloque.</strong> Un <code>unsafe</code> correcto se puede romper por un cambio en un campo privado, hecho seis meses después por alguien que no sabía que existía la dependencia. Esa es la razón por la que el "unsafe superblock" del módulo es la unidad real de auditoría.</li>
+  <li><strong>Los bugs que produce son de la clase más cara de diagnosticar.</strong> No se reproducen, dependen del nivel de optimización y desaparecen bajo el debugger.</li>
+  <li><strong>La suite necesita correr bajo Miri</strong>, con el costo de CI y de mantenimiento que eso implica.</li>
+</ul>
+
+<p>Frente a eso, un 30% en un hotspot que representa el 5% del tiempo total del programa es una mejora del 1,5% end-to-end. Vale la pena preguntarse si no había un algoritmo mejor, o si el tiempo del equipo no rendía más en otro lado.</p>
+
+<h2>RuS5.12 Auditar unsafe ajeno</h2>
+
+<p>Tu crate puede tener cero bloques <code>unsafe</code> y aun así depender de doscientos mil, a través del árbol de dependencias. Auditar eso es parte del trabajo senior.</p>
+
+<pre><code class="lang-bash"># Radiografía del unsafe en todo el árbol de dependencias
+cargo install cargo-geiger
+cargo geiger
+
+# Salida típica (☢️ = usa unsafe, 🔒 = declara forbid(unsafe_code)):
+# Functions  Expressions  Impls  Traits  Methods  Dependency
+# 0/0        0/0          0/0    0/0     0/0      🔒 mi_app 0.1.0
+# 4/4        182/182      2/2    0/0     8/8      ☢️  ├── memchr 2.7.6
+# 0/0        0/0          0/0    0/0     0/0      🔒  ├── serde 1.0.228
+# 12/14      401/455      6/6    0/0     21/23    ☢️  └── ring 0.17.14</code></pre>
+
+<pre><code class="lang-bash"># Vulnerabilidades conocidas (RustSec advisory database)
+cargo install cargo-audit &amp;&amp; cargo audit
+
+# Auditorías compartidas entre organizaciones (Mozilla, Google, ...)
+cargo install cargo-vet &amp;&amp; cargo vet init &amp;&amp; cargo vet
+
+# Reseñas de la comunidad, firmadas criptográficamente
+cargo install cargo-crev &amp;&amp; cargo crev repo fetch all</code></pre>
+
+<div class="warn">
+  <strong><code>cargo-geiger</code> cuenta, no juzga.</strong> Un número alto no significa "inseguro": <code>memchr</code> tiene mucho <code>unsafe</code> porque hace SIMD a mano, y es de los crates más auditados y probados del ecosistema. Y un cero tampoco es prueba de nada si el crate delega todo su trabajo peligroso en un <code>-sys</code>. La métrica es un <em>punto de partida para mirar</em>, jamás un veredicto.
+</div>
+
+<p>Cuando te toca leer un bloque de <code>unsafe</code> ajeno, esta es la checklist:</p>
+
+<ol>
+  <li><strong>¿Hay un <code>// SAFETY:</code>, y enuncia un invariante concreto?</strong> Si dice "es seguro", empezá a desconfiar.</li>
+  <li><strong>¿Existe alguna secuencia de llamadas <code>safe</code> públicas que rompa el invariante?</strong> Esta es la pregunta central: probá mentalmente el caso vacío, el caso lleno, el índice del borde y el reentrante.</li>
+  <li><strong>¿Qué pasa si algo hace pánico a mitad del bloque?</strong> ¿Queda el tipo en un estado inconsistente que después alguien va a leer? (<em>exception safety</em>: el error más sutil de todos.)</li>
+  <li><strong>¿El bloque abarca más operaciones de las necesarias?</strong> Un <code>unsafe { }</code> de veinte líneas casi siempre esconde dos operaciones peligrosas y dieciocho inocentes.</li>
+  <li><strong>¿La suite del proyecto corre bajo Miri?</strong> Mirá el CI. Si el crate tiene mucho <code>unsafe</code> y no corre Miri, es una señal fuerte.</li>
+  <li><strong>¿Los tests cubren los caminos que ejecutan el <code>unsafe</code>?</strong> Recordá: Miri solo ve lo que se ejecuta.</li>
+</ol>
+
+<p>Y del lado de tu propio crate, la declaración explícita vale más que cualquier convención informal:</p>
+
+<pre><code class="lang-bash"># Cargo.toml — prohibir unsafe en todo el crate, sin excepciones posibles
+[lints.rust]
+unsafe_code = "forbid"
+
+# Si un módulo lo necesita, se usa "deny" (que un módulo puede permitir
+# explícitamente con #[allow]) en vez de "forbid" (que no se puede levantar).</code></pre>
+
+<h2>RuS5.13 Worked example: buffer circular "por rendimiento"</h2>
+
+<p>Vamos a hacer el recorrido completo, tal como pasa en un proyecto real: escribir una versión segura, escribir una versión unsafe "porque va a ser más rápida", ver que los tests pasan, correr Miri, encontrar UB, arreglarlo, y <strong>medir</strong>. El final es la lección.</p>
+
+<h3>Paso 1 — La versión segura</h3>
+
+<pre><code class="lang-rust">// src/ring_safe.rs
+pub struct RingSafe&lt;T&gt; {
+    buf: Vec&lt;Option&lt;T&gt;&gt;,
+    cabeza: usize,
+    cola: usize,
+    largo: usize,
+}
+
+impl&lt;T&gt; RingSafe&lt;T&gt; {
+    pub fn nuevo(cap: usize) -&gt; Self {
+        assert!(cap &gt; 0, "la capacidad debe ser positiva");
+        let mut buf = Vec::with_capacity(cap);
+        buf.resize_with(cap, || None);
+        Self { buf, cabeza: 0, cola: 0, largo: 0 }
+    }
+
+    pub fn push(&amp;mut self, v: T) -&gt; Result&lt;(), T&gt; {
+        if self.largo == self.buf.len() { return Err(v); }
+        self.buf[self.cola] = Some(v);
+        self.cola = (self.cola + 1) % self.buf.len();
+        self.largo += 1;
+        Ok(())
+    }
+
+    pub fn pop(&amp;mut self) -&gt; Option&lt;T&gt; {
+        if self.largo == 0 { return None; }
+        let v = self.buf[self.cabeza].take();
+        self.cabeza = (self.cabeza + 1) % self.buf.len();
+        self.largo -= 1;
+        v
+    }
+
+    pub fn len(&amp;self) -&gt; usize { self.largo }
+    pub fn is_empty(&amp;self) -&gt; bool { self.largo == 0 }
+}</code></pre>
+
+<p>Funciona, es imposible de romper y no tiene un solo <code>unsafe</code>. Sus dos costos reales: cada elemento paga el espacio del discriminante de <code>Option&lt;T&gt;</code>, y cada <code>push</code>/<code>pop</code> paga un chequeo de límites más una operación de módulo.</p>
+
+<h3>Paso 2 — La versión unsafe (con el bug adentro)</h3>
+
+<pre><code class="lang-rust">// src/ring_unsafe.rs
+use std::mem::MaybeUninit;
+
+pub struct RingRaw&lt;T&gt; {
+    buf: Box&lt;[MaybeUninit&lt;T&gt;]&gt;,
+    mascara: usize,        // cap - 1, con cap potencia de dos → módulo por AND
+    cabeza: usize,
+    cola: usize,
+    largo: usize,
+}
+
+impl&lt;T&gt; RingRaw&lt;T&gt; {
+    pub fn nuevo(cap: usize) -&gt; Self {
+        assert!(cap.is_power_of_two(), "la capacidad debe ser potencia de dos");
+        let mut v = Vec::with_capacity(cap);
+        v.resize_with(cap, MaybeUninit::uninit);
+        Self {
+            buf: v.into_boxed_slice(),
+            mascara: cap - 1,
+            cabeza: 0, cola: 0, largo: 0,
+        }
+    }
+
+    pub fn push(&amp;mut self, v: T) -&gt; Result&lt;(), T&gt; {
+        if self.largo == self.buf.len() { return Err(v); }
+        let i = self.cola;
+        // 🐛 EL BUG: `as_ptr()` devuelve un puntero de SOLO LECTURA derivado
+        // de un préstamo compartido. Castearlo a *mut no le suma permisos.
+        let p = self.buf.as_ptr() as *mut MaybeUninit&lt;T&gt;;
+        // SAFETY: creemos que basta con que el índice esté en rango. No basta.
+        unsafe { (*p.add(i)).write(v); }
+        self.cola = (self.cola + 1) &amp; self.mascara;
+        self.largo += 1;
+        Ok(())
+    }
+
+    pub fn pop(&amp;mut self) -&gt; Option&lt;T&gt; {
+        if self.largo == 0 { return None; }
+        let i = self.cabeza;
+        // SAFETY: la posición `i` está inicializada porque largo &gt; 0 y solo
+        // se leen posiciones escritas por `push`. `assume_init_read` mueve
+        // el valor afuera y deja el hueco lógicamente vacío.
+        let v = unsafe { self.buf[i].assume_init_read() };
+        self.cabeza = (self.cabeza + 1) &amp; self.mascara;
+        self.largo -= 1;
+        Some(v)
+    }
+
+    pub fn len(&amp;self) -&gt; usize { self.largo }
+}
+
+impl&lt;T&gt; Drop for RingRaw&lt;T&gt; {
+    fn drop(&amp;mut self) {
+        // Hay que destruir SOLO los elementos vivos: los demás nunca existieron.
+        while self.pop().is_some() {}
+    }
+}</code></pre>
+
+<h3>Paso 3 — Los tests pasan</h3>
+
+<pre><code class="lang-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifo_basico() {
+        let mut r = RingRaw::nuevo(4);
+        r.push(1).unwrap();
+        r.push(2).unwrap();
+        assert_eq!(r.pop(), Some(1));
+        assert_eq!(r.pop(), Some(2));
+        assert_eq!(r.pop(), None);
+    }
+
+    #[test]
+    fn se_llena_y_da_la_vuelta() {
+        let mut r = RingRaw::nuevo(4);
+        for i in 0..4 { r.push(i).unwrap(); }
+        assert!(r.push(99).is_err());
+        assert_eq!(r.pop(), Some(0));
+        r.push(100).unwrap();
+        assert_eq!(r.len(), 4);
+    }
+
+    #[test]
+    fn libera_los_elementos_vivos() {
+        let mut r = RingRaw::nuevo(4);
+        r.push(String::from("a")).unwrap();
+        r.push(String::from("b")).unwrap();
+        drop(r);   // sin fugas: el Drop vacía el buffer
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">$ cargo test
+running 3 tests
+test tests::fifo_basico ... ok
+test tests::libera_los_elementos_vivos ... ok
+test tests::se_llena_y_da_la_vuelta ... ok
+
+test result: ok. 3 passed; 0 failed; finished in 0.00s</code></pre>
+
+<p>Verde. Tres tests, incluye el caso del wrap-around y el de <code>Drop</code> con tipos que asignan. En un PR normal, esto se mergea.</p>
+
+<h3>Paso 4 — Miri encuentra el UB</h3>
+
+<pre><code class="lang-bash">$ cargo +nightly miri test
+
+error: Undefined Behavior: attempting a write access using &lt;4127&gt; at
+       alloc2043[0x0], but that tag only grants SharedReadOnly permission
+       for this location
+  --&gt; src/ring_unsafe.rs:31:18
+   |
+31 |         unsafe { (*p.add(i)).write(v); }
+   |                  ^^^^^^^^^^^^^^^^^^^ this error occurs as part of an
+   |                  access at alloc2043[0x0..0x8]
+   |
+   = help: this indicates a potential bug in the program: it performed an
+           invalid operation, but the Stacked Borrows rules it violated are
+           still experimental
+help: &lt;4127&gt; was created by a SharedReadOnly retag at offsets [0x0..0x20]
+  --&gt; src/ring_unsafe.rs:29:17
+   |
+29 |         let p = self.buf.as_ptr() as *mut MaybeUninit&lt;T&gt;;
+   |                 ^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+test result: FAILED. 0 passed; 3 failed</code></pre>
+
+<p>Miri no solo dice <em>dónde</em> falla: dice <em>dónde nació</em> el puntero problemático. Los tres tests fallan, porque los tres pasan por <code>push</code>. El diagnóstico es exacto: <code>as_ptr()</code> creó un puntero con permiso <code>SharedReadOnly</code>, y el <code>as *mut</code> es solo un cambio de tipo — no un ascenso de privilegios.</p>
+
+<div class="concept">
+  <strong>💡 Por qué esto importa aunque "funcione".</strong> El puntero de solo lectura le dice a LLVM que esa memoria no cambia mientras el puntero esté vivo. Con esa información, el optimizador puede cachear una lectura en un registro, hoistear una carga fuera del bucle, o reordenar accesos. Hoy el binario sale bien; con <code>-C lto=fat</code> y ese <code>push</code> inlineado dentro de un bucle caliente, puede dejar de estarlo — sin que ningún test cambie.
+</div>
+
+<h3>Paso 5 — El arreglo</h3>
+
+<pre><code class="lang-rust">pub fn push(&amp;mut self, v: T) -&gt; Result&lt;(), T&gt; {
+    if self.largo == self.buf.len() { return Err(v); }
+    let i = self.cola;
+    // ✅ `as_mut_ptr` deriva de `&amp;mut self`: el puntero SÍ tiene permiso
+    // de escritura sobre toda la asignación.
+    let p = self.buf.as_mut_ptr();
+    // SAFETY: `i &lt; buf.len()` porque `largo &lt; buf.len()` y `cola` siempre
+    // se mantiene enmascarado con `mascara == len - 1`. El puntero viene de
+    // `&amp;mut self`, así que tiene permiso de escritura, y no hay otro alias
+    // vivo de esta asignación mientras dure la llamada.
+    unsafe { (*p.add(i)).write(v); }
+    self.cola = (self.cola + 1) &amp; self.mascara;
+    self.largo += 1;
+    Ok(())
+}</code></pre>
+
+<pre><code class="lang-bash">$ cargo +nightly miri test
+running 3 tests
+test tests::fifo_basico ... ok
+test tests::libera_los_elementos_vivos ... ok
+test tests::se_llena_y_da_la_vuelta ... ok
+
+test result: ok. 3 passed; 0 failed; finished in 4.71s</code></pre>
+
+<p>Limpio. Notá el tiempo: 4,71 s bajo Miri contra 0,00 s en nativo, para tres tests triviales. Ese es el orden de magnitud del costo.</p>
+
+<h3>Paso 6 — Medir contra la versión segura</h3>
+
+<p>Ahora la pregunta que había que hacerse al principio: <em>¿cuánto ganamos?</em></p>
+
+<pre><code class="lang-rust">// benches/ring.rs
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use ring::{RingRaw, RingSafe};
+
+fn bench(c: &amp;mut Criterion) {
+    let mut g = c.benchmark_group("ring/1024_ops");
+
+    g.bench_function("safe", |b| {
+        b.iter(|| {
+            let mut r = RingSafe::nuevo(1024);
+            for i in 0..1024u64 { let _ = r.push(black_box(i)); }
+            for _ in 0..1024 { black_box(r.pop()); }
+        })
+    });
+
+    g.bench_function("raw", |b| {
+        b.iter(|| {
+            let mut r = RingRaw::nuevo(1024);
+            for i in 0..1024u64 { let _ = r.push(black_box(i)); }
+            for _ in 0..1024 { black_box(r.pop()); }
+        })
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, bench);
+criterion_main!(benches);</code></pre>
+
+<pre><code class="lang-bash">$ cargo bench
+
+ring/1024_ops/safe      time:   [3.8412 µs 3.8567 µs 3.8741 µs]
+ring/1024_ops/raw       time:   [3.6791 µs 3.6934 µs 3.7098 µs]
+
+# Diferencia: 3.8567 → 3.6934  =  −4.23 %</code></pre>
+
+<table>
+  <thead>
+    <tr><th>Versión</th><th>Tiempo (1024 push+pop)</th><th>Bloques <code>unsafe</code></th><th>Necesita Miri en CI</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>RingSafe</code></td><td>3,857 µs</td><td>0</td><td>No</td></tr>
+    <tr><td><code>RingRaw</code></td><td>3,693 µs (<strong>−4,2%</strong>)</td><td>3</td><td>Sí</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La conclusión del ejercicio: el 4,2% no justifica el unsafe.</strong> Pagamos tres bloques <code>unsafe</code>, un <code>Drop</code> manual que hay que mantener correcto, un UB que ningún test detectó y que tardó una corrida de Miri en aparecer, y un requisito permanente de Miri en el CI. A cambio de 164 nanosegundos cada mil operaciones. En un programa donde el ring buffer no es el hotspot —y casi nunca lo es— el efecto end-to-end es indistinguible de cero.
+</div>
+
+<p>¿Por qué la ganancia fue tan chica? Porque LLVM ya estaba haciendo casi todo el trabajo: el chequeo de límites de <code>self.buf[i]</code> se elimina cuando el optimizador puede probar que el índice está en rango, y el módulo por una potencia de dos se compila al mismo <code>AND</code> que escribimos a mano. El <code>unsafe</code> nos dio lo único que LLVM no podía deducir: ahorrarse el discriminante de <code>Option&lt;T&gt;</code>. Cuatro por ciento.</p>
+
+<div class="tip">
+  <strong>Cuándo sí habría valido la pena:</strong> si el perfil mostrara que este ring buffer se lleva el 40% del tiempo del proceso, si <code>T</code> fuera grande y el <code>Option</code> agregara padding significativo, o si el buffer viviera en un contexto <code>no_std</code> con memoria contada en kilobytes. Ninguna de esas condiciones aparece por defecto: <strong>hay que ir a buscarlas con un profiler antes de escribir la primera línea de unsafe</strong>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si <code>unsafe</code> no desactiva el borrow checker, ¿qué desactiva exactamente?</summary>
+<p>Nada: <em>habilita</em> cinco operaciones que fuera de un bloque <code>unsafe</code> son un error de compilación — desreferenciar punteros crudos, llamar funciones <code>unsafe</code>, implementar traits <code>unsafe</code>, acceder a <code>static mut</code> y leer campos de <code>union</code>. Todo lo demás sigue chequeado igual: ownership, borrowing, lifetimes, tipos, <code>Drop</code>. Lo que <em>sí</em> cambia es de quién es la responsabilidad de mantener los invariantes de esas cinco operaciones: pasa del compilador a vos, y por eso todo bloque lleva un <code>// SAFETY:</code> que enuncia el invariante concreto del que te hacés cargo.</p></details>
+
+<details><summary>Tus tests pasan y tenés 90% de cobertura. ¿Alcanza para afirmar que tu código unsafe no tiene UB?</summary>
+<p>No, por dos razones distintas. Primero, un test verde no dice nada sobre UB: el ejemplo de <code>as_ptr() as *mut</code> del worked example pasó tres tests, incluido el del wrap-around, y era UB en cada llamada — el síntoma aparece recién cuando el optimizador aprovecha la suposición que rompiste. Segundo, aun corriendo Miri, <strong>Miri solo ve lo que ejecutás</strong>: un UB en una rama que ningún test recorre es invisible. La afirmación defendible es "no encontré UB en los caminos que mis tests cubren bajo Miri, con estos flags", que es bastante más modesta y bastante más honesta.</p></details>
+
+<details><summary>Un compañero justifica un <code>unsafe</code> diciendo "es 30% más rápido". ¿Qué preguntás?</summary>
+<p>Cuatro cosas, en orden. <strong>(1) ¿Dónde está el benchmark?</strong> — sin número reproducible, el 30% es una suposición. <strong>(2) ¿El 30% de qué fracción del tiempo total?</strong> — un 30% sobre un hotspot que pesa el 3% end-to-end es un 0,9%. <strong>(3) ¿Cuál es el invariante y puede romperse desde la API pública?</strong> — si existe alguna secuencia de llamadas <code>safe</code> que cause UB, la API está rota sin importar la velocidad. <strong>(4) ¿Corre bajo Miri, y los tests cubren los caminos que ejecutan el bloque?</strong> Y aunque las cuatro respuestas sean buenas, queda el costo permanente: cada PR sobre ese módulo va a necesitar un revisor que entienda el modelo de memoria.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><code>unsafe</code> <strong>no da permisos, transfiere obligaciones</strong>: las reglas son las mismas, cambia quién las verifica.</li>
+  <li>Habilita exactamente <strong>cinco</strong> cosas: desreferenciar punteros crudos, llamar <code>unsafe fn</code>, hacer <code>unsafe impl</code>, tocar <code>static mut</code> y leer campos de <code>union</code>. El resto de Rust sigue chequeado.</li>
+  <li>El diseño correcto es la <strong>safety boundary</strong>: encapsular el unsafe en una API safe que sea imposible de romper desde afuera, y documentar cada bloque con <code>// SAFETY:</code>.</li>
+  <li><strong>UB no es un bug</strong>: el compilador optimiza asumiendo que no ocurre, así que el síntoma aparece lejos, cambia con el nivel de optimización y desaparece bajo el debugger.</li>
+  <li>Los seis UB frecuentes: <strong>dangling, aliasing de <code>&amp;mut</code>, memoria no inicializada, desalineación, valores inválidos y data races</strong>. Overflow y fugas <em>no</em> son UB.</li>
+  <li>Un puntero lleva <strong>provenance</strong>, no solo una dirección. Usá <code>addr()</code>, <code>map_addr()</code> y <code>with_exposed_provenance()</code> en vez de castear a <code>usize</code>.</li>
+  <li><code>MaybeUninit&lt;T&gt;</code> es el tipo honesto para memoria sin inicializar; <code>mem::uninitialized()</code> está deprecado desde 1.39 porque su firma mentía.</li>
+  <li><strong>Miri</strong> detecta UB en runtime y es la herramienta central del módulo — con una limitación que define cómo se usa: <strong>solo ve lo que ejecutás</strong>, así que tu cobertura de tests es tu cobertura de verificación.</li>
+  <li>La <strong>edición 2024</strong> endureció el terreno: <code>unsafe_op_in_unsafe_fn</code>, <code>unsafe extern</code>, <code>#[unsafe(no_mangle)]</code> y <code>static_mut_refs</code> como error.</li>
+  <li>En FFI, respondé <strong>quién libera</strong> antes de escribir código; el error clásico es el <code>CString</code> temporal cuyo <code>as_ptr()</code> queda colgado en la misma línea.</li>
+  <li><strong>Casi siempre hay una alternativa segura</strong>, y suele ser igual de rápida. La performance se mide antes, no se supone: el worked example ganó <strong>4,2%</strong> a cambio de tres bloques unsafe, un UB y Miri en CI.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí un programa que cree un <code>bool</code> con <code>transmute(2u8)</code> y lo pase por un <code>match</code>. Compilalo con <code>-C opt-level=0</code> y con <code>-C opt-level=3</code>, compará la salida, y después mirá el asm con <code>cargo asm</code> o <a href="https://godbolt.org">Compiler Explorer</a> para ver por qué difieren.</li>
+  <li>Implementá <code>split_at_mut</code> genérico (<code>&amp;mut [T]</code>) con <code>unsafe</code>, escribí el <code>// SAFETY:</code> completo, y agregá tests para los tres bordes: <code>medio == 0</code>, <code>medio == len</code> y <code>medio &gt; len</code>. Corré la suite bajo Miri.</li>
+  <li>Tomá el <code>RingRaw</code> del worked example y agregá un método <code>as_slices(&amp;mut self) -&gt; (&amp;mut [T], &amp;mut [T])</code>. Escribilo <em>mal</em> a propósito (que los dos slices se solapen cuando el buffer está lleno), verificá que un test ingenuo pasa, y después mostrá cómo Miri lo detecta.</li>
+  <li>Escribí una función <code>unsafe fn suma_unchecked(a: &amp;[f32], b: &amp;[f32]) -&gt; f32</code> con <code>get_unchecked</code> y su equivalente safe con <code>zip</code>. Medí ambas con <code>criterion</code> sobre slices de 1.000, 100.000 y 10.000.000 elementos. Reportá una tabla con tus números.</li>
+  <li>Escribí una librería en C con una función que reciba un <code>char *</code> y devuelva un <code>char *</code> asignado con <code>malloc</code>. Llamala desde Rust: definí quién libera qué, escribí el wrapper safe, y documentá el contrato. Después provocá a propósito el bug del <code>CString</code> temporal y confirmá que Miri o ASan lo detectan.</li>
+  <li>Definí un tipo con un <code>*mut u8</code> adentro y hacé <code>unsafe impl Send</code>. Escribí el <code>// SAFETY:</code> que lo justifique. Después modificá el tipo para que la justificación deje de ser cierta (agregale un método que exponga <code>&amp;mut</code> desde <code>&amp;self</code>) y explicá exactamente en qué línea se rompió la promesa.</li>
+  <li>Corré <code>cargo geiger</code> sobre un proyecto tuyo con al menos diez dependencias. Elegí el crate con más <code>unsafe</code>, entrá al código, y auditá un bloque real con la checklist de RuS5.12. Escribí tres párrafos: qué invariante mantiene, cómo lo garantiza y si su CI corre Miri.</li>
+</ol>
+
+<section class="quiz" id="quizRuS5">
+  <style>
+    #quizRuS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS5 .q{margin-bottom:1.5rem}
+    #quizRuS5 .q p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS5 .opt:hover{border-color:var(--accent)}
+    #quizRuS5 .opt:disabled{cursor:default}
+    #quizRuS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS5 .exp.show{display:block}
+    #quizRuS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Metés un préstamo conflictivo adentro de un bloque <code>unsafe</code> y el compilador lo sigue rechazando. ¿Por qué?</p>
+    <button class="opt">Porque falta agregar <code>#![allow(unsafe_code)]</code> en el crate</button>
+    <button class="opt">Porque el bloque tiene que ser <code>unsafe fn</code>, no <code>unsafe { }</code></button>
+    <button class="opt">Porque <code>unsafe</code> solo habilita cinco operaciones puntuales; el borrow checker sigue activo</button>
+    <div class="exp"><code>unsafe</code> habilita desreferenciar punteros crudos, llamar funciones <code>unsafe</code>, hacer <code>unsafe impl</code>, tocar <code>static mut</code> y leer campos de <code>union</code>. Nada más. Ownership, borrowing y lifetimes se siguen chequeando idénticamente adentro y afuera del bloque. Si necesitás eludir el borrow checker, la vía es pasar por punteros crudos —y ahí sos vos quien tiene que garantizar el aliasing, que es exactamente la obligación que <code>unsafe</code> te transfiere.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu suite de tests pasa bajo <code>cargo +nightly miri test</code> sin errores. ¿Qué podés afirmar?</p>
+    <button class="opt">Que no hay UB en los caminos que tus tests ejecutaron, con esos flags — nada más</button>
+    <button class="opt">Que el crate está libre de Undefined Behavior</button>
+    <button class="opt">Que el código es seguro incluso al llamarlo desde C</button>
+    <div class="exp">Miri es un intérprete, no un análisis estático: solo observa el código que efectivamente se ejecuta. Un bloque <code>unsafe</code> en una rama que ningún test recorre le es invisible, y su modelo de aliasing depende de los flags (<code>-Zmiri-strict-provenance</code>, <code>-Zmiri-tree-borrows</code>). Además Miri no puede ejecutar la mayoría del código FFI, así que sobre la frontera con C no dice casi nada. La conclusión práctica: tu cobertura de tests <em>es</em> tu cobertura de verificación de UB.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Reescribiste un hotspot con <code>unsafe</code> y el benchmark da 4% de mejora. ¿Cuál es la lectura correcta?</p>
+    <button class="opt">Cualquier mejora medible justifica el unsafe: 4% es 4%</button>
+    <button class="opt">No justifica: el costo real incluye auditoría permanente, Miri en CI y una clase de bug que no se reproduce</button>
+    <button class="opt">Hay que probar con <code>-C target-cpu=native</code> hasta llegar al 20% y ahí sí justificarlo</button>
+    <div class="exp">El 4% es solo un lado de la balanza. Del otro lado hay costos que no aparecen en el benchmark: cada PR sobre ese módulo necesita un revisor que entienda el modelo de memoria, el invariante es global al módulo y se puede romper meses después desde un cambio aparentemente inocente, los bugs que produce dependen del nivel de optimización y no se reproducen, y la suite pasa a necesitar Miri en CI. Además, un 4% sobre un hotspot que pesa el 5% del tiempo total es un 0,2% end-to-end. El unsafe se justifica cuando un profiler muestra un cuello de botella dominante <em>y</em> la ganancia medida es sustancial — no antes.</div>
+  </div>
+
+  <div class="score" id="scoreRuS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RuS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus4-tokio/lecture.html">← RuS4: Tokio en producción</a>
+  <a href="../rus6-macros/lecture.html">RuS6: Macros →</a>
+</nav>
+
+</div>
+</body>
+</html>

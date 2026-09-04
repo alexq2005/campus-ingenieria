@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RuS8 — Embebido y producción: no_std, Embassy y deploy · Rust Senior</title>
+  <meta name="description" content="Las dos puntas de Rust en producción: errores con thiserror/anyhow, observabilidad con tracing, deploy estático con musl y supply chain; y del otro lado no_std, la pila PAC/HAL/BSP, Embassy 0.6, esp-rs, probe-rs y defmt.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Rust Senior</a>
+  <a href="../../index.html">🦀 Curso de Rust</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RuS8</span>
+  <span class="badge">⏱ 60–165 min</span>
+  <span class="badge">🎯 Pre-req: RuS1–RuS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>RuS8 — Embebido y producción: no_std, Embassy y deploy</h1>
+
+<h2>RuS8.0 Por qué este módulo</h2>
+
+<p>Hay una propiedad de Rust que casi ningún otro lenguaje tiene, y que recién se aprecia cuando la usás en los dos extremos a la vez: <strong>el mismo lenguaje, con la misma semántica de ownership y los mismos traits, corre en un servidor con 128 GB de RAM y en un microcontrolador con 64 KB de flash</strong>. No es "Rust y además un dialecto embebido". Es el mismo compilador, el mismo <code>cargo</code>, los mismos <code>Result</code> y las mismas reglas de préstamos. Lo único que cambia es qué biblioteca estándar tenés disponible.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Este es el cierre del track, y cubre las dos puntas de lo que significa "poner Rust en producción". <strong>Del lado servidor</strong>, producción es una lista corta de decisiones que se toman una vez y se pagan durante años: cómo se representan los errores, cómo se observa el sistema, cómo se empaqueta y cómo se audita el árbol de dependencias. <strong>Del lado embebido</strong>, producción es entender qué desaparece cuando sacás <code>std</code>, qué queda, y cómo el modelo de <code>async</code> que estudiaste en RuS3 resulta ser —de manera bastante inesperada— la mejor herramienta que existe para escribir firmware que dure meses con una batería.
+</div>
+
+<p>Y hay una razón para estudiar el lado embebido <em>ahora</em> y no dentro de tres años: dejó de ser un experimento. Espressif adoptó Rust como <strong>SDK oficial de primer nivel</strong> a través de <code>esp-rs</code>. <strong>Embassy</strong> se convirtió en el runtime async de facto en microcontroladores y los proyectos nuevos rara vez arrancan con el patrón clásico de <em>super-loop</em> más interrupciones. <strong><code>probe-rs</code></strong> reemplazó a OpenOCD en la práctica para flashear y debuggear. Lo que hace cinco años eran demos de conferencia hoy es el camino por defecto.</p>
+
+<div class="info">
+  Este módulo tiene dos mitades que se pueden leer por separado. La <strong>Parte A</strong> (RuS8.1–RuS8.5) es sobre servicios: si trabajás en backend, es la que te toca mañana. La <strong>Parte B</strong> (RuS8.6–RuS8.12) es sobre firmware. Recomiendo leer las dos igual, porque la Parte B te obliga a ver con claridad cuánto trabajo hace <code>std</code> por vos —trabajo que en el servidor es invisible justamente porque siempre está ahí.
+</div>
+
+<hr>
+
+<h2>RuS8.1 Parte A — Errores en una app real: <code>thiserror</code> vs <code>anyhow</code></h2>
+
+<p>En RuS2 viste que <code>Result</code> y el operador <code>?</code> se apoyan en el trait <code>From</code>: <code>?</code> propaga el error convirtiéndolo al tipo de error de la función que lo contiene. En un ejercicio eso es trivial porque hay un solo tipo de error. En una aplicación real vas a tener errores de I/O, de red, de parseo, de la base de datos y de tu propia lógica de dominio, y la pregunta se vuelve concreta: <strong>¿qué tipo de error devuelve cada capa?</strong></p>
+
+<p>La respuesta del ecosistema es una regla con dos casos, y vale la pena entender <em>por qué</em> son dos casos distintos y no una preferencia de estilo.</p>
+
+<div class="rule">
+  <strong>📌 La regla.</strong> <code>thiserror</code> en <strong>librerías</strong>. <code>anyhow</code> en <strong>binarios</strong>. La diferencia real es quién va a consumir el error: si es <em>otro código</em>, el error tiene que ser un tipo cerrado que se pueda inspeccionar con <code>match</code>; si es <em>un humano leyendo un log</em>, lo que importa es el contexto acumulado, no la forma del tipo.
+</div>
+
+<p>Una librería expone un enum de errores. El punto no es que sea "más prolijo": es que el que llama necesita poder <strong>decidir distinto según el caso</strong>. Si tu librería devuelve un error opaco, el que la usa no puede distinguir "el token expiró, reintentá" de "el JSON está roto, no reintentes nunca".</p>
+
+<pre><code class="lang-rust">use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ClienteError {
+    #[error("fallo de transporte hacia {url}")]
+    Transporte {
+        url: String,
+        #[source] fuente: reqwest::Error,
+    },
+
+    #[error("la respuesta no es JSON válido")]
+    Deserializacion(#[from] serde_json::Error),
+
+    #[error("el servidor respondió {codigo}: {mensaje}")]
+    Api { codigo: u16, mensaje: String },
+
+    #[error("el token expiró hace {0} segundos")]
+    TokenExpirado(u64),
+}</code></pre>
+
+<p><code>thiserror</code> es una macro derive —de las que estudiaste en RuS6— que genera el <code>impl Display</code> a partir de los atributos <code>#[error(...)]</code> y el <code>impl std::error::Error</code> con el método <code>source()</code> apuntando al campo marcado con <code>#[source]</code>. El <code>#[from]</code> genera además el <code>impl From</code>, que es lo que hace funcionar al <code>?</code>:</p>
+
+<pre><code class="lang-rust">pub fn parsear(cuerpo: &amp;str) -&gt; Result&lt;Usuario, ClienteError&gt; {
+    // serde_json::Error se convierte solo, porque hay #[from]
+    let u: Usuario = serde_json::from_str(cuerpo)?;
+    Ok(u)
+}</code></pre>
+
+<div class="mistake">
+  <strong>Error frecuente:</strong> poner <code>#[from]</code> en <em>todas</em> las variantes. <code>#[from]</code> exige que la conversión sea sin ambigüedad: no podés tener dos variantes que conviertan desde <code>std::io::Error</code>, porque el compilador no sabría cuál elegir. Además, la conversión automática <strong>tira contexto</strong>: si tenés tres llamadas de red distintas en una función y las tres se convierten a la misma variante, el mensaje no te dice cuál falló. Cuando querés contexto, construí la variante a mano con <code>map_err</code>.
+</div>
+
+<pre><code class="lang-rust">let resp = self.http.get(&amp;url).send().await
+    .map_err(|e| ClienteError::Transporte { url: url.clone(), fuente: e })?;</code></pre>
+
+<h3>Del otro lado: el binario</h3>
+
+<p>En el <code>main</code> de un servicio, esa disciplina se vuelve contraproducente. Nadie va a hacer <code>match</code> sobre el error de tu <code>main</code>: el error se loguea y el proceso decide si sigue o se muere. Escribir un enum que una las quince fuentes de error de todo el programa es trabajo puro sin beneficio. Ahí entra <code>anyhow</code>, que da un tipo único —<code>anyhow::Error</code>— capaz de contener cualquier cosa que implemente <code>std::error::Error</code>, y que aporta lo que sí importa: <strong>contexto encadenado</strong>.</p>
+
+<pre><code class="lang-rust">use anyhow::{Context, Result};
+
+fn cargar_config(ruta: &amp;Path) -&gt; Result&lt;Config&gt; {
+    let texto = std::fs::read_to_string(ruta)
+        .with_context(|| format!("no pude leer la config en {}", ruta.display()))?;
+
+    let cfg: Config = toml::from_str(&amp;texto)
+        .with_context(|| format!("la config en {} no es TOML válido", ruta.display()))?;
+
+    cfg.validar().context("la config parsea pero es inconsistente")?;
+    Ok(cfg)
+}</code></pre>
+
+<p>Cuando eso falla, el error impreso no es <code>No such file or directory (os error 2)</code>, que no le sirve a nadie. Es una cadena:</p>
+
+<pre><code class="lang-bash">Error: no pude leer la config en /etc/svc/config.toml
+
+Caused by:
+    0: No such file or directory (os error 2)</code></pre>
+
+<div class="tip">
+  <code>with_context</code> toma un closure y solo lo ejecuta si hay error, así que el <code>format!</code> no se paga en el camino feliz. <code>context</code> toma un valor ya construido: usalo con literales, no con <code>format!</code>.
+</div>
+
+<p>Las dos bibliotecas conviven sin fricción, porque <code>anyhow::Error</code> implementa <code>From&lt;E&gt;</code> para todo <code>E: std::error::Error + Send + Sync + 'static</code>. Tus errores de <code>thiserror</code> entran solos:</p>
+
+<pre><code class="lang-rust">// en el binario, mezclando errores de tres librerías distintas
+async fn ciclo(&amp;self) -&gt; anyhow::Result&lt;()&gt; {
+    let cfg = cargar_config(&amp;self.ruta)?;              // anyhow
+    let datos = self.cliente.traer().await             // ClienteError (thiserror)
+        .context("fallo al traer datos del proveedor")?;
+    self.db.guardar(&amp;datos).await                       // sqlx::Error
+        .context("fallo al persistir el lote")?;
+    Ok(())
+}</code></pre>
+
+<p>La regla se rompe en un caso, y es un caso que aparece: cuando el binario <strong>sí</strong> necesita decidir según el error. En un servidor HTTP tenés que mapear el error a un código de estado, y eso es lógica, no logging. Ahí querés un enum propio en la capa de handlers aunque el resto del programa use <code>anyhow</code>:</p>
+
+<pre><code class="lang-rust">// axum: el error de la capa HTTP sí es un tipo cerrado
+#[derive(Debug, Error)]
+enum ApiError {
+    #[error("no encontrado")]
+    NoEncontrado,
+    #[error("credenciales inválidas")]
+    NoAutorizado,
+    #[error(transparent)]
+    Interno(#[from] anyhow::Error),   // el cajón de sastre
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -&gt; Response {
+        let status = match self {
+            ApiError::NoEncontrado =&gt; StatusCode::NOT_FOUND,
+            ApiError::NoAutorizado =&gt; StatusCode::UNAUTHORIZED,
+            ApiError::Interno(ref e) =&gt; {
+                tracing::error!(error = ?e, "error interno");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        (status, self.to_string()).into_response()
+    }
+}</code></pre>
+
+<div class="warn">
+  Fijate en el <code>Interno</code>: el mensaje del error interno se loguea con todo el detalle, pero al cliente le llega solo el status. <strong>Nunca devuelvas el <code>Display</code> de un error interno en una respuesta HTTP</strong>: los errores de base de datos filtran nombres de tablas, y los de I/O filtran rutas del filesystem. Eso es exactamente la clase de fuga de información que trata el <a href="../../../../sistemas/Curso-Ciberseguridad/m07-secretos-supply-chain/lecture.html">M07 de Ciberseguridad</a>.
+</div>
+
+<h2>RuS8.2 Observabilidad: <code>tracing</code>, no <code>log</code></h2>
+
+<p>El crate <code>log</code> es la fachada clásica: <code>info!</code>, <code>warn!</code>, <code>error!</code>. Funciona, es minúsculo y para una CLI alcanza. Para un servicio async no alcanza, y la razón es estructural, no de gustos.</p>
+
+<p>Un log es una línea con un instante. En un servidor sincrónico con un thread por request, eso es suficiente porque el thread es la unidad de trabajo: agrupás por thread ID y reconstruís la request. En un servidor async —lo que viste en RuS3 y RuS4— <strong>una tarea salta de thread en cada <code>.await</code></strong>, y miles de tareas se intercalan sobre el mismo par de threads. El thread ID deja de significar nada. Si tenés diez requests concurrentes, tus líneas de log quedan entreveradas sin ninguna manera de separarlas.</p>
+
+<div class="analogy">
+  <strong>La diferencia.</strong> <code>log</code> registra <em>eventos</em>: "pasó esto, a esta hora". <code>tracing</code> registra eventos <em>y</em> <strong>spans</strong>: períodos de tiempo con estructura, que se anidan y que <strong>viajan con la tarea</strong>. Un span es "estoy adentro del procesamiento del pedido 4471", y todo lo que se loguee mientras esa tarea está viva —aunque sea en otro thread, aunque pasen tres <code>.await</code>— queda etiquetado con ese pedido. Es la única forma de que un log async sea legible.
+</div>
+
+<pre><code class="lang-rust">use tracing::{info, warn, instrument};
+
+#[instrument(skip(db), fields(pedido_id = %pedido.id))]
+async fn procesar(pedido: Pedido, db: &amp;Pool) -&gt; anyhow::Result&lt;Recibo&gt; {
+    info!("iniciando procesamiento");
+
+    let stock = verificar_stock(&amp;pedido, db).await?;   // hereda el span
+    if stock.faltante &gt; 0 {
+        warn!(faltante = stock.faltante, "stock insuficiente, backorder");
+    }
+
+    let recibo = cobrar(&amp;pedido).await?;               // hereda el span
+    info!(monto = recibo.monto, "procesamiento completo");
+    Ok(recibo)
+}</code></pre>
+
+<p>El atributo <code>#[instrument]</code> —otra macro procedural— envuelve la función en un span que se abre al entrar y se cierra al salir, incluyendo la duración. <code>skip(db)</code> evita que intente formatear el pool de conexiones, que no tiene <code>Debug</code> útil y sería enorme. <code>fields(...)</code> agrega campos al span; el <code>%</code> pide <code>Display</code> y el <code>?</code> pide <code>Debug</code>.</p>
+
+<p>Lo importante es lo que <em>no</em> se ve: <code>verificar_stock</code> y <code>cobrar</code> no reciben el <code>pedido_id</code> por parámetro. Sus propios logs lo llevan igual, porque el span es contextual y se propaga por la tarea. Esto es lo que hace que <code>tracing</code> encaje con async: el contexto sigue a la <em>tarea</em>, no al thread.</p>
+
+<h3>El suscriptor: dónde se decide el formato</h3>
+
+<p><code>tracing</code> solo emite. Quien decide qué hacer con eso es <code>tracing-subscriber</code>, y esa separación es lo que te deja cambiar de formato sin tocar una línea de código de negocio.</p>
+
+<pre><code class="lang-rust">use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+fn init_telemetria(json: bool) {
+    let filtro = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,hyper=warn"));
+
+    let registro = tracing_subscriber::registry().with(filtro);
+
+    if json {
+        // producción: una línea JSON por evento, para ingestión automática
+        registro.with(tracing_subscriber::fmt::layer().json()).init();
+    } else {
+        // desarrollo: legible por humanos, con colores
+        registro.with(tracing_subscriber::fmt::layer().pretty()).init();
+    }
+}</code></pre>
+
+<pre><code class="lang-bash"># el filtro se controla por variable de entorno, sin recompilar
+RUST_LOG=info cargo run
+RUST_LOG=debug,mi_app::pagos=trace,sqlx=off cargo run
+
+# en producción: subir el nivel de un módulo puntual sin tocar el resto
+RUST_LOG="warn,mi_app::pagos=debug" ./servicio</code></pre>
+
+<div class="rule">
+  <strong>📌 En producción, JSON siempre.</strong> Un log de texto plano obliga a que alguien escriba expresiones regulares del lado del agregador, y esas regex se rompen el día que alguien cambia un mensaje. Con <code>.json()</code>, cada campo del span es un campo del documento: filtrar por <code>pedido_id</code> es una query, no un <code>grep</code>. El costo es que deja de ser cómodo de leer a mano — por eso la función de arriba tiene las dos ramas.
+</div>
+
+<h3>OpenTelemetry: cuando el sistema es más de un proceso</h3>
+
+<p>Cuando la request atraviesa tres servicios, los spans locales dejan de alcanzar: necesitás que el span del servicio A sea el <em>padre</em> del span del servicio B. Ese es el estándar <strong>OpenTelemetry</strong>, y el puente se llama <code>tracing-opentelemetry</code>. Como es una capa más del <code>registry</code>, se agrega sin tocar nada de lo anterior:</p>
+
+<pre><code class="lang-rust">use tracing_opentelemetry::OpenTelemetryLayer;
+
+let tracer = opentelemetry_otlp::new_pipeline()
+    .tracing()
+    .with_exporter(opentelemetry_otlp::new_exporter().tonic())
+    .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+tracing_subscriber::registry()
+    .with(EnvFilter::from_default_env())
+    .with(tracing_subscriber::fmt::layer().json())   // logs a stdout
+    .with(OpenTelemetryLayer::new(tracer))           // trazas al colector
+    .init();</code></pre>
+
+<div class="info">
+  El <code>install_batch</code> importa: exportar cada span de a uno por red agrega latencia a cada request. El exportador por lotes acumula en memoria y manda en tandas desde una tarea aparte. La contra es que si el proceso se muere de golpe, perdés el último lote — un intercambio razonable para telemetría, inaceptable para un log de auditoría.
+</div>
+
+<h2>RuS8.3 Configuración y secretos</h2>
+
+<p>La configuración de un servicio viene de tres lados que hay que combinar con precedencia clara: valores por defecto en el código, un archivo, y variables de entorno que pisan a los dos. En Rust eso se resuelve deserializando a un struct con <code>serde</code>, lo cual tiene una ventaja enorme sobre leer un diccionario: <strong>si falta un campo o tiene el tipo equivocado, el proceso no arranca</strong>, en lugar de explotar tres horas después cuando alguien toca ese código path.</p>
+
+<pre><code class="lang-rust">use serde::Deserialize;
+use secrecy::{ExposeSecret, SecretString};
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    #[serde(default = "puerto_default")]
+    pub puerto: u16,
+    pub base_datos_url: SecretString,     // ← nunca se imprime
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub modo_debug: bool,
+}
+
+fn puerto_default() -&gt; u16 { 8080 }
+
+impl Config {
+    pub fn cargar() -&gt; anyhow::Result&lt;Self&gt; {
+        // figment: capas con precedencia explícita, de menor a mayor
+        figment::Figment::new()
+            .merge(figment::providers::Toml::file("config.toml"))
+            .merge(figment::providers::Env::prefixed("APP_"))
+            .extract()
+            .context("configuración inválida")
+    }
+}</code></pre>
+
+<p>El detalle que separa un servicio serio de uno que va a filtrar credenciales es <code>SecretString</code>, del crate <code>secrecy</code>. Es un wrapper cuyo <code>Debug</code> imprime <code>Secret([REDACTED String])</code> en lugar del valor. Suena menor hasta que ves cómo se filtran los secretos en la vida real: casi nunca por un <code>println!</code> deliberado. Se filtran porque alguien puso <code>#[derive(Debug)]</code> en la config, y después alguien más escribió <code>tracing::debug!(config = ?cfg, "arrancando")</code>, y esa línea mandó la URL de la base con usuario y contraseña a un agregador de logs de terceros que la retiene 90 días.</p>
+
+<pre><code class="lang-rust">let cfg = Config::cargar()?;
+
+tracing::info!(config = ?cfg, "config cargada");
+// -&gt; Config { puerto: 8080, base_datos_url: Secret([REDACTED alloc::string::String]), .. }
+
+// para usarlo hay que pedirlo explícitamente, y eso se ve en el code review
+let pool = PgPool::connect(cfg.base_datos_url.expose_secret()).await?;</code></pre>
+
+<div class="rule">
+  <strong>📌 El valor de <code>secrecy</code> no es criptográfico, es social.</strong> No cifra nada. Lo que hace es convertir "filtrar un secreto por accidente" en "filtrar un secreto escribiendo <code>expose_secret()</code>", que es una línea que salta en cualquier revisión y que podés buscar con <code>grep</code> en todo el repo. Mueve el error de invisible a visible.
+</div>
+
+<p>El resto de la historia —de dónde salen esas variables de entorno, rotación de credenciales, por qué un secreto en el repo sigue estando en el repo aunque lo borres con un commit, y qué hace un gestor tipo Vault— está en el <a href="../../../../sistemas/Curso-Ciberseguridad/m07-secretos-supply-chain/lecture.html">M07 del curso de Ciberseguridad</a>. Es el complemento directo de esta sección y de la RuS8.5.</p>
+
+<h2>RuS8.4 Deploy: binario estático, imagen mínima y compilación cruzada</h2>
+
+<p>Un binario de Rust compilado con el target por defecto de Linux (<code>x86_64-unknown-linux-gnu</code>) enlaza dinámicamente contra <strong>glibc</strong>. Eso significa que el binario que compilaste en tu Ubuntu 24.04 puede no arrancar en una imagen basada en Debian 11: <code>version GLIBC_2.38 not found</code>. Es el clásico. La solución es enlazar contra <strong>musl</strong>, que produce un binario completamente estático, sin ninguna dependencia de bibliotecas del sistema:</p>
+
+<pre><code class="lang-bash">rustup target add x86_64-unknown-linux-musl
+
+# en Debian/Ubuntu hace falta el linker de musl
+sudo apt install musl-tools
+
+cargo build --release --target x86_64-unknown-linux-musl
+
+# comprobalo: "statically linked" es la respuesta que querés
+ldd target/x86_64-unknown-linux-musl/release/servicio
+#   not a dynamic executable</code></pre>
+
+<p>Con un binario estático, la imagen de Docker deja de necesitar sistema operativo:</p>
+
+<pre><code class="lang-bash"># Dockerfile — build multi-etapa hacia una imagen sin nada adentro
+FROM rust:1.83-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+
+# truco de caché: copiar solo los manifiestos y compilar dependencias primero
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src &amp;&amp; echo "fn main(){}" &gt; src/main.rs &amp;&amp; cargo build --release
+RUN rm -rf src
+
+COPY src ./src
+RUN touch src/main.rs &amp;&amp; cargo build --release
+
+FROM scratch
+COPY --from=build /src/target/release/servicio /servicio
+USER 10001:10001
+ENTRYPOINT ["/servicio"]</code></pre>
+
+<p><code>FROM scratch</code> es literalmente una imagen vacía. El resultado típico ronda los <strong>8–20 MB</strong>: solo tu binario. La superficie de ataque es mínima porque no hay shell, no hay <code>curl</code>, no hay gestor de paquetes: un atacante que logre ejecución remota no tiene con qué moverse. Y el escáner de vulnerabilidades del registry no reporta nada, porque no hay paquetes del sistema que reportar.</p>
+
+<div class="warn">
+  <code>scratch</code> tiene tres trampas que muerden siempre. <strong>(1) No hay certificados raíz</strong>: cualquier request HTTPS saliente falla con un error de verificación de certificado. Hay que copiar <code>/etc/ssl/certs/ca-certificates.crt</code> desde la etapa de build, o usar <code>rustls</code> con la feature <code>webpki-roots</code>, que los embebe en el binario. <strong>(2) No hay <code>/etc/passwd</code></strong>: el <code>USER</code> tiene que ser numérico. <strong>(3) No hay zoneinfo</strong>: las zonas horarias con nombre no resuelven. Si algo de eso te complica, <strong>distroless</strong> (<code>gcr.io/distroless/static-debian12</code>) trae certificados, usuarios y zonas, sigue sin shell, y pesa unos 2 MB más.
+</div>
+
+<p>El tamaño del binario en sí se controla desde el perfil de release, y las opciones tienen un costo que conviene conocer:</p>
+
+<pre><code class="lang-toml">[profile.release]
+opt-level = 3
+lto = "fat"          # optimización entre unidades: más rápido y más chico, compila lento
+codegen-units = 1    # menos paralelismo al compilar, mejor código final
+strip = "symbols"    # saca símbolos de debug: puede ser la mitad del tamaño
+panic = "abort"      # sin unwinding: menos código, pero NO se puede recuperar de un panic
+
+# perfil aparte para perfilar en producción: release + símbolos
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"</code></pre>
+
+<div class="mistake">
+  <strong>Cuidado con <code>panic = "abort"</code> del lado servidor.</strong> Sin unwinding, <code>std::panic::catch_unwind</code> deja de funcionar y un panic en <em>cualquier</em> tarea mata el proceso entero. Tokio, por defecto, aísla el panic de una tarea: la tarea muere, el runtime sigue. Con <code>abort</code> perdés eso. En un servicio que atiende miles de requests, un panic en una sola por un input raro se convierte en una caída total. En embebido es al revés y <code>abort</code> es prácticamente obligatorio — lo vemos en RuS8.12.
+</div>
+
+<h3>Compilación cruzada</h3>
+
+<p>Compilar para otra arquitectura desde tu máquina —típicamente ARM64 para servidores Graviton o para una Raspberry Pi— es donde <code>cargo</code> solo se queda corto, porque necesita un linker de la arquitectura destino. La herramienta que resuelve eso es <code>cross</code>, que hace el build dentro de un contenedor con el toolchain ya armado:</p>
+
+<pre><code class="lang-bash">cargo install cross --git https://github.com/cross-rs/cross
+
+cross build --release --target aarch64-unknown-linux-musl
+cross build --release --target armv7-unknown-linux-musleabihf   # Pi 32 bits
+
+# y para el otro extremo de este módulo: un micro Cortex-M4
+rustup target add thumbv7em-none-eabihf
+cargo build --release --target thumbv7em-none-eabihf</code></pre>
+
+<p>Ese último comando es la bisagra del módulo. <code>thumbv7em-none-eabihf</code>: el <code>none</code> del medio es el sistema operativo, y dice que no hay ninguno. Ese target no tiene <code>std</code> disponible. Todo lo que sigue en la Parte B sale de ahí.</p>
+
+<h2>RuS8.5 Supply chain: el árbol de dependencias es tu superficie de ataque</h2>
+
+<p>Rust tiene una biblioteca estándar deliberadamente chica: no trae cliente HTTP, ni serialización, ni generación de números aleatorios criptográficos, ni fechas. Todo eso viene de crates.io. La consecuencia es directa y hay que decirla sin eufemismos: <strong>en Rust el árbol de dependencias crece muy rápido</strong>. Un servicio web con <code>axum</code> + <code>tokio</code> + <code>sqlx</code> + <code>serde</code> arranca cómodamente arriba de las 250 dependencias transitivas.</p>
+
+<pre><code class="lang-bash">cargo install cargo-tree cargo-audit cargo-deny cargo-outdated
+
+cargo tree --depth 1            # dependencias directas
+cargo tree --duplicates         # el mismo crate en dos versiones mayores: peso muerto
+cargo tree -i openssl-sys       # ¿QUIÉN metió openssl en mi build?</code></pre>
+
+<p>Ese último comando (<code>-i</code>, de <em>invert</em>) es el que más se usa en la práctica: te dice qué dependencia tuya arrastró a una que no querías. Es la forma de encontrar por qué tu build necesita OpenSSL del sistema cuando vos creías estar usando <code>rustls</code>.</p>
+
+<h3>Las dos herramientas que van en CI</h3>
+
+<p><code>cargo-audit</code> compara tu <code>Cargo.lock</code> contra la <strong>RustSec Advisory Database</strong> y falla si alguna versión que estás usando tiene una vulnerabilidad publicada:</p>
+
+<pre><code class="lang-bash">cargo audit
+
+#    Crate:     time
+#    Version:   0.1.44
+#    Title:     Potential segfault in the time crate
+#    ID:        RUSTSEC-2020-0071
+#    Solution:  Upgrade to &gt;=0.2.23
+#    Dependency tree: time 0.1.44 -&gt; chrono 0.4.19 -&gt; mi-app 0.1.0</code></pre>
+
+<p><code>cargo-deny</code> es más amplio y es el que realmente conviene tener: además de vulnerabilidades, revisa <strong>licencias</strong>, <strong>fuentes</strong> y <strong>duplicados</strong>, todo desde un archivo de política versionado en el repo:</p>
+
+<pre><code class="lang-toml"># deny.toml
+[advisories]
+yanked = "deny"
+ignore = []                       # cada excepción va acá, con comentario y fecha
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+deny = [
+  { name = "openssl", reason = "usamos rustls en todo el stack" },
+]
+
+[sources]
+unknown-registry = "deny"         # nada fuera de crates.io
+allow-git = []                    # ninguna dependencia apuntando a un repo suelto</code></pre>
+
+<pre><code class="lang-bash"># en CI, esto tiene que fallar el pipeline
+cargo deny check advisories
+cargo deny check licenses
+cargo deny check bans sources</code></pre>
+
+<div class="rule">
+  <strong>📌 El <code>Cargo.lock</code> se commitea. Siempre.</strong> La regla vieja era "solo en binarios, no en librerías". Cambió: hoy se commitea también en librerías, porque el lockfile es lo que hace que el CI sea reproducible y lo que <code>cargo audit</code> necesita leer. El lockfile de una librería <strong>no</strong> afecta a quien la consume — cargo lo ignora al resolver dependencias de otro proyecto. No hay contra.
+</div>
+
+<div class="danger">
+  <strong>El riesgo que no se resuelve con herramientas.</strong> Un crate de crates.io ejecuta código tuyo en tres momentos: al compilar (<code>build.rs</code>), al expandir macros procedurales (RuS6) y en runtime. Los dos primeros corren <strong>con tus permisos, en tu máquina y en tu CI, antes de que ningún test se ejecute</strong>. <code>cargo-audit</code> encuentra vulnerabilidades <em>conocidas</em>; no encuentra un crate malicioso publicado hace dos horas con un nombre parecido al que quisiste escribir. Las defensas reales son aburridas: pocas dependencias directas, leer qué arrastra cada una, fijar versiones, y desconfiar de nombres casi iguales a los populares. <code>cargo-vet</code> y <code>cargo-crev</code> agregan revisión compartida entre organizaciones, pero eso ya es política de equipo, no una herramienta.
+</div>
+
+<hr>
+
+<h2>RuS8.6 Parte B — Qué desaparece sin <code>std</code></h2>
+
+<p>Un microcontrolador típico no tiene sistema operativo, no tiene MMU, no tiene filesystem y no tiene red salvo que se la pongas vos. La biblioteca estándar de Rust asume que todas esas cosas existen. Sacarla es una línea:</p>
+
+<pre><code class="lang-rust">#![no_std]
+#![no_main]</code></pre>
+
+<p>Y a partir de esa línea, esto es lo que se va y lo que queda:</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Qué te da</th><th>Requiere</th></tr></thead>
+<tbody>
+<tr><td><code>core</code></td><td>Tipos primitivos, <code>Option</code>, <code>Result</code>, iteradores, traits, slices, <code>fmt</code>, aritmética, punteros, atómicos (si el target los tiene)</td><td><strong>Nada.</strong> Siempre está disponible</td></tr>
+<tr><td><code>alloc</code></td><td><code>Vec</code>, <code>String</code>, <code>Box</code>, <code>Rc</code>, <code>Arc</code>, <code>BTreeMap</code>, <code>VecDeque</code></td><td>Un <strong>allocator global</strong> que le proporciones vos</td></tr>
+<tr><td><code>std</code></td><td>Todo lo anterior más threads, <code>File</code>, <code>TcpStream</code>, <code>std::time</code>, <code>HashMap</code>, variables de entorno, <code>println!</code>, panic con unwinding</td><td>Un <strong>sistema operativo</strong></td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Lo que <em>no</em> se pierde es lo importante.</strong> Ownership, borrowing, lifetimes, traits, genéricos, pattern matching, <code>Result</code> y el operador <code>?</code>, iteradores con todas sus optimizaciones, macros declarativas y procedurales: todo eso vive en el compilador y en <code>core</code>, no en <code>std</code>. Escribir <code>no_std</code> no es escribir "Rust reducido". Es escribir Rust sin heap ni I/O — lo cual, en un micro, es exactamente lo que querés.
+</div>
+
+<h3>Sin heap: <code>heapless</code></h3>
+
+<p>Perder <code>Vec</code> y <code>String</code> parece dramático hasta que ves el reemplazo. El crate <code>heapless</code> da las mismas estructuras con capacidad fija, definida en el tipo mediante un parámetro const genérico. Viven enteras en el stack o en un <code>static</code>:</p>
+
+<pre><code class="lang-rust">use heapless::{Vec, String, spsc::Queue};
+
+// un Vec de hasta 32 muestras, sin heap, tamaño conocido en tiempo de compilación
+let mut muestras: Vec&lt;u16, 32&gt; = Vec::new();
+
+match muestras.push(lectura) {
+    Ok(()) =&gt; {}
+    Err(_valor) =&gt; {
+        // el buffer está lleno. En std esto reasignaba en silencio;
+        // acá el compilador te OBLIGA a decidir qué hacer.
+        muestras.remove(0);
+        let _ = muestras.push(lectura);
+    }
+}
+
+let mut linea: String&lt;64&gt; = String::new();
+let _ = write!(linea, "t={}C h={}%", temp, hum);
+
+// cola de un productor y un consumidor: la forma segura de pasarle datos a una ISR
+static mut COLA: Queue&lt;u16, 16&gt; = Queue::new();</code></pre>
+
+<div class="rule">
+  <strong>📌 Que <code>push</code> devuelva <code>Result</code> es la característica, no el inconveniente.</strong> En un sistema empotrado que tiene que correr meses sin reiniciarse, "el buffer se llenó" no es un caso excepcional: es un caso operativo que va a pasar, probablemente de noche, cuando el sensor se vuelva loco o la red se caiga. <code>heapless</code> te fuerza a escribir la política —descartar el más viejo, descartar el nuevo, encender un LED de error— en el momento en que escribís el código, en vez de descubrirla cuando el dispositivo se queda sin memoria en campo.
+</div>
+
+<p>Si igual necesitás asignación dinámica —parsear JSON de tamaño variable, por ejemplo— podés usar <code>alloc</code> como término medio, aportando vos el allocator:</p>
+
+<pre><code class="lang-rust">#![no_std]
+extern crate alloc;
+
+use alloc::vec::Vec;              // ahora sí, Vec dinámico
+use embedded_alloc::LlffHeap as Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
+fn init_heap() {
+    use core::mem::MaybeUninit;
+    const TAM_HEAP: usize = 8 * 1024;                      // 8 KB, y ni uno más
+    static mut MEMORIA: [MaybeUninit&lt;u8&gt;; TAM_HEAP] = [MaybeUninit::uninit(); TAM_HEAP];
+    unsafe { HEAP.init(&amp;raw mut MEMORIA as usize, TAM_HEAP) }
+}</code></pre>
+
+<div class="warn">
+  Usar <code>alloc</code> en un micro es una decisión con consecuencias, no una comodidad. Sin MMU no hay memoria virtual: la <strong>fragmentación</strong> es permanente y acumulativa, y un dispositivo que asigna y libera bloques de tamaños distintos durante semanas termina fallando una asignación aunque le sobre memoria total. Además, el tiempo de <code>alloc</code> no es determinista, lo cual rompe cualquier análisis de tiempo real. La regla del ecosistema: <strong><code>heapless</code> por defecto, <code>alloc</code> solo donde el tamaño es genuinamente dinámico</strong>, y nunca dentro de una interrupción.
+</div>
+
+<h2>RuS8.7 La pila del ecosistema: PAC → HAL → BSP</h2>
+
+<p>El ecosistema embebido de Rust está organizado en tres capas más un contrato transversal, y entender esa arquitectura es lo que te permite leer cualquier proyecto de firmware y saber dónde mirar.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Qué es</th><th>Ejemplo</th><th>Quién la escribe</th></tr></thead>
+<tbody>
+<tr><td><strong>PAC</strong><br><em>Peripheral Access Crate</em></td><td>Un mapa de registros, generado automáticamente desde el archivo SVD del fabricante. Acceso type-safe a cada bit de cada registro, sin ninguna abstracción</td><td><code>stm32f4</code>, <code>esp32c3</code>, <code>nrf52840-pac</code></td><td>Generado por <code>svd2rust</code></td></tr>
+<tr><td><strong>HAL</strong><br><em>Hardware Abstraction Layer</em></td><td>API idiomática sobre el PAC: "configurá este pin como salida", "abrí un UART a 115200". Implementa los traits de <code>embedded-hal</code></td><td><code>stm32f4xx-hal</code>, <code>esp-hal</code>, <code>nrf-hal</code></td><td>La comunidad, o el fabricante</td></tr>
+<tr><td><strong>BSP</strong><br><em>Board Support Package</em></td><td>Una capa sobre el HAL para <em>una placa concreta</em>: nombra los periféricos como están en el silkscreen (<code>led_rojo</code>, <code>boton_usuario</code>) en vez de <code>PC13</code></td><td><code>nucleo-f401re</code>, <code>microbit</code></td><td>Comunidad; muchas placas no tienen</td></tr>
+<tr><td><strong><code>embedded-hal</code></strong></td><td><strong>No es una capa: es el contrato.</strong> Un conjunto de traits (<code>OutputPin</code>, <code>SpiDevice</code>, <code>I2c</code>, <code>DelayNs</code>) que todos los HAL implementan</td><td>—</td><td>El working group de embebidos</td></tr>
+</tbody>
+</table>
+
+<p>Vale la pena ver la diferencia de niveles con el mismo objetivo —prender un LED— escrito en cada capa.</p>
+
+<pre><code class="lang-rust">// ── PAC: registros crudos. Sabés exactamente qué bit tocás y por qué.
+let dp = stm32f4::stm32f401::Peripherals::take().unwrap();
+dp.RCC.ahb1enr.modify(|_, w| w.gpiocen().set_bit());     // clock del puerto C
+dp.GPIOC.moder.modify(|_, w| w.moder13().output());      // PC13 como salida
+dp.GPIOC.odr.modify(|_, w| w.odr13().set_bit());         // en alto</code></pre>
+
+<pre><code class="lang-rust">// ── HAL: la misma operación, con el ownership haciendo de sistema de tipos
+use stm32f4xx_hal::{pac, prelude::*};
+
+let dp = pac::Peripherals::take().unwrap();
+let gpioc = dp.GPIOC.split();
+let mut led = gpioc.pc13.into_push_pull_output();
+led.set_high();</code></pre>
+
+<div class="concept">
+  <strong>💡 El truco de tipos que hace segura la capa HAL.</strong> <code>gpioc.pc13.into_push_pull_output()</code> <strong>consume</strong> el pin y devuelve un tipo <em>distinto</em>: <code>PC13&lt;Output&lt;PushPull&gt;&gt;</code>. El pin original ya no existe, así que es literalmente imposible configurar el mismo pin dos veces de dos formas distintas desde dos módulos, o llamar a <code>set_high()</code> sobre un pin que quedó como entrada. En C eso es un bug clásico de firmware que se manifiesta como un periférico que "a veces no anda". Acá es un error de compilación, y no se paga nada en runtime: todos esos tipos desaparecen en la compilación. Es el mismo <em>typestate</em> que viste en RuS2, aplicado a hardware.
+</div>
+
+<h3><code>embedded-hal</code>: por qué un driver es portable</h3>
+
+<p>Acá está el aporte arquitectónico más importante del ecosistema. Si escribís el driver de un sensor contra los traits de <code>embedded-hal</code> en vez de contra un HAL concreto, ese driver funciona en <strong>cualquier</strong> micro que tenga un HAL —STM32, nRF, RP2040, ESP32— sin cambiar una línea:</p>
+
+<pre><code class="lang-rust">use embedded_hal::i2c::I2c;
+use embedded_hal::delay::DelayNs;
+
+pub struct Sht31&lt;I2C&gt; {
+    i2c: I2C,
+    dir: u8,
+}
+
+impl&lt;I2C: I2c&gt; Sht31&lt;I2C&gt; {
+    pub fn new(i2c: I2C) -&gt; Self {
+        Self { i2c, dir: 0x44 }
+    }
+
+    pub fn medir&lt;D: DelayNs&gt;(&amp;mut self, delay: &amp;mut D)
+        -&gt; Result&lt;(f32, f32), I2C::Error&gt;
+    {
+        self.i2c.write(self.dir, &amp;[0x24, 0x00])?;   // medición de alta repetibilidad
+        delay.delay_ms(15);                          // el sensor necesita este tiempo
+
+        let mut buf = [0u8; 6];
+        self.i2c.read(self.dir, &amp;mut buf)?;
+
+        let t_raw = u16::from_be_bytes([buf[0], buf[1]]);
+        let h_raw = u16::from_be_bytes([buf[3], buf[4]]);
+
+        let temp = -45.0 + 175.0 * (t_raw as f32) / 65535.0;
+        let hum  = 100.0 * (h_raw as f32) / 65535.0;
+        Ok((temp, hum))
+    }
+}</code></pre>
+
+<p>Ese <code>impl&lt;I2C: I2c&gt;</code> es todo. El driver no sabe en qué placa corre y no le importa. El usuario le pasa el bus I2C que le dio <em>su</em> HAL:</p>
+
+<pre><code class="lang-rust">// en una placa STM32
+let i2c = dp.I2C1.i2c((scl, sda), 100.kHz(), &amp;clocks);
+let mut sensor = Sht31::new(i2c);
+
+// en un ESP32-C3, el MISMO driver
+let i2c = esp_hal::i2c::master::I2c::new(peripherals.I2C0, config)?
+    .with_sda(peripherals.GPIO4)
+    .with_scl(peripherals.GPIO5);
+let mut sensor = Sht31::new(i2c);</code></pre>
+
+<div class="rule">
+  <strong>📌 Esto es lo que en C no existe.</strong> En C, un driver de sensor se escribe contra el SDK del fabricante, o contra punteros a función que vos tenés que cablear a mano en cada proyecto. Portarlo es reescribir la capa de acceso. En Rust, <code>embedded-hal</code> convirtió eso en genéricos con traits — y por eso hay cientos de drivers de sensores en crates.io que andan en cualquier micro sin tocarlos. Es la razón principal por la que el ecosistema embebido de Rust creció tan rápido.
+</div>
+
+<h2>RuS8.8 Sin sistema operativo: <code>#[entry]</code>, panics e interrupciones</h2>
+
+<p>Sin <code>std</code> no hay <code>fn main</code> en el sentido habitual, porque no hay runtime de C que llame a <code>main</code> después de inicializar el proceso. El programa mínimo se ve así:</p>
+
+<pre><code class="lang-rust">#![no_std]
+#![no_main]
+
+use cortex_m_rt::entry;
+use panic_halt as _;              // define el manejador de panic (frena y listo)
+
+#[entry]
+fn main() -&gt; ! {                  // ← nunca retorna: no hay a dónde volver
+    let mut contador: u32 = 0;
+    loop {
+        contador = contador.wrapping_add(1);
+        cortex_m::asm::nop();
+    }
+}</code></pre>
+
+<p>Tres cosas ahí valen una explicación. El tipo de retorno <code>!</code> ("never") dice que la función <strong>no termina nunca</strong>, y el compilador lo verifica: si el <code>loop</code> tuviera un <code>break</code>, no compila. Es correcto, porque si el firmware "terminara" el procesador se quedaría ejecutando lo que hubiera en la memoria siguiente. El <code>#[entry]</code> de <code>cortex-m-rt</code> pone la dirección de esa función en la tabla de vectores, en la posición del reset handler, e inserta el código de arranque que inicializa <code>.data</code> y pone <code>.bss</code> en cero. Y el <code>use panic_halt as _</code> —importado solo por su efecto— aporta el manejador de panic, que en <code>no_std</code> tenés que proveer vos:</p>
+
+<pre><code class="lang-rust">// las alternativas más usadas, elegís UNA
+use panic_halt as _;      // loop {} — el dispositivo se congela
+use panic_reset as _;     // reinicia el micro: lo típico en producción
+use panic_probe as _;     // imprime el panic por RTT al debugger: para desarrollo
+
+// o el tuyo, si querés registrar la causa antes de reiniciar
+#[panic_handler]
+fn panic(info: &amp;core::panic::PanicInfo) -&gt; ! {
+    guardar_en_flash(info);       // para poder leerlo en el próximo arranque
+    cortex_m::peripheral::SCB::sys_reset()
+}</code></pre>
+
+<h3>El problema difícil: compartir estado con una interrupción</h3>
+
+<p>Acá es donde el modelo de Rust se cruza de frente con la realidad del hardware. Una interrupción (ISR) es una función que el hardware invoca en cualquier momento, interrumpiendo lo que sea que estuviera corriendo. Si la ISR y el <code>main</code> tocan el mismo dato, tenés una carrera. Rust <em>no te deja</em> escribir eso sin decir cómo lo estás resolviendo: no podés simplemente poner un <code>static mut</code> y tocarlo desde los dos lados.</p>
+
+<pre><code class="lang-rust">use core::cell::RefCell;
+use critical_section::Mutex;
+
+// el dato compartido: Mutex de critical-section + RefCell adentro
+static CONTADOR: Mutex&lt;RefCell&lt;u32&gt;&gt; = Mutex::new(RefCell::new(0));
+
+#[interrupt]
+fn TIM2() {
+    critical_section::with(|cs| {
+        let mut c = CONTADOR.borrow_ref_mut(cs);
+        *c += 1;
+    });
+    limpiar_flag_timer();
+}
+
+#[entry]
+fn main() -&gt; ! {
+    loop {
+        let valor = critical_section::with(|cs| *CONTADOR.borrow_ref(cs));
+        if valor % 100 == 0 {
+            hacer_algo(valor);
+        }
+    }
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué ese <code>Mutex</code> no es el de <code>std</code>.</strong> El <code>Mutex</code> de <code>std</code> duerme al thread si el candado está tomado. En un micro no hay threads y una ISR <em>no puede dormir</em>: si la ISR se bloquea esperando un candado que tiene el <code>main</code>, y el <code>main</code> no puede avanzar porque la ISR lo está interrumpiendo, el sistema se cuelga para siempre. Por eso <code>critical_section::Mutex</code> no bloquea: <strong>deshabilita las interrupciones</strong> mientras dura la sección. El token <code>cs</code> que recibe el closure es una <em>prueba en el sistema de tipos</em> de que las interrupciones están apagadas, y sin ese token no hay forma de acceder al dato. Es imposible olvidarse de tomar la sección crítica, porque el código no compilaría.
+</div>
+
+<div class="warn">
+  El costo de eso es real: mientras la sección crítica está abierta, <strong>ninguna</strong> interrupción se atiende. Una sección crítica larga aumenta la latencia máxima de todo el sistema y puede hacerte perder eventos. La regla es entrar, copiar o modificar el mínimo, y salir. Nada de I/O ni de cálculos adentro. Esta clase de razonamiento —quién puede interrumpir a quién, y por cuánto tiempo— es el trabajo intelectual central del firmware clásico, y es exactamente lo que Embassy viene a simplificar.
+</div>
+
+<h2>RuS8.9 Embassy: async sin sistema operativo ni allocator</h2>
+
+<p>Acá se cierra el círculo del track. En RuS3 viste que un <code>async fn</code> compila a una máquina de estados que implementa <code>Future</code>, y que <code>.await</code> es un punto donde esa máquina de estados se suspende y devuelve el control. En RuS4 viste un ejecutor (Tokio) que las agenda sobre un pool de threads. La pregunta que casi nadie se hace al estudiar eso es: <strong>¿el modelo necesita threads?</strong></p>
+
+<p>No los necesita. Un <code>Future</code> es un struct con un <code>poll</code>. El ejecutor es un bucle que decide a cuál llamarle. Nada de eso requiere sistema operativo, ni threads, ni asignación dinámica de memoria. Y resulta que la semántica de "esperar sin bloquear" describe con una precisión asombrosa lo que hace un microcontrolador: <strong>esperar a que un periférico termine</strong>.</p>
+
+<div class="analogy">
+  <strong>La coincidencia feliz.</strong> Un firmware pasa casi todo su tiempo esperando: que el ADC termine la conversión, que el UART termine de mandar el byte, que pasen 30 segundos, que el usuario apriete el botón. El patrón clásico es o bien un <em>busy-wait</em> (que quema batería) o bien una interrupción por cada evento más una máquina de estados a mano que reconstruya en qué punto del procedimiento estabas. <strong>Esa máquina de estados escrita a mano es exactamente lo que <code>async</code> genera automáticamente.</strong> Embassy hace que la ISR sea, simplemente, lo que despierta al future.
+</div>
+
+<p><strong>Embassy 0.6</strong> es el runtime async para microcontroladores, y hoy es el punto de partida por defecto de casi cualquier proyecto nuevo. Sus tareas se asignan estáticamente en tiempo de compilación —cada <code>#[embassy_executor::task]</code> reserva su propio espacio, con tamaño conocido— así que <strong>no hay heap y no hay allocator</strong>.</p>
+
+<pre><code class="lang-rust">#![no_std]
+#![no_main]
+
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use embassy_stm32::gpio::{Level, Output, Speed, AnyPin};
+use {defmt_rtt as _, panic_probe as _};
+
+#[embassy_executor::task]
+async fn parpadeo(pin: AnyPin, periodo: Duration) {
+    let mut led = Output::new(pin, Level::Low, Speed::Low);
+    loop {
+        led.toggle();
+        Timer::after(periodo).await;     // ← acá el micro se DUERME
+    }
+}
+
+#[embassy_executor::task]
+async fn leer_sensor(mut i2c: I2c&lt;'static&gt;) {
+    let mut sensor = Sht31::new(i2c);
+    loop {
+        if let Ok((t, h)) = sensor.medir_async().await {
+            defmt::info!("t={=f32} h={=f32}", t, h);
+        }
+        Timer::after(Duration::from_secs(30)).await;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+
+    spawner.spawn(parpadeo(p.PC13.degrade(), Duration::from_millis(500))).unwrap();
+    spawner.spawn(leer_sensor(construir_i2c(p.I2C1))).unwrap();
+}</code></pre>
+
+<p>Eso son dos actividades concurrentes, cada una escrita como un procedimiento lineal y legible, sin una sola máquina de estados a mano, sin una sola sección crítica escrita por vos, y sin heap. Comparalo con lo que hace falta para lo mismo en el modelo clásico: un timer configurado, dos contadores en <code>static</code>, una ISR que los decrementa, dos <code>Mutex</code> de <code>critical-section</code>, y un <code>loop</code> en <code>main</code> que revisa flags.</p>
+
+<h3>Lo que hace <code>Timer::after(...).await</code></h3>
+
+<p>Esta es la parte que importa para el consumo, y conviene entenderla con precisión. Cuando ninguna tarea tiene trabajo, el ejecutor de Embassy no hace <em>busy polling</em>: ejecuta <code>wfi</code> (<em>wait for interrupt</em>), que deja al núcleo dormido hasta que llegue una interrupción. El driver de <code>embassy-time</code> programó de antemano un timer de hardware para que dispare en el instante del próximo <code>Timer</code> pendiente. El micro duerme, el timer dispara, la ISR marca el future como listo, el ejecutor lo vuelve a pollear.</p>
+
+<pre><code class="lang-rust">// esto NO es lo mismo, aunque el efecto visible parezca igual:
+delay.delay_ms(30_000);              // busy-wait: el núcleo ejecuta NOPs 30 s a full
+Timer::after_secs(30).await;         // el núcleo duerme 30 s en wfi</code></pre>
+
+<div class="rule">
+  <strong>📌 En un dispositivo a batería, esa línea es la diferencia entre un día y una semana.</strong> Un Cortex-M4 haciendo <em>busy-wait</em> consume del orden de 10–20 mA. En <code>wfi</code>, del orden de 1–2 mA. Y la belleza del asunto es que no tuviste que <em>hacer</em> nada para conseguirlo: el ahorro sale gratis de escribir <code>.await</code> en vez de <code>delay</code>. El modelo async, que en el servidor optimiza <em>throughput</em>, en un micro optimiza <em>energía</em>. Es el mismo mecanismo con otro beneficio.
+</div>
+
+<p>Embassy además trae primitivas de sincronización pensadas para esto: <code>Channel</code> (una cola async con capacidad fija), <code>Signal</code> (el último valor, sin cola), <code>Mutex</code> async y <code>select</code>, que espera al primero de varios futures:</p>
+
+<pre><code class="lang-rust">use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
+use embassy_futures::select::{select, Either};
+
+static MUESTRAS: Channel&lt;ThreadModeRawMutex, Muestra, 8&gt; = Channel::new();
+
+#[embassy_executor::task]
+async fn productor(mut sensor: Sensor) {
+    loop {
+        let m = sensor.leer().await;
+        MUESTRAS.send(m).await;                  // espera si la cola está llena
+        Timer::after_secs(30).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn transmisor(mut radio: Radio) {
+    loop {
+        let m = MUESTRAS.receive().await;
+
+        // lo que sea que termine primero: el envío o el timeout
+        match select(radio.enviar(&amp;m), Timer::after_secs(5)).await {
+            Either::First(Ok(())) =&gt; defmt::info!("enviado"),
+            Either::First(Err(e)) =&gt; defmt::warn!("error de radio: {}", e),
+            Either::Second(_)     =&gt; defmt::warn!("timeout de envío"),
+        }
+    }
+}</code></pre>
+
+<p>Ese <code>select</code> con timeout es, en el modelo clásico, un timer extra, otro flag y otra rama en la máquina de estados. Acá son tres líneas.</p>
+
+<h3>La comparación honesta</h3>
+
+<table>
+<thead><tr><th>Criterio</th><th>Super-loop + ISR</th><th>RTOS (FreeRTOS, Zephyr)</th><th>Embassy</th></tr></thead>
+<tbody>
+<tr><td>Concurrencia</td><td>Máquinas de estado a mano</td><td>Threads preemptivos</td><td>Tareas async cooperativas</td></tr>
+<tr><td>RAM por tarea</td><td>Ninguna extra</td><td>Un <strong>stack completo</strong> por thread (1–4 KB c/u)</td><td>Solo el tamaño del future (decenas de bytes)</td></tr>
+<tr><td>Sincronización</td><td>Secciones críticas manuales</td><td>Mutex, semáforos, colas</td><td>Casi no hace falta: sin preemption no hay carrera <em>entre tareas</em></td></tr>
+<tr><td>Bajo consumo</td><td>Hay que programarlo a mano</td><td>Hook de idle configurable</td><td><strong>Por defecto</strong>: <code>wfi</code> cuando nada está listo</td></tr>
+<tr><td>Determinismo duro</td><td>Analizable, con esfuerzo</td><td>Fuerte: prioridades y preemption</td><td>Cooperativo: <strong>una tarea que no cede bloquea a todas</strong></td></tr>
+<tr><td>Madurez / certificación</td><td>Décadas</td><td>Décadas, con variantes certificadas</td><td>Joven; sin certificaciones de seguridad funcional</td></tr>
+<tr><td>Ecosistema de drivers</td><td>Del fabricante</td><td>Enorme (Zephyr)</td><td>Creciendo rápido vía <code>embedded-hal</code></td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>La limitación real de Embassy hay que decirla:</strong> el ejecutor es <strong>cooperativo</strong>. Una tarea que hace un cálculo de 200 ms sin un solo <code>.await</code> deja a todas las demás esperando 200 ms, y ningún <code>Timer</code> va a dispararse a tiempo. En un RTOS preemptivo, el scheduler le saca el CPU. Si tenés un requisito de tiempo real duro sobre una tarea larga, o el trabajo pesado va en una interrupción de alta prioridad (que sí interrumpe al ejecutor), o Embassy no es la herramienta. Para el 90% de los dispositivos IoT —que esperan mucho más de lo que calculan— es la mejor opción disponible.
+</div>
+
+<h2>RuS8.10 <code>esp-rs</code> y la elección de placa: RISC-V vs Xtensa</h2>
+
+<p>Espressif adoptó Rust como <strong>SDK oficial de primer nivel</strong>: <code>esp-rs</code> no es un port comunitario, es un equipo pago del fabricante manteniendo <code>esp-hal</code>, <code>esp-wifi</code>, <code>esp-idf-hal</code> y la integración con Embassy. Para un ecosistema donde durante años Rust fue tolerado en el mejor de los casos, es un cambio grande, y es la razón por la que hoy la placa más recomendable para empezar con Rust embebido es un ESP32 — con una advertencia que decide qué modelo comprás.</p>
+
+<div class="danger">
+  <strong>La decisión que hay que tomar ANTES de comprar la placa.</strong> Espressif fabrica chips con dos arquitecturas distintas, y en Rust no se tratan igual:
+  <ul>
+    <li><strong>RISC-V</strong> (ESP32-<strong>C3</strong>, <strong>C6</strong>, <strong>H2</strong>, <strong>P4</strong>): compila con el <strong>Rust upstream</strong>. Un <code>rustup target add</code> y listo. El toolchain es el mismo que usás para todo lo demás, se actualiza con <code>rustup update</code> y funciona en CI sin trámite.</li>
+    <li><strong>Xtensa</strong> (ESP32 original, ESP32-<strong>S2</strong>, <strong>S3</strong>): Xtensa <strong>no está en LLVM upstream</strong>, así que necesita un <strong>fork de LLVM</strong> y un toolchain aparte que se instala con <code>espup</code>. Funciona bien, pero es una cadena de herramientas paralela: se actualiza aparte, va atrás de las versiones de Rust, y complica el CI y los contenedores de build.</li>
+  </ul>
+</div>
+
+<pre><code class="lang-bash"># ── RISC-V (ESP32-C3/C6/H2/P4): toolchain estándar, sin nada especial
+rustup target add riscv32imc-unknown-none-elf      # C3
+rustup target add riscv32imac-unknown-none-elf     # C6 / H2
+cargo build --release --target riscv32imc-unknown-none-elf
+
+# ── Xtensa (ESP32 / S2 / S3): toolchain forkeado
+cargo install espup
+espup install
+. ~/export-esp.sh          # exporta el toolchain "esp" en cada shell
+cargo +esp build --release --target xtensa-esp32s3-none-elf</code></pre>
+
+<div class="rule">
+  <strong>📌 La recomendación práctica.</strong> Si estás empezando, o si vas a montar CI, <strong>comprá RISC-V</strong>. Un <strong>ESP32-C3</strong> cuesta unos pocos dólares, trae WiFi y BLE, y compila con el toolchain que ya tenés. Un <strong>ESP32-C6</strong> agrega Thread/Zigbee y WiFi 6. Elegí Xtensa solo si necesitás algo específico del S3 —dos núcleos, PSRAM grande, aceleración para inferencia— y sabé de antemano que estás firmando por un toolchain paralelo.
+</div>
+
+<pre><code class="lang-toml"># Cargo.toml de un ESP32-C3 con Embassy y WiFi
+[dependencies]
+esp-hal          = { version = "0.22", features = ["esp32c3"] }
+esp-hal-embassy  = { version = "0.5",  features = ["esp32c3"] }
+esp-wifi         = { version = "0.11", features = ["esp32c3", "wifi"] }
+embassy-executor = { version = "0.6",  features = ["task-arena-size-32768"] }
+embassy-time     = "0.3"
+embassy-net      = { version = "0.4",  features = ["tcp", "dhcpv4", "udp"] }
+heapless         = "0.8"
+esp-backtrace    = { version = "0.14", features = ["esp32c3", "panic-handler", "println"] }
+defmt            = "0.3"
+
+[profile.release]
+opt-level = "s"       # optimizar por TAMAÑO: en un micro el flash es el recurso escaso
+lto = "fat"
+codegen-units = 1</code></pre>
+
+<div class="info">
+  <code>esp-rs</code> tiene en realidad <strong>dos caminos</strong>, y conviene no confundirlos. <code>esp-hal</code> es <code>no_std</code> puro: Rust bare-metal, integrado con Embassy, sin FreeRTOS. <code>esp-idf-hal</code> es lo contrario: envuelve el ESP-IDF de C, te da <code>std</code> completo (con threads, sockets y filesystem) a costa de arrastrar todo el runtime de C y FreeRTOS. Si venís del mundo ESP-IDF y querés migrar de a poco, <code>esp-idf-hal</code> es el puente. Para un proyecto nuevo pensado para bajo consumo, <code>esp-hal</code> + Embassy es el camino.
+</div>
+
+<h2>RuS8.11 <code>probe-rs</code> y <code>defmt</code>: flashear, debuggear y loguear</h2>
+
+<p>Durante veinte años, debuggear un micro con herramientas libres significó OpenOCD: un archivo de configuración por placa, GDB por arriba, y una experiencia que espantaba a cualquiera que viniera de otro lado. <strong><code>probe-rs</code></strong> reemplazó eso en la práctica dentro del mundo Rust. Es una implementación nativa en Rust del protocolo de debug (CMSIS-DAP, J-Link, ST-Link), con soporte para cientos de chips y —esto es lo que cambia el día a día— <strong>integración directa con <code>cargo run</code></strong>.</p>
+
+<pre><code class="lang-bash">cargo install probe-rs-tools
+
+probe-rs list                                  # ¿ve la sonda?
+probe-rs info --chip esp32c3                   # ¿ve el chip?
+
+probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/firmware
+probe-rs attach --chip esp32c3 ...             # conectarse sin reflashear</code></pre>
+
+<pre><code class="lang-toml"># .cargo/config.toml — para que "cargo run" flashee y corra en la placa
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip STM32F401RETx"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.'cfg(all())']
+rustflags = [
+  "-C", "link-arg=-Tlink.x",       # el linker script de cortex-m-rt
+  "-C", "link-arg=-Tdefmt.x",      # las tablas de defmt
+]</code></pre>
+
+<p>Con eso, <code>cargo run --release</code> compila, flashea, resetea el chip y te deja la salida de log en la terminal. El ciclo de desarrollo pasa a ser el mismo que en un proyecto de escritorio.</p>
+
+<h3><code>defmt</code>: logging que casi no ocupa flash</h3>
+
+<p>Loguear en un micro tiene un problema que en el servidor no existe: <strong>el texto pesa</strong>. Cada cadena de formato de un <code>println!</code> es bytes de flash, y el código de formateo de <code>core::fmt</code> puede sumar varios KB. En un chip con 128 KB de flash, un logging generoso se come una fracción notable del presupuesto.</p>
+
+<p><code>defmt</code> (<em>deferred formatting</em>) resuelve eso con una idea elegante: <strong>las cadenas no van al dispositivo</strong>. Quedan en una tabla dentro del binario ELF, que se queda en tu máquina; el dispositivo transmite un índice más los argumentos en binario, y el host reconstruye el mensaje leyendo la tabla del mismo ELF que flasheó.</p>
+
+<pre><code class="lang-rust">use defmt::{info, warn, error, Format};
+
+#[derive(Format)]                       // como Debug, pero para defmt
+struct Muestra { temp: f32, hum: f32, bateria_mv: u16 }
+
+info!("arrancando, versión {=str}", env!("CARGO_PKG_VERSION"));
+info!("muestra: {}", muestra);                       // usa el derive Format
+warn!("batería baja: {=u16} mV", bateria_mv);
+error!("i2c falló en 0x{=u8:x}", direccion);</code></pre>
+
+<pre><code class="lang-bash"># el nivel se decide EN COMPILACIÓN: lo que no pasa el filtro no ocupa un solo byte
+DEFMT_LOG=info cargo run --release
+DEFMT_LOG=trace cargo run                    # desarrollo
+DEFMT_LOG=off   cargo build --release        # producción: cero costo, cero flash</code></pre>
+
+<div class="tip">
+  La comparación típica: una línea de log con dos valores cuesta del orden de <strong>4–8 bytes transmitidos</strong> con <code>defmt</code>, contra 30–60 bytes de texto y varios KB de código de formateo con <code>println!</code>. En un enlace RTT eso significa que podés loguear en un bucle rápido sin alterar el <em>timing</em> del sistema — que es la trampa clásica del debugging por <code>printf</code> en firmware: el log es tan lento que el bug desaparece cuando lo instrumentás.
+</div>
+
+<h2>RuS8.12 Restricciones reales del embebido</h2>
+
+<p>Todo lo anterior puede dar la impresión de que el embebido en Rust es cómodo. Lo es, comparado con lo que era. Pero hay restricciones que no desaparecen y que conviene tener presentes antes de empezar un proyecto.</p>
+
+<h3>Tamaño del binario</h3>
+
+<p>El flash es un presupuesto duro y fijo. Se mide y se vigila:</p>
+
+<pre><code class="lang-bash">cargo install cargo-binutils cargo-bloat
+rustup component add llvm-tools-preview
+
+cargo size --release -- -A                 # secciones: .text, .rodata, .data, .bss
+cargo bloat --release -n 20                # las 20 funciones más grandes
+cargo bloat --release --crates             # qué crate ocupa cuánto</code></pre>
+
+<div class="warn">
+  Los tres culpables habituales cuando un binario embebido se va de tamaño: <strong>(1)</strong> el código de formateo de <code>core::fmt</code>, que entra por un <code>write!</code> o un <code>unwrap()</code> con mensaje —por eso <code>defmt</code>—; <strong>(2)</strong> las <strong>monomorfizaciones</strong> de RuS7: una función genérica instanciada con quince tipos son quince copias en el flash; <strong>(3)</strong> matemática de punto flotante en un micro sin FPU, donde cada operación se convierte en una llamada a una rutina de software. <code>opt-level = "s"</code> o <code>"z"</code> optimizan por tamaño en lugar de por velocidad, y en embebido suele ser lo que querés.
+</div>
+
+<h3><code>panic = "abort"</code> y qué significa un panic acá</h3>
+
+<p>En embebido, <code>panic = "abort"</code> no es una opción: es obligatorio, porque el unwinding necesita tablas de excepciones que no tienen sentido sin sistema operativo. La consecuencia de diseño es que <strong>un panic es una caída total del dispositivo</strong>, y eso cambia cómo escribís el código: <code>unwrap()</code> y <code>expect()</code> son aceptables durante la inicialización —si el hardware no está donde debe, no hay nada que hacer— y son inaceptables en el bucle principal.</p>
+
+<pre><code class="lang-toml">[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+overflow-checks = true   # ojo: en release está APAGADO por defecto</code></pre>
+
+<div class="danger">
+  Ese <code>overflow-checks = true</code> merece un párrafo. En <code>release</code>, Rust <strong>desactiva</strong> la verificación de desbordamiento por defecto, y un <code>u8</code> que pasa de 255 vuelve a 0 en silencio. En un servidor eso es un bug feo; en un dispositivo que controla un motor o una válvula puede ser un problema de seguridad física. Si el costo de rendimiento te lo permite —y en un firmware que espera el 99% del tiempo, te lo permite—, dejalo prendido. Si no, usá <code>checked_add</code>, <code>saturating_add</code> o <code>wrapping_add</code> de forma <strong>explícita</strong>, para que quede escrito cuál de los tres comportamientos querías.
+</div>
+
+<h3>No hay <code>std::time</code></h3>
+
+<p><code>Instant::now()</code> y <code>SystemTime</code> no existen: no hay reloj de sistema, ni epoch, ni nadie que sincronice nada. El tiempo lo da un timer de hardware, y lo que tenés es <em>tiempo transcurrido desde el arranque</em>, no fecha y hora. Si necesitás una marca temporal real hay que traerla de afuera (NTP por red, o un RTC con su propia pila).</p>
+
+<pre><code class="lang-rust">use embassy_time::{Instant, Duration, Timer};
+
+let t0 = Instant::now();                       // desde el boot, no desde 1970
+hacer_algo().await;
+let transcurrido: Duration = t0.elapsed();
+defmt::info!("tardó {=u64} ms", transcurrido.as_millis());</code></pre>
+
+<div class="info">
+  <strong>El resto de las cosas que no están:</strong> no hay <code>HashMap</code> (usá <code>heapless::FnvIndexMap</code> o <code>BTreeMap</code> con <code>alloc</code>), no hay <code>std::error::Error</code> (por eso <code>thiserror</code> tiene un modo <code>no_std</code> y <code>anyhow</code> directamente no aplica), no hay variables de entorno, no hay filesystem, no hay <code>Box&lt;dyn Trait&gt;</code> sin <code>alloc</code>, y la mayoría de los crates que usás a diario tampoco están. Buscá siempre el badge <code>no_std</code> en crates.io o la feature <code>default-features = false</code>.
+</div>
+
+<h3>Dónde sigue esto: el hardware</h3>
+
+<p>Este módulo cubre el <strong>software</strong> del embebido: <code>no_std</code>, la pila de crates, el runtime, el toolchain. Lo que deliberadamente no cubre es el otro 50% del oficio: cómo se lee un datasheet, qué es realmente un bus I2C o SPI en el osciloscopio, por qué necesitás una resistencia de pull-up, cómo se mide el consumo de verdad, y qué hace un regulador de tensión. Todo eso está en el curso de <a href="../../../../sistemas/Curso-Computacion-Fisica/index.html">Computación Física</a>, que es el complemento natural de esta parte. <strong>El firmware más elegante del mundo no arranca si el circuito está mal</strong>, y la mayoría de las horas perdidas en un proyecto embebido son de hardware, no de código.</p>
+
+<h2>🧑‍🎓 Worked Example — un sensor que tiene que durar meses con batería</h2>
+
+<blockquote>Requisito: un sensor de temperatura y humedad reporta por WiFi cada 30 segundos a un servidor. Va adentro de una cámara frigorífica, alimentado con una batería de 2000 mAh, y no se puede abrir para cambiarla en <strong>al menos tres meses</strong>. Hardware: ESP32-C3 + SHT31 por I2C. ¿Super-loop o Embassy? ¿Alcanza con eso?</blockquote>
+
+<p><strong>Paso 1 — Traducir el requisito a una cifra.</strong> Antes que cualquier decisión de arquitectura, la restricción hay que convertirla en un número, porque es el número el que decide:</p>
+
+<pre><code class="lang-bash"># 3 meses = 2160 horas. Con 2000 mAh y un 20% de margen por temperatura y envejecimiento:
+# corriente media máxima = (2000 mAh * 0.8) / 2160 h = 0.74 mA
+#
+# PRESUPUESTO: 0,74 mA de consumo MEDIO. Todo lo que sigue se mide contra eso.</code></pre>
+
+<div class="rule">
+  <strong>📌 Este paso es el que más se saltea y el que más caro sale.</strong> "Que dure meses" no es un requisito: es un deseo. <strong>0,74 mA promedio</strong> sí es un requisito, porque se puede medir con un instrumento y porque descarta arquitecturas enteras de un plumazo. Sin este número, la discusión "super-loop vs Embassy" es una cuestión de opinión.
+</div>
+
+<p><strong>Paso 2 — La versión ingenua, para tener la línea de base.</strong> Así se escribe casi siempre la primera vez, y es la que hay que descartar con datos:</p>
+
+<pre><code class="lang-rust">// SUPER-LOOP: correcto, legible... y come batería como si estuviera enchufado
+#[entry]
+fn main() -&gt; ! {
+    let (mut i2c, mut wifi, mut delay) = init();
+    wifi.conectar(SSID, PASS).unwrap();       // se conecta una vez y queda asociado
+
+    loop {
+        let (t, h) = sht31_leer(&amp;mut i2c, &amp;mut delay).unwrap();
+        wifi.post("http://servidor/m", &amp;formatear(t, h)).ok();
+        delay.delay_ms(30_000);               // ← 30 segundos ejecutando NOPs
+    }
+}</code></pre>
+
+<p>Dos cosas están mal, y ninguna es evidente leyendo el código. La primera: ese <code>delay_ms</code> es un <em>busy-wait</em> — el núcleo ejecuta instrucciones a máxima frecuencia durante 30 segundos para no hacer nada. La segunda, más cara todavía: el WiFi queda <strong>asociado permanentemente</strong>, y una radio asociada consume decenas de miliamperes de forma continua, aunque no transmita.</p>
+
+<p><strong>Paso 3 — La versión con Embassy y deep sleep.</strong> La estructura importante es que el dispositivo <em>no está vivo</em> entre lecturas: se apaga casi por completo y el RTC lo despierta:</p>
+
+<pre><code class="lang-rust">#![no_std]
+#![no_main]
+
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use esp_hal::rtc_cntl::{Rtc, sleep::TimerWakeupSource};
+use {esp_backtrace as _, defmt_rtt as _};
+
+// sobrevive al deep sleep: esta RAM no se apaga
+#[unsafe(link_section = ".rtc.data")]
+static mut BUFFER: [Muestra; 10] = [Muestra::VACIA; 10];
+#[unsafe(link_section = ".rtc.data")]
+static mut CUANTAS: usize = 0;
+
+#[esp_hal_embassy::main]
+async fn main(_spawner: Spawner) -&gt; ! {
+    let p = esp_hal::init(esp_hal::Config::default());
+    let mut rtc = Rtc::new(p.LPWR);
+
+    // 1. despertar, leer el sensor: ~150 ms, sin radio
+    let mut sensor = Sht31::new(construir_i2c(p.I2C0, p.GPIO4, p.GPIO5));
+    let muestra = sensor.medir_async().await.unwrap_or(Muestra::VACIA);
+
+    let n = unsafe {
+        BUFFER[CUANTAS] = muestra;
+        CUANTAS += 1;
+        CUANTAS
+    };
+
+    // 2. transmitir solo cada 10 muestras (= cada 5 minutos)
+    if n &gt;= 10 {
+        transmitir_lote(p.WIFI, unsafe { &amp;BUFFER }).await.ok();
+        unsafe { CUANTAS = 0 };
+    }
+
+    // 3. dormir hasta la próxima lectura. No es un await: el chip se APAGA.
+    let despertador = TimerWakeupSource::new(core::time::Duration::from_secs(30));
+    rtc.sleep_deep(&amp;[&amp;despertador]);
+}
+
+async fn transmitir_lote(wifi: WIFI, buf: &amp;[Muestra; 10]) -&gt; Result&lt;(), Error&gt; {
+    let mut stack = conectar_wifi(wifi).await?;      // ~600 ms con IP estática
+
+    // sin timeout, un AP caído deja la radio prendida hasta agotar la batería
+    match select(enviar(&amp;mut stack, buf), Timer::after_secs(3)).await {
+        Either::First(r) =&gt; r,
+        Either::Second(_) =&gt; Err(Error::Timeout),    // cortamos y a dormir igual
+    }
+}</code></pre>
+
+<p><strong>Paso 4 — Los números, que son los que deciden.</strong> Con corrientes típicas de un ESP32-C3 (~10 µA en deep sleep, ~25 mA despierto sin radio, ~140 mA promedio con WiFi transmitiendo):</p>
+
+<table>
+<thead><tr><th>#</th><th>Estrategia</th><th>Corriente media</th><th>Autonomía (2000 mAh)</th><th>¿Cumple 0,74 mA?</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>Super-loop, <code>delay</code> bloqueante, WiFi asociada</td><td>~80 mA</td><td><strong>~1 día</strong></td><td>❌ 108× por encima</td></tr>
+<tr><td>B</td><td>Embassy, <code>.await</code> (núcleo en <code>wfi</code>), WiFi asociada</td><td>~20 mA</td><td>~4 días</td><td>❌ 27× por encima</td></tr>
+<tr><td>C</td><td>Embassy + deep sleep, reconecta cada 30 s (3 s despierto)</td><td>~12 mA</td><td>~7 días</td><td>❌ 16× por encima</td></tr>
+<tr><td>D</td><td>C + conexión optimizada (0,8 s: IP estática, BSSID cacheado)</td><td>~3,8 mA</td><td>~22 días</td><td>❌ 5× por encima</td></tr>
+<tr><td>E</td><td>D + <em>batching</em>: leer cada 30 s, transmitir cada 5 min</td><td><strong>~0,5 mA</strong></td><td><strong>~5 meses</strong></td><td>✅</td></tr>
+</tbody>
+</table>
+
+<p>La cuenta de la fila E, para que se pueda auditar: cada 30 s el chip despierta 150 ms a 25 mA (3,75 mA·s); una de cada diez veces suma 0,8 s de radio a 140 mA (112 mA·s); el resto del tiempo duerme a 10 µA. Por ventana de 5 minutos: <code>10 × 3,75 + 112 + 3 ≈ 152 mA·s</code>, dividido 300 s da <strong>0,51 mA</strong> promedio.</p>
+
+<div class="concept">
+  <strong>💡 Leé la tabla dos veces, porque dice dos cosas distintas.</strong> La primera es la esperable: <strong>Embassy le gana al super-loop 4× de entrada</strong> (fila A a B) sin que hayas hecho ningún esfuerzo de optimización — solo por escribir <code>.await</code> en vez de <code>delay</code>, que pone al núcleo en <code>wfi</code>. La segunda es la incómoda: <strong>ese 4× no alcanza ni de cerca</strong>. Lo que realmente cierra el presupuesto es el <em>duty cycling</em> (dormir de verdad, no esperar) y el <em>batching</em> (desacoplar la frecuencia de medición de la de transmisión). El pico de consumo que importa no es el CPU: <strong>es la radio, y el gasto grande está en asociarse a la red, no en mandar los datos</strong>.
+</div>
+
+<p><strong>Paso 5 — Entonces, ¿por qué Embassy, si lo que salvó el proyecto fue el batching?</strong> Porque el batching y el deep sleep <em>también</em> se pueden hacer en un super-loop, pero mirá qué forma tiene la lógica en cada modelo:</p>
+
+<table>
+<thead><tr><th>Lo que hay que expresar</th><th>Super-loop</th><th>Embassy</th></tr></thead>
+<tbody>
+<tr><td>Esperar sin gastar</td><td>Configurar timer + ISR + flag + <code>wfi</code> manual</td><td><code>Timer::after(...).await</code></td></tr>
+<tr><td>Esperar al sensor I2C</td><td>Polling del flag de fin de conversión</td><td><code>sensor.medir_async().await</code></td></tr>
+<tr><td>Timeout de red</td><td>Otro timer, otro flag, otra rama en la máquina de estados</td><td><code>select(enviar(), Timer::after_secs(3))</code></td></tr>
+<tr><td>Leer y transmitir a ritmos distintos</td><td>Dos contadores en <code>static</code> + secciones críticas</td><td>Dos tareas y un <code>Channel</code></td></tr>
+<tr><td>Estado entre pasos de un procedimiento</td><td>Un <code>enum</code> de estados escrito y mantenido a mano</td><td>Lo genera el compilador a partir del <code>async fn</code></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La conclusión del ejercicio, que es la del módulo entero.</strong> Embassy no gana porque sea "más moderno": gana porque <strong>convierte en tres líneas legibles la estructura que de verdad ahorra energía</strong>, y esa estructura —dormir agresivamente, medir y transmitir a ritmos distintos, cortar por timeout— es la que en el modelo clásico se escribe como una máquina de estados de doscientas líneas que nadie quiere tocar. El ahorro directo del <code>wfi</code> es un 4×. El ahorro real, el 100×, viene de una arquitectura que solo se sostiene en el tiempo si es fácil de leer. <strong>Y nada de esto reemplaza medirlo: conectá un medidor de corriente antes de creerle a esta tabla, incluida la mía.</strong>
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué <code>thiserror</code> en librerías y <code>anyhow</code> en binarios, si los dos "manejan errores"?</summary>
+<p>Porque cambia quién consume el error. El código que usa tu librería necesita <strong>decidir distinto según el caso</strong>: reintentar si el token expiró, abortar si el JSON está roto. Eso exige un tipo cerrado que se pueda inspeccionar con <code>match</code>, y <code>thiserror</code> genera ese enum con sus <code>Display</code> y sus <code>From</code>. En cambio, en el <code>main</code> de un servicio el error termina en un log que lee una persona: no hace falta un tipo, hace falta <strong>contexto acumulado</strong>, y <code>anyhow</code> lo da con <code>.context()</code> a un costo de escritura casi nulo. La excepción es la capa de handlers HTTP, donde el binario sí necesita hacer <code>match</code> para elegir el status code — ahí volvés a un enum, con una variante <code>Interno(#[from] anyhow::Error)</code> de cajón de sastre.</p></details>
+
+<details><summary>Estás en <code>no_std</code> y necesitás juntar hasta 32 lecturas. ¿Qué usás y por qué no <code>Vec</code>?</summary>
+<p><code>heapless::Vec&lt;u16, 32&gt;</code>. <code>Vec</code> vive en <code>alloc</code>, que necesita un allocator global que en un micro tenés que proveer vos — y hacerlo tiene un costo que no es solo de código: sin MMU, la <strong>fragmentación es permanente</strong> y un dispositivo que asigna y libera durante semanas puede terminar fallando una asignación aunque le sobre memoria; además el tiempo de asignación no es determinista. <code>heapless::Vec</code> tiene la capacidad en el tipo, vive en el stack o en un <code>static</code>, y su <code>push</code> devuelve <code>Result</code>, lo que te obliga a escribir <strong>ahora</strong> qué pasa cuando el buffer se llena. Eso no es una molestia: es la política de desbordamiento explícita, en lugar de descubrirla en campo a las tres de la mañana.</p></details>
+
+<details><summary>Un compañero dice: "Embassy es async, o sea que es más lento que un super-loop, que corre directo sobre el hardware". ¿Qué le contestás?</summary>
+<p>Que confunde async con "runtime pesado". Las tareas de Embassy se asignan <strong>estáticamente en tiempo de compilación</strong>: no hay heap, no hay allocator y no hay un stack por tarea como en un RTOS — cada tarea ocupa solo el tamaño de su máquina de estados, decenas de bytes. El ejecutor es un bucle que llama a <code>poll</code>; cuando ninguna tarea está lista ejecuta <code>wfi</code> y el núcleo <strong>duerme</strong>, mientras que un super-loop con <code>delay_ms</code> ejecuta NOPs a máxima frecuencia. O sea que en un dispositivo a batería, async no es que sea "casi tan bueno": es <strong>varias veces mejor</strong>, y sin que tengas que hacer nada. La limitación real de Embassy es otra y sí hay que decirla: el ejecutor es <strong>cooperativo</strong>, así que una tarea que calcula 200 ms sin ceder bloquea a todas las demás. Si tenés tiempo real duro sobre una tarea larga, eso va en una interrupción o Embassy no es la herramienta.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Errores</strong>: <code>thiserror</code> en librerías (tipo cerrado, inspeccionable con <code>match</code>), <code>anyhow</code> en binarios (contexto encadenado con <code>.context()</code>). Se combinan sin fricción; en handlers HTTP volvés a un enum para mapear status codes, y nunca devolvés el <code>Display</code> de un error interno al cliente.</li>
+  <li><strong>Observabilidad</strong>: <code>tracing</code>, no <code>log</code>. En async el thread ID no significa nada; los <strong>spans</strong> viajan con la tarea y sobreviven a los <code>.await</code>. <code>#[instrument]</code>, salida JSON en producción, <code>EnvFilter</code> por <code>RUST_LOG</code>, y OpenTelemetry como una capa más del <code>registry</code>.</li>
+  <li><strong>Secretos</strong>: <code>SecretString</code> de <code>secrecy</code> no cifra nada — convierte una fuga accidental por <code>Debug</code> en una llamada explícita a <code>expose_secret()</code> que se ve en el code review. El resto, en el M07 de Ciberseguridad.</li>
+  <li><strong>Deploy</strong>: <code>musl</code> para binario estático, <code>FROM scratch</code> o distroless para imágenes de 8–20 MB sin shell. Ojo con los certificados raíz, el <code>USER</code> numérico y las zonas horarias. <code>panic = "abort"</code> es peligroso del lado servidor y obligatorio del lado embebido.</li>
+  <li><strong>Supply chain</strong>: en Rust el árbol crece rápido (250+ deps es normal). <code>cargo audit</code> y <code>cargo deny</code> en CI, <code>deny.toml</code> versionado, <code>Cargo.lock</code> siempre commiteado. <code>build.rs</code> y las macros procedurales <strong>ejecutan código en tu CI antes de cualquier test</strong>: esa es la parte que ninguna herramienta te resuelve.</li>
+  <li><strong><code>no_std</code></strong>: se van heap, <code>Vec</code>/<code>String</code>, threads, I/O, <code>std::time</code> y <code>HashMap</code>. Queda <code>core</code> con todo lo que hace a Rust: ownership, traits, genéricos, <code>Result</code>, iteradores. <code>alloc</code> es el término medio, con un allocator propio y el costo de la fragmentación.</li>
+  <li><strong>Arquitectura</strong>: <strong>PAC → HAL → BSP</strong>, con <code>embedded-hal</code> como el <em>contrato</em> transversal. Un driver escrito contra esos traits corre sin cambios en STM32, nRF, RP2040 o ESP32 — eso es lo que en C no existe.</li>
+  <li><strong>Embassy 0.6</strong> es el runtime async de facto en microcontroladores: tareas asignadas estáticamente, sin heap, y <code>wfi</code> por defecto cuando nada está listo. Su límite es que el ejecutor es <strong>cooperativo</strong>.</li>
+  <li><strong>Placa</strong>: <code>esp-rs</code> es SDK oficial de Espressif. <strong>RISC-V</strong> (C3, C6, H2, P4) compila con Rust <strong>upstream</strong>; <strong>Xtensa</strong> (ESP32, S2, S3) necesita un <strong>LLVM forkeado</strong> vía <code>espup</code>. Para empezar y para CI, RISC-V.</li>
+  <li><strong>Herramientas</strong>: <code>probe-rs</code> reemplazó a OpenOCD y se integra con <code>cargo run</code>; <code>defmt</code> deja las cadenas en el host y transmite índices, así que loguear cuesta bytes en vez de kilobytes.</li>
+  <li><strong>La lección del Worked Example</strong>: async da un 4× gratis, pero el 100× lo da la arquitectura (dormir de verdad + desacoplar medición de transmisión). Embassy gana porque hace que esa arquitectura sea fácil de escribir y de mantener. Y todo se mide antes de creerlo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un proyecto tuyo con <code>Box&lt;dyn Error&gt;</code> y migralo: <code>thiserror</code> para el módulo de librería, <code>anyhow</code> para el <code>main</code>. Provocá un fallo a propósito y comprobá que la cadena de <code>Caused by</code> alcanza para diagnosticar sin abrir el código.</li>
+  <li>Instrumentá un servicio async con <code>tracing</code>: <code>#[instrument]</code> en el handler, salida JSON, y un campo <code>request_id</code> en el span raíz. Verificá con 20 requests concurrentes que podés reconstruir una request completa filtrando por ese campo, y que los logs de las funciones internas lo llevan aunque nadie se lo pase por parámetro.</li>
+  <li>Compilá el mismo binario en <code>x86_64-unknown-linux-gnu</code> y en <code>x86_64-unknown-linux-musl</code>. Compará <code>ldd</code>, tamaño y tiempo de arranque; después armá las dos imágenes (<code>debian:slim</code> vs <code>scratch</code>) y compará el tamaño final y lo que reporta un escáner de vulnerabilidades sobre cada una.</li>
+  <li>Corré <code>cargo tree --duplicates</code> y <code>cargo deny check</code> sobre un proyecto real. Elegí <strong>una</strong> dependencia duplicada o con licencia problemática y escribí, en tres líneas, qué la trajo (usá <code>cargo tree -i</code>) y qué harías al respecto.</li>
+  <li>Escribí un driver <code>no_std</code> para cualquier sensor I2C usando <strong>solo</strong> los traits de <code>embedded-hal</code>. Después escribí un test unitario con <code>embedded-hal-mock</code> que verifique la secuencia de bytes enviada — sin hardware. Ese test es el que demuestra que el driver es realmente portable.</li>
+  <li>En una placa (o en el simulador QEMU para Cortex-M), implementá el mismo parpadeo de dos LEDs a frecuencias distintas de las dos formas: super-loop con timer e ISR, y Embassy con dos tareas. Compará líneas de código, y buscá con <code>cargo bloat</code> cuánto flash ocupa cada versión.</li>
+  <li>Reproducí el Worked Example con números <strong>tuyos</strong>: medí el consumo real de tu placa en deep sleep, despierta sin radio, y transmitiendo. Rehacé la tabla de las cinco filas y calculá tu propio presupuesto de corriente media. ¿Cuánto se te desvía de mis estimaciones, y por qué?</li>
+</ol>
+
+<h2>Cierre del track — qué estudiar después</h2>
+
+<p>Terminaste los ocho módulos de Rust Senior: ownership en profundidad (RuS1), traits y el sistema de tipos (RuS2), el modelo de <code>Future</code> por dentro (RuS3), Tokio y async en producción (RuS4), <code>unsafe</code> y FFI (RuS5), macros (RuS6), performance y perfilado (RuS7), y producción en los dos extremos (RuS8). Lo que sigue no es "más Rust": es aplicarlo.</p>
+
+<div class="step"><strong>1. Escribí algo que corra meses.</strong> Un servicio o un dispositivo que no reinicies. Todo lo de este módulo —observabilidad, manejo de errores, política de desbordamiento, presupuesto de consumo— existe por cosas que solo aparecen después de la semana tres. Un proyecto que corre una tarde no te enseña nada de esto.</div>
+
+<div class="step"><strong>2. Leé código de gente que sabe más.</strong> El código fuente de <code>tokio</code>, <code>embassy</code>, <code>serde</code> y <code>hyper</code> está a un clic, es de altísima calidad y usa exactamente lo que estudiaste en el track. Empezá por las <em>issues</em> etiquetadas <code>good first issue</code>: es la forma más rápida de calibrar tu nivel real contra el del ecosistema.</div>
+
+<div class="step"><strong>3. Elegí una profundidad y bajá.</strong> <strong>Embebido</strong>: seguí con <a href="../../../../sistemas/Curso-Computacion-Fisica/index.html">Computación Física</a> para el lado del hardware, que es la mitad que este módulo no cubre. <strong>Sistemas</strong>: <code>io_uring</code>, allocators propios, sistemas operativos escritos en Rust. <strong>WebAssembly</strong>: <code>wasm32-unknown-unknown</code> y los componentes WASI, donde Rust es el lenguaje de referencia. <strong>Datos</strong>: Polars, Arrow y DataFusion.</div>
+
+<div class="step"><strong>4. No dejes que Rust te vuelva monolingüe.</strong> El mejor argumento para usar Rust es saber exactamente cuándo <em>no</em> usarlo. Un script de veinte líneas en Python, un servicio de red simple en Go y un frontend en TypeScript siguen siendo, muchas veces, la respuesta correcta. Los tres cursos están en este campus por algo.</div>
+
+<blockquote class="author">"Rust no te hace escribir código correcto. Te hace escribir explícitamente qué estabas asumiendo — y ahí es donde descubrís que la mitad de tus suposiciones estaban mal."</blockquote>
+
+<section class="quiz" id="quizRuS8">
+  <style>
+    #quizRuS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRuS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRuS8 .q{margin-bottom:1.5rem}
+    #quizRuS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRuS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRuS8 .opt:hover{border-color:var(--accent)}
+    #quizRuS8 .opt:disabled{cursor:default}
+    #quizRuS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRuS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRuS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRuS8 .exp.show{display:block}
+    #quizRuS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Vas a arrancar un proyecto de firmware en Rust y querés que el toolchain sea el estándar, sin instalaciones paralelas, para que ande en CI sin trámite. ¿Qué placa elegís?</p>
+    <button class="opt">Un ESP32-S3, porque tiene dos núcleos y es el más potente de la familia</button>
+    <button class="opt">Da igual: desde que <code>esp-rs</code> es oficial, todos los ESP32 compilan igual</button>
+    <button class="opt">Un ESP32-C3 o C6, porque son RISC-V y compilan con Rust upstream</button>
+    <div class="exp">La línea <strong>RISC-V</strong> (C3, C6, H2, P4) compila con el Rust de siempre: un <code>rustup target add</code> y listo. La línea <strong>Xtensa</strong> (ESP32 original, S2, S3) no está en LLVM upstream y necesita un <strong>fork de LLVM</strong> que se instala con <code>espup</code>: funciona bien, pero es una cadena de herramientas paralela que se actualiza aparte, va atrás de las versiones de Rust y complica CI y contenedores de build. Que <code>esp-rs</code> sea SDK oficial de Espressif no borra esa diferencia de arquitectura. Elegí Xtensa solo si necesitás algo específico del S3, sabiendo lo que estás firmando.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tu dispositivo a batería duerme con <code>Timer::after_secs(30).await</code> en vez de <code>delay.delay_ms(30_000)</code>, y ganaste ~4× de autonomía. Necesitás 100×. ¿Dónde está el resto?</p>
+    <button class="opt">En dormir de verdad (deep sleep) y en desacoplar la frecuencia de medición de la de transmisión</button>
+    <button class="opt">En bajar la frecuencia del reloj del CPU y compilar con <code>opt-level = "z"</code></button>
+    <button class="opt">En reemplazar Embassy por un RTOS preemptivo, que administra mejor el consumo</button>
+    <div class="exp">El <code>.await</code> pone al núcleo en <code>wfi</code> y eso es el 4×, gratis. Pero el consumo dominante no es el CPU: <strong>es la radio</strong>, y el gasto grande está en <em>asociarse</em> a la red, no en mandar los bytes. Los dos cambios que mueven la aguja son <strong>deep sleep</strong> (apagar el chip entre lecturas, no solo dejarlo idle) y <strong>batching</strong> (leer cada 30 s pero transmitir cada 5 minutos, guardando en RTC RAM). Bajar el reloj y optimizar por tamaño ayudan en los márgenes; cambiar de runtime no toca el problema, porque el problema es de arquitectura, no de scheduler.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Publicás una librería que habla con una API HTTP. Un usuario se queja de que no puede distinguir un token expirado (que conviene reintentar) de un JSON malformado (que no). ¿Qué hiciste mal?</p>
+    <button class="opt">Nada: para eso está el <code>Display</code>, que puede parsear buscando "token" en el mensaje</button>
+    <button class="opt">Devolviste <code>anyhow::Error</code> desde una librería, en vez de un enum con <code>thiserror</code></button>
+    <button class="opt">Faltó agregar <code>.context()</code> en cada punto donde se propaga el error</button>
+    <div class="exp">Esa es exactamente la línea que separa los dos crates. <code>anyhow::Error</code> es un contenedor opaco: sirve cuando el consumidor es <em>un humano leyendo un log</em>, y por eso va en binarios. Desde una librería, el consumidor es <em>otro código</em> que necesita <strong>decidir distinto según el caso</strong>, y eso requiere un tipo cerrado que se pueda inspeccionar con <code>match</code> — un enum de <code>thiserror</code> con variantes <code>TokenExpirado</code> y <code>Deserializacion</code>. Parsear el mensaje de <code>Display</code> es un contrato frágil que se rompe el día que alguien mejora la redacción del error, y agregar contexto no arregla nada porque el problema no es la falta de información: es que no hay nada sobre lo que ramificar.</div>
+  </div>
+
+  <div class="score" id="scoreRuS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRuS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRuS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track de Rust Senior.' : '  — repasá las que fallaste. Es el cierre del track: vale la pena.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rus7-performance/lecture.html">← RuS7: Performance</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

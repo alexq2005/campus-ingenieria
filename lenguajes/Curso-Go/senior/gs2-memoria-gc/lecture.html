@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GS2 — Memoria, escape analysis y el GC Green Tea · Go Senior</title>
+  <meta name="description" content="Stack vs heap en Go, escape analysis con -gcflags='-m -m', boxing en interfaces, el GC concurrente tricolor, el nuevo GC Green Tea (default desde Go 1.26), tuning con GOGC y GOMEMLIMIT, y cómo medir la presión de GC con gctrace, runtime/metrics y pprof.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← Go Senior</a>
+  <a href="../../index.html">🐹 Curso de Go</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">GS2</span>
+  <span class="badge">⏱ 50–135 min</span>
+  <span class="badge">🎯 Pre-req: GS1</span>
+  <span class="badge">💾 Memoria</span>
+</div>
+
+<article>
+
+<h1>GS2 — Memoria, escape analysis y el GC Green Tea</h1>
+
+<h2>GS2.0 Por qué este módulo</h2>
+
+<p>En GS1 desarmaste el scheduler: viste que el runtime multiplexa goroutines sobre hilos del sistema y que casi nada de lo que parece "concurrencia gratis" es realmente gratis. Este módulo hace lo mismo con la otra mitad del runtime: <strong>la memoria</strong>.</p>
+
+<p>Go no tiene <code>malloc</code> ni <code>free</code>. Tampoco tiene ownership como Rust ni destructores deterministas como C++. La lectura ingenua de eso es "en Go la memoria no es mi problema". La lectura correcta es otra: <strong>la decisión sigue existiendo, solo que la toma el compilador — y la toma leyendo cómo escribiste vos</strong>. Cambiar una firma de <code>func f() Usuario</code> a <code>func f() *Usuario</code> puede mover un millón de asignaciones por segundo del stack al heap sin que aparezca ni una línea nueva de código.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El rendimiento de memoria en Go se explica con tres capas encadenadas: <strong>(1)</strong> el compilador decide, con <em>escape analysis</em>, si un valor vive en el stack (gratis) o en el heap (caro); <strong>(2)</strong> todo lo que va al heap se convierte en trabajo futuro para el recolector; <strong>(3)</strong> el recolector está diseñado para no pausarte, no para ser barato. Entendé el orden: <em>primero</em> reducís lo que llega al heap, <em>después</em> tuneás el GC. Al revés casi nunca funciona.
+</div>
+
+<p>Y hay una razón muy concreta para estudiarlo <em>ahora</em>: el recolector de Go acaba de cambiar. El GC <strong>Green Tea</strong>, que durante dos versiones fue experimental, <strong>es el recolector por defecto desde Go 1.26</strong> (febrero de 2026). En programas reales con uso intensivo de memoria reduce el overhead del GC entre un <strong>10% y un 40%</strong>, con menos pausas y más throughput. El recolector viejo todavía se puede pedir como escape hatch, pero <strong>solo hasta Go 1.27, que elimina la opción</strong>. Es decir: si tenés servicios cuyos números de GC conocés de memoria, esos números ya no valen.</p>
+
+<h2>GS2.1 Dónde vive un valor: stack o heap</h2>
+
+<p>Un programa Go tiene dos lugares donde poner datos, y la diferencia de costo entre ellos es de dos órdenes de magnitud.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Stack</th><th>Heap</th></tr></thead>
+<tbody>
+<tr><td>Costo de reservar</td><td>Mover un puntero. Prácticamente cero</td><td>Buscar en el <em>size class</em>, tocar metadatos, a veces pedir memoria al SO</td></tr>
+<tr><td>Costo de liberar</td><td>Cero: se descarta el frame al volver</td><td>Trabajo futuro del recolector</td></tr>
+<tr><td>Localidad de caché</td><td>Excelente: el frame está caliente</td><td>Variable: los objetos quedan dispersos</td></tr>
+<tr><td>Quién decide</td><td>El compilador</td><td>El compilador</td></tr>
+<tr><td>Presión de GC</td><td>Ninguna</td><td>Proporcional a bytes y a <em>cantidad de objetos</em></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 En Go, <code>new</code> y <code>&amp;</code> no significan "heap".</strong> A diferencia de C++ o Java, tomar la dirección de una variable local no obliga a asignarla en el heap. Si el compilador puede probar que ese puntero <em>no sobrevive</em> a la función, el valor se queda en el stack aunque hayas escrito <code>&amp;</code>. Y al revés: un valor sin ningún <code>&amp;</code> puede terminar en el heap si su tamaño no se conoce en compilación. La sintaxis no te dice nada; el compilador sí.
+</div>
+
+<pre><code class="lang-go">package main
+
+type Punto struct{ X, Y float64 }
+
+// El puntero NO sale de la función: Punto se queda en el stack.
+func distanciaAlOrigen() float64 {
+    p := &amp;Punto{X: 3, Y: 4}
+    return p.X*p.X + p.Y*p.Y
+}
+
+// El puntero SÍ sale: Punto se mueve al heap.
+func nuevoPunto(x, y float64) *Punto {
+    p := &amp;Punto{X: x, Y: y}
+    return p
+}</code></pre>
+
+<h3>El stack de goroutine que crece</h3>
+
+<p>El stack de una goroutine no es un bloque fijo como el de un hilo del sistema operativo. Arranca chiquito — <strong>2 KB</strong> — y crece cuando hace falta. Ese detalle es lo que permite tener cientos de miles de goroutines vivas: si cada una reservara 1 MB como un pthread, 100.000 goroutines pedirían 100 GB de direcciones.</p>
+
+<p>El mecanismo se llama <em>stack growth</em> y funciona así: el compilador inserta un chequeo al principio de cada función que pueda necesitar más espacio (el <em>prólogo</em>). Si el stack no alcanza, el runtime llama a <code>morestack</code>, <strong>reserva un stack del doble de tamaño, copia el viejo adentro y ajusta todos los punteros que apuntaban a él</strong>. Por eso en Go no podés guardar la dirección de una variable de stack fuera del alcance del runtime: el runtime necesita poder mover ese stack.</p>
+
+<pre><code class="lang-go">package main
+
+import (
+    "fmt"
+    "runtime"
+)
+
+// Recursión profunda: fuerza al runtime a agrandar el stack varias veces.
+func profundo(n int, marca *byte) uintptr {
+    var local [64]byte
+    if n == 0 {
+        // Distancia aproximada entre el frame actual y el inicial.
+        return uintptr(len(local)) // solo para que 'local' no se optimice
+    }
+    return profundo(n-1, &amp;local[0])
+}
+
+func main() {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&amp;m)
+    fmt.Println("stack en uso antes:", m.StackInuse)
+
+    var b byte
+    profundo(20_000, &amp;b)
+
+    runtime.ReadMemStats(&amp;m)
+    fmt.Println("stack en uso después:", m.StackInuse)
+}</code></pre>
+
+<div class="info">
+  El stack de una goroutine también se <strong>encoge</strong>: el recolector, durante el escaneo, puede reducir a la mitad un stack que quedó sobredimensionado. El límite superior por goroutine es de <strong>1 GB</strong> en 64 bits, y es ajustable con <code>runtime/debug.SetMaxStack</code>. Cuando lo cruzás, el runtime aborta con <code>goroutine stack exceeds limit</code> — que en la práctica casi siempre significa recursión infinita, no un stack legítimamente grande.
+</div>
+
+<div class="mistake">
+  <strong>El costo escondido del stack growth.</strong> Copiar un stack no es gratis: es un <code>memmove</code> más el ajuste de punteros. Una función caliente que queda justo en el borde y hace crecer/encoger el stack en cada llamada puede costarte más que la asignación en heap que estabas tratando de evitar. Es raro, pero cuando aparece en un perfil se ve clarísimo: <code>runtime.morestack</code> arriba de todo.
+</div>
+
+<h2>GS2.2 Escape analysis: la decisión más importante que no escribiste</h2>
+
+<p>El <em>escape analysis</em> es una fase del compilador que, para cada valor, se pregunta: <strong>¿alguna referencia a esto sobrevive al frame que lo creó?</strong> Si la respuesta demostrable es "no", el valor va al stack. Si es "sí", o si el compilador no puede probar que no, el valor <em>escapa</em> al heap.</p>
+
+<div class="rule">
+  <strong>📌 El análisis es conservador, y eso es correcto.</strong> Ante la duda, el compilador manda al heap. Un falso negativo (mandar al heap algo que podía ir al stack) cuesta rendimiento; un falso positivo (dejar en el stack algo que sobrevive) sería memoria corrupta. Por eso muchas veces la pregunta útil no es "¿por qué escapa?" sino "<em>¿qué le impide al compilador probar que no escapa?</em>".
+</div>
+
+<h3>Cómo verlo</h3>
+
+<pre><code class="lang-bash"># Un -m: las decisiones. Dos -m: además el razonamiento (por qué).
+go build -gcflags='-m' ./...
+go build -gcflags='-m -m' ./...
+
+# Solo un paquete, sin ruido de inlining:
+go build -gcflags='-m' ./internal/procesador 2&gt;&amp;1 | grep -v inline
+
+# También funciona en tests y benchmarks:
+go test -gcflags='-m' -run xxx -bench=Handler ./internal/procesador</code></pre>
+
+<div class="warn">
+  <strong>Ojo con las comillas en Windows.</strong> En PowerShell, <code>-gcflags='-m'</code> con comillas simples puede llegar literal al compilador. Usá <code>go build "-gcflags=-m" ./...</code> o corré el comando desde Git Bash. Si ves el error <code>flag provided but not defined</code>, es esto.
+</div>
+
+<h3>La salida real, leída línea por línea</h3>
+
+<pre><code class="lang-go">// archivo: escape.go
+package escape
+
+type Usuario struct {
+    ID     int
+    Nombre string
+    Tags   []string
+}
+
+func porValor(id int) Usuario {
+    u := Usuario{ID: id, Nombre: "ana"}
+    return u
+}
+
+func porPuntero(id int) *Usuario {
+    u := Usuario{ID: id, Nombre: "ana"}
+    return &amp;u
+}
+
+func soloLectura(u *Usuario) int {
+    return u.ID
+}
+
+func usar() int {
+    a := porValor(1)
+    return soloLectura(&amp;a)
+}</code></pre>
+
+<pre><code class="lang-bash">$ go build -gcflags='-m' ./escape.go
+./escape.go:9:6:  can inline porValor
+./escape.go:14:6: can inline porPuntero
+./escape.go:19:6: can inline soloLectura
+./escape.go:19:18: u does not escape
+./escape.go:15:5: &amp;u escapes to heap
+./escape.go:15:5: moved to heap: u
+./escape.go:24:22: &amp;a does not escape</code></pre>
+
+<p>Traducido: <code>porValor</code> devuelve una copia y no genera nada en el heap. <code>porPuntero</code> devuelve la dirección de una local, y el compilador la <strong>mueve al heap</strong> (<code>moved to heap: u</code>). En <code>soloLectura</code> el parámetro <code>u</code> "does not escape": el compilador probó que la función no guarda ese puntero en ningún lado, así que quien la llame puede pasarle la dirección de una variable de stack sin pagar nada.</p>
+
+<p>Con <code>-m -m</code> el compilador te muestra <em>el camino</em> por el que el valor se escapa. Esto es lo que realmente sirve cuando el escape no es obvio:</p>
+
+<pre><code class="lang-bash">$ go build -gcflags='-m -m' ./escape.go
+./escape.go:15:5: &amp;u escapes to heap:
+./escape.go:15:5:   flow: ~r0 = &amp;{storage for &amp;u}:
+./escape.go:15:5:     from &amp;u (spill) at ./escape.go:15:9
+./escape.go:15:5:     from return &amp;u (return) at ./escape.go:15:2
+./escape.go:15:5: moved to heap: u</code></pre>
+
+<div class="tip">
+  Ese bloque <code>flow:</code> es la herramienta. Se lee de abajo hacia arriba: <em>"vuelve por el return → se guarda en el registro de retorno → por lo tanto escapa"</em>. Cuando el escape viene de tres funciones más abajo por una interfaz, el <code>flow</code> es la única forma de encontrar el eslabón real sin adivinar.
+</div>
+
+<h3>Los cuatro patrones que fuerzan un escape</h3>
+
+<div class="step"><strong>1. Devolver un puntero a una local.</strong> El caso canónico. El valor tiene que sobrevivir al frame, punto. No hay análisis que lo evite.</div>
+
+<div class="step"><strong>2. Guardar el valor en una interfaz.</strong> Meter un valor concreto en un <code>any</code>, en un <code>error</code>, en un <code>io.Reader</code>: casi siempre implica una asignación en heap. Es la causa más frecuente y la menos visible. Sección GS2.3.</div>
+
+<div class="step"><strong>3. Capturarlo en un closure que sobrevive.</strong> Una goroutine, un callback guardado en una estructura, un <code>defer</code> en un loop: si el closure se va, las variables capturadas se van con él.</div>
+
+<div class="step"><strong>4. Tamaño desconocido en compilación.</strong> Históricamente, <code>make([]byte, n)</code> con <code>n</code> variable iba siempre al heap, porque el compilador no sabía cuánto stack reservar. <strong>Esto cambió</strong>: el compilador de las versiones recientes puede asignar el <em>backing store</em> de un slice en el stack en bastantes más situaciones que antes. Sigue habiendo un límite de tamaño, y sigue exigiendo que el slice no escape por otra vía.</div>
+
+<pre><code class="lang-go">package escape
+
+import "sync"
+
+var global *int
+var mu sync.Mutex
+
+// (1) return de puntero a local -&gt; heap
+func uno() *int {
+    x := 42
+    return &amp;x
+}
+
+// (2) interfaz -&gt; heap
+func dos() any {
+    x := 42
+    return x // el valor se "empaqueta" dentro de la interfaz
+}
+
+// (3) closure que sobrevive -&gt; heap
+func tres() func() int {
+    contador := 0
+    return func() int { contador++; return contador }
+}
+
+// (3b) goroutine que captura -&gt; heap
+func tresB(datos []byte) {
+    go func() {
+        mu.Lock()
+        _ = len(datos) // 'datos' vive más que tresB
+        mu.Unlock()
+    }()
+}
+
+// (4) tamaño variable: puede o no quedar en stack según el caso
+func cuatro(n int) int {
+    buf := make([]byte, n)
+    s := 0
+    for i := 0; i &lt; len(buf); i++ {
+        s += int(buf[i])
+    }
+    return s
+}
+
+// (5) escribir en un puntero global -&gt; heap seguro
+func cinco() {
+    x := 7
+    global = &amp;x
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El escape se propaga hacia arriba, no hacia abajo.</strong> Una función tuya, chiquita y perfecta, puede empezar a asignar en heap porque alguien allá arriba la pasó a través de una interfaz. Por eso los resultados de <code>-gcflags='-m'</code> se leen por <em>call path</em>, no por función suelta, y por eso un benchmark microscópico que da 0 <code>allocs/op</code> puede dar 3 cuando lo integrás al servicio real.
+</div>
+
+<h3>El truco de los benchmarks: <code>//go:noinline</code></h3>
+
+<p>Si medís una función chica, el compilador la va a inlinear y el escape analysis va a ver todo el contexto junto. Eso puede darte 0 asignaciones en el benchmark y 2 en producción. Para medir la función <em>aislada</em>, se desactiva el inlining:</p>
+
+<pre><code class="lang-go">package escape
+
+//go:noinline
+func crearAislado(id int) *Usuario {
+    return &amp;Usuario{ID: id}
+}</code></pre>
+
+<div class="warn">
+  Usá <code>//go:noinline</code> <strong>solo para experimentos</strong>. Dejarlo en código de producción es una pesimización silenciosa: el inlining es una de las optimizaciones que más rinde en Go, y además <em>habilita</em> el escape analysis que te ahorra las asignaciones.
+</div>
+
+<h2>GS2.3 Interfaces y boxing: la asignación que no ves</h2>
+
+<p>Una interfaz en Go es un par de palabras: un puntero al descriptor de tipo y un puntero al dato. La consecuencia es directa: <strong>para meter un valor concreto en una interfaz, ese valor tiene que estar en algún lado al que se pueda apuntar</strong>. Si el valor vivía en el stack y la interfaz lo sobrevive, hay que copiarlo al heap. A eso se le dice <em>boxing</em>.</p>
+
+<pre><code class="lang-go">package boxing
+
+import "fmt"
+
+type Contador struct{ N int64 }
+
+func imprimir() {
+    c := Contador{N: 5}
+    fmt.Println(c) // c escapa: los ...any de Println son "leaking param"
+}
+
+func sinEscape() int64 {
+    c := Contador{N: 5}
+    return c.N    // no hay interfaz de por medio: stack
+}</code></pre>
+
+<pre><code class="lang-bash">$ go build -gcflags='-m' ./boxing.go
+./boxing.go:10:14: ... argument does not escape
+./boxing.go:10:14: c escapes to heap</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>fmt.Println</code> hace escapar sus argumentos. Siempre.</strong> La firma es <code>func Println(a ...any) (int, error)</code>, y la implementación usa reflexión, así que el compilador no puede probar que el valor no se guarda. Por eso un <code>fmt.Println</code> de debug dentro de un loop caliente no solo cuesta el I/O: <strong>convierte en asignaciones en heap valores que antes vivían en el stack</strong>, y ese costo persiste aunque el output vaya a <code>/dev/null</code>.
+</div>
+
+<p>El compilador tiene algunos atajos. Los valores de tamaño cero (<code>struct{}{}</code>) no asignan nunca, y los enteros chicos se resuelven contra una tabla estática del runtime en vez de asignar. Pero no armes tu diseño sobre esos atajos: son detalles de implementación.</p>
+
+<pre><code class="lang-go">package boxing
+
+// Sumidero para que el compilador no borre el trabajo del benchmark.
+var sumidero any
+
+func BoxingChico()  { sumidero = 42 }      // suele NO asignar (valor cacheado)
+func BoxingGrande() { sumidero = 1 &lt;&lt; 40 } // asigna: 8 bytes en heap
+func BoxingCero()   { sumidero = struct{}{} } // nunca asigna</code></pre>
+
+<h3>Dónde te muerde esto en un servicio real</h3>
+
+<table>
+<thead><tr><th>Patrón</th><th>Qué pasa</th><th>Alternativa</th></tr></thead>
+<tbody>
+<tr><td><code>log.Printf("id=%d", id)</code> en el hot path</td><td><code>id</code> escapa por el <code>...any</code></td><td>Logging estructurado con niveles, o <code>slog</code> con chequeo de nivel previo</td></tr>
+<tr><td><code>err := fmt.Errorf("...: %w", err)</code> por request exitoso</td><td>Asigna la cadena y el wrapper aunque nadie la lea</td><td>Errores centinela con <code>errors.Is</code>; construir el mensaje solo en el camino de error</td></tr>
+<tr><td><code>map[string]any</code> para payloads</td><td>Una asignación por valor guardado</td><td><code>struct</code> tipado; <code>json.Unmarshal</code> directo al struct</td></tr>
+<tr><td>Métodos con receiver por valor sobre structs grandes</td><td>Copias en cada llamada</td><td>Receiver por puntero — con cuidado, porque puede forzar el escape</td></tr>
+<tr><td><code>sync.Pool.Put(v)</code> con <code>v</code> no-puntero</td><td>El <code>any</code> del Put boxea el valor: asignás justo donde querías ahorrar</td><td>Guardar siempre punteros en la pool</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El anti-patrón de la abstracción prematura.</strong> Definir <code>type Store interface { Get(id int) (*Registro, error) }</code> cuando hay una sola implementación no te da flexibilidad: te da un <em>dynamic dispatch</em> que impide inlinear, impide el escape analysis a través del borde, y convierte cada retorno en una asignación. La interfaz se agrega cuando aparece la segunda implementación o el test la necesita — no "por si acaso".
+</div>
+
+<h2>GS2.4 El recolector de Go: concurrente, tricolor, con write barrier</h2>
+
+<p>El GC de Go es un <strong>mark-and-sweep concurrente, no generacional, no compactante</strong>. Cada una de esas cuatro palabras es una decisión de diseño con consecuencias que vas a ver en tus perfiles.</p>
+
+<h3>El algoritmo tricolor, en cuatro frases</h3>
+
+<div class="analogy">
+  <strong>La metáfora de los tres baldes.</strong> Todos los objetos empiezan <strong>blancos</strong> (candidatos a morir). El recolector pinta de <strong>gris</strong> lo que es alcanzable desde las raíces (stacks de goroutines, globales, registros). Después toma cada objeto gris, pinta de gris a todo lo que ese objeto apunta, y se pinta a sí mismo de <strong>negro</strong> (vivo y ya escaneado). Cuando no quedan grises, todo lo blanco es basura y se libera de una.
+</div>
+
+<p>Lo interesante no es el algoritmo: es que <strong>corre al mismo tiempo que tu programa</strong>. Y eso rompe el invariante. Si mientras el recolector trabaja tu código toma un puntero de un objeto blanco y lo guarda en un objeto ya negro, el recolector nunca va a volver a mirar ese negro — y liberaría memoria viva.</p>
+
+<p>La solución es el <strong>write barrier</strong>: durante la fase de marcado, el compilador inserta un chequeo en <em>cada escritura de puntero</em> del programa, que le avisa al recolector "che, este objeto cambió". Es el costo estructural del GC de Go y es la razón de que el marcado tenga un impacto en throughput incluso cuando no hay ninguna pausa visible.</p>
+
+<pre><code class="lang-go">// Lo que escribís:
+nodo.siguiente = otro
+
+// Lo que corre durante la fase de marcado (conceptual):
+// if writeBarrier.enabled {
+//     gcWriteBarrier(&amp;nodo.siguiente, otro)
+// }
+// nodo.siguiente = otro</code></pre>
+
+<h3>Las pausas: qué se para y por cuánto</h3>
+
+<p>Go tiene dos <em>stop-the-world</em> por ciclo, y ambos son cortos porque solo hacen preparación y cierre, nunca el trabajo pesado:</p>
+
+<table>
+<thead><tr><th>Fase</th><th>¿Para el mundo?</th><th>Qué hace</th></tr></thead>
+<tbody>
+<tr><td><strong>Sweep termination</strong></td><td>Sí, microsegundos</td><td>Cierra el barrido anterior, activa el write barrier</td></tr>
+<tr><td><strong>Marking</strong></td><td>No</td><td>El grueso del trabajo. Corre en paralelo con tu código, usando ~25% del CPU</td></tr>
+<tr><td><strong>Mark termination</strong></td><td>Sí, microsegundos</td><td>Verifica que no quedan grises, apaga el write barrier</td></tr>
+<tr><td><strong>Sweeping</strong></td><td>No</td><td>Libera lo blanco, perezosamente, a medida que se pide memoria</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Go optimizó latencia, no throughput — y eso es una decisión, no una virtud absoluta.</strong> El objetivo declarado del GC de Go son pausas por debajo del milisegundo, y hoy típicamente están en decenas o cientos de <em>micro</em>segundos. El precio está en dos lados: el write barrier le cuesta a tu código incluso cuando no hay pausa, y el marcado se lleva alrededor de un cuarto del CPU mientras corre. Un GC generacional como el de la JVM puede tener más throughput bruto en cargas batch; el de Go gana cuando lo que te importa es el p99 de una API.
+</div>
+
+<div class="info">
+  <strong>Por qué Go no es generacional.</strong> La hipótesis generacional ("casi todos los objetos mueren jóvenes") vale menos en Go que en Java, porque en Go los objetos de vida corta muchas veces ni llegan al heap: el escape analysis los deja en el stack. Y no compacta porque compactar exige mover objetos, y mover objetos exige poder actualizar todos los punteros — algo que se pelea con <code>unsafe.Pointer</code>, con cgo y con la simplicidad del modelo. En vez de compactar, Go usa un asignador por <em>size classes</em> que mantiene la fragmentación acotada.
+</div>
+
+<h3>Cuándo arranca un ciclo</h3>
+
+<p>El GC de Go es <strong>proporcional</strong>. No corre cada N segundos: corre cuando el heap creció un porcentaje sobre el tamaño que tenía vivo al final del ciclo anterior. Ese porcentaje es <code>GOGC</code>, y su default es <strong>100</strong>.</p>
+
+<pre><code class="lang-bash"># Con GOGC=100 (default):
+#   heap vivo al final del ciclo anterior = 100 MB
+#   objetivo del próximo ciclo            = 100 + 100% de 100 = 200 MB
+#
+# Con GOGC=200:  objetivo = 100 + 200% = 300 MB  -&gt; menos ciclos, más RAM
+# Con GOGC=50:   objetivo = 100 +  50% = 150 MB  -&gt; más ciclos, menos RAM
+# Con GOGC=off:  nunca corre por crecimiento (peligroso sin GOMEMLIMIT)</code></pre>
+
+<div class="rule">
+  <strong>📌 De acá sale la intuición más útil del módulo:</strong> el trabajo total del GC no depende de cuánto asignás, sino de <strong>cuánto queda vivo</strong> multiplicado por <strong>cuántas veces corre</strong>. Un programa que asigna 10 GB por segundo pero mantiene 5 MB vivos casi no le da trabajo al recolector. Un programa que asigna poquito pero mantiene un caché de 8 GB vivos le da muchísimo, porque cada ciclo tiene que recorrer ese grafo entero.
+</div>
+
+<h2>GS2.5 Green Tea: qué cambió y por qué mejora</h2>
+
+<div class="concept">
+  <strong>💡 Lo que cambió.</strong> <strong>Green Tea</strong> es un rediseño del algoritmo de <em>marcado</em>. El recolector clásico marcaba <strong>objeto por objeto</strong>: sacaba un puntero de la cola de grises, iba a ese objeto, lo escaneaba, encolaba sus hijos. Green Tea marca <strong>por spans</strong>: agrupa el trabajo por bloques contiguos de memoria y escanea el bloque entero de una, aprovechando que esos objetos ya están en la misma línea de caché.
+</div>
+
+<p>Puesto en términos de hardware: el marcado clásico es <em>pointer chasing</em>, el peor patrón posible para una CPU moderna. Cada salto es un fallo de caché potencial, el prefetcher no puede anticipar nada, y el procesador pasa la mayor parte del tiempo esperando a la RAM. Green Tea reordena el mismo trabajo para que sea mayormente secuencial, que es exactamente lo que el hardware sabe hacer rápido — y además abre la puerta a usar instrucciones vectoriales para escanear varios objetos por operación.</p>
+
+<table>
+<thead><tr><th></th><th>GC clásico</th><th>Green Tea</th></tr></thead>
+<tbody>
+<tr><td>Unidad de trabajo</td><td>Un objeto</td><td>Un span (bloque contiguo)</td></tr>
+<tr><td>Patrón de acceso</td><td>Saltos por punteros</td><td>Mayormente secuencial</td></tr>
+<tr><td>Aprovecha la caché</td><td>Poco</td><td>Mucho</td></tr>
+<tr><td>Estado en Go 1.25</td><td>Default</td><td>Experimental (opt-in)</td></tr>
+<tr><td>Estado en <strong>Go 1.26</strong></td><td>Opt-out temporal</td><td><strong>Default</strong></td></tr>
+<tr><td>Estado en <strong>Go 1.27</strong></td><td><strong>Eliminado</strong></td><td>Único recolector</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Go 1.26: Green Tea es el default. No hay que hacer nada.
+
+# El escape hatch, SOLO mientras exista (desaparece en 1.27):
+GODEBUG=greenteagc=0 ./mi-servicio
+
+# Comparar los dos en la misma carga, antes de decidir nada:
+go test -bench=. -benchtime=10s ./... &gt; nuevo.txt
+GODEBUG=greenteagc=0 go test -bench=. -benchtime=10s ./... &gt; viejo.txt
+benchstat viejo.txt nuevo.txt</code></pre>
+
+<div class="rule">
+  <strong>📌 La ganancia medida es de 10% a 40% menos overhead de GC</strong> en programas reales con uso intensivo de memoria, con menos pausas y más throughput. Leé bien qué significa ese número: es una reducción del <em>costo del recolector</em>, no del tiempo total de tu programa. Si tu servicio gastaba 8% de CPU en GC, el mejor caso te devuelve unos 3 puntos de CPU. Es excelente y es gratis, pero no es una bala de plata: <strong>si tu problema es que asignás de más, Green Tea no te lo arregla, solo lo hace más barato de limpiar</strong>.
+</div>
+
+<div class="warn">
+  <strong>Qué revisar cuando actualices a 1.26.</strong> El cambio es transparente para el código, pero <strong>tus umbrales de alerta pueden dejar de tener sentido</strong>: si tenías una alarma sobre "ciclos de GC por minuto" o sobre el CPU de GC, los valores base se mueven. Y si algún dashboard parsea las líneas de <code>gctrace</code>, verificá el formato después de actualizar. El plan sano es: medir con 1.26 antes de tocar nada, guardar los números nuevos como línea de base, y recién ahí re-calibrar las alertas.
+</div>
+
+<div class="tip">
+  Dos mejoras del compilador que acompañan a esta versión y que juegan a favor del mismo objetivo: <strong>el backing store de los slices se puede asignar en el stack en más situaciones</strong> que antes (menos objetos llegando al heap), y el builtin <strong><code>new</code> ahora acepta una expresión</strong> — <code>p := new(calcular())</code> te da un puntero a una variable nueva ya inicializada, sin la danza de <code>tmp := calcular(); p := &amp;tmp</code>.
+</div>
+
+<h2>GS2.6 Tuning honesto: GOGC y GOMEMLIMIT</h2>
+
+<p>Go te da exactamente dos perillas. Dos. No hay veinte flags como en la JVM, y eso es a propósito.</p>
+
+<table>
+<thead><tr><th>Perilla</th><th>Qué controla</th><th>Default</th><th>Naturaleza</th></tr></thead>
+<tbody>
+<tr><td><code>GOGC</code></td><td>Cuánto puede crecer el heap antes del próximo ciclo, en % del heap vivo</td><td><code>100</code></td><td>Relativa</td></tr>
+<tr><td><code>GOMEMLIMIT</code></td><td>Techo <strong>blando</strong> de memoria total del runtime (heap + stacks + metadatos)</td><td>ilimitado</td><td>Absoluta</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 <code>GOMEMLIMIT</code> es la herramienta más útil de las dos, y la que menos se usa.</strong> <code>GOGC</code> es relativa: no sabe cuánta RAM tenés. Si tu heap vivo salta de 100 MB a 900 MB por una ráfaga de tráfico, <code>GOGC=100</code> va a apuntar tranquilamente a 1,8 GB — y si el contenedor tiene un límite de 1 GB, el kernel te mata antes de que el GC decida correr. <code>GOMEMLIMIT</code> le da al runtime la única información que le falta: <strong>cuánto techo hay</strong>. Cuando el total se acerca a ese techo, el GC corre más seguido aunque <code>GOGC</code> no lo pida, y además le devuelve memoria al sistema operativo más agresivamente.
+</div>
+
+<pre><code class="lang-bash"># Se puede fijar por variable de entorno...
+GOMEMLIMIT=900MiB ./mi-servicio
+GOMEMLIMIT=1GiB GOGC=off ./mi-servicio    # solo por límite, sin ciclos por crecimiento
+
+# ...o desde el código, que es lo correcto en un contenedor,
+# porque el límite se puede leer del propio cgroup.</code></pre>
+
+<pre><code class="lang-go">package main
+
+import (
+    "os"
+    "runtime/debug"
+    "strconv"
+)
+
+// Fija GOMEMLIMIT al 90% del límite del contenedor, dejando el 10%
+// para lo que el runtime de Go no contabiliza (cgo, mmap de terceros, el binario).
+func configurarLimite(limiteContenedorBytes int64) {
+    limite := limiteContenedorBytes * 90 / 100
+    debug.SetMemoryLimit(limite)
+}
+
+func main() {
+    // En Kubernetes, la Downward API puede inyectar el límite del contenedor:
+    //   valueFrom: { resourceFieldRef: { resource: limits.memory } }
+    if v := os.Getenv("MEMORY_LIMIT_BYTES"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+            configurarLimite(n)
+        }
+    }
+    // ...
+}</code></pre>
+
+<h3>La tabla de decisión</h3>
+
+<table>
+<thead><tr><th>Situación</th><th>Qué tocar</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Servicio en un contenedor con límite de memoria</td><td><strong><code>GOMEMLIMIT</code> ≈ 90% del límite</strong>, <code>GOGC</code> en 100</td><td>Convierte un OOM kill duro en presión de GC gradual. Es la configuración por defecto que <em>todo</em> servicio Go en Kubernetes debería tener</td></tr>
+<tr><td>Sobra RAM y el GC aparece en el perfil de CPU</td><td><code>GOGC=200</code> … <code>400</code>, con <code>GOMEMLIMIT</code> puesto</td><td>Menos ciclos a cambio de más heap. El límite te protege del exceso</td></tr>
+<tr><td>Latencia p99 crítica, RAM abundante y estable</td><td><code>GOGC=off</code> + <code>GOMEMLIMIT</code></td><td>El GC solo corre cuando se acerca al techo. Requiere que el heap vivo sea predecible</td></tr>
+<tr><td>Job por lotes de vida corta</td><td><code>GOGC</code> alto o <code>off</code></td><td>El proceso muere antes de que la memoria importe</td></tr>
+<tr><td>Poca RAM, muchas réplicas chicas</td><td><code>GOGC=50</code> … <code>75</code> + <code>GOMEMLIMIT</code></td><td>Más CPU de GC a cambio de un footprint menor por réplica</td></tr>
+<tr><td><strong>No medí nada todavía</strong></td><td><strong>Nada, salvo <code>GOMEMLIMIT</code></strong></td><td>Los defaults son buenos. <code>GOMEMLIMIT</code> es seguridad, no optimización</td></tr>
+</tbody>
+</table>
+
+<h3>El caso clásico: OOMKilled en Kubernetes</h3>
+
+<blockquote>El servicio corre estable con 300 MB durante semanas. Un martes a las 11, el tráfico se duplica, y el pod muere con <code>OOMKilled</code>, exit code 137. Los dashboards de memoria muestran una rampa limpia hasta el límite y corte. El GC "no llegó a correr".</blockquote>
+
+<p>Lo que pasó: con <code>GOGC=100</code> y un heap vivo que subió a 550 MB por la ráfaga, el runtime se fijó como objetivo del próximo ciclo <strong>1,1 GB</strong>. El pod tenía <code>limits.memory: 1Gi</code>. El GC estaba haciendo exactamente lo que le pediste — el problema es que nunca le dijiste que existía un techo.</p>
+
+<pre><code class="lang-bash"># El fix mínimo, en el manifiesto:
+resources:
+  limits:
+    memory: 1Gi
+  requests:
+    memory: 1Gi
+env:
+  # 90% de 1Gi. El 10% restante cubre lo que el runtime de Go NO contabiliza.
+  - name: GOMEMLIMIT
+    value: "900MiB"
+  # Bonus: GOMAXPROCS coherente con el límite de CPU (ver GS1).
+  - name: GOMAXPROCS
+    valueFrom:
+      resourceFieldRef:
+        resource: limits.cpu</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>GOMEMLIMIT</code> es un límite BLANDO, y esa palabra importa.</strong> Si tu memoria <em>realmente viva</em> supera el límite, el runtime <strong>no te va a matar el programa</strong> ni va a liberar memoria alcanzable: va a correr el GC una y otra vez, sin recuperar nada, quemando CPU. Es la <em>death spiral</em>. Go la mitiga limitando el GC al 50% del CPU, así que el proceso sigue avanzando, pero degradado y lentísimo. Por eso <code>GOMEMLIMIT</code> <strong>nunca reemplaza al límite del contenedor</strong>: se ponen los dos, con el del contenedor un poco más arriba, para que si hay una fuga real el pod muera rápido y se reinicie en vez de agonizar.
+</div>
+
+<div class="mistake">
+  <strong>Fijar <code>GOMEMLIMIT</code> igual al límite del contenedor.</strong> El runtime de Go contabiliza su heap, sus stacks y sus metadatos — pero no el binario mapeado en memoria, ni lo que reserve una librería vía cgo, ni buffers del kernel. Si ponés los dos números iguales, el kernel te mata igual, solo que ahora también estás quemando CPU en GC mientras te matan. El 90% es un punto de partida razonable; si usás cgo pesado, bajá más.
+</div>
+
+<h2>GS2.7 Medir el GC: tres herramientas, tres preguntas</h2>
+
+<h3>1. <code>GODEBUG=gctrace=1</code> — ¿qué está haciendo el GC ahora?</h3>
+
+<pre><code class="lang-bash">GODEBUG=gctrace=1 ./mi-servicio 2&gt;&amp;1 | head -20</code></pre>
+
+<pre><code class="lang-bash">gc 14 @3.201s 2%: 0.031+4.7+0.012 ms clock, 0.25+0.42/3.9/0+0.09 ms cpu, 84-&gt;86-&gt;43 MB, 89 MB goal, 0 MB stacks, 0 MB globals, 8 P</code></pre>
+
+<table>
+<thead><tr><th>Campo</th><th>Significa</th><th>Qué mirar</th></tr></thead>
+<tbody>
+<tr><td><code>gc 14</code></td><td>Número de ciclo</td><td>Cuántos por minuto. Muchos y muy seguidos = presión alta</td></tr>
+<tr><td><code>@3.201s</code></td><td>Segundos desde el arranque</td><td>La distancia entre ciclos consecutivos</td></tr>
+<tr><td><strong><code>2%</code></strong></td><td><strong>% del CPU total gastado en GC desde el arranque</strong></td><td><strong>El número más importante de la línea</strong></td></tr>
+<tr><td><code>0.031+4.7+0.012 ms clock</code></td><td>STW inicial + marcado concurrente + STW final</td><td>Los del borde son tus pausas. Deberían estar en microsegundos</td></tr>
+<tr><td><code>... ms cpu</code></td><td>Lo mismo, en tiempo de CPU sumado entre núcleos</td><td>Cuánto trabajo real costó</td></tr>
+<tr><td><code>84-&gt;86-&gt;43 MB</code></td><td>Heap al empezar → al terminar → <strong>vivo</strong> al final</td><td>El tercero es el que gobierna todo: es la base del próximo objetivo</td></tr>
+<tr><td><code>89 MB goal</code></td><td>Objetivo que se había fijado</td><td>Si el segundo número lo supera seguido, el GC llega tarde</td></tr>
+<tr><td><code>8 P</code></td><td>Procesadores lógicos (GOMAXPROCS)</td><td>Coherencia con el límite de CPU del contenedor</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Leé la línea en dos pasos.</strong> Primero el <code>2%</code>: te dice si vale la pena seguir mirando. Después el tercer número del trío de MB (el heap vivo): si crece monótonamente ciclo tras ciclo, tenés una <strong>fuga</strong>, no un problema de tuning, y ninguna perilla lo va a arreglar.
+</div>
+
+<h3>2. <code>runtime/metrics</code> — ¿cómo lo exporto?</h3>
+
+<div class="rule">
+  <strong>📌 Preferí <code>runtime/metrics</code> sobre <code>runtime.MemStats</code>.</strong> <code>ReadMemStats</code> hace un <strong>stop-the-world</strong> para tomar una foto consistente: llamarlo cada segundo desde un scraper de métricas es meterle pausas a tu propio servicio para medir pausas. <code>runtime/metrics</code> es la API moderna, no para el mundo, expone muchísimo más (histogramas de pausas, desglose de CPU, límites efectivos) y es estable ante cambios internos del runtime — precisamente porque el runtime cambia, como acaba de pasar con Green Tea.
+</div>
+
+<pre><code class="lang-go">package observabilidad
+
+import "runtime/metrics"
+
+// Fracción del CPU total que se está yendo en el recolector.
+// Este número es el que decide si tiene sentido optimizar memoria.
+func FraccionGC() float64 {
+    m := []metrics.Sample{
+        {Name: "/cpu/classes/gc/total:cpu-seconds"},
+        {Name: "/cpu/classes/total:cpu-seconds"},
+    }
+    metrics.Read(m)
+    total := m[1].Value.Float64()
+    if total == 0 {
+        return 0
+    }
+    return m[0].Value.Float64() / total
+}</code></pre>
+
+<pre><code class="lang-go">package observabilidad
+
+import (
+    "fmt"
+    "runtime/metrics"
+)
+
+// Las métricas que conviene exportar a Prometheus/OTel en cualquier servicio.
+var interesantes = []string{
+    "/gc/heap/allocs:bytes",            // total asignado desde el arranque
+    "/gc/heap/objects:objects",         // objetos vivos ahora
+    "/gc/cycles/total:gc-cycles",       // ciclos completados
+    "/gc/gogc:percent",                 // GOGC efectivo
+    "/gc/gomemlimit:bytes",             // GOMEMLIMIT efectivo (¿lo fijaste de verdad?)
+    "/memory/classes/heap/objects:bytes",
+    "/memory/classes/total:bytes",      // lo que el runtime le pidió al SO
+    "/sched/latencies:seconds",         // histograma: cuánto esperan las goroutines
+}
+
+func Volcar() {
+    m := make([]metrics.Sample, len(interesantes))
+    for i, n := range interesantes {
+        m[i].Name = n
+    }
+    metrics.Read(m)
+
+    for _, s := range m {
+        switch s.Value.Kind() {
+        case metrics.KindUint64:
+            fmt.Printf("%-38s %d\n", s.Name, s.Value.Uint64())
+        case metrics.KindFloat64:
+            fmt.Printf("%-38s %f\n", s.Name, s.Value.Float64())
+        case metrics.KindFloat64Histogram:
+            h := s.Value.Float64Histogram()
+            fmt.Printf("%-38s p50≈%.6fs\n", s.Name, percentil(h, 0.5))
+        case metrics.KindBad:
+            fmt.Printf("%-38s (no existe en este runtime)\n", s.Name)
+        }
+    }
+}
+
+func percentil(h *metrics.Float64Histogram, p float64) float64 {
+    var total uint64
+    for _, c := range h.Counts {
+        total += c
+    }
+    objetivo, acum := uint64(float64(total)*p), uint64(0)
+    for i, c := range h.Counts {
+        acum += c
+        if acum &gt;= objetivo {
+            return h.Buckets[i]
+        }
+    }
+    return 0
+}</code></pre>
+
+<div class="warn">
+  <strong>Manejá siempre <code>KindBad</code>.</strong> El catálogo de <code>runtime/metrics</code> cambia entre versiones: se agregan métricas y algunas se renombran (el histograma de pausas, por ejemplo, migró a <code>/sched/pauses/total/gc:seconds</code> en versiones recientes, conviviendo con el nombre viejo). Pedir una métrica inexistente <strong>no explota</strong>: te devuelve <code>KindBad</code>. Si no lo chequeás, vas a exportar ceros silenciosos y a construir alertas sobre nada. Descubrí lo disponible en tu runtime con <code>metrics.All()</code>.
+</div>
+
+<h3>3. <code>pprof</code> — ¿quién está asignando?</h3>
+
+<pre><code class="lang-bash"># Desde un benchmark:
+go test -bench=BenchmarkProcesar -benchmem -memprofile=mem.out ./internal/procesador
+go tool pprof -alloc_objects mem.out
+
+# Desde un servicio vivo (con net/http/pprof importado):
+go tool pprof -alloc_objects http://localhost:6060/debug/pprof/allocs
+go tool pprof -inuse_space  http://localhost:6060/debug/pprof/heap
+
+# Vista web, que es donde realmente se entiende:
+go tool pprof -http=:8080 -alloc_objects mem.out</code></pre>
+
+<table>
+<thead><tr><th>Perfil</th><th>Responde</th><th>Usalo para</th></tr></thead>
+<tbody>
+<tr><td><code>-alloc_objects</code></td><td>¿Cuántos objetos se asignaron en total?</td><td><strong>Presión de GC.</strong> El recolector sufre por cantidad, no por bytes</td></tr>
+<tr><td><code>-alloc_space</code></td><td>¿Cuántos bytes se asignaron en total?</td><td>Ancho de banda de memoria, buffers grandes</td></tr>
+<tr><td><code>-inuse_objects</code></td><td>¿Cuántos objetos siguen vivos?</td><td>Fugas por cantidad (mapas que crecen para siempre)</td></tr>
+<tr><td><code>-inuse_space</code></td><td>¿Cuántos bytes siguen vivos?</td><td><strong>Fugas.</strong> Es el que mirás cuando la memoria sube y no baja</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Para presión de GC, mirá <code>-alloc_objects</code>, no <code>-alloc_space</code>.</strong> Un buffer de 1 MB es <em>un</em> objeto: el marcado lo despacha en un paso. Un millón de structs de 24 bytes son 24 MB — menos memoria — pero un millón de nodos que recorrer. La asimetría es brutal y explica por qué "asignar menos bytes" a veces no mejora nada mientras "asignar menos objetos" mejora muchísimo.
+</div>
+
+<h2>GS2.8 Reducir la presión: las tres técnicas que rinden</h2>
+
+<h3>1. Prealocar con la capacidad conocida</h3>
+
+<p>La técnica de mejor relación esfuerzo/beneficio del lenguaje, y la que más se olvida. Un <code>append</code> sobre un slice sin capacidad reasigna y copia cada vez que se llena — con crecimiento geométrico, así que para <em>n</em> elementos hacés del orden de log(n) asignaciones y copiás O(n) bytes de más.</p>
+
+<pre><code class="lang-go">package prealoc
+
+type Registro struct {
+    ID     int64
+    Nombre string
+}
+
+// ❌ Sin capacidad: reasigna y copia varias veces.
+func TransformarMal(entrada []Registro) []string {
+    var out []string
+    for _, r := range entrada {
+        out = append(out, r.Nombre)
+    }
+    return out
+}
+
+// ✅ Con capacidad: UNA asignación, cero copias.
+func TransformarBien(entrada []Registro) []string {
+    out := make([]string, 0, len(entrada))
+    for _, r := range entrada {
+        out = append(out, r.Nombre)
+    }
+    return out
+}</code></pre>
+
+<pre><code class="lang-go">package prealoc
+
+import "testing"
+
+var datos = make([]Registro, 10_000)
+
+func BenchmarkMal(b *testing.B) {
+    b.ReportAllocs()
+    for i := 0; i &lt; b.N; i++ {
+        _ = TransformarMal(datos)
+    }
+}
+
+func BenchmarkBien(b *testing.B) {
+    b.ReportAllocs()
+    for i := 0; i &lt; b.N; i++ {
+        _ = TransformarBien(datos)
+    }
+}</code></pre>
+
+<pre><code class="lang-bash">$ go test -bench=. -benchmem ./internal/prealoc
+BenchmarkMal-8     6314    189_204 ns/op    433_968 B/op    20 allocs/op
+BenchmarkBien-8   14882     80_137 ns/op    163_840 B/op     1 allocs/op
+
+# 20 asignaciones -&gt; 1. Y 2,6x menos bytes, porque desaparecieron las copias
+# intermedias que el GC igual tenía que recolectar después.</code></pre>
+
+<div class="tip">
+  Lo mismo vale para mapas: <code>make(map[string]int, n)</code> evita los rehash sucesivos. Y para armar strings: <code>strings.Builder</code> con <code>Grow(n)</code> en vez de <code>s += x</code> en un loop, que asigna un string nuevo <em>en cada iteración</em> porque los strings en Go son inmutables.
+</div>
+
+<h3>2. Evitar conversiones <code>string</code> ↔ <code>[]byte</code> innecesarias</h3>
+
+<p>Convertir entre <code>string</code> y <code>[]byte</code> <strong>copia</strong>, porque los strings son inmutables y los slices no. En un parser o un handler HTTP eso puede ser el grueso de tus asignaciones.</p>
+
+<p>La buena noticia es que el compilador conoce varios patrones y los optimiza sin copiar. Vale la pena tenerlos memorizados, porque escribir el patrón "correcto" es gratis:</p>
+
+<pre><code class="lang-go">package conv
+
+import "strings"
+
+var m = map[string]int{"a": 1}
+
+func patronesSinCopia(b []byte) {
+    _ = m[string(b)]                 // ✅ lookup: no copia
+    _ = string(b) == "esperado"      // ✅ comparación: no copia
+    for range string(b) {            // ✅ range: no copia
+    }
+    _ = strings.Contains(string(b), "x") // ⚠️ ACÁ SÍ copia
+}
+
+func siempreCopia(b []byte) string {
+    return string(b) // ✅ correcto: querés una copia inmutable e independiente
+}</code></pre>
+
+<pre><code class="lang-go">package conv
+
+import "unsafe"
+
+// Conversiones sin copia. Go 1.20+ ofrece unsafe.String / unsafe.Slice.
+// USALAS SOLO si podés garantizar el invariante que dice el comentario.
+
+// El []byte NO se puede modificar mientras el string exista.
+func bytesAString(b []byte) string {
+    if len(b) == 0 {
+        return ""
+    }
+    return unsafe.String(&amp;b[0], len(b))
+}
+
+// El string resultante NO se puede escribir. Escribirlo es UB.
+func stringABytes(s string) []byte {
+    return unsafe.Slice(unsafe.StringData(s), len(s))
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>unsafe.String</code> convierte un problema de rendimiento en un problema de corrupción de memoria.</strong> Si el <code>[]byte</code> de origen se reutiliza —y en un handler HTTP con <code>sync.Pool</code> <em>se reutiliza</em>—, el string que devolviste cambia de contenido debajo de tus pies. Peor: si ese string quedó como clave de un mapa, el mapa queda inconsistente para siempre y el bug aparece a los tres días, en otro endpoint. Regla práctica: <strong>usá <code>unsafe</code> solo si el perfil lo justifica, solo en una función chica con un comentario que declare el invariante, y solo si el resultado no sobrevive al llamador.</strong>
+</div>
+
+<h3>3. <code>sync.Pool</code>: reusar buffers, con las trampas puestas sobre la mesa</h3>
+
+<p><code>sync.Pool</code> es un caché de objetos temporales por procesador lógico. Su lugar natural es el buffer por request de un servidor de alto tráfico: algo que se pide muchísimas veces por segundo, se usa dentro de un scope corto y se devuelve.</p>
+
+<pre><code class="lang-go">package handler
+
+import (
+    "bytes"
+    "net/http"
+    "sync"
+)
+
+var bufPool = sync.Pool{
+    // Ojo: puntero, no valor. Ver la trampa 2 más abajo.
+    New: func() any { return new(bytes.Buffer) },
+}
+
+const capMaxRetenida = 64 &lt;&lt; 10 // 64 KiB
+
+func Manejar(w http.ResponseWriter, r *http.Request) {
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset() // trampa 1: SIEMPRE resetear al sacarlo
+
+    defer func() {
+        // trampa 3: no devolver monstruos a la pool
+        if buf.Cap() &lt;= capMaxRetenida {
+            bufPool.Put(buf)
+        }
+    }()
+
+    serializar(buf, r)
+    _, _ = w.Write(buf.Bytes()) // trampa 4: escribir ANTES de devolver
+}
+
+func serializar(dst *bytes.Buffer, r *http.Request) {
+    dst.WriteString(r.URL.Path)
+}</code></pre>
+
+<table>
+<thead><tr><th>#</th><th>Trampa</th><th>Consecuencia</th><th>Antídoto</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>No resetear el objeto</td><td><strong>Filtración de datos entre requests.</strong> Es un bug de seguridad, no de rendimiento</td><td><code>Reset()</code> al hacer <code>Get</code>, no al hacer <code>Put</code></td></tr>
+<tr><td>2</td><td>Guardar un valor en vez de un puntero</td><td>El <code>any</code> del <code>Put</code> boxea: asignás justo donde querías ahorrar</td><td><code>New</code> devuelve siempre <code>*T</code></td></tr>
+<tr><td>3</td><td>Devolver buffers gigantes</td><td>Un request con un payload de 200 MB deja ese buffer retenido para siempre, por cada P</td><td>Chequear <code>Cap()</code> antes del <code>Put</code></td></tr>
+<tr><td>4</td><td>Usar el objeto después del <code>Put</code></td><td>Otra goroutine ya lo tiene: corrupción intermitente e irreproducible</td><td><code>defer Put</code> y no tocar nada después</td></tr>
+<tr><td>5</td><td>Poolear objetos chicos</td><td><em>Empeora</em>: el <code>Get</code>/<code>Put</code> cuesta más que la asignación</td><td>Solo poolear lo que es caro de crear o grande</td></tr>
+<tr><td>6</td><td>Tráfico bajo</td><td>La pool se vacía en cada GC: casi todos los <code>Get</code> son <em>miss</em> y pagás el overhead a cambio de nada</td><td>Medir. Sin volumen sostenido, <code>sync.Pool</code> no rinde</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  <strong>Cómo interactúa con el GC.</strong> La pool se vacía en cada ciclo de recolección — con un matiz importante: existe una <em>victim cache</em>, así que los objetos sobreviven un ciclo antes de desaparecer. Por eso <code>sync.Pool</code> es un caché de objetos <strong>efímeros</strong>, no un <em>free list</em> permanente: si necesitás que algo viva garantizadamente, <code>sync.Pool</code> es la herramienta equivocada.
+</div>
+
+<h2>GS2.9 Cuándo NO optimizar memoria</h2>
+
+<div class="rule">
+  <strong>📌 La pregunta de una sola línea.</strong> Antes de tocar nada, mirá el porcentaje de la línea de <code>gctrace</code> o el resultado de <code>FraccionGC()</code>. <strong>Si el GC ocupa el 2% de tu CPU, el techo absoluto de toda tu optimización de memoria es 2%.</strong> No hay <code>sync.Pool</code>, prealocación ni <code>unsafe</code> que te dé más que eso — y cada uno de ellos suma complejidad y superficie de bugs para siempre.
+</div>
+
+<table>
+<thead><tr><th>GC en % de CPU</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td><strong>&lt; 3%</strong></td><td>No optimices memoria. Tu tiempo está en otro lado: I/O, base de datos, serialización, un algoritmo cuadrático</td></tr>
+<tr><td><strong>3–10%</strong></td><td>Zona gris. Mirá <code>-alloc_objects</code>: si hay dos o tres culpables claros, arreglalos. Si está repartido parejo, dejalo</td></tr>
+<tr><td><strong>&gt; 10%</strong></td><td>Hay algo estructural: asignás por elemento en un loop caliente, o boxeás en una interfaz por request. Vale la pena entrar</td></tr>
+<tr><td><strong>&gt; 25% sostenido</strong></td><td>Casi seguro no es tuning: es un diseño que asigna por ítem donde debería asignar por lote, o una fuga</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Los tres errores de prioridad que se repiten.</strong> <strong>(a)</strong> Meter <code>sync.Pool</code> en un servicio que hace 40 requests por minuto. <strong>(b)</strong> Bajar <code>GOGC</code> "para usar menos memoria" en una máquina con 60 GB libres, y duplicar el CPU de GC a cambio de nada. <strong>(c)</strong> Pelear tres días contra el escape analysis en un handler que pasa el 92% del tiempo esperando a PostgreSQL. Los tres tienen la misma raíz: optimizar lo que se entiende en vez de lo que se midió.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el servicio que gasta 8% en GC</h2>
+
+<blockquote>Un servicio recibe eventos JSON por HTTP, los valida, los enriquece y los publica en una cola. Sostiene 4.000 req/s con p99 de 120 ms. El dashboard muestra <strong>8% del CPU en GC</strong> y picos de latencia que correlacionan con los ciclos. Hay que bajarlo sin reescribir el servicio.</blockquote>
+
+<p><strong>Paso 1 — Cuantificar antes de tocar.</strong> Primero el número que decide si vale la pena entrar:</p>
+
+<pre><code class="lang-bash">$ GODEBUG=gctrace=1 ./servicio 2&gt;&amp;1 | tail -5
+gc 812 @1204.1s 8%: 0.048+31+0.021 ms clock, ... 512-&gt;548-&gt;261 MB, 522 MB goal, ...
+gc 813 @1204.9s 8%: 0.044+29+0.019 ms clock, ... 519-&gt;551-&gt;258 MB, 522 MB goal, ...</code></pre>
+
+<p>Se lee así: 8% de CPU en GC, un ciclo cada <strong>0,8 segundos</strong>, y el heap vivo estable en ~260 MB. El heap vivo <em>no</em> crece, así que no hay fuga: hay <strong>churn</strong>, mucha asignación de objetos de vida corta. Con 8% en la zona alta de la tabla anterior, entramos.</p>
+
+<p><strong>Paso 2 — Perfilar por cantidad de objetos.</strong> Presión de GC = objetos, no bytes:</p>
+
+<pre><code class="lang-bash">$ go tool pprof -alloc_objects http://localhost:6060/debug/pprof/allocs
+(pprof) top10
+      flat  flat%   sum%        cum   cum%
+  41200000 38.1%  38.1%   41200000 38.1%  servicio.(*Procesador).leerCuerpo
+  22800000 21.1%  59.2%   67300000 62.2%  encoding/json.(*decodeState).object
+  14100000 13.0%  72.2%   14100000 13.0%  servicio.enriquecer
+   9300000  8.6%  80.8%    9300000  8.6%  net/http.(*conn).readRequest
+(pprof) list leerCuerpo</code></pre>
+
+<pre><code class="lang-go">// Lo que muestra 'list': 41 millones de objetos salen de acá.
+func (p *Procesador) leerCuerpo(r *http.Request) ([]byte, error) {
+    buf := make([]byte, 0, 4096) // un buffer NUEVO por request
+    tmp := make([]byte, 4096)    // y otro más
+    for {
+        n, err := r.Body.Read(tmp)
+        buf = append(buf, tmp[:n]...)
+        if err != nil {
+            break
+        }
+    }
+    return buf, nil
+}</code></pre>
+
+<p><strong>Paso 3 — Confirmar con el compilador por qué escapa.</strong> No alcanza con sospechar: hay que ver el <code>flow</code>.</p>
+
+<pre><code class="lang-bash">$ go build -gcflags='-m -m' ./internal/servicio 2&gt;&amp;1 | grep -A3 leerCuerpo
+./procesador.go:22:16: make([]byte, 0, 4096) escapes to heap:
+./procesador.go:22:16:   flow: ~r0 = &amp;{storage for make([]byte, 0, 4096)}:
+./procesador.go:22:16:     from buf (assign) at ./procesador.go:22:6
+./procesador.go:22:16:     from return buf (return) at ./procesador.go:31:2
+./procesador.go:23:16: make([]byte, 4096) does not escape</code></pre>
+
+<div class="concept">
+  <strong>💡 Acá está el diagnóstico completo.</strong> <code>tmp</code> "does not escape": el compilador ya lo dejó en el stack, no cuesta nada. <code>buf</code> escapa porque <strong>se devuelve</strong>. Ninguna prealocación arregla eso: mientras la función devuelva el buffer, ese buffer tiene que sobrevivir al frame. La única salida es <strong>cambiar el contrato</strong>: en vez de devolver un buffer nuevo, recibir uno prestado y devolverlo cuando termina el request.
+</div>
+
+<p><strong>Paso 4 — El cambio, en dos movimientos.</strong> Primero prealocar con el tamaño real (el header <code>Content-Length</code> lo dice), después reusar con una pool:</p>
+
+<pre><code class="lang-go">package servicio
+
+import (
+    "bytes"
+    "io"
+    "net/http"
+    "sync"
+)
+
+var cuerpoPool = sync.Pool{
+    New: func() any {
+        b := new(bytes.Buffer)
+        b.Grow(8 &lt;&lt; 10) // 8 KiB: el p90 medido de los payloads
+        return b
+    },
+}
+
+const capMaxRetenida = 256 &lt;&lt; 10
+
+// Ahora el buffer es PRESTADO: el llamador lo devuelve cuando terminó.
+func (p *Procesador) leerCuerpo(r *http.Request) (*bytes.Buffer, error) {
+    buf := cuerpoPool.Get().(*bytes.Buffer)
+    buf.Reset()
+
+    // Si el cliente mandó Content-Length, reservamos exacto y evitamos regrowth.
+    if n := r.ContentLength; n &gt; 0 &amp;&amp; n &lt; int64(capMaxRetenida) {
+        buf.Grow(int(n))
+    }
+    if _, err := io.Copy(buf, r.Body); err != nil {
+        devolverCuerpo(buf)
+        return nil, err
+    }
+    return buf, nil
+}
+
+func devolverCuerpo(buf *bytes.Buffer) {
+    if buf.Cap() &lt;= capMaxRetenida {
+        cuerpoPool.Put(buf)
+    }
+}
+
+func (p *Procesador) Manejar(w http.ResponseWriter, r *http.Request) {
+    buf, err := p.leerCuerpo(r)
+    if err != nil {
+        http.Error(w, "cuerpo inválido", http.StatusBadRequest)
+        return
+    }
+    defer devolverCuerpo(buf) // una sola salida, siempre
+
+    p.procesar(buf.Bytes()) // válido SOLO hasta el defer
+}</code></pre>
+
+<p><strong>Paso 5 — Medir de nuevo. Sin este paso, el trabajo no está hecho.</strong></p>
+
+<pre><code class="lang-bash">$ go test -bench=BenchmarkManejar -benchmem -benchtime=5s ./internal/servicio &gt; nuevo.txt
+$ benchstat viejo.txt nuevo.txt
+
+name        old time/op    new time/op    delta
+Manejar-8     84.2µs ± 2%    61.7µs ± 1%  -26.72%  (p=0.000 n=10+10)
+
+name        old alloc/op   new alloc/op   delta
+Manejar-8     26.4kB ± 0%     3.1kB ± 0%  -88.26%  (p=0.000 n=10+10)
+
+name        old allocs/op  new allocs/op  delta
+Manejar-8       31.0 ± 0%       9.0 ± 0%  -70.97%  (p=0.000 n=10+10)</code></pre>
+
+<pre><code class="lang-bash">$ GODEBUG=gctrace=1 ./servicio 2&gt;&amp;1 | tail -2
+gc 291 @1206.4s 3%: 0.039+18+0.014 ms clock, ... 498-&gt;511-&gt;257 MB, 514 MB goal, ...
+gc 292 @1209.1s 3%: 0.041+17+0.015 ms clock, ... 501-&gt;509-&gt;256 MB, 514 MB goal, ...</code></pre>
+
+<p><strong>El resultado real:</strong> el GC bajó de <strong>8% a 3%</strong> del CPU, los ciclos pasaron de uno cada 0,8 s a uno cada 2,7 s, y el p99 bajó de 120 ms a 94 ms. El heap vivo no se movió (~257 MB), que es exactamente lo esperado: no cambiamos qué sobrevive, cambiamos cuánta basura generamos por el camino.</p>
+
+<h3>El contraejemplo: el <code>sync.Pool</code> que empeoró todo</h3>
+
+<p>Envalentonado por el resultado, otro integrante del equipo aplicó la misma receta a la estructura <code>Evento</code>, que se crea una vez por request:</p>
+
+<pre><code class="lang-go">package servicio
+
+type Evento struct {
+    ID     int64
+    Tipo   uint8
+    TS     int64
+    Origen string
+}
+
+// ❌ La "optimización" que salió mal.
+var eventoPool = sync.Pool{
+    New: func() any { return new(Evento) },
+}
+
+func decodificarMal(b []byte) *Evento {
+    e := eventoPool.Get().(*Evento)
+    *e = Evento{} // reset
+    _ = json.Unmarshal(b, e)
+    return e // y alguien, en algún lado, tiene que acordarse de devolverlo
+}</code></pre>
+
+<pre><code class="lang-bash">$ benchstat antes-pool.txt con-pool.txt
+name          old time/op    new time/op    delta
+Decodificar-8   1.42µs ± 1%    1.68µs ± 2%  +18.31%  (p=0.000 n=10+10)
+
+name          old allocs/op  new allocs/op  delta
+Decodificar-8     4.00 ± 0%      5.00 ± 0%  +25.00%  (p=0.000 n=10+10)</code></pre>
+
+<p>18% más lento y <strong>una asignación más</strong> que antes de "optimizar". Tres causas, todas instructivas:</p>
+
+<div class="step"><strong>1. El objeto era chico.</strong> <code>Evento</code> son ~40 bytes: una asignación en el heap de Go para un tamaño así es una operación en el <em>mcache</em> local del P, sin locks. Un <code>Get</code>/<code>Put</code> de <code>sync.Pool</code> cuesta más que eso.</div>
+
+<div class="step"><strong>2. La pool derrotó al escape analysis.</strong> Antes del cambio, en varios call paths el compilador probaba que el <code>Evento</code> no escapaba y lo dejaba <strong>en el stack</strong> — costo cero. Al pasarlo por <code>Get() any</code>, el compilador pierde toda la información de tipo y flujo: ahora el objeto <strong>tiene</strong> que estar en el heap, sí o sí. <em>La pool convirtió asignaciones de stack en asignaciones de heap.</em></div>
+
+<div class="step"><strong>3. El <code>any</code> del <code>Put</code> agregó su propio boxing</strong> en los caminos donde el compilador no pudo eliminarlo. De ahí sale la asignación extra que se ve en el <code>benchstat</code>.</div>
+
+<div class="rule">
+  <strong>📌 La lección del contraejemplo no es "sync.Pool es malo".</strong> Es que <strong><code>sync.Pool</code> resuelve un problema muy específico: objetos grandes o caros de construir, en un servicio con volumen sostenido, con un ciclo de vida claramente delimitado.</strong> Aplicada fuera de ese caso, no es neutral: es una pesimización que además te agrega la obligación de acordarte de devolver el objeto — la misma carga mental del <code>free()</code> manual, sin la ayuda del compilador. Y notá que la diferencia entre el caso bueno (el buffer, 8 KiB, prestado dentro de un handler) y el malo (el evento, 40 bytes, devuelto al llamador) no se descubre razonando: se descubre con <code>benchstat</code>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un programa que asigna 10 GB/s puede darle menos trabajo al GC que uno que asigna 100 MB/s?</summary>
+<p>Porque el costo del recolector no lo manda cuánto asignás, sino <strong>cuánto queda vivo</strong>. El marcado tiene que recorrer el grafo de objetos alcanzables: si de esos 10 GB/s sobreviven 5 MB, cada ciclo escanea 5 MB y termina enseguida. Si el otro programa asigna 100 MB/s pero mantiene un caché de 8 GB vivos, cada ciclo tiene que recorrer ese grafo entero. Además, con <code>GOGC=100</code> el objetivo del próximo ciclo se calcula sobre el heap vivo, así que el segundo programa además dispara ciclos más caros. El corolario práctico: para bajar el costo del GC hay dos palancas distintas —reducir la <em>basura</em> (escape analysis, prealocar, reusar) y reducir lo <em>vivo</em> (cachés más chicos, TTL, estructuras compactas)— y sirven para problemas diferentes.</p></details>
+
+<details><summary>Tu pod muere con OOMKilled pero <code>gctrace</code> muestra que el GC corría normal y el heap vivo era estable. ¿Qué pasó y cómo se arregla?</summary>
+<p>El GC estaba haciendo justo lo que le pediste. Con <code>GOGC=100</code>, el runtime apunta a un heap del doble del vivo: si el vivo saltó a 550 MB por una ráfaga, el objetivo pasó a 1,1 GB, y el kernel mató el proceso al cruzar el <code>limits.memory</code> de 1 GiB antes de que el ciclo se disparara. El runtime <strong>no sabía que existía un techo</strong>. El arreglo es <code>GOMEMLIMIT</code> al ~90% del límite del contenedor (dejando margen para lo que Go no contabiliza: el binario, cgo, buffers del kernel), y dejar el límite del contenedor puesto igual, porque <code>GOMEMLIMIT</code> es blando: si la memoria realmente viva supera el techo, el runtime entra en <em>death spiral</em> —GC continuo sin recuperar nada, acotado al 50% del CPU— y ahí querés que el pod muera y se reinicie en vez de agonizar.</p></details>
+
+<details><summary>Green Tea es default desde Go 1.26 y baja el overhead de GC 10–40%. ¿Qué hacés con tu servicio que gasta 15% de CPU en GC?</summary>
+<p>Actualizás, medís, y <strong>después</strong> seguís trabajando — porque Green Tea abarata el marcado, no reduce lo que asignás. En el mejor caso, ese 15% baja a ~9%: sigue estando muy por encima del umbral donde vale la pena entrar a mirar <code>-alloc_objects</code>. El orden correcto es siempre el mismo: primero medir con la versión nueva y guardar esos números como línea de base (los viejos ya no valen, y las alertas calibradas sobre ellos hay que rehacerlas), después atacar la causa —que casi siempre es asignar por ítem en un loop caliente o boxear en una interfaz por request—, y recién al final tocar <code>GOGC</code>. Sumale que el opt-out <code>GODEBUG=greenteagc=0</code> desaparece en 1.27: sirve para comparar durante la migración, no como configuración permanente.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El compilador decide stack o heap</strong> con escape analysis, y la sintaxis no te lo anticipa: <code>&amp;</code> no significa heap. Lo mirás con <code>go build -gcflags='-m -m'</code> y leés el bloque <code>flow:</code> para encontrar el eslabón real.</li>
+  <li>Cuatro patrones fuerzan el escape: <strong>devolver un puntero a una local</strong>, <strong>guardar en una interfaz</strong>, <strong>capturar en un closure que sobrevive</strong>, y <strong>tamaño desconocido</strong> (esto último, cada vez menos: el compilador ya puede poner el backing store de slices en el stack en más casos).</li>
+  <li>Meter un valor en <code>any</code>/<code>error</code>/<code>io.Reader</code> casi siempre lo manda al heap. <code>fmt.Println</code> en un hot path no cuesta solo I/O: <strong>convierte valores de stack en asignaciones de heap</strong>.</li>
+  <li>El GC es <strong>concurrente, tricolor, con write barrier</strong>, y está optimizado para <strong>latencia, no throughput</strong>: pausas de microsegundos a cambio del costo del barrier y ~25% del CPU durante el marcado.</li>
+  <li><strong>Green Tea es el recolector por defecto desde Go 1.26</strong>: marca por spans contiguos en vez de saltar de objeto en objeto, y reduce el overhead de GC entre <strong>10% y 40%</strong>. El opt-out <code>GODEBUG=greenteagc=0</code> <strong>desaparece en Go 1.27</strong>.</li>
+  <li><strong>Todo servicio Go en un contenedor debería fijar <code>GOMEMLIMIT</code></strong> al ~90% del límite, y mantener también el límite del contenedor: el techo de Go es blando y, si la memoria viva lo supera, degrada en vez de morir.</li>
+  <li>Medí con tres herramientas y tres preguntas: <code>gctrace=1</code> (¿qué está pasando?), <code>runtime/metrics</code> (¿cómo lo exporto sin un STW por scrape?), <code>pprof -alloc_objects</code> (¿quién asigna?). <strong>El recolector sufre por cantidad de objetos, no por bytes.</strong></li>
+  <li>Las técnicas que rinden, en orden: <strong>prealocar con capacidad conocida</strong>, evitar conversiones <code>string</code>↔<code>[]byte</code>, y <code>sync.Pool</code> <em>solo</em> para objetos grandes o caros con volumen sostenido — mal aplicada, derrota al escape analysis y empeora las cosas.</li>
+  <li><strong>Si el GC ocupa menos del 3% de tu CPU, no hay nada que ganar acá.</strong> Medí antes de optimizar y volvé a medir después; si no medís, no optimizaste: cambiaste código.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí cinco funciones que reproduzcan los patrones de escape de GS2.2 (retorno de puntero, interfaz, closure, goroutine, global). Corré <code>go build -gcflags='-m -m'</code> y armá una tabla con tres columnas: función, veredicto del compilador, y la línea del <code>flow:</code> que lo explica. Marcá cuál te sorprendió.</li>
+  <li>Tomá <code>TransformarMal</code>/<code>TransformarBien</code> de GS2.8 y reproducí el benchmark con tus números. Después variá el tamaño de entrada (100, 10.000, 1.000.000) y graficá <code>allocs/op</code>. ¿La ventaja de prealocar crece, se mantiene o se achica en proporción?</li>
+  <li>Escribí un programa que mantenga vivo un mapa de N entradas y asigne basura en un loop. Corrélo con <code>GODEBUG=gctrace=1</code> para N = 10.000 y N = 10.000.000, con la misma tasa de asignación. Documentá cómo cambia el % de GC y explicá por qué, usando el concepto de "heap vivo".</li>
+  <li>Agarrá un servicio HTTP tuyo (o el ejemplo de GS2.9), fijale <code>GOMEMLIMIT</code> a un valor deliberadamente bajo —por debajo de su heap vivo— y observá la <em>death spiral</em> con <code>gctrace=1</code>. Anotá qué pasa con el CPU y con la latencia. Después subilo al 90% del límite real y compará.</li>
+  <li>Instrumentá un servicio con la función <code>FraccionGC()</code> de GS2.7 y exponela como métrica. Con ese número en mano, decidí con la tabla de GS2.9 si vale la pena optimizar — y escribí en dos líneas por qué sí o por qué no. Este ejercicio se aprueba con la decisión, no con el código.</li>
+  <li>Reproducí el contraejemplo del worked example: meté un <code>sync.Pool</code> para un struct de menos de 64 bytes en una función caliente y medí con <code>benchstat</code>. Confirmá con <code>-gcflags='-m'</code> que el objeto que antes no escapaba, ahora escapa. Explicá con la salida del compilador por qué la pool "rompió" el escape analysis.</li>
+  <li><strong>(Integrador)</strong> Elegí un binario Go real que uses, corrélo con la carga que quieras y armá un mini reporte de una página con: (a) % de CPU en GC, (b) top 5 de <code>-alloc_objects</code>, (c) heap vivo estable o creciente, (d) si <code>GOMEMLIMIT</code> está fijado, (e) tu recomendación —incluyendo "no tocar nada"— con el número que la justifica. Un reporte que concluye "no hay nada que hacer" con evidencia vale exactamente lo mismo que uno que encuentra un problema.</li>
+</ol>
+
+<section class="quiz" id="quizGS2">
+  <style>
+    #quizGS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizGS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizGS2 .q{margin-bottom:1.5rem}
+    #quizGS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizGS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizGS2 .opt:hover{border-color:var(--accent)}
+    #quizGS2 .opt:disabled{cursor:default}
+    #quizGS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizGS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizGS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizGS2 .exp.show{display:block}
+    #quizGS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu servicio corre en un pod con <code>limits.memory: 2Gi</code> y muere con <code>OOMKilled</code> durante los picos, aunque el heap vivo es estable en 400 MB. ¿Cuál es el arreglo correcto?</p>
+    <button class="opt">Bajar <code>GOGC</code> a 20 para que el recolector corra mucho más seguido</button>
+    <button class="opt">Fijar <code>GOMEMLIMIT</code> a ~90% del límite del pod y dejar el límite del contenedor puesto</button>
+    <button class="opt">Llamar a <code>runtime.GC()</code> al final de cada request para forzar la liberación</button>
+    <div class="exp">Con <code>GOGC=100</code> el runtime apunta al doble del heap vivo, y no tiene forma de saber que existe un techo de 2 GiB: en un pico el objetivo se le va por arriba del límite y el kernel mata el proceso. <code>GOMEMLIMIT</code> le da esa información y convierte un OOM duro en presión de GC gradual. Bajar <code>GOGC</code> a 20 es una perilla relativa que quema CPU permanentemente sin garantizar el techo, y <code>runtime.GC()</code> por request es un stop-the-world autoinfligido que además no libera memoria alcanzable. El límite del contenedor se mantiene: <code>GOMEMLIMIT</code> es blando, y ante una fuga real preferís que el pod muera y se reinicie antes que agonizar en <em>death spiral</em>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Metiste un <code>sync.Pool</code> para un struct de 40 bytes en tu hot path y <code>benchstat</code> dice que quedó 18% más lento y con <strong>una asignación más</strong> por operación. ¿Cuál es la explicación más probable?</p>
+    <button class="opt">La pool no se llenó todavía; hay que aumentar <code>benchtime</code> hasta que caliente</button>
+    <button class="opt">Falta llamar a <code>runtime.GC()</code> antes del benchmark para vaciar la <em>victim cache</em></button>
+    <button class="opt">Al pasar por <code>Get() any</code> el objeto perdió el análisis de flujo del compilador: lo que antes quedaba en el stack ahora está obligado a estar en el heap, y el <code>any</code> del <code>Put</code> agrega su propio boxing</button>
+    <div class="exp">Es el contraejemplo del worked example. Para un struct chico, asignar en el heap de Go es una operación en el <em>mcache</em> local del P, sin locks, más barata que el <code>Get</code>/<code>Put</code> de la pool. Y lo más importante: <code>sync.Pool</code> trabaja con <code>any</code>, así que el compilador pierde el tipo y el flujo, y objetos que el escape analysis dejaba en el stack pasan obligatoriamente al heap. La pool no ahorró asignaciones — creó unas nuevas. <code>sync.Pool</code> rinde con objetos <strong>grandes o caros de construir</strong>, en servicios con volumen sostenido y un ciclo de vida bien delimitado.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Actualizaste a Go 1.26 y el GC Green Tea es ahora el default. Tu perfil muestra que el recolector consume el <strong>2% del CPU</strong>. ¿Qué esperás ganar dedicándole una semana a optimizar asignaciones?</p>
+    <button class="opt">Como mucho 2%: ese es el techo absoluto de cualquier optimización de memoria acá, así que el tiempo está mejor invertido en otro lado</button>
+    <button class="opt">Bastante, porque Green Tea multiplica el efecto de cada asignación que elimines</button>
+    <button class="opt">Un 10–40%, que es la mejora que trae Green Tea sobre el GC anterior</button>
+    <div class="exp">Si el recolector ocupa el 2% del CPU, eliminar <em>todas</em> tus asignaciones te devuelve, en el límite teórico, 2 puntos. Con ese número, el tiempo rinde muchísimo más en el I/O, la base de datos o el algoritmo que se está comiendo el otro 98%. Y ojo con el 10–40% de Green Tea: es una reducción del <strong>overhead del recolector</strong>, no del tiempo total del programa — sobre un 2%, son décimas. La regla del módulo es esta: medí el porcentaje primero, y dejá que ese número decida si vale la pena entrar.</div>
+  </div>
+
+  <div class="score" id="scoreGS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizGS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreGS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con GS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../gs1-runtime-scheduler/lecture.html">← GS1: El runtime por dentro</a>
+  <a href="../gs3-concurrencia/lecture.html">GS3: Concurrencia avanzada →</a>
+</nav>
+
+</div>
+</body>
+</html>
