@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS7 — Build, distribución y updates OTA · React Native Senior</title>
+  <meta name="description" content="El pipeline de build de React Native, firmas y certificados en iOS y Android, EAS Build y EAS Update, runtime version, rollout progresivo y rollback, las reglas de las tiendas sobre OTA, versionado y CI/CD.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS7</span>
+  <span class="badge">⏱ 45–115 min</span>
+  <span class="badge">🎯 Pre-req: RNS1</span>
+  <span class="badge">📦 Distribución</span>
+</div>
+
+<article>
+
+<h1>RNS7 — Build, distribución y updates OTA</h1>
+
+<h2>RNS7.0 Por qué este módulo</h2>
+
+<p>En la web, desplegar es una decisión tuya. Hacés <code>git push</code>, corre el pipeline, y tres minutos después el usuario que recarga ya está en la versión nueva. Si rompiste algo, revertís y en otros tres minutos el incidente terminó. Toda tu intuición sobre releases —desplegar seguido, desplegar chico, arreglar hacia adelante— nació de ese ciclo de minutos.</p>
+
+<p>En móvil hay <strong>dos empresas entre vos y tu usuario</strong>. Apple y Google deciden si tu binario existe, cuándo aparece, y bajo qué reglas. Aunque aprueben en veinticuatro horas, después viene la parte que nadie controla: el usuario tiene que <em>actualizar</em>. Y muchos no lo hacen nunca. Un mes después de publicar la 1.4.0, una porción enorme de tu base sigue en la 1.2.0, ejecutando código que vos ya considerás muerto y pegándole a tu API con contratos que ya querías retirar.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La estrategia de release móvil se deduce de un único hecho: <strong>el binario es caro de cambiar y las versiones viejas no mueren</strong>. De ahí sale todo lo demás. Los updates OTA existen para esquivar el costo del binario cuando el cambio es solo JavaScript. El <em>runtime version</em> existe porque esquivarlo mal rompe la app. El rollout progresivo existe porque no podés revertir tan rápido como en web. Y las reglas de las tiendas existen porque las tiendas saben perfectamente que estás esquivándolas.
+</div>
+
+<p>Este módulo es el que convierte "sé compilar mi app" en "sé operar releases de una app con usuarios reales". La mitad del contenido es infraestructura (firmas, perfiles, CI) y la otra mitad es criterio: <strong>cuándo un cambio puede ir por aire y cuándo no</strong>. Esa segunda mitad es la que se paga cara cuando falta.</p>
+
+<h2>RNS7.1 El pipeline de build: qué se compila cuándo</h2>
+
+<p>Una app React Native es dos artefactos que se juntan al final. Entender dónde está la frontera es lo que después te va a decir qué se puede actualizar por aire.</p>
+
+<pre><code class="lang-bash">  TU CÓDIGO                    PROCESO                        SALIDA
+  ─────────                    ───────                        ──────
+
+  src/**/*.tsx  ┐
+  assets/**     │──▶  Metro: resolución + transform  ──▶  bundle JS
+  package.json  ┘     (babel, minify, tree-shake)         + mapa de assets
+                              │
+                              ▼
+                      Hermes: compilación AOT
+                      a bytecode (.hbc)                 ──▶  main.jsbundle
+                              │                                (bytecode)
+                              │
+  ios/  android/  ┐           │
+  node_modules/   │           │
+   con código     │           ▼
+   nativo         │──▶  Toolchain nativo:  Xcode (Swift/ObjC) · Gradle (Kotlin/Java)
+  app.json/       │     compila, linkea, EMPAQUETA el bundle JS adentro
+   config plugins ┘           │
+                              ▼
+                        FIRMA con tu certificado / keystore
+                              │
+                              ▼
+                        .ipa (iOS)  ·  .aab / .apk (Android)</code></pre>
+
+<p>Las dos ramas se compilan en momentos distintos y con herramientas distintas, y esa asimetría es el corazón del módulo:</p>
+
+<ul>
+  <li><strong>La rama JS</strong> la produce Metro en segundos y no necesita ni Xcode ni Gradle. Hermes la convierte a bytecode <em>antes</em> de embarcarla, así que en el dispositivo no hay parseo ni compilación en el arranque — por eso la Nueva Arquitectura (RNS1) arranca rápido.</li>
+  <li><strong>La rama nativa</strong> necesita el toolchain completo: un Mac con Xcode para iOS, el SDK de Android y Gradle para Android. Tarda minutos, depende de versiones de sistema, y produce un binario que hay que <strong>firmar</strong>.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 El bundle JS es un archivo <em>adentro</em> del binario, no parte del binario.</strong> El toolchain nativo lo trata como un recurso más, igual que un PNG. Esa es exactamente la grieta por la que pasa OTA: si el runtime sabe buscar ese archivo en el disco antes de recurrir al que vino embebido, podés reemplazarlo sin tocar el binario. Todo <code>expo-updates</code> es esa única idea, bien implementada.
+</div>
+
+<p>Podés ver la rama JS aislada, sin nada nativo, y conviene hacerlo al menos una vez para que deje de ser magia:</p>
+
+<pre><code class="lang-bash"># Producir el bundle de producción a mano, sin tocar Xcode ni Gradle
+npx expo export --platform ios --output-dir ./dist
+
+# Qué quedó adentro
+ls -R dist
+#   dist/_expo/static/js/ios/entry-[hash].hbc     ← tu app entera, en bytecode
+#   dist/assets/[hash]                            ← imágenes y fuentes
+#   dist/metadata.json                            ← el manifiesto que consume expo-updates
+
+# El tamaño del .hbc es el número que importa para el arranque
+du -h dist/_expo/static/js/ios/*.hbc</code></pre>
+
+<div class="info">
+  Ese <code>metadata.json</code> es lo que EAS Update sube al CDN. Un update OTA <strong>es</strong> esta carpeta: un manifiesto que lista assets con su hash y apunta al bundle. Nada más. Cuando entiendas que un update son estos archivos y nada más, la pregunta "¿esto se puede actualizar por aire?" se vuelve mecánica: ¿mi cambio se refleja en esta carpeta, o afecta a lo que quedó fuera de ella?
+</div>
+
+<h2>RNS7.2 Firmas y certificados en iOS</h2>
+
+<p>Firmar es la parte que hace sufrir a todo el mundo, y sufre por una razón concreta: Apple usa cuatro entidades distintas con nombres parecidos, y los errores no te dicen cuál falta. Vale la pena aprenderlas una vez de verdad.</p>
+
+<table>
+  <thead>
+    <tr><th>Entidad</th><th>Qué es</th><th>Dónde vive</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>App ID / Bundle Identifier</strong></td><td>La identidad de la app: <code>com.tuempresa.app</code>. Declara qué <em>capabilities</em> puede usar (push, iCloud, Sign in with Apple).</td><td>Apple Developer Portal</td></tr>
+    <tr><td><strong>Distribution Certificate</strong></td><td>Tu identidad como <em>publicador</em>. Un par de claves: Apple firma tu clave pública, vos guardás la privada. Con eso se firma el binario.</td><td><code>.p12</code> (cert + clave privada)</td></tr>
+    <tr><td><strong>Provisioning Profile</strong></td><td>El permiso que <em>une</em> las tres cosas: este App ID, firmado por este certificado, con estos entitlements, para estos dispositivos.</td><td><code>.mobileprovision</code></td></tr>
+    <tr><td><strong>App Store Connect API Key</strong></td><td>Credencial de máquina para <em>subir</em> el binario sin tu usuario ni 2FA. No firma nada.</td><td><code>.p8</code> + issuer ID + key ID</td></tr>
+    <tr><td><strong>APNs Key</strong></td><td>Credencial para mandar push. Independiente de todo lo anterior.</td><td><code>.p8</code></td></tr>
+  </tbody>
+</table>
+
+<p>El provisioning profile es donde se rompen las cosas, porque es el único que <strong>caduca</strong> (un año) y el único que depende de una lista de dispositivos. Hay dos tipos que importan:</p>
+
+<ul>
+  <li><strong>App Store</strong>: sin lista de dispositivos, sirve para subir a App Store Connect y TestFlight. Es el de producción.</li>
+  <li><strong>Ad Hoc</strong>: lleva adentro los UDIDs de hasta cien dispositivos por año. Si agregás un tester nuevo, hay que <em>regenerar el profile y volver a compilar</em>. No alcanza con instalar de nuevo — es una causa clásica de "a mí no me instala" que hace perder tardes enteras.</li>
+</ul>
+
+<div class="mistake">
+  <strong>El error que todos cometen una vez:</strong> revocar un certificado de distribución para "limpiar" el portal. Un certificado revocado invalida todos los provisioning profiles que lo referencian, incluidos los de builds ya subidos. Las apps ya publicadas en la store <em>no</em> se caen (Apple re-firma al distribuir), pero cualquier build ad hoc en el dispositivo de un tester deja de abrir, y no podés compilar hasta rehacer toda la cadena. Un certificado no se revoca por prolijidad; se revoca cuando se filtró.
+</div>
+
+<h2>RNS7.3 Firmas en Android: el keystore y por qué se resguarda como un secreto de estado</h2>
+
+<p>Android es más simple de entender y mucho más peligroso de manejar mal. Todo se reduce a un archivo: el <strong>keystore</strong>, un contenedor cifrado con un par de claves y un alias.</p>
+
+<pre><code class="lang-bash"># Así se genera uno (EAS lo hace por vos, pero mirá qué contiene)
+keytool -genkeypair -v \
+  -keystore mi-app-upload.jks \
+  -alias mi-app \
+  -keyalg RSA -keysize 2048 \
+  -validity 10000                      # ~27 años: no querés que caduque nunca
+
+# Inspeccionar el que ya tenés — el SHA-256 es la huella que Play compara
+keytool -list -v -keystore mi-app-upload.jks -alias mi-app</code></pre>
+
+<p>Android identifica una app por la combinación de <code>applicationId</code> <strong>más</strong> la firma. Si subís un <code>.aab</code> firmado con otra clave, Play lo rechaza: para Play, esa es otra app que casualmente se llama igual.</p>
+
+<div class="danger">
+  <strong>☠️ Perder el keystore es perder la app.</strong> Sin él no podés publicar una actualización, nunca. La única salida es publicar una app nueva, con otro <code>applicationId</code>, y empezar de cero: cero instalaciones, cero reseñas, cero ranking, cero usuarios — porque tus usuarios actuales jamás se enteran de que existe. Se han perdido productos enteros por un disco que murió y un backup que nadie verificó.
+</div>
+
+<p>Google mitigó ese desastre con <strong>Play App Signing</strong>, y hoy es obligatorio para apps nuevas. Cambia el modelo por completo:</p>
+
+<pre><code class="lang-bash">TU MÁQUINA / EAS                    GOOGLE PLAY                    DISPOSITIVO
+────────────────                    ───────────                    ───────────
+
+.aab firmado con        ──subís──▶  Play verifica la      ──▶  APKs firmados con
+  UPLOAD KEY                        UPLOAD KEY, la quita        la APP SIGNING KEY
+  (la que tenés vos)                y re-firma con la           (la que tiene Google)
+                                    APP SIGNING KEY
+                                    (custodiada por Google)</code></pre>
+
+<ul>
+  <li>La <strong>app signing key</strong> —la que realmente valida el dispositivo— la guarda Google en su infraestructura. No la tenés ni la podés perder.</li>
+  <li>La <strong>upload key</strong> es la tuya, y su única función es probarle a Play que el <code>.aab</code> lo mandaste vos. <strong>Si la perdés, se puede resetear</strong>: pedís el reset en Play Console con una clave nueva. Tarda unos días, pero la app sobrevive.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Regla de resguardo, sin excepciones.</strong> El keystore y su password van a un gestor de secretos (1Password, Vault, el secret manager de tu nube), <strong>nunca</strong> al repositorio ni a Drive sin cifrar. Guardás además el SHA-256 y el alias en texto plano en la documentación del proyecto, porque el día que hay que verificar cuál de tres keystores es el bueno, la huella es lo único que lo resuelve. Y una vez por año, un humano restaura el backup en una máquina limpia y compila con él. Un backup que nunca se restauró no es un backup.
+</div>
+
+<div class="tip">
+  Si dejás que EAS administre las credenciales, viven cifradas en el servidor de Expo y las bajás cuando querés con <code>eas credentials</code>. Aun así, <strong>exportá una copia propia</strong> y guardala en tu gestor: no querés que tu única copia de la llave de tu producto dependa de tu relación comercial con un tercero.
+</div>
+
+<h2>RNS7.4 EAS Build: perfiles, entornos y secretos</h2>
+
+<p>EAS Build compila en la nube de Expo con el toolchain ya armado. Su valor real no es "no necesitás una Mac" —que también—, sino que <strong>el build es reproducible</strong>: la misma imagen, las mismas versiones, las mismas credenciales, corra donde corra. Se configura entero en <code>eas.json</code>:</p>
+
+<pre><code class="lang-json">{
+  "cli": {
+    "version": "&gt;= 12.0.0",
+    // "remote" = EAS lleva la cuenta del buildNumber/versionCode en su servidor.
+    // Es lo que querés: sacás el número del repo y se acaban los conflictos de merge.
+    "appVersionSource": "remote"
+  },
+
+  "build": {
+    // Perfil base: lo que comparten todos. Los demás lo extienden.
+    "base": {
+      "node": "22.11.0",
+      "env": { "EXPO_PUBLIC_API_URL": "https://api.staging.miapp.com" }
+    },
+
+    "development": {
+      "extends": "base",
+      // developmentClient: instala expo-dev-client → build depurable con menú de dev
+      "developmentClient": true,
+      "distribution": "internal",       // no pasa por la store: link o QR
+      "ios": { "simulator": true },     // build para simulador, gratis y rápido
+      "channel": "development"
+    },
+
+    "preview": {
+      "extends": "base",
+      "distribution": "internal",
+      "android": { "buildType": "apk" },   // .apk se instala a mano; .aab NO
+      "channel": "preview",
+      "env": { "EXPO_PUBLIC_API_URL": "https://api.staging.miapp.com" }
+    },
+
+    "production": {
+      "extends": "base",
+      "autoIncrement": true,               // sube buildNumber/versionCode solo
+      "channel": "production",
+      "env": { "EXPO_PUBLIC_API_URL": "https://api.miapp.com" },
+      "android": { "buildType": "app-bundle" }
+    }
+  },
+
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "releases@miapp.com",
+        "ascAppId": "1234567890",
+        "appleTeamId": "ABCD123456"
+      },
+      "android": {
+        "serviceAccountKeyPath": "../secrets/play-service-account.json",
+        "track": "internal"              // entra por Internal Testing, no a producción
+      }
+    }
+  }
+}</code></pre>
+
+<div class="info">
+  <code>eas.json</code> tolera comentarios <code>//</code>, así que podés documentarlo en el lugar donde se lee. Si alguna herramienta tuya se queja al parsearlo, sacalos — pero mantené el comentario en algún lado: un <code>eas.json</code> sin explicar es una de las cosas que más tiempo hace perder al que entra nuevo al proyecto.
+</div>
+
+<h3>Variables de entorno y secretos</h3>
+
+<p>Hay una distinción que se paga cara si se confunde:</p>
+
+<table>
+  <thead>
+    <tr><th>Tipo</th><th>Cuándo se resuelve</th><th>¿Termina en el bundle?</th><th>Para qué</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>EXPO_PUBLIC_*</code></td><td>Al compilar (Metro las inlinea)</td><td><strong>Sí, en texto plano</strong></td><td>URL de la API, flags públicos, id de proyecto de analytics</td></tr>
+    <tr><td>Secreto de EAS</td><td>Al compilar, solo en el servidor de build</td><td>No, si no lo referenciás desde el JS</td><td>Tokens de servicios de build, claves de firma, credenciales de submit</td></tr>
+    <tr><td>Secreto de verdad</td><td>Nunca en el cliente</td><td>Jamás</td><td>Claves de API con permisos de escritura, secretos de OAuth</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="lang-bash"># Variables de entorno de EAS, por entorno (development/preview/production)
+eas env:create --environment production \
+  --name SENTRY_AUTH_TOKEN --value "sntrys_..." --visibility secret
+
+eas env:list --environment production        # los secretos se listan, no se leen
+eas env:pull --environment development       # baja un .env local para desarrollar</code></pre>
+
+<div class="danger">
+  <strong>Todo lo que el JS puede leer, el usuario lo puede leer.</strong> Un <code>.hbc</code> se descompila, y aunque no se descompilara, las cadenas están ahí. Cualquier variable <code>EXPO_PUBLIC_*</code> es <strong>pública</strong>, sin matices, aunque la hayas cargado como "secreto" en EAS. Si tu app necesita hablar con un servicio que exige una clave privilegiada, esa llamada va del backend, no del teléfono. Esto no es paranoia: es la fuente número uno de claves filtradas en apps móviles.
+</div>
+
+<h3>Build en la nube vs build local</h3>
+
+<pre><code class="lang-bash"># En la nube: cola, logs en el navegador, credenciales administradas
+eas build --platform ios --profile production
+
+# Local: mismo eas.json, mismas credenciales, tu máquina y tu toolchain
+eas build --platform android --profile production --local
+
+# En CI: sin prompts y sin quedarse esperando el resultado
+eas build --platform all --profile production --non-interactive --no-wait</code></pre>
+
+<p>El build local sirve para dos cosas puntuales: <strong>depurar un build que falla</strong> (tenés los artefactos intermedios a mano en vez de un log truncado) y no gastar minutos de cuota en un proyecto con muchas iteraciones nativas. El costo es que perdés la reproducibilidad: tu Xcode no es el de la imagen de EAS, y ese delta es exactamente el tipo de diferencia que produce un "en mi máquina compila".</p>
+
+<h2>RNS7.5 Development builds vs Expo Go</h2>
+
+<p>Expo Go es una app publicada en las stores que trae precompilado un conjunto fijo de módulos nativos, y ejecuta tu JS adentro. Es excelente para empezar y deja de servir en un punto muy identificable.</p>
+
+<div class="concept">
+  <strong>💡 El momento exacto en que Expo Go deja de alcanzar.</strong> Cuando tu app necesita <em>un solo</em> módulo nativo que Expo Go no trae precompilado —el que escribiste vos en RNS4, un SDK de pagos, una librería de mapas específica—, se terminó. No hay configuración que lo arregle: ese código nativo no está adentro del binario de Expo Go, y no hay forma de meterlo por aire. Es la misma regla de OTA, aplicada al entorno de desarrollo.
+</div>
+
+<p>El reemplazo es el <strong>development build</strong>: tu propio Expo Go. Un binario compilado con <em>tus</em> dependencias nativas, que incluye <code>expo-dev-client</code> y por lo tanto conserva todo lo bueno del desarrollo — fast refresh, menú de dev, cargar el bundle desde tu máquina.</p>
+
+<pre><code class="lang-bash">npx expo install expo-dev-client
+eas build --profile development --platform ios
+# instalás ese binario UNA vez en el dispositivo...
+
+npx expo start --dev-client
+# ...y a partir de acá desarrollás igual que con Expo Go</code></pre>
+
+<table>
+  <thead>
+    <tr><th></th><th>Expo Go</th><th>Development build</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Módulos nativos propios</td><td>❌ imposible</td><td>✅ los que quieras</td></tr>
+    <tr><td>Config plugins</td><td>❌ ignorados</td><td>✅ aplicados</td></tr>
+    <tr><td><code>Info.plist</code> / permisos reales</td><td>❌ los de Expo Go</td><td>✅ los tuyos</td></tr>
+    <tr><td>Bundle id propio</td><td>❌</td><td>✅</td></tr>
+    <tr><td>Fidelidad con producción</td><td>Baja</td><td>Alta: mismo nativo, otro bundle</td></tr>
+    <tr><td>Recompilar al agregar una dep nativa</td><td>—</td><td>Sí, build nuevo</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla de equipo.</strong> Migrá a development builds <em>antes</em> de necesitarlo, no el día que se rompe. Un development build por plataforma en el arranque del proyecto cuesta veinte minutos; migrar a mitad de un sprint con todo el equipo bloqueado cuesta un día. Y sobre todo: el development build te da fidelidad con producción, así que los bugs que solo aparecen en el binario real aparecen en tu máquina y no en la del usuario.
+</div>
+
+<h2>RNS7.6 Variantes: dev, staging y prod en el mismo teléfono</h2>
+
+<p>Querés las tres en el mismo dispositivo al mismo tiempo. El QA verifica staging mientras usa producción como usuario normal; vos reproducís un bug de prod sin desinstalar tu build de desarrollo. Como Android e iOS identifican la app por su id, la condición es tener <strong>un id distinto por variante</strong>.</p>
+
+<pre><code class="lang-jsx">// app.config.js — reemplaza app.json cuando necesitás lógica
+const VARIANTE = process.env.APP_VARIANT || 'development';
+
+const CONFIG = {
+  development: { sufijo: '.dev',     nombre: 'MiApp Dev',     icono: './assets/icon-dev.png' },
+  preview:     { sufijo: '.staging', nombre: 'MiApp Staging', icono: './assets/icon-staging.png' },
+  production:  { sufijo: '',         nombre: 'MiApp',         icono: './assets/icon.png' },
+}[VARIANTE];
+
+export default {
+  name: CONFIG.nombre,
+  slug: 'mi-app',                                  // el slug NO cambia: es el proyecto en EAS
+  icon: CONFIG.icono,
+  version: '1.4.0',
+  ios:     { bundleIdentifier: `com.miempresa.miapp${CONFIG.sufijo}` },
+  android: { package:          `com.miempresa.miapp${CONFIG.sufijo}` },
+  updates: { url: 'https://u.expo.dev/[project-id]' },
+  runtimeVersion: { policy: 'fingerprint' },
+};</code></pre>
+
+<p>Y en cada perfil de <code>eas.json</code> se elige la variante:</p>
+
+<pre><code class="lang-json">{
+  "build": {
+    "development": { "env": { "APP_VARIANT": "development" }, "channel": "development" },
+    "preview":     { "env": { "APP_VARIANT": "preview" },     "channel": "preview" },
+    "production":  { "env": { "APP_VARIANT": "production" },  "channel": "production" }
+  }
+}</code></pre>
+
+<div class="tip">
+  <strong>Íconos distintos, no solo nombres distintos.</strong> Poné un badge de color sobre el ícono de dev y staging. Suena cosmético hasta el día en que alguien reporta un bug crítico de producción que en realidad estaba probando en staging, y el equipo pierde medio día persiguiendo un fantasma. El ícono es la única señal que se ve <em>antes</em> de abrir la app.
+</div>
+
+<h2>RNS7.7 EAS Update: qué viaja por aire y qué no</h2>
+
+<p>Llegamos a la sección que justifica el módulo. EAS Update reemplaza en caliente el bundle JS y los assets. El mecanismo es exactamente el de RNS7.1: <code>expo-updates</code> consulta un manifiesto en el CDN, y si hay uno más nuevo lo baja y lo usa en el próximo arranque.</p>
+
+<pre><code class="lang-bash">┌─────────────────────────────────────────────────────────────────┐
+│  LO QUE SÍ VIAJA POR AIRE          │  LO QUE NO VIAJA JAMÁS      │
+├────────────────────────────────────┼─────────────────────────────┤
+│  Componentes y pantallas           │  Dependencias con nativo    │
+│  Lógica de negocio, hooks          │  Config plugins             │
+│  Estilos, textos, traducciones     │  Permisos (Info.plist,      │
+│  Imágenes, fuentes, JSON local     │    AndroidManifest)         │
+│  Llamadas a la API, parsing        │  Ícono, splash, nombre      │
+│  Navegación (rutas, params)        │  Bundle id / package        │
+│  Feature flags evaluados en JS     │  Versión de React Native    │
+│  Fixes de crashes de JS            │  Versión del SDK de Expo    │
+│  Casi todo tu código, en realidad  │  Extensiones (widgets, WC)  │
+└────────────────────────────────────┴─────────────────────────────┘
+
+  La frontera es literal:  ¿el cambio aparece en `npx expo export`?
+                           SÍ → puede ir por OTA
+                           NO → necesita build nuevo</code></pre>
+
+<pre><code class="lang-bash">npx expo install expo-updates
+
+# Publicar un update a la rama production
+eas update --branch production --message "fix: carrito vacío al aplicar cupón"
+
+# Ver qué hay publicado y en qué orden
+eas update:list --branch production
+eas update:view [update-group-id]</code></pre>
+
+<p>La configuración del cliente define cuándo se aplica, y las opciones tienen consecuencias visibles para el usuario:</p>
+
+<pre><code class="lang-json">{
+  "expo": {
+    "updates": {
+      "url": "https://u.expo.dev/[project-id]",
+      "enabled": true,
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
+    "runtimeVersion": { "policy": "fingerprint" }
+  }
+}</code></pre>
+
+<ul>
+  <li><code>fallbackToCacheTimeout: 0</code> — <strong>el default correcto</strong>. La app arranca ya con el bundle que tiene, descarga el update en segundo plano y lo aplica en el <em>próximo</em> arranque. Cero impacto en el tiempo de inicio.</li>
+  <li>Un valor mayor a 0 hace que la app <em>espere</em> hasta ese timeout por un update nuevo antes de arrancar. Tu usuario en una red mala mira un splash congelado. Casi nunca vale la pena.</li>
+</ul>
+
+<p>Si necesitás control fino —por ejemplo, ofrecer "reiniciar ahora" tras un fix crítico— manejalo desde JS:</p>
+
+<pre><code class="lang-jsx">import * as Updates from 'expo-updates';
+import { useEffect, useState } from 'react';
+
+export function useUpdateDisponible() {
+  const [listo, setListo] = useState(false);
+
+  useEffect(() =&gt; {
+    // En dev el módulo está deshabilitado: evitá el ruido en la consola
+    if (__DEV__ || !Updates.isEnabled) return;
+
+    let cancelado = false;
+    (async () =&gt; {
+      try {
+        const check = await Updates.checkForUpdateAsync();
+        if (!check.isAvailable || cancelado) return;
+        await Updates.fetchUpdateAsync();      // ya está en disco, sin aplicar
+        if (!cancelado) setListo(true);
+      } catch (e) {
+        // Que falle un update NUNCA puede romper la app: la vieja sigue andando
+        console.warn('[updates]', e);
+      }
+    })();
+    return () =&gt; { cancelado = true; };
+  }, []);
+
+  // El reload lo dispara el usuario, no vos: reiniciar mientras escribe es hostil
+  return { listo, aplicar: () =&gt; Updates.reloadAsync() };
+}</code></pre>
+
+<div class="mistake">
+  <strong>El antipatrón más común:</strong> llamar a <code>Updates.reloadAsync()</code> apenas termina la descarga. La app se reinicia sola en medio de un formulario, de un pago o de un video, y el usuario pierde lo que estaba haciendo. El reinicio se ofrece —un banner discreto— o se aplica en el próximo arranque natural. Nunca se impone.
+</div>
+
+<h2>RNS7.8 Runtime version: el mecanismo que evita el desastre</h2>
+
+<p>Acá está el problema de fondo. Un update OTA reemplaza el JS de una app cuyo <strong>lado nativo ya está fijo</strong>. Si el JS nuevo asume un módulo nativo que ese binario no tiene, la app crashea al arrancar. Y crashea <em>en el arranque</em>, que es el peor lugar posible: el usuario no puede ni entrar para que le llegue el fix. Un update mal enviado convierte tu app en un ladrillo hasta que las stores aprueben un binario nuevo.</p>
+
+<pre><code class="lang-bash">    ESCENARIO ROTO — sin runtime version
+    ────────────────────────────────────
+    App v1.4.0 en el teléfono          Update OTA publicado
+    RN 0.86 · SIN expo-camera    ◀───  JS que hace import de expo-camera
+                                       (agregado en el build 1.5.0)
+
+    Arranque → el JS pide un módulo nativo que no existe
+             → excepción no capturada en el bootstrap
+             → CRASH INMEDIATO, en el 100% de esos dispositivos
+             → el usuario no llega a ninguna pantalla
+             → el único arreglo es un binario nuevo, con revisión de la store</code></pre>
+
+<p>El <strong>runtime version</strong> es un identificador de la "forma nativa" del binario. Un update solo se entrega a apps cuyo runtime version <em>coincide exactamente</em>. Si no coincide, el servidor simplemente no ofrece el update: la app sigue con lo que tenía, funcionando.</p>
+
+<table>
+  <thead>
+    <tr><th>Política</th><th>Cómo se calcula</th><th>Veredicto</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>fingerprint</code></td><td>Hash del proyecto nativo completo: deps, plugins, config, versión de RN.</td><td><strong>La que hay que usar en 2026.</strong> Cambia sola cuando cambia algo nativo, sin que nadie tenga que acordarse.</td></tr>
+    <tr><td><code>appVersion</code></td><td>El <code>version</code> de <code>app.json</code> (ej. <code>1.4.0</code>).</td><td>Manejable, pero depende de tu disciplina para subirlo al tocar algo nativo. Un olvido = crash.</td></tr>
+    <tr><td><code>sdkVersion</code></td><td>La versión del SDK de Expo.</td><td>Demasiado gruesa: dos builds con el mismo SDK pueden tener nativos distintos.</td></tr>
+    <tr><td><code>nativeVersion</code></td><td><code>version</code> + build number.</td><td>Tan estricta que casi ningún update llega a nadie. Rara vez útil.</td></tr>
+    <tr><td>String fijo</td><td>Lo que escribas, ej. <code>"7"</code>.</td><td>Solo si administrás vos el ciclo nativo a mano y sabés exactamente lo que hacés.</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 <code>{ "policy": "fingerprint" }</code> y se terminó la clase de bugs.</strong> El fingerprint hashea todo lo que afecta al binario. Instalás una librería con código nativo y el hash cambia solo; tus updates dejan de llegar automáticamente a los binarios viejos, sin que nadie tenga que darse cuenta de nada. Es la diferencia entre una salvaguarda que depende de la memoria de un humano y una que depende de una función.
+</div>
+
+<pre><code class="lang-bash"># Ver el fingerprint actual y por qué cambió
+npx expo-updates fingerprint:generate --platform ios
+
+# Comparar contra el commit del último build de producción: el diff te dice
+# exactamente qué dependencia o config rompió la compatibilidad OTA
+npx expo-updates fingerprint:generate --platform ios &gt; /tmp/ahora.json
+git stash &amp;&amp; npx expo-updates fingerprint:generate --platform ios &gt; /tmp/antes.json
+git stash pop &amp;&amp; diff /tmp/antes.json /tmp/ahora.json</code></pre>
+
+<h3>Canales y ramas: la indirección que hace todo posible</h3>
+
+<p>Hay tres conceptos y confundirlos es habitual:</p>
+
+<ul>
+  <li><strong>Channel</strong> — se hornea <em>dentro del binario</em> en tiempo de build (el campo <code>channel</code> de <code>eas.json</code>). Un binario nace con su canal y muere con él.</li>
+  <li><strong>Branch</strong> — una secuencia de updates publicados, del lado del servidor. Se crea y se mueve cuando querés.</li>
+  <li><strong>El mapeo channel → branch</strong> — la indirección. Un binario en el canal <code>production</code> pregunta "¿qué rama me toca?" y el servidor responde.</li>
+</ul>
+
+<pre><code class="lang-bash">  BINARIOS (canal fijo)          MAPEO (mutable)         RAMAS (updates)
+  ─────────────────────          ───────────────         ───────────────
+  build 1.4.0  channel:prod  ──▶  production  ──▶  branch "production"
+  build 1.4.1  channel:prod  ──┘                    ├─ update #48 (activo)
+                                                    ├─ update #47
+  build 1.5.0  channel:preview ▶  preview     ──▶  branch "release-1.5"
+                                                    └─ update #12
+
+# Apuntar producción a otra rama sin recompilar nada: así se promueve
+# lo que ya se validó en staging, sin volver a construir el bundle.
+eas channel:edit production --branch release-1.5</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué esta indirección vale oro.</strong> El canal está congelado en un binario que ya está en manos de millones de personas: no lo podés cambiar. La rama sí. Entonces todo el control operativo —promover, revertir, congelar, dividir tráfico— se ejerce sobre el mapeo, que es un registro en un servidor y responde al instante. Es exactamente la misma razón por la que en infraestructura apuntás un DNS a un balanceador en vez de a una IP.
+</div>
+
+<h2>RNS7.9 Rollout progresivo y rollback</h2>
+
+<p>Publicar un update a producción es empujar código al 100% de tu base en cuestión de horas, sin revisión de nadie. Eso es poder y es riesgo en la misma proporción. El rollout progresivo es la mitigación estándar.</p>
+
+<pre><code class="lang-bash"># 1) Publicar el update en su propia rama, sin exponerlo a nadie todavía
+eas update --branch hotfix-1.4.1 --message "fix: crash en checkout con cupón"
+
+# 2) Abrir un rollout: el canal production sirve la rama nueva al 10%
+#    y la rama anterior al 90% restante
+eas channel:rollout production \
+  --branch hotfix-1.4.1 \
+  --percent 10 \
+  --non-interactive
+
+# 3) Mirar el estado del rollout en cualquier momento
+eas channel:view production
+
+# 4) Si los números acompañan, se sube por escalones
+eas channel:rollout production --percent 50
+eas channel:rollout production --percent 100
+
+# 5) Si NO acompañan: cerrar el rollout volviendo a la rama anterior
+eas channel:rollout production --end --branch production</code></pre>
+
+<p>Hay tres formas de revertir y sirven para situaciones distintas. Elegir la equivocada bajo presión es un error caro:</p>
+
+<table>
+  <thead>
+    <tr><th>Mecanismo</th><th>Comando</th><th>Cuándo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Cerrar el rollout</strong></td><td><code>eas channel:rollout ... --end --branch production</code></td><td>El update malo está en rollout parcial. Lo más rápido y lo más limpio.</td></tr>
+    <tr><td><strong>Republicar el anterior</strong></td><td><code>eas update:republish --group [id-viejo]</code></td><td>Ya está al 100% y sabés que la versión anterior era sana. Vuelve a publicar ese bundle como update nuevo.</td></tr>
+    <tr><td><strong>Volver al embebido</strong></td><td><code>eas update:roll-back-to-embedded --branch production</code></td><td>Botón de pánico: todos vuelven al bundle que venía dentro del binario de la store. Cuando no confiás en ningún update de la rama.</td></tr>
+  </tbody>
+</table>
+
+<div class="warn">
+  <strong>Un rollback no es instantáneo.</strong> El dispositivo se entera en su próximo chequeo, y aplica en el próximo arranque. En la práctica, la reversión se propaga en minutos u horas según el patrón de uso de tu app — no en segundos como un rollback de web. Por eso el rollout progresivo no es opcional: cuando detectás el problema, el rollback tarda; lo único que podés controlar de verdad es <em>a cuánta gente le llegó antes de que lo detectaras</em>.
+</div>
+
+<h2>RNS7.10 Lo que las tiendas permiten y lo que no</h2>
+
+<p>Apple y Google saben que OTA existe. Ninguna de las dos lo prohíbe, y ninguna de las dos lo deja libre.</p>
+
+<p><strong>Apple</strong>, en las guías de revisión (2.5.2 y 3.3.2 del acuerdo de desarrollador), permite descargar y ejecutar código interpretado <em>siempre que</em>: (a) todo el código corra en el motor de JavaScript del sistema o en tu intérprete embebido, sin comprometer la firma ni el sandbox; (b) el código descargado <strong>no cambie el propósito principal de la app</strong> respecto de lo que se revisó; (c) no se use para crear tiendas o mecanismos de compra paralelos.</p>
+
+<p><strong>Google</strong> llega al mismo lugar por la política de <em>Device and Network Abuse</em>: podés actualizar el intérprete y su código, pero lo que se ejecute debe cumplir todas las políticas de Play, como si hubiera venido en el binario revisado.</p>
+
+<table>
+  <thead>
+    <tr><th>✅ Aceptado sin discusión</th><th>❌ Te puede costar la app</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Corregir un crash o un bug de lógica</td><td>Publicar una funcionalidad grande y nueva por OTA para saltear la revisión</td></tr>
+    <tr><td>Ajustar textos, precios mostrados, traducciones</td><td>Cambiar el propósito de la app tras la aprobación (el clásico <em>bait and switch</em>)</td></tr>
+    <tr><td>Cambios de UI, estilos, layout</td><td>Activar por OTA algo que se ocultó deliberadamente durante la revisión</td></tr>
+    <tr><td>Activar features detrás de flags ya revisados</td><td>Meter compras o pagos externos esquivando el IAP</td></tr>
+    <tr><td>Actualizar contenido, catálogos, campañas</td><td>Cargar código que no sea JS interpretado (nada de binarios)</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La prueba de olfato.</strong> Preguntate: <em>si el revisor viera hoy mi app con este update aplicado, ¿aprobaría lo mismo que aprobó?</em> Si la respuesta es sí, tu OTA está dentro de las reglas. Si la respuesta es "bueno, ahora hace bastante más cosas", mandá un build. La sanción por cruzar esa línea no es una advertencia: es la remoción de la app, y en el peor caso la de la cuenta de desarrollador. Ningún feature vale eso.
+</div>
+
+<div class="info">
+  Hay una consecuencia de diseño que conviene aceptar temprano: <strong>los feature flags se revisan una vez y se activan después</strong>. Si querés poder encender una feature sin build, la feature tiene que estar <em>en</em> el binario que el revisor vio, apagada tras un flag. Eso es legítimo y es práctica estándar de la industria. Lo que no es legítimo es que el código de esa feature llegue después, por aire.
+</div>
+
+<h2>RNS7.11 Versionado: dos números que hacen cosas distintas</h2>
+
+<p>Cada plataforma tiene un número para humanos y un número para la máquina, y el segundo es el que rompe las subidas.</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Para el usuario</th><th>Para la tienda</th><th>Regla</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>iOS</strong></td><td><code>CFBundleShortVersionString</code> → <code>version</code></td><td><code>CFBundleVersion</code> → <code>ios.buildNumber</code></td><td>Debe crecer en <em>cada</em> subida a App Store Connect, aunque la version no cambie</td></tr>
+    <tr><td><strong>Android</strong></td><td><code>versionName</code> → <code>version</code></td><td><code>versionCode</code> → <code>android.versionCode</code></td><td>Entero, estrictamente creciente. No se puede bajar nunca</td></tr>
+  </tbody>
+</table>
+
+<p>Que <code>versionCode</code> sea irreversible tiene un corolario que muerde: si por error subís un build con <code>versionCode: 900</code>, quedaste obligado a que todos los siguientes sean mayores. No hay forma de volver. Por eso el número no se escribe a mano.</p>
+
+<pre><code class="lang-json">{
+  "cli": { "appVersionSource": "remote" },
+  "build": {
+    "production": {
+      "autoIncrement": true
+    }
+  }
+}</code></pre>
+
+<pre><code class="lang-bash"># Consultar qué número tiene EAS registrado
+eas build:version:get --platform ios --profile production
+
+# Sincronizar si migrás un proyecto que ya tenía builds subidos a mano
+eas build:version:set --platform android --profile production</code></pre>
+
+<div class="tip">
+  <strong>La convención que funciona en equipo:</strong> <code>version</code> lo mueve una persona, a mano, en el PR de release, y significa algo para el usuario (1.4.0 → 1.5.0 = features nuevas). El build number no lo toca nadie: lo administra EAS. Así el número que se comunica es una decisión de producto, y el número que la tienda exige es un detalle de infraestructura. Mezclarlos es lo que produce esos conflictos de merge en <code>app.json</code> que aparecen en cada PR.
+</div>
+
+<h2>RNS7.12 El proceso de revisión: cuánto planificar y por qué te rechazan</h2>
+
+<p>Los tiempos de 2026, en la práctica: Apple resuelve la mayoría de las revisiones <strong>en menos de 24–48 horas</strong>; Google Play suele ser similar para cuentas establecidas, pero puede tomar varios días para cuentas nuevas, que además arrastran requisitos extra de testeo cerrado previo. Ninguno de los dos garantiza nada, y ambos se vuelven más lentos alrededor de las fiestas de fin de año.</p>
+
+<div class="warn">
+  <strong>Planificá con el rechazo incluido, no con el camino feliz.</strong> Un rechazo cuesta la revisión que ya gastaste más el arreglo más una revisión nueva. Si tu release tiene fecha comprometida, la regla práctica es enviar con <strong>una semana</strong> de margen, no con dos días. Y si de verdad no podés fallar, el <em>expedited review</em> de Apple existe: se pide con justificación y se usa poco, porque abusarlo te lo hace perder.
+</div>
+
+<h3>Los rechazos que se repiten</h3>
+
+<ul>
+  <li><strong>Guideline 5.1.1 — Privacidad.</strong> Falta un <em>purpose string</em>, o dice "la app usa la cámara". Tiene que decir <em>para qué</em>: "para escanear el código de barras de tus productos". Es el rechazo número uno y es cien por ciento evitable.</li>
+  <li><strong>Guideline 2.1 — Performance / Completeness.</strong> Crashea en el dispositivo del revisor, o no le diste una <strong>cuenta de demo</strong> funcional. Si tu app tiene login, sin credenciales de prueba en las notas de revisión, el rechazo es automático.</li>
+  <li><strong>Guideline 4.2 — Minimum functionality.</strong> La app es un WebView de tu sitio. Necesita valor nativo real.</li>
+  <li><strong>Guideline 3.1.1 — In-App Purchase.</strong> Vendés bienes digitales por fuera del sistema de compras. Sin excepciones, salvo las categorías que Apple define explícitamente.</li>
+  <li><strong>Privacy manifests.</strong> Desde 2024 tu app y sus SDKs de terceros deben declarar en <code>PrivacyInfo.xcprivacy</code> el uso de las <em>required reason APIs</em>. Un SDK viejo sin manifiesto ni firma te bloquea la subida entera, y el error llega por mail después de subir, no al compilar.</li>
+  <li><strong>Google Play — Data safety.</strong> El formulario declarado tiene que coincidir con lo que la app realmente recolecta. Play compara contra el análisis del binario y contra tu política de privacidad.</li>
+  <li><strong>Google Play — target API level.</strong> Play exige apuntar a un nivel de API reciente. Un SDK de Expo desactualizado te deja afuera sin aviso previo, y la salida es actualizar el SDK, que no es una tarde de trabajo.</li>
+</ul>
+
+<pre><code class="lang-bash"># El chequeo que corrés ANTES de gastar una revisión
+npx expo-doctor                    # versiones incompatibles, config rota
+npx expo config --type public      # mirá el Info.plist/Manifest efectivos
+
+# El binario a la pista interna primero, siempre. Nunca directo a producción.
+eas submit --platform ios --profile production        # → TestFlight
+eas submit --platform android --profile production    # → Internal Testing</code></pre>
+
+<div class="tip">
+  <strong>Ambas plataformas tienen despliegue escalonado del binario, y casi nadie lo usa.</strong> iOS tiene <em>phased release</em> (7 días: 1%, 2%, 5%, 10%, 20%, 50%, 100%, con pausa disponible en cualquier momento). Google Play tiene <em>staged rollout</em> con el porcentaje que elijas y la posibilidad de frenarlo. Es el mismo principio del rollout de OTA aplicado al binario. Activalo: es gratis y es la única red de contención que tenés para bugs que solo aparecen en dispositivos reales.
+</div>
+
+<h2>RNS7.13 CI/CD: qué se automatiza y qué se deja en manos de un humano</h2>
+
+<p>EAS Workflows permite describir el pipeline en YAML dentro del repo, con los jobs corriendo en la infraestructura de EAS:</p>
+
+<pre><code class="lang-yaml"># .eas/workflows/release-production.yml
+name: Release a producción
+
+on:
+  push:
+    branches: ['release/*']
+
+jobs:
+  verificar:
+    steps:
+      - uses: eas/checkout
+      - uses: eas/install_node_modules
+      - name: Typecheck y tests
+        run: npm run typecheck &amp;&amp; npm test -- --ci
+
+  build_ios:
+    needs: [verificar]
+    type: build
+    params:
+      platform: ios
+      profile: production
+
+  build_android:
+    needs: [verificar]
+    type: build
+    params:
+      platform: android
+      profile: production
+
+  # Sube a TestFlight / Internal Testing. NO publica a los usuarios.
+  submit_interno:
+    needs: [build_ios, build_android]
+    type: submit
+    params:
+      profile: production</code></pre>
+
+<p>Si preferís GitHub Actions —lo más común cuando el móvil convive con backend y web en el mismo repo—, el patrón es el mismo:</p>
+
+<pre><code class="lang-yaml"># .github/workflows/preview.yml — un build instalable por cada PR
+name: Preview build
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      - run: npm ci
+      - run: npx expo-doctor
+      - name: Build de preview
+        run: eas build --platform android --profile preview --non-interactive --no-wait</code></pre>
+
+<table>
+  <thead>
+    <tr><th>✅ Automatizar sin dudarlo</th><th>🚦 Con aprobación humana</th><th>❌ Nunca automático</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Lint, typecheck, tests unitarios en cada PR</td><td>Publicar un OTA a <code>production</code></td><td>Liberar a producción en la store</td></tr>
+    <tr><td>Build de preview por PR</td><td>Subir a TestFlight / Internal Testing</td><td>Subir el porcentaje de un rollout</td></tr>
+    <tr><td>OTA automático a <code>development</code> y <code>preview</code></td><td>Promover una rama a <code>production</code></td><td>Cerrar un incidente por métricas solas</td></tr>
+    <tr><td>Build de producción al taguear</td><td>Cambiar el mapeo channel → branch</td><td>Cualquier cosa irreversible sin revisión</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio es la reversibilidad, no la comodidad.</strong> Automatizá todo lo que se pueda deshacer barato. Pedí un humano para todo lo que llega al usuario final, porque en móvil deshacer cuesta horas y a veces una revisión de la store. Un pipeline que publica OTA a producción en cada merge a <code>main</code> es exactamente el diseño que convierte un martes común en un incidente.
+</div>
+
+<h2>🧑‍🎓 Worked Example — hotfix crítico en producción</h2>
+
+<p><strong>El escenario.</strong> Son las 14:40. La 1.4.0 salió hace tres días. Sentry viene tranquilo hasta que en dos horas la tasa de sesiones sin crash cae de <strong>99.4% a 95.8%</strong>. El stack apunta a la pantalla de checkout:</p>
+
+<pre><code class="lang-bash">TypeError: undefined is not an object (evaluating 'cupon.descuentos.map')
+  at CheckoutResumen (app/checkout/resumen.tsx:88)
+  at renderWithHooks (react-native-renderer.js:...)
+
+  Afectados: 3.812 sesiones · 1.204 usuarios · 100% de ellos en 1.4.0
+  Correlación: todos aplicaron un cupón antes de entrar al checkout</code></pre>
+
+<p>La causa se encuentra en cuatro minutos: la campaña de marketing que arrancó hoy emite cupones de un tipo nuevo, y para esos la API devuelve <code>descuentos: null</code> en vez de un arreglo vacío. El JS asume el arreglo. Backend puede arreglarlo, pero el cliente tiene que tolerarlo igual.</p>
+
+<h3>Paso 1 — El árbol de decisión: ¿OTA o build?</h3>
+
+<p>Esta es la parte que importa. Antes de escribir una línea, se corre el árbol, en este orden y sin saltear pasos:</p>
+
+<pre><code class="lang-bash">              ¿El fix toca SOLO archivos .ts/.tsx/.js/.json/assets?
+                        │
+           ┌────NO──────┴───────SÍ────┐
+           ▼                          ▼
+    ══════════════          ¿Agrega o cambia alguna
+    BUILD NUEVO             dependencia de package.json?
+    Sin discusión.                    │
+    Empezá ya, que              ┌─NO──┴──SÍ─┐
+    la revisión tarda.          ▼           ▼
+    ══════════════        ¿Toca app.json/   ¿Esa dep tiene
+                          config plugins/    código nativo?
+                          permisos?          (mirá si trae
+                                │            ios/ o android/)
+                          ┌─NO──┴──SÍ─┐          │
+                          ▼           ▼      ┌─SÍ┴─NO─┐
+                  ¿El fingerprint   BUILD    ▼        ▼
+                  cambia respecto   NUEVO   BUILD   sigue
+                  del build vivo?           NUEVO   evaluando
+                          │
+                    ┌─NO──┴──SÍ─┐
+                    ▼           ▼
+              ═════════════   BUILD NUEVO
+              ELEGIBLE OTA    (el fingerprint es
+              ═════════════    la última palabra)</code></pre>
+
+<pre><code class="lang-bash"># Paso 1a — qué archivos toca el fix
+git diff --name-only main...hotfix/cupon-null
+#   app/checkout/resumen.tsx
+#   lib/cupones.ts
+#   __tests__/cupones.test.ts
+#   → solo JS. No hay package.json, no hay app.json. Buena señal.
+
+# Paso 1b — la verificación que manda: el fingerprint nativo
+npx expo-updates fingerprint:generate --platform ios
+#   { "hash": "a91c3f...e07", ... }
+
+eas build:list --platform ios --profile production --limit 1 --json \
+  | grep -i fingerprint
+#   "fingerprintHash": "a91c3f...e07"
+
+#   IDÉNTICOS → el binario vivo y este código comparten el mismo nativo.
+#   VEREDICTO: elegible para OTA.</code></pre>
+
+<div class="rule">
+  <strong>📌 El fingerprint es la única evidencia que cuenta.</strong> "Toqué solo JS" es una impresión; el hash es un hecho. Un <code>npm install</code> que actualizó una transitiva con código nativo no aparece en tu diff y sí aparece en el hash. Comparar el fingerprint del working tree contra el del build que está vivo en producción es un comando, tarda diez segundos, y es lo que separa un hotfix de un incidente peor que el original.
+</div>
+
+<h3>Paso 2 — El fix, defensivo en los dos lados</h3>
+
+<pre><code class="lang-jsx">// lib/cupones.ts
+export function normalizarCupon(raw: unknown): Cupon {
+  const c = (raw ?? {}) as Partial&lt;CuponRaw&gt;;
+  return {
+    codigo: c.codigo ?? '',
+    // El fix: la API puede mandar null, undefined o algo que no es arreglo
+    descuentos: Array.isArray(c.descuentos) ? c.descuentos : [],
+    vence: c.vence ? new Date(c.vence) : null,
+  };
+}</code></pre>
+
+<pre><code class="lang-jsx">// __tests__/cupones.test.ts — el test que reproduce EXACTAMENTE el crash
+it('tolera descuentos null (cupones de campaña)', () =&gt; {
+  const c = normalizarCupon({ codigo: 'VERANO26', descuentos: null });
+  expect(c.descuentos).toEqual([]);
+  expect(() =&gt; c.descuentos.map((d) =&gt; d.monto)).not.toThrow();
+});</code></pre>
+
+<h3>Paso 3 — Publicar al 10%</h3>
+
+<pre><code class="lang-bash">npm test -- --ci                    # 214 passed. No se publica sin verde.
+
+# El update va a su PROPIA rama. Nadie lo recibe todavía.
+eas update \
+  --branch hotfix-1.4.1 \
+  --message "fix: descuentos null en cupones de campaña (INC-482)" \
+  --platform all
+
+#   Branch: hotfix-1.4.1
+#   Runtime version: a91c3f...e07     ← coincide con el binario vivo ✅
+#   Update group: 8f2a91c4-...
+
+# Recién ahora se expone, y al 10%
+eas channel:rollout production \
+  --branch hotfix-1.4.1 --percent 10 --non-interactive
+
+eas channel:view production
+#   production → 10% hotfix-1.4.1 · 90% production</code></pre>
+
+<h3>Paso 4 — Monitorear, y aceptar lo que dicen los números</h3>
+
+<p>Se define de antemano —antes de mirar nada— qué significa éxito y qué significa abortar. Definirlo después es cómo se racionalizan los desastres.</p>
+
+<table>
+  <thead>
+    <tr><th>Hora</th><th>Crash-free (cohorte 10%)</th><th>Errores no fatales</th><th>Lectura</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>15:10</td><td>95.8% (línea de base)</td><td>—</td><td>Rollout abierto</td></tr>
+    <tr><td>15:40</td><td><strong>99.1%</strong> 🟢</td><td>+12</td><td>El crash original desapareció</td></tr>
+    <tr><td>16:10</td><td>99.2% 🟢</td><td><strong>+840</strong> ⚠️</td><td>Algo nuevo apareció</td></tr>
+    <tr><td>16:25</td><td>99.2%</td><td><strong>+3.100</strong> 🔴</td><td>"Total del pedido: $0" — checkouts abandonados</td></tr>
+  </tbody>
+</table>
+
+<p>El crash está arreglado y aun así la situación empeoró. Al normalizar a <code>[]</code>, la pantalla de resumen calcula el total sin el descuento y muestra un total que el usuario no reconoce, así que abandona. La métrica que se estaba mirando —crash-free— mejoró; la que importa —checkouts completados— se derrumbó.</p>
+
+<div class="mistake">
+  <strong>La trampa clásica del hotfix:</strong> monitorear únicamente la métrica del síntoma que salías a arreglar. Si solo mirás crash-free, este rollout parece un éxito rotundo y lo subís al 100%. Todo rollout se mide con <strong>dos</strong> familias de métricas: la técnica (crashes, errores, latencia) y <strong>la de negocio</strong> (conversión, checkouts, sesiones). Un fix puede mejorar la primera mientras destruye la segunda, y en general el negocio es lo que se está tratando de proteger.
+</div>
+
+<h3>Paso 5 — Rollback</h3>
+
+<pre><code class="lang-bash"># El update está en rollout parcial → cerrar el rollout es lo correcto,
+# lo más rápido y lo que no ensucia el historial de la rama.
+eas channel:rollout production --end --branch production
+
+eas channel:view production
+#   production → 100% production  (el 10% vuelve al update anterior)
+
+# Si YA hubiera estado al 100%, la salida sería republicar el bueno:
+#   eas update:list --branch production
+#   eas update:republish --group [id-del-update-sano] \
+#     --message "revert: INC-482, vuelta a 1.4.0 estable"
+
+# Y si ningún update de la rama fuera confiable, el botón de pánico:
+#   eas update:roll-back-to-embedded --branch production</code></pre>
+
+<p><strong>Cierre.</strong> El 10% vuelve al comportamiento anterior: el crash del cupón regresa para ese subconjunto, pero es un crash conocido, acotado a una campaña, y mucho menos costoso que cobrar mal. El fix correcto —normalizar <em>y</em> recalcular el total con los descuentos que la API manda por otro campo— sale al día siguiente por el mismo camino: rama propia, 10%, las dos familias de métricas, y recién ahí los escalones.</p>
+
+<div class="concept">
+  <strong>💡 Lo que este ejemplo enseña de verdad.</strong> El árbol de decisión no ahorró tiempo: <em>evitó un desastre</em>. Si esa dependencia hubiera traído código nativo y el update salía igual, el resultado no habría sido un total mal calculado sino una app que no abre, en el 10% de la base, arreglable solo con una revisión de la store. Los cinco pasos —clasificar, verificar el fingerprint, publicar acotado, medir dos familias de métricas, revertir sin negociar— son el mismo procedimiento para cualquier cambio en producción móvil. La disciplina no está en saber los comandos; está en no saltear pasos a las 14:40 con el gerente respirándote en la nuca.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu fix toca únicamente archivos <code>.tsx</code>, pero el fingerprint cambió. ¿Qué pasó y qué hacés?</summary>
+<p>Algo alteró el proyecto nativo sin aparecer en tu diff de código: casi siempre un <code>npm install</code> que movió una dependencia transitiva con carpeta <code>ios/</code> o <code>android/</code>, o un cambio en el lockfile, o una versión distinta del SDK de Expo resuelta al instalar. El fingerprint hashea el proyecto nativo entero, no tu diff. Qué hacés: <strong>no publicás el OTA</strong>. O bien volvés el lockfile al estado del build vivo y verificás que el hash coincida otra vez —y ahí sí publicás—, o aceptás que el cambio requiere build nuevo. Publicar igual, "porque es solo JS", es exactamente el escenario que deja la app sin abrir: el JS nuevo puede pedirle al binario viejo un módulo nativo que no tiene.</p></details>
+
+<details><summary>¿Por qué un canal se hornea en el binario pero una rama se puede cambiar cuando querés?</summary>
+<p>Porque el canal es la <em>pregunta</em> que hace la app y la rama es la <em>respuesta</em> que da el servidor. El canal se compila adentro del binario, y ese binario ya está instalado en dispositivos que no controlás: cambiarlo requeriría una app nueva. La rama y el mapeo channel → branch viven del lado del servidor, así que cambian al instante. Esa indirección es la que hace posible todo el control operativo —promover staging a producción, dividir tráfico en un rollout, revertir— sin recompilar ni pedirle nada a las tiendas. Es la misma razón por la que apuntás un DNS a un balanceador y no a una IP: lo inmutable apunta a algo mutable.</p></details>
+
+<details><summary>Marketing quiere activar por OTA una sección nueva completa que no estaba en el binario aprobado. ¿Se puede?</summary>
+<p>Técnicamente sí, y por eso hay que ser explícito: <strong>no se debe</strong>. Apple (2.5.2 / 3.3.2) y Google (Device and Network Abuse) permiten actualizar código interpretado siempre que no cambie el propósito principal de lo que se revisó. Una sección nueva completa, publicada después de la aprobación, es precisamente el <em>bait and switch</em> que esas cláusulas describen, y la sanción va de la remoción de la app a la de la cuenta. La alternativa correcta cuesta poco: la sección viaja <strong>en</strong> el binario que el revisor ve, apagada tras un feature flag, y el OTA solo cambia el valor del flag. Eso es práctica estándar y está dentro de las reglas, porque lo que se activa es algo que ya fue revisado.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El binario y el bundle JS se compilan por caminos distintos y el bundle termina <em>adentro</em> del binario como un recurso más. Esa grieta es todo lo que hace posible OTA.</li>
+  <li><strong>Perder el keystore de Android sin Play App Signing es perder la app para siempre.</strong> Con Play App Signing, la upload key se puede resetear. En iOS, no revoques certificados por prolijidad: invalidan todos los profiles que los referencian.</li>
+  <li>Los perfiles de <code>eas.json</code> (development / preview / production) más un <code>bundleIdentifier</code> por variante te dan los tres entornos conviviendo en el mismo dispositivo. Íconos distintos, no solo nombres distintos.</li>
+  <li>Expo Go deja de servir en el instante en que aparece <em>un</em> módulo nativo propio. El development build es tu propio Expo Go, con tus dependencias y fidelidad real con producción.</li>
+  <li><strong>Por aire viaja JS y assets. Nada nativo, nunca.</strong> El criterio mecánico: si el cambio no aparece en <code>npx expo export</code>, necesita build.</li>
+  <li><strong><code>runtimeVersion: { policy: "fingerprint" }</code></strong> es la salvaguarda que impide entregar un update a un binario incompatible. Convierte una disciplina humana en una función, y elimina la clase de bug más destructiva de OTA.</li>
+  <li>Canal = pregunta horneada en el binario. Rama = respuesta mutable del servidor. Todo el control operativo se ejerce sobre el mapeo entre ambos.</li>
+  <li>Nada llega al 100% de golpe. Rollout progresivo con <code>eas channel:rollout</code>, y tres formas de revertir según dónde estés: cerrar el rollout, republicar el anterior, o volver al bundle embebido.</li>
+  <li>Las tiendas permiten OTA para arreglar y ajustar, no para saltear la revisión. La prueba de olfato: ¿el revisor aprobaría hoy lo mismo que aprobó?</li>
+  <li>El build number lo administra EAS (<code>appVersionSource: "remote"</code> + <code>autoIncrement</code>); la <code>version</code> la mueve un humano en el PR de release.</li>
+  <li>Automatizá lo reversible; poné un humano delante de todo lo que llega al usuario final. En móvil, deshacer cuesta horas y a veces una revisión de la store.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Corré <code>npx expo export</code> en tu proyecto e inspeccioná <code>dist/</code>. Después agregá una dependencia con código nativo, volvé a exportar y compará: mostrá con los archivos en la mano por qué esa dependencia no puede viajar por OTA.</li>
+  <li>Configurá las tres variantes (dev / staging / prod) con <code>app.config.js</code>, cada una con su <code>bundleIdentifier</code>, nombre e ícono. Instalá las tres en el mismo dispositivo y sacá una captura de la pantalla de inicio con las tres conviviendo.</li>
+  <li>Escribí un script que compare el fingerprint del working tree contra el del último build de producción y salga con código distinto de cero si difieren. Enganchalo como paso previo obligatorio de tu comando de publicar OTA.</li>
+  <li>Provocá el desastre a propósito en un proyecto de prueba: publicá un update que importe un módulo nativo ausente en el binario instalado, con <code>runtimeVersion</code> fijado a mano en un string. Documentá exactamente qué ve el usuario. Después cambiá a <code>policy: "fingerprint"</code>, repetí y mostrá que el update ya no se entrega.</li>
+  <li>Armá el ciclo completo de rollout en un proyecto real: publicá a una rama nueva, abrí el rollout al 10%, verificá el reparto con <code>eas channel:view</code>, subí a 50% y cerrá revirtiendo a la rama anterior. Anotá cuánto tarda cada cambio en llegar a un dispositivo de prueba.</li>
+  <li>Tomá los últimos diez commits de un proyecto tuyo y clasificá cada uno con el árbol de decisión de RNS7.13: OTA o build. Para los tres primeros, verificá tu clasificación contra el fingerprint real. ¿En cuántos te equivocaste al ojo?</li>
+  <li>Escribí el <em>runbook</em> de hotfix de tu equipo en una página: el árbol de decisión, los comandos exactos de publicar y de revertir, las <strong>dos</strong> familias de métricas con sus umbrales de abortar definidos de antemano, y quién autoriza subir de escalón. Debe poder ejecutarlo alguien del equipo que nunca publicó un OTA.</li>
+</ol>
+
+<section class="quiz" id="quizRNS7">
+  <style>
+    #quizRNS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS7 .q{margin-bottom:1.5rem}
+    #quizRNS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS7 .opt:hover{border-color:var(--accent)}
+    #quizRNS7 .opt:disabled{cursor:default}
+    #quizRNS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS7 .exp.show{display:block}
+    #quizRNS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu fix toca solo archivos <code>.tsx</code>, pero <code>expo-updates fingerprint:generate</code> devuelve un hash distinto al del build que está vivo en producción. ¿Qué hacés?</p>
+    <button class="opt">Publicás el OTA igual: el fingerprint es una heurística y el diff manda</button>
+    <button class="opt">Publicás el OTA pero solo al 1%, para limitar el daño si algo sale mal</button>
+    <button class="opt">No publicás: o volvés el proyecto al estado del build vivo hasta que el hash coincida, o mandás un build nuevo</button>
+    <div class="exp">El fingerprint hashea el proyecto nativo entero, no tu diff — típicamente cambió porque un <code>npm install</code> movió una transitiva con código nativo o el lockfile. Publicar igual es el escenario del ladrillo: el JS nuevo puede pedirle al binario viejo un módulo que no tiene y la app no abre, sin forma de arreglarlo por aire. El 1% tampoco sirve: rompe al 1% de tu base y ese 1% queda inutilizable hasta que las tiendas aprueben un binario nuevo.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Perdiste el keystore de Android. ¿Qué determina si podés seguir actualizando la app?</p>
+    <button class="opt">Si estás en Play App Signing: perdiste solo la upload key y se puede resetear. Si no, la app quedó sin forma de actualizarse</button>
+    <button class="opt">Nada: Google siempre puede regenerar cualquier keystore a pedido del titular de la cuenta</button>
+    <button class="opt">Alcanza con generar un keystore nuevo con el mismo alias y la misma contraseña</button>
+    <div class="exp">Con Play App Signing la clave que valida el dispositivo la custodia Google; la tuya es solo la upload key y su reset se pide en Play Console. Sin Play App Signing, esa clave era la única y no hay recuperación posible: la única salida es publicar otra app, con otro <code>applicationId</code>, perdiendo instalaciones, reseñas y ranking. El alias y la contraseña no reconstruyen nada — lo que importa es el par de claves, y regenerarlo produce una firma distinta que Play rechaza.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un rollout de OTA al 10% mejora el crash-free de 95.8% a 99.2%, pero los checkouts completados de esa cohorte caen a la mitad. ¿Qué hacés?</p>
+    <button class="opt">Subís a 100%: el objetivo del hotfix era el crash y el crash está resuelto</button>
+    <button class="opt">Cerrás el rollout volviendo a la rama anterior y rehacés el fix contemplando también el cálculo del total</button>
+    <button class="opt">Dejás el rollout en 10% indefinidamente mientras investigás con calma</button>
+    <div class="exp">Todo rollout se evalúa con dos familias de métricas: la técnica y la de negocio. Acá el fix eliminó el crash pero rompió lo que el crash estaba impidiendo — cobrar. Como el update está en rollout parcial, <code>eas channel:rollout production --end --branch production</code> es la reversión más rápida y limpia. Dejarlo en 10% es la peor opción: mantenés el daño abierto sobre usuarios reales sin ningún beneficio, porque investigar no requiere que el update siga entregándose.</div>
+  </div>
+
+  <div class="score" id="scoreRNS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Listo para RNS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns6-offline-datos/lecture.html">← RNS6: Offline-first y datos</a>
+  <a href="../rns8-produccion/lecture.html">RNS8: Producción →</a>
+</nav>
+
+</div>
+</body>
+</html>

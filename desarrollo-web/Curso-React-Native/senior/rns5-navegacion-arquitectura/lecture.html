@@ -1,0 +1,1370 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS5 — Navegación y arquitectura de app · React Native Senior</title>
+  <meta name="description" content="El árbol de navegadores como decisión de arquitectura: ciclo de vida real de una pantalla en móvil, useFocusEffect, Expo Router vs React Navigation 7, params vs estado global, deep links y universal links, árboles condicionales de autenticación, restauración de estado, precarga, accesibilidad y estructura de proyecto.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS5</span>
+  <span class="badge">⏱ 50–160 min</span>
+  <span class="badge">🎯 Pre-req: RNS1</span>
+  <span class="badge">🧭 Arquitectura</span>
+</div>
+
+<article>
+
+<h1>RNS5 — Navegación y arquitectura de app</h1>
+
+<h2>RNS5.0 Por qué este módulo</h2>
+
+<p>En el M04 aprendiste a mover al usuario de una pantalla a otra. Este módulo va por otra cosa: <strong>en una app móvil, el árbol de navegación <em>es</em> la arquitectura</strong>. No es una capa de presentación que después se ajusta — es la estructura que decide qué componentes se montan, cuáles siguen vivos cuando no se ven, qué estado sobrevive a un cambio de pestaña, qué se pierde cuando el sistema operativo mata el proceso, y qué pasa cuando alguien abre un link a la pantalla 5 sin haber pasado por las cuatro anteriores.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En la web, navegar <strong>reemplaza</strong> el árbol: cambiás de URL y el componente anterior se desmonta. En móvil, navegar <strong>apila</strong>: la pantalla anterior <strong>sigue montada, viva y ejecutando</strong> detrás de la nueva. Casi todos los bugs raros de una app grande —datos viejos al volver, memoria que sube y no baja, sockets duplicados, timers fantasma, pantallas que parpadean al arrancar— salen de asumir el modelo web sobre un runtime que se comporta como el móvil.
+</div>
+
+<p>Y decidir mal acá es caro de una forma particular: refactorizar un componente lleva una tarde, mover el estado de autenticación de un contexto a otro lleva una semana, pero <strong>reorganizar el árbol de navegadores de una app en producción toca todas las pantallas a la vez</strong>. Es la decisión menos reversible que vas a tomar en la primera semana del proyecto.</p>
+
+<div class="info">
+  <strong>Contexto 2026.</strong> La <strong>Nueva Arquitectura</strong> es el default desde <strong>React Native 0.76</strong>. <strong>React Navigation 7.2+</strong> y <strong>Expo SDK 52+</strong> son compatibles con ella. Para apps nuevas sobre Expo, el enfoque recomendado hoy es <strong>Expo Router</strong> (ruteo basado en archivos), que por debajo <em>es</em> React Navigation — no un competidor, sino una capa de convenciones encima.
+</div>
+
+<h2>RNS5.1 El modelo mental: el árbol de navegadores</h2>
+
+<p>Hay cuatro primitivas y todo lo demás es composición de esas cuatro:</p>
+
+<table>
+<thead><tr><th>Navegador</th><th>Qué hace</th><th>Qué pasa con la pantalla anterior</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td><code>native-stack</code></td><td>Apila pantallas; transición y gesto de vuelta los maneja el sistema</td><td><strong>Queda montada</strong> debajo</td><td>Default. Casi siempre este.</td></tr>
+<tr><td><code>stack</code> (JS)</td><td>Lo mismo, pero animado desde JS con Reanimated</td><td>Queda montada debajo</td><td>Solo si necesitás una transición custom que el nativo no da</td></tr>
+<tr><td><code>bottom-tabs</code></td><td>Secciones hermanas, cambio sin jerarquía</td><td><strong>Queda montada</strong> (lazy en el primer foco, viva después)</td><td>3–5 secciones de igual peso</td></tr>
+<tr><td><code>drawer</code></td><td>Menú lateral</td><td>Queda montada</td><td>Muchas secciones secundarias; en móvil, menos común que tabs</td></tr>
+<tr><td>Modal (<code>presentation</code>)</td><td>Una pantalla del stack presentada encima</td><td>Queda montada y <strong>visible detrás</strong></td><td>Tareas cortas y auto-contenidas</td></tr>
+</tbody>
+</table>
+
+<p>Un modal <strong>no</strong> es un quinto navegador: es una opción de presentación de una pantalla del stack. Esa distinción importa porque el modal comparte el historial de la pila que lo contiene, y por lo tanto comparte también su ciclo de vida.</p>
+
+<p>El árbol típico de una app real se ve así:</p>
+
+<pre>RootStack  (native-stack)
+│
+├── [guard: sin sesión]  AuthStack
+│   ├── Bienvenida
+│   ├── Login
+│   └── Registro
+│
+└── [guard: con sesión]  AppTabs  (bottom-tabs)
+    │
+    ├── Tab "Inicio"      → HomeStack   (native-stack)
+    │                        ├── Feed
+    │                        └── Publicacion/[id]
+    │
+    ├── Tab "Pedidos"     → PedidosStack (native-stack)
+    │                        ├── Lista
+    │                        ├── Detalle/[id]
+    │                        └── Seguimiento/[id]
+    │
+    └── Tab "Perfil"      → PerfilStack  (native-stack)
+                             ├── Perfil
+                             └── Ajustes
+
+   ── presentados por RootStack, encima de TODO ──
+   ├── Modal: Buscador           (presentation: 'modal')
+   ├── Modal: Filtros            (presentation: 'formSheet')
+   └── Full-screen: Camara       (presentation: 'fullScreenModal')</pre>
+
+<div class="rule">
+  <strong>📌 La regla del árbol.</strong> Las pantallas que se presentan <strong>encima de todo</strong> (modales globales, cámara, onboarding, paywall) van en el <strong>stack raíz</strong>, no dentro de una pestaña. Si el modal de búsqueda vive dentro de <code>HomeStack</code>, al abrirlo desde la pestaña "Pedidos" vas a saltar de pestaña sin querer, y la barra de tabs va a quedar visible debajo de un modal que debería taparla.
+</div>
+
+<p>Con React Navigation 7 el árbol se puede declarar de forma <strong>estática</strong>, que es la forma nueva y la que mejor tipa:</p>
+
+<pre><code class="lang-tsx">// navigation/root.tsx — React Navigation 7, API estática
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { createStaticNavigation } from '@react-navigation/native';
+
+const AppTabs = createBottomTabNavigator({
+  screens: {
+    Inicio:  { screen: HomeStack,    options: { title: 'Inicio' } },
+    Pedidos: { screen: PedidosStack, options: { title: 'Pedidos' } },
+    Perfil:  { screen: PerfilStack,  options: { title: 'Perfil' } },
+  },
+});
+
+const RootStack = createNativeStackNavigator({
+  screens: {
+    App:      { screen: AppTabs,  options: { headerShown: false } },
+    Buscador: { screen: Buscador, options: { presentation: 'modal' } },
+    Camara:   { screen: Camara,   options: { presentation: 'fullScreenModal' } },
+  },
+});
+
+export const Navigation = createStaticNavigation(RootStack);
+// App.tsx:  export default () =&gt; &lt;Navigation /&gt;</code></pre>
+
+<div class="tip">
+  La API estática existe justamente porque el árbol es arquitectura: al declararlo como <strong>datos</strong> en vez de como JSX condicional, React Navigation puede derivar los tipos, la configuración de deep linking y la lista de rutas sin que vos las escribas tres veces. La API dinámica (<code>&lt;Stack.Screen /&gt;</code>) sigue existiendo y sigue siendo válida — la necesitás cuando el árbol depende de datos en tiempo de ejecución.
+</div>
+
+<h2>RNS5.2 El ciclo de vida de una pantalla en móvil</h2>
+
+<p>Este es el corazón del módulo. Si te llevás una sola idea, que sea esta:</p>
+
+<div class="danger">
+  <strong>⚠️ Cuando hacés <code>push</code>, la pantalla anterior NO se desmonta.</strong> Se queda montada, con su estado, sus efectos activos, sus timers corriendo, sus suscripciones abiertas y su lista de 500 elementos en memoria. Simplemente dejó de estar visible. Lo mismo pasa al cambiar de pestaña: la pestaña que dejaste sigue viva. En React web, <code>useEffect(() =&gt; {...}, [])</code> con cleanup es suficiente porque desmontar es lo normal. Acá, desmontar es la <em>excepción</em>.
+</div>
+
+<p>Comparado con lo que ya sabés de la web:</p>
+
+<table>
+<thead><tr><th>Acción del usuario</th><th>Web (SPA con router)</th><th>React Native</th></tr></thead>
+<tbody>
+<tr><td>Ir de A a B</td><td>A se desmonta, B se monta</td><td>A <strong>sigue montada</strong>, B se monta encima</td></tr>
+<tr><td>Volver de B a A</td><td>A se <strong>vuelve a montar</strong> (efectos corren de nuevo)</td><td>B se desmonta, A <strong>recibe foco</strong> — sus efectos <strong>NO</strong> vuelven a correr</td></tr>
+<tr><td>Cambiar de pestaña</td><td>Desmonta y monta</td><td>Ambas quedan montadas</td></tr>
+<tr><td>App a background</td><td>Nada (la pestaña sigue)</td><td>Todo sigue montado; el SO puede matar el proceso sin aviso</td></tr>
+<tr><td>Volver del background</td><td>Nada</td><td>O sigue todo igual, o <strong>arranca de cero</strong> — no hay término medio</td></tr>
+</tbody>
+</table>
+
+<p>La fila que rompe todo es la segunda: <strong>volver no re-monta</strong>. Por eso el patrón que en web funciona —cargar datos en <code>useEffect</code> con array vacío— acá produce datos viejos para siempre.</p>
+
+<h3>Los eventos que sí existen</h3>
+
+<p>React Navigation expone el ciclo de vida <em>de navegación</em>, que es distinto del ciclo de vida de React. Instrumentarlo es la primera herramienta de diagnóstico:</p>
+
+<pre><code class="lang-tsx">// hooks/useLifecycleLogger.ts — pegalo en una pantalla sospechosa
+import { useEffect } from 'react';
+import { useNavigation, useRoute } from '@react-navigation/native';
+
+export function useLifecycleLogger() {
+  const navigation = useNavigation();
+  const route = useRoute();
+  const tag = `[${route.name}#${route.key.slice(-4)}]`;
+
+  useEffect(() =&gt; {
+    console.log(tag, 'MOUNT');
+    const offFocus = navigation.addListener('focus', () =&gt; console.log(tag, 'focus'));
+    const offBlur  = navigation.addListener('blur',  () =&gt; console.log(tag, 'blur'));
+    return () =&gt; {
+      offFocus(); offBlur();
+      console.log(tag, 'UNMOUNT');   // si esto NO aparece, ahí está tu fuga
+    };
+  }, [navigation, tag]);
+}</code></pre>
+
+<p>Navegá Lista → Detalle → atrás → Detalle → atrás y mirá la consola. Vas a ver <code>MOUNT</code> de Lista una sola vez, y pares <code>MOUNT/UNMOUNT</code> de Detalle. El <code>#key</code> te dice que cada <code>push</code> crea una <strong>instancia nueva</strong> de la pantalla: dos <code>Detalle</code> apilados son dos componentes distintos con estado independiente.</p>
+
+<h3><code>useEffect</code> vs <code>useFocusEffect</code></h3>
+
+<pre><code class="lang-tsx">import { useCallback, useEffect } from 'react';
+import { useFocusEffect } from '@react-navigation/native';   // o desde 'expo-router'
+
+function Pantalla() {
+  // ❌ Corre UNA vez, al montar. Si el usuario vuelve acá dentro de una hora,
+  //    sigue mostrando lo que se cargó hace una hora.
+  useEffect(() =&gt; { cargarDatos(); }, []);
+
+  // ✅ Corre cada vez que la pantalla GANA foco, y limpia cuando lo PIERDE.
+  useFocusEffect(
+    useCallback(() =&gt; {
+      const sub = suscribirseAUbicacion();
+      return () =&gt; sub.remove();     // se ejecuta al perder foco, no al desmontar
+    }, [])
+  );
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error #1 con <code>useFocusEffect</code>:</strong> pasarle una función inline. <code>useFocusEffect(() =&gt; {...})</code> recibe una callback nueva en cada render, y el hook la interpreta como "cambió el efecto": se limpia y se vuelve a ejecutar en <strong>cada render</strong>. Un fetch en loop infinito. <strong>Siempre</strong> envolvela en <code>useCallback</code> con sus dependencias explícitas. Habilitá la regla <code>react-hooks/exhaustive-deps</code> con <code>additionalHooks: "useFocusEffect"</code> para que ESLint te lo marque.
+</div>
+
+<pre><code class="lang-json">// .eslintrc.json — que el linter entienda useFocusEffect
+{
+  "rules": {
+    "react-hooks/exhaustive-deps": [
+      "warn",
+      { "additionalHooks": "(useFocusEffect|useAnimatedStyle)" }
+    ]
+  }
+}</code></pre>
+
+<h3>La tabla de decisión</h3>
+
+<table>
+<thead><tr><th>Necesito…</th><th>Hook</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Setup que vale para toda la vida de la pantalla (crear un cliente, leer una prop)</td><td><code>useEffect</code></td><td>No depende del foco</td></tr>
+<tr><td>Suscripción cara: GPS, sensores, websocket, cámara, timer</td><td><code>useFocusEffect</code></td><td>Debe apagarse cuando la pantalla no se ve</td></tr>
+<tr><td>Refrescar datos al volver</td><td><code>useFocusEffect</code> + caché</td><td>Volver no re-monta; y sin caché, refetch en cada foco</td></tr>
+<tr><td>Renderizar distinto si está o no visible</td><td><code>useIsFocused()</code></td><td>Es estado, no efecto — provoca re-render</td></tr>
+<tr><td>Evitar que el usuario salga con cambios sin guardar</td><td><code>usePreventRemove()</code></td><td>Intercepta el pop <em>antes</em> de que ocurra</td></tr>
+<tr><td>Reaccionar a que la app entera pasó a background</td><td><code>AppState</code></td><td>El foco de navegación no cambia al minimizar la app</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>El foco de navegación y el estado de la app son ejes independientes.</strong> Si el usuario minimiza la app, la pantalla visible <strong>no</strong> dispara <code>blur</code>: sigue "enfocada" dentro de su navegador. Una pantalla con un websocket que solo escucha <code>useFocusEffect</code> va a mantener la conexión abierta con la app en background y se va a comer la batería. La combinación correcta es <strong>las dos cosas</strong>.
+</div>
+
+<pre><code class="lang-tsx">// hooks/useActiveEffect.ts — activo = enfocado Y app en primer plano
+import { useCallback, useEffect, useRef } from 'react';
+import { AppState } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+
+export function useActiveEffect(start: () =&gt; () =&gt; void) {
+  const stop = useRef&lt;null | (() =&gt; void)&gt;(null);
+
+  const arrancar = useCallback(() =&gt; { if (!stop.current) stop.current = start(); }, [start]);
+  const frenar   = useCallback(() =&gt; { stop.current?.(); stop.current = null; }, []);
+
+  useFocusEffect(useCallback(() =&gt; {
+    arrancar();
+    const sub = AppState.addEventListener('change', (s) =&gt; {
+      s === 'active' ? arrancar() : frenar();
+    });
+    return () =&gt; { sub.remove(); frenar(); };
+  }, [arrancar, frenar]));
+}</code></pre>
+
+<h3>Congelar lo que no se ve</h3>
+
+<p><code>react-native-screens</code> permite <strong>congelar</strong> las pantallas sin foco: dejan de re-renderizar aunque su estado cambie. No se desmontan (no perdés el scroll ni el estado), pero paran de gastar CPU cuando un contexto global se actualiza.</p>
+
+<pre><code class="lang-tsx">// index.js — antes de registrar el componente raíz
+import { enableFreeze } from 'react-native-screens';
+enableFreeze(true);
+
+// …o por pantalla, en React Navigation 7:
+&lt;Stack.Screen name="Feed" component={Feed} options={{ freezeOnBlur: true }} /&gt;</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Congelar NO arregla fugas.</strong> Una pantalla congelada no re-renderiza, pero sus <code>setInterval</code>, sus listeners y su memoria siguen exactamente donde estaban. Si <code>freezeOnBlur</code> "arregló" tu bug de performance, lo que hiciste fue tapar un efecto que nunca debió correr en background. Arreglá el efecto; usá el freeze como optimización encima, no como parche.
+</div>
+
+<div class="info">
+  En React Navigation 7 la opción <code>unmountOnBlur</code> de tabs y drawer quedó deprecada en favor de <code>popToTopOnBlur</code> (verificá el nombre exacto en la versión que tengas instalada). El cambio tiene una razón de fondo: <strong>desmontar al perder foco casi nunca es la solución correcta</strong> — es una forma cara de limpiar efectos que deberían limpiarse solos, y encima destruye la posición de scroll y el estado del formulario que el usuario esperaba encontrar.
+</div>
+
+<h2>RNS5.3 Expo Router vs React Navigation puro</h2>
+
+<p>Expo Router toma la idea de Next.js —<strong>la estructura de carpetas <em>es</em> el árbol de rutas</strong>— y la aplica sobre React Navigation. No reemplaza nada: genera la configuración de navegadores a partir del filesystem.</p>
+
+<pre>app/
+├── _layout.tsx                 → RootStack (envuelve TODO)
+├── +not-found.tsx              → ruta 404
+├── (auth)/                     → grupo: NO aparece en la URL
+│   ├── _layout.tsx             → Stack de auth
+│   ├── login.tsx               → /login
+│   └── registro.tsx            → /registro
+├── (app)/                      → grupo con guard de sesión
+│   ├── _layout.tsx             → aquí vive el &lt;Redirect&gt; si no hay sesión
+│   └── (tabs)/
+│       ├── _layout.tsx         → Tabs
+│       ├── index.tsx           → /
+│       ├── pedidos/
+│       │   ├── index.tsx       → /pedidos
+│       │   └── [id].tsx        → /pedidos/42
+│       └── perfil.tsx          → /perfil
+└── modal.tsx                   → /modal   (presentation: 'modal')</pre>
+
+<p>Los <code>_layout.tsx</code> son los navegadores. Los paréntesis marcan <strong>grupos</strong>: organizan archivos y permiten aplicar un layout compartido <em>sin</em> agregar un segmento a la URL. Los corchetes son segmentos dinámicos.</p>
+
+<pre><code class="lang-tsx">// app/_layout.tsx — el stack raíz
+import { Stack } from 'expo-router';
+import { SessionProvider } from '@/features/auth/session';
+
+export default function RootLayout() {
+  return (
+    &lt;SessionProvider&gt;
+      &lt;Stack screenOptions={{ headerShown: false }}&gt;
+        &lt;Stack.Screen name="(app)" /&gt;
+        &lt;Stack.Screen name="(auth)" /&gt;
+        &lt;Stack.Screen name="modal" options={{ presentation: 'modal' }} /&gt;
+      &lt;/Stack&gt;
+    &lt;/SessionProvider&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// app/(app)/(tabs)/_layout.tsx
+import { Tabs } from 'expo-router';
+
+export const unstable_settings = { initialRouteName: 'index' };
+
+export default function TabsLayout() {
+  return (
+    &lt;Tabs screenOptions={{ tabBarHideOnKeyboard: true }}&gt;
+      &lt;Tabs.Screen name="index"   options={{ title: 'Inicio' }} /&gt;
+      &lt;Tabs.Screen name="pedidos" options={{ title: 'Pedidos' }} /&gt;
+      &lt;Tabs.Screen name="perfil"  options={{ title: 'Perfil' }} /&gt;
+    &lt;/Tabs&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// app/(app)/(tabs)/pedidos/[id].tsx
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
+
+export default function DetallePedido() {
+  const { id } = useLocalSearchParams&lt;{ id: string }&gt;();   // ⚠️ SIEMPRE string
+  const router = useRouter();
+
+  return (
+    &lt;&gt;
+      &lt;Stack.Screen options={{ title: `Pedido ${id}` }} /&gt;
+      &lt;Boton onPress={() =&gt; router.push(`/pedidos/${id}/seguimiento`)} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>unstable_settings.initialRouteName</code> no es opcional en una app con deep links.</strong> Si alguien abre <code>/pedidos/42</code> desde una notificación, Expo Router monta esa ruta directamente — <strong>sin nada debajo</strong>. El usuario aterriza en el detalle y no tiene botón "atrás", porque no hay pila. <code>initialRouteName</code> le dice al router qué ruta ancla debajo para reconstruir un historial coherente. Es el bug de deep linking más reportado y la línea que lo arregla es una.
+</div>
+
+<h3>La tabla honesta</h3>
+
+<table>
+<thead><tr><th>Dimensión</th><th>Expo Router</th><th>React Navigation puro</th></tr></thead>
+<tbody>
+<tr><td>Definición del árbol</td><td>Implícita en las carpetas</td><td>Explícita en código</td></tr>
+<tr><td>Deep links</td><td>Casi gratis: la ruta <strong>es</strong> la URL</td><td>Config <code>linking</code> escrita y mantenida a mano</td></tr>
+<tr><td>Web (React Native Web)</td><td>URLs reales, SSG, historial del browser</td><td>Funciona, pero el ruteo web lo armás vos</td></tr>
+<tr><td>Tipado de rutas</td><td>Tipos generados (<code>typedRoutes</code>)</td><td>Tipos que declarás vos (<code>ParamList</code>)</td></tr>
+<tr><td>Rutas que dependen de datos en runtime</td><td>Incómodo: el archivo existe siempre; se resuelve con guards y redirects</td><td>Natural: renderizás las <code>Screen</code> que quieras</td></tr>
+<tr><td>Árboles muy dinámicos (server-driven UI, flags por tenant)</td><td>Se pelea con el modelo</td><td>Es su terreno</td></tr>
+<tr><td>Brownfield (RN embebido en una app nativa)</td><td>Fricción alta</td><td>Control total del contenedor</td></tr>
+<tr><td>Curva del equipo</td><td>Baja si vienen de Next.js</td><td>Baja si vienen de apps nativas</td></tr>
+<tr><td>Acoplamiento a Expo</td><td>Sí (aunque funciona en bare con config)</td><td>Ninguno</td></tr>
+<tr><td>Refactor de estructura</td><td>Mover archivos = cambiar URLs públicas</td><td>Renombrar una constante</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Recomendación práctica para 2026:</strong> app nueva sobre Expo → <strong>Expo Router</strong>. Vas a escribir menos configuración, el deep linking sale bien por default y el equipo que viene de Next.js arranca en una tarde. App existente con React Navigation funcionando → <strong>no migres por moda</strong>: la migración toca cada pantalla y el beneficio es de conveniencia, no de capacidad.
+</div>
+
+<h3>Cuándo el imperativo sigue siendo mejor</h3>
+
+<div class="step"><strong>1. El árbol depende de datos.</strong> Una app B2B donde los módulos habilitados vienen del backend por tenant. Con archivos tenés que crear todas las rutas y esconder las que no aplican; con código simplemente no las renderizás.</div>
+
+<div class="step"><strong>2. Flujos con estado propio y salida controlada.</strong> Un checkout de cinco pasos donde el paso 3 solo existe si el paso 2 devolvió cierta cosa, y donde volver atrás debe recalcular. Un stack armado a mano modela eso mejor que cinco archivos que fingen ser independientes.</div>
+
+<div class="step"><strong>3. Brownfield.</strong> React Native embebido en una app nativa existente, donde el contenedor de navegación lo maneja iOS o Android y RN solo dibuja algunas pantallas.</div>
+
+<div class="step"><strong>4. Rutas que no deberían ser URLs.</strong> Un debug menu interno, un flujo de recuperación de cuenta con token de un solo uso: si la ruta es un archivo, la ruta existe y es alcanzable. A veces eso es exactamente lo que no querés.</div>
+
+<h2>RNS5.4 Estado de navegación: params, global y contexto por pila</h2>
+
+<p>Hay tres lugares donde puede vivir el estado que una pantalla necesita, y elegir mal es la causa silenciosa de la mitad de los bugs de restauración:</p>
+
+<table>
+<thead><tr><th>Dónde</th><th>Vive mientras…</th><th>Se serializa</th><th>Para qué sirve</th></tr></thead>
+<tbody>
+<tr><td><strong>Params de ruta</strong></td><td>La ruta esté en el historial</td><td>✅ Sí (y <strong>debe</strong> poder)</td><td><strong>Identificar</strong> qué mira la pantalla: ids, filtros, modo</td></tr>
+<tr><td><strong>Estado global</strong> (store/caché)</td><td>Viva el proceso</td><td>Depende</td><td>Datos compartidos: sesión, carrito, entidades cacheadas</td></tr>
+<tr><td><strong>Contexto por pila</strong></td><td>Viva ese navegador</td><td>❌ No</td><td>Estado de un flujo: wizard, borrador, selección múltiple</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error clásico: pasar el objeto entero por params.</strong>
+  <pre><code class="lang-tsx">// ❌ Mal
+navigation.navigate('Detalle', { pedido });   // objeto de 40 KB con Dates y funciones
+
+// ✅ Bien
+navigation.navigate('Detalle', { pedidoId: pedido.id });</code></pre>
+  Los params <strong>son</strong> el estado de navegación, y el estado de navegación se serializa a JSON para persistirlo y restaurarlo. Un objeto con <code>Date</code>, <code>Map</code>, una función o una referencia circular rompe esa serialización — React Navigation te avisa en desarrollo con <em>"Non-serializable values were found in the navigation state"</em>. Además, ese objeto queda <strong>congelado</strong>: si el pedido cambia mientras el detalle está abierto, seguís mostrando la copia vieja.
+</div>
+
+<p>La versión correcta: la ruta lleva el <strong>id</strong>, y los datos salen de la caché compartida. Así, cualquier actualización se propaga a todas las pantallas que muestran esa entidad, sin importar cuántas instancias haya apiladas:</p>
+
+<pre><code class="lang-tsx">// features/pedidos/screens/DetallePedido.tsx
+import { useQuery } from '@tanstack/react-query';
+
+export function DetallePedido({ route }: Props) {
+  const { pedidoId } = route.params;                 // solo el id viaja
+  const { data, isPending } = useQuery({
+    queryKey: ['pedido', pedidoId],
+    queryFn: () =&gt; api.getPedido(pedidoId),
+    staleTime: 30_000,
+  });
+
+  if (isPending) return &lt;Skeleton /&gt;;
+  return &lt;Detalle pedido={data} /&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong>En Expo Router el problema es más estricto:</strong> los params <strong>son</strong> parámetros de URL, así que <code>useLocalSearchParams()</code> devuelve siempre <code>string</code> o <code>string[]</code>. Un <code>id</code> numérico llega como <code>"42"</code>, un booleano como <code>"true"</code>, y un objeto tenés que serializarlo vos con <code>JSON.stringify</code> (mala idea salvo para payloads mínimos). Convertí y validá en el borde de la pantalla, una sola vez.
+</div>
+
+<pre><code class="lang-tsx">// Validar params en el borde: nunca confíes en que la URL trae lo que esperás
+import { z } from 'zod';
+import { useLocalSearchParams, Redirect } from 'expo-router';
+
+const Params = z.object({ id: z.coerce.number().int().positive() });
+
+export default function Detalle() {
+  const parsed = Params.safeParse(useLocalSearchParams());
+  if (!parsed.success) return &lt;Redirect href="/+not-found" /&gt;;   // deep link malformado
+  const { id } = parsed.data;
+  // …
+}</code></pre>
+
+<h3>Diferencia entre <code>useLocalSearchParams</code> y <code>useGlobalSearchParams</code></h3>
+
+<pre><code class="lang-tsx">// useLocalSearchParams  → los params de ESTA ruta. NO se actualiza cuando
+//                         otra pantalla se apila encima. Es lo que querés casi siempre.
+// useGlobalSearchParams → los params de la URL activa, global. Se actualiza en
+//                         TODA pantalla montada cuando navegás → re-renders en cascada
+//                         de pantallas que ni se ven.</code></pre>
+
+<div class="rule">
+  <strong>📌 Usá <code>useLocalSearchParams</code> por default.</strong> <code>useGlobalSearchParams</code> hace re-renderizar cada pantalla montada de la pila con cada navegación — que, como ya sabés de RNS5.2, son todas. Reservalo para analítica o para un layout que de verdad necesita saber dónde está el usuario.
+</div>
+
+<h3>Contexto por pila: el estado que vive lo que vive el flujo</h3>
+
+<p>Un wizard de checkout necesita estado compartido entre pasos, que debe <strong>morir</strong> cuando el usuario abandona el flujo. Ni params (no se comparte bien entre pasos), ni store global (sobrevive de más y se ensucia entre sesiones). La respuesta es un provider en el <em>layout</em> de esa pila:</p>
+
+<pre><code class="lang-tsx">// app/(app)/checkout/_layout.tsx
+import { Stack } from 'expo-router';
+import { CheckoutProvider } from '@/features/checkout/context';
+
+export default function CheckoutLayout() {
+  // El provider se monta con la pila y se desmonta al salir del grupo:
+  // el borrador del checkout se destruye solo. Sin cleanup manual.
+  return (
+    &lt;CheckoutProvider&gt;
+      &lt;Stack screenOptions={{ gestureEnabled: false }} /&gt;
+    &lt;/CheckoutProvider&gt;
+  );
+}</code></pre>
+
+<div class="analogy">
+  Pensalo como <strong>scoping léxico</strong>. El store global es una variable de módulo: existe siempre y cualquiera la toca. Los params son argumentos de función: viajan con la llamada y tienen que ser valores simples. El contexto por pila es una variable local de un bloque: nace cuando entrás al bloque, muere cuando salís, y nadie de afuera la ve. La mayoría de los bugs de "quedó estado sucio de la vez anterior" son variables globales que debieron ser locales.
+</div>
+
+<h3>Tipar la navegación</h3>
+
+<pre><code class="lang-tsx">// navigation/types.ts — React Navigation 7 (API dinámica)
+export type RootStackParamList = {
+  App: undefined;
+  Buscador: { query?: string };
+  Camara: { modo: 'foto' | 'video' };
+};
+
+export type PedidosStackParamList = {
+  Lista: { filtro?: 'abiertos' | 'cerrados' };
+  Detalle: { pedidoId: string };
+  Seguimiento: { pedidoId: string };
+};
+
+// Que useNavigation() quede tipado en TODA la app sin importar nada:
+declare global {
+  namespace ReactNavigation {
+    interface RootParamList extends RootStackParamList {}
+  }
+}</code></pre>
+
+<pre><code class="lang-json">// app.json — Expo Router: rutas tipadas (href verificado en compilación)
+{
+  "expo": {
+    "scheme": "miapp",
+    "experiments": { "typedRoutes": true }
+  }
+}</code></pre>
+
+<h2>RNS5.5 Deep links y universal links</h2>
+
+<p>Tres cosas distintas que se confunden todo el tiempo:</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Ejemplo</th><th>Requiere dominio</th><th>Si la app no está instalada</th></tr></thead>
+<tbody>
+<tr><td><strong>Custom scheme</strong></td><td><code>miapp://pedidos/42</code></td><td>No</td><td>No pasa nada (link muerto)</td></tr>
+<tr><td><strong>Universal Link</strong> (iOS)</td><td><code>https://miapp.com/pedidos/42</code></td><td>Sí, verificado</td><td>Abre la web</td></tr>
+<tr><td><strong>App Link</strong> (Android)</td><td><code>https://miapp.com/pedidos/42</code></td><td>Sí, verificado</td><td>Abre la web</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El custom scheme no es seguro y no es exclusivo.</strong> Cualquier app puede registrar <code>miapp://</code> y secuestrar tus links. Por eso los tokens de autenticación, los códigos de un solo uso y cualquier dato sensible <strong>nunca</strong> viajan por un scheme custom: van por universal link con dominio verificado, o no van. El scheme es útil para desarrollo, OAuth con PKCE y navegación interna — no como canal de confianza.
+</div>
+
+<h3>Configuración</h3>
+
+<pre><code class="lang-json">// app.json
+{
+  "expo": {
+    "scheme": "miapp",
+    "ios": {
+      "bundleIdentifier": "com.miempresa.miapp",
+      "associatedDomains": ["applinks:miapp.com", "applinks:www.miapp.com"]
+    },
+    "android": {
+      "package": "com.miempresa.miapp",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [{ "scheme": "https", "host": "miapp.com", "pathPrefix": "/pedidos" }],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    }
+  }
+}</code></pre>
+
+<p>Del lado del servidor tenés que publicar dos archivos, servidos por <strong>HTTPS</strong>, con <code>Content-Type: application/json</code> y <strong>sin redirecciones</strong>:</p>
+
+<pre><code class="lang-json">// https://miapp.com/.well-known/apple-app-site-association   (SIN extensión .json)
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["TEAMID123.com.miempresa.miapp"],
+        "components": [
+          { "/": "/pedidos/*", "comment": "detalle de pedido" },
+          { "/": "/admin/*", "exclude": true, "comment": "esto se queda en la web" }
+        ]
+      }
+    ]
+  }
+}</code></pre>
+
+<pre><code class="lang-json">// https://miapp.com/.well-known/assetlinks.json
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.miempresa.miapp",
+      "sha256_cert_fingerprints": ["AB:CD:EF:…"]
+    }
+  }
+]</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El fingerprint SHA-256 tiene que ser el de la firma con la que se distribuye la app.</strong> Si usás Play App Signing, es la clave de <strong>Google</strong>, no la tuya local. Este es el motivo número uno de "los App Links funcionan en debug y no en producción": verificaste el fingerprint equivocado. Publicá los <strong>dos</strong> (upload key y app signing key) en el array.
+</div>
+
+<h3>Probar deep links de verdad</h3>
+
+<pre><code class="lang-bash"># Custom scheme, cualquier plataforma
+npx uri-scheme open "miapp://pedidos/42" --ios
+npx uri-scheme open "miapp://pedidos/42" --android
+
+# iOS simulador
+xcrun simctl openurl booted "https://miapp.com/pedidos/42"
+
+# Android: simular que el link llega desde OTRA app (el caso real)
+adb shell am start -a android.intent.action.VIEW \
+  -c android.intent.category.BROWSABLE \
+  -d "https://miapp.com/pedidos/42"
+
+# Android: ver el estado REAL de verificación del dominio
+adb shell pm get-app-links com.miempresa.miapp
+# Buscá "verified"; "legacy_failure" significa que assetlinks.json no se validó</code></pre>
+
+<div class="mistake">
+  <strong>Probar el link pegándolo en la barra del navegador no vale.</strong> Chrome y Safari tratan distinto una URL escrita a mano que una tocada desde otra app: escribirla suele quedarse en el browser aunque el App Link esté correctamente verificado. Probá siempre desde un mensaje, una nota o el comando <code>adb</code> de arriba, que reproduce el intent real.
+</div>
+
+<h3>Mapear URL a estado de navegación</h3>
+
+<pre><code class="lang-tsx">// navigation/linking.ts — React Navigation puro
+import type { LinkingOptions } from '@react-navigation/native';
+
+export const linking: LinkingOptions&lt;RootStackParamList&gt; = {
+  prefixes: ['miapp://', 'https://miapp.com'],
+  config: {
+    screens: {
+      App: {
+        screens: {
+          Pedidos: {
+            initialRouteName: 'Lista',     // ← garantiza que haya "atrás"
+            screens: {
+              Lista:   'pedidos',
+              Detalle: 'pedidos/:pedidoId',
+            },
+          },
+        },
+      },
+    },
+  },
+};</code></pre>
+
+<p>En Expo Router no hay archivo de configuración: la URL <em>es</em> la ruta. Lo que sí existe es un punto de intercepción para links que no mapean uno a uno:</p>
+
+<pre><code class="lang-tsx">// app/+native-intent.ts — traducir URLs legacy o de campañas a rutas internas
+export function redirectSystemPath({ path, initial }: { path: string; initial: boolean }) {
+  // URLs viejas de la web anterior
+  if (path.startsWith('/order/')) return path.replace('/order/', '/pedidos/');
+
+  // Links de campaña: guardamos el UTM y sacamos el ruido de la ruta
+  const url = new URL(path, 'https://miapp.com');
+  if (url.searchParams.has('utm_source')) {
+    analytics.track('deep_link', { source: url.searchParams.get('utm_source'), initial });
+    url.searchParams.delete('utm_source');
+    return url.pathname + url.search;
+  }
+  return path;
+}</code></pre>
+
+<h3>El link que apunta a una pantalla con sesión</h3>
+
+<p>Este es el caso que separa una integración de deep links hecha a las apuradas de una hecha bien. Alguien te manda <code>https://miapp.com/pedidos/42</code>. La app abre. No hay sesión. ¿Qué pasa?</p>
+
+<p>La respuesta ingenua —mandarlo al login y después a la home— <strong>pierde la intención del usuario</strong> y es exactamente lo que hace que la gente abandone. El patrón correcto tiene tres partes: <strong>capturar</strong> la intención, <strong>validarla</strong>, y <strong>resolverla</strong> después del login.</p>
+
+<pre><code class="lang-tsx">// features/auth/intencionPendiente.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const CLAVE = 'intencion.pendiente.v1';
+const MAX_EDAD_MS = 10 * 60 * 1000;   // 10 minutos: después ya no es "la intención"
+
+// ⚠️ Allowlist: un deep link es entrada del atacante. Nunca redirijas a algo
+//    que no esté en esta lista, y NUNCA a una URL absoluta externa.
+const RUTAS_PERMITIDAS = [
+  /^\/pedidos\/[a-z0-9-]+$/i,
+  /^\/publicacion\/[a-z0-9-]+$/i,
+  /^\/perfil$/,
+];
+
+export async function guardarIntencion(ruta: string) {
+  if (!RUTAS_PERMITIDAS.some((re) =&gt; re.test(ruta))) return;   // descartada en silencio
+  await AsyncStorage.setItem(CLAVE, JSON.stringify({ ruta, ts: Date.now() }));
+}
+
+export async function tomarIntencion(): Promise&lt;string | null&gt; {
+  const raw = await AsyncStorage.getItem(CLAVE);
+  await AsyncStorage.removeItem(CLAVE);        // de un solo uso, siempre
+  if (!raw) return null;
+  const { ruta, ts } = JSON.parse(raw);
+  if (Date.now() - ts &gt; MAX_EDAD_MS) return null;
+  return RUTAS_PERMITIDAS.some((re) =&gt; re.test(ruta)) ? ruta : null;  // revalidar al leer
+}</code></pre>
+
+<pre><code class="lang-tsx">// app/(app)/_layout.tsx — el guard captura la intención antes de redirigir
+import { Redirect, Slot, usePathname } from 'expo-router';
+import { useSession } from '@/features/auth/session';
+import { guardarIntencion } from '@/features/auth/intencionPendiente';
+
+export default function AppLayout() {
+  const { session, cargando } = useSession();
+  const pathname = usePathname();
+
+  if (cargando) return &lt;Splash /&gt;;                 // ni redirijas ni renderices: esperá
+  if (!session) {
+    guardarIntencion(pathname);                    // ← acá se salva el /pedidos/42
+    return &lt;Redirect href="/login" /&gt;;
+  }
+  return &lt;Slot /&gt;;
+}</code></pre>
+
+<pre><code class="lang-tsx">// features/auth/useLoginExitoso.ts — resolver la intención al terminar el login
+import { useRouter } from 'expo-router';
+import { tomarIntencion } from './intencionPendiente';
+
+export function useLoginExitoso() {
+  const router = useRouter();
+  return async () =&gt; {
+    const destino = await tomarIntencion();
+    // replace, no push: el login NO debe quedar en el historial
+    router.replace(destino ?? '/');
+  };
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Tres reglas de seguridad no negociables para deep links.</strong>
+  <strong>(1)</strong> Todo path que venga de afuera se valida contra una allowlist antes de usarlo como destino — sin eso tenés un <em>open redirect</em> dentro de tu propia app.
+  <strong>(2)</strong> Nunca aceptes credenciales, tokens de sesión ni códigos de verificación por params de un scheme custom: quedan en logs del sistema, en el historial del browser y accesibles a cualquier app que registre el mismo scheme.
+  <strong>(3)</strong> La intención pendiente es de <strong>un solo uso y con vencimiento</strong>. Si no la borrás al leerla, el usuario va a aterrizar en el pedido 42 cada vez que inicie sesión durante el resto del año.
+</div>
+
+<h2>RNS5.6 Autenticación y navegación: árboles condicionales</h2>
+
+<p>Hay dos formas de manejar la autenticación y una es claramente mejor:</p>
+
+<pre><code class="lang-tsx">// ❌ Redirigir imperativamente
+useEffect(() =&gt; {
+  if (!session) navigation.navigate('Login');
+}, [session]);
+
+// ✅ Renderizar el árbol que corresponde
+{session ? &lt;Stack.Screen name="App" component={AppTabs} /&gt;
+         : &lt;Stack.Screen name="Auth" component={AuthStack} /&gt;}</code></pre>
+
+<table>
+<thead><tr><th>Problema</th><th>Con <code>navigate</code> imperativo</th><th>Con árbol condicional</th></tr></thead>
+<tbody>
+<tr><td>Flash de la pantalla protegida antes del redirect</td><td>Ocurre: se monta, se ve, y recién ahí redirige</td><td>Imposible: nunca existió en el árbol</td></tr>
+<tr><td>Botón atrás de Android vuelve a la pantalla protegida</td><td>Ocurre: quedó en el historial</td><td>Imposible: el historial se reemplazó entero</td></tr>
+<tr><td>Logout deja pantallas montadas con datos del usuario anterior</td><td>Ocurre, y se ven al volver</td><td>Todo el subárbol se desmonta de golpe</td></tr>
+<tr><td>Race entre "cargando sesión" y "sin sesión"</td><td>Parpadeo del login en cada arranque</td><td>Se resuelve con un tercer estado explícito</td></tr>
+<tr><td>Deep link a ruta protegida</td><td>Se pierde salvo que lo manejes aparte</td><td>El guard es el lugar natural para capturarlo</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La sesión tiene TRES estados, no dos.</strong> <code>cargando</code>, <code>autenticado</code>, <code>anónimo</code>. Modelarla como un booleano es la causa directa del parpadeo de login que se ve en cada arranque de miles de apps: mientras se lee el token de <code>SecureStore</code>, <code>session</code> es <code>null</code>, y <code>null</code> se interpreta como "anónimo". Mientras estás en <code>cargando</code>, no redirijas ni renderices el árbol protegido: mostrá el splash.
+</div>
+
+<pre><code class="lang-tsx">// features/auth/session.tsx
+import * as SecureStore from 'expo-secure-store';
+
+type Estado =
+  | { tipo: 'cargando' }
+  | { tipo: 'anonimo' }
+  | { tipo: 'autenticado'; usuario: Usuario };
+
+const Ctx = createContext&lt;Estado&gt;({ tipo: 'cargando' });
+
+export function SessionProvider({ children }: PropsWithChildren) {
+  const [estado, setEstado] = useState&lt;Estado&gt;({ tipo: 'cargando' });
+
+  useEffect(() =&gt; {
+    let vivo = true;
+    (async () =&gt; {
+      const token = await SecureStore.getItemAsync('token');
+      if (!vivo) return;
+      if (!token) return setEstado({ tipo: 'anonimo' });
+      try {
+        const usuario = await api.me(token);
+        if (vivo) setEstado({ tipo: 'autenticado', usuario });
+      } catch {
+        if (vivo) setEstado({ tipo: 'anonimo' });     // token vencido = anónimo
+      }
+    })();
+    return () =&gt; { vivo = false; };
+  }, []);
+
+  return &lt;Ctx.Provider value={estado}&gt;{children}&lt;/Ctx.Provider&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong>El logout no termina cuando borrás el token.</strong> Al cambiar de rama del árbol, las pantallas del usuario anterior se desmontan — pero la <strong>caché de datos</strong> no vive en el árbol. Si usás TanStack Query, Redux o Zustand, tenés que limpiarla explícitamente, o el próximo usuario que inicie sesión en el mismo dispositivo va a ver por un instante los pedidos del anterior. Es una filtración de datos entre cuentas, y es más común de lo que parece.
+</div>
+
+<pre><code class="lang-tsx">// El logout completo: token + caché + árbol
+async function logout() {
+  await SecureStore.deleteItemAsync('token');
+  queryClient.clear();          // ← sin esto, datos del usuario anterior visibles
+  useCarrito.getState().reset();
+  setEstado({ tipo: 'anonimo' }); // el árbol se reemplaza solo
+}</code></pre>
+
+<h2>RNS5.7 Restauración de estado: la app que el sistema mató</h2>
+
+<p>Escenario real, y frecuente: el usuario está llenando un formulario en el paso 3 de un flujo, entra una llamada, abre WhatsApp, contesta un mail, y a los diez minutos vuelve a tu app. En Android con poca RAM (o con "No mantener actividades" activado en opciones de desarrollador), el sistema <strong>mató el proceso</strong>. En iOS con la app en background y presión de memoria, lo mismo.</p>
+
+<div class="concept">
+  <strong>💡 Lo que hay que entender.</strong> Cuando el SO mata el proceso, <strong>todo el contexto de JavaScript desaparece</strong>: variables, estado de React, caché en memoria, el árbol de navegación entero. La app arranca de cero. El sistema restaura la <em>tarea</em> (el usuario ve tu app, no el home), pero el bundle se ejecuta desde la primera línea. No hay un "hidratar" automático — todo lo que quieras recuperar lo tenés que haber escrito a disco antes.
+</div>
+
+<table>
+<thead><tr><th>Qué</th><th>¿Sobrevive a un process kill?</th><th>Cómo lo hacés sobrevivir</th></tr></thead>
+<tbody>
+<tr><td>Estado de React (<code>useState</code>)</td><td>❌ No</td><td>Persistir a AsyncStorage/MMKV lo que valga la pena</td></tr>
+<tr><td>Árbol de navegación</td><td>❌ No por default</td><td><code>initialState</code> + <code>onStateChange</code>, o persistir el pathname</td></tr>
+<tr><td>Caché de queries</td><td>❌ No</td><td><code>persistQueryClient</code> con un persister</td></tr>
+<tr><td>Token de sesión</td><td>✅ Sí</td><td>SecureStore / Keychain / Keystore</td></tr>
+<tr><td>Base de datos local (SQLite)</td><td>✅ Sí</td><td>Ya está en disco</td></tr>
+<tr><td>Posición de scroll</td><td>❌ No</td><td>Casi nunca vale la pena; aceptalo</td></tr>
+<tr><td>Borrador de un formulario</td><td>❌ No</td><td>Guardar con debounce mientras el usuario escribe</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// React Navigation puro: persistir y restaurar el árbol
+const CLAVE = 'nav.state.v3';       // ⚠️ la versión es OBLIGATORIA (ver abajo)
+
+function App() {
+  const [listo, setListo] = useState(false);
+  const [estadoInicial, setEstadoInicial] = useState();
+
+  useEffect(() =&gt; {
+    (async () =&gt; {
+      try {
+        const guardado = await AsyncStorage.getItem(CLAVE);
+        if (guardado) setEstadoInicial(JSON.parse(guardado));
+      } catch { /* estado corrupto: arrancamos limpio, no crasheamos */ }
+      finally { setListo(true); }
+    })();
+  }, []);
+
+  if (!listo) return &lt;Splash /&gt;;
+
+  return (
+    &lt;NavigationContainer
+      initialState={estadoInicial}
+      onStateChange={(s) =&gt; AsyncStorage.setItem(CLAVE, JSON.stringify(s))}
+    &gt;
+      {/* … */}
+    &lt;/NavigationContainer&gt;
+  );
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Un estado de navegación persistido es una bomba de tiempo si no lo versionás.</strong> Sale la versión 2.0 de tu app, renombraste una ruta, y el estado guardado por la 1.9 apunta a una pantalla que ya no existe. Resultado: crash al abrir, en todos los usuarios que actualizan, sin forma de recuperarse porque el crash ocurre <em>antes</em> de poder borrar el estado. Tres defensas: <strong>(a)</strong> incluí la versión en la clave (<code>nav.state.v3</code>) y bumpeala en cada cambio de rutas; <strong>(b)</strong> envolvé el parseo en <code>try/catch</code>; <strong>(c)</strong> descartá el estado si es más viejo que unos minutos — a nadie le sirve que le restaures dónde estaba hace tres días.
+</div>
+
+<p>En Expo Router no manipulás el <code>NavigationContainer</code>, pero tenés algo mejor: <strong>la ruta es una URL</strong>, así que persistir el estado es persistir un string.</p>
+
+<pre><code class="lang-tsx">// features/restauracion/useRestaurarRuta.ts (Expo Router)
+import { usePathname, useRouter } from 'expo-router';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const CLAVE = 'ruta.ultima.v2';
+const MAX_EDAD_MS = 15 * 60 * 1000;
+
+// Flujos que NUNCA se restauran: sensibles, transaccionales o de un solo uso
+const NO_RESTAURAR = [/^\/checkout/, /^\/pagar/, /^\/login/, /^\/verificar/];
+
+export function useRecordarRuta() {
+  const pathname = usePathname();
+  useEffect(() =&gt; {
+    if (NO_RESTAURAR.some((re) =&gt; re.test(pathname))) return;
+    AsyncStorage.setItem(CLAVE, JSON.stringify({ pathname, ts: Date.now() }));
+  }, [pathname]);
+}
+
+export async function rutaARestaurar(): Promise&lt;string | null&gt; {
+  try {
+    const raw = await AsyncStorage.getItem(CLAVE);
+    if (!raw) return null;
+    const { pathname, ts } = JSON.parse(raw);
+    if (Date.now() - ts &gt; MAX_EDAD_MS) return null;
+    if (NO_RESTAURAR.some((re) =&gt; re.test(pathname))) return null;
+    return pathname;
+  } catch { return null; }
+}</code></pre>
+
+<div class="mistake">
+  <strong>Restaurar un flujo de pago es un bug, no una feature.</strong> Si el usuario estaba en "confirmando pago" cuando el sistema mató el proceso, devolverlo ahí al reabrir es peligroso: no sabés si la transacción se completó del lado del servidor. Lo correcto es llevarlo al estado real —consultar el backend por el pedido— y no reconstruir un paso intermedio a partir de estado local que puede estar desincronizado. La misma lógica aplica a verificaciones con código, subidas de archivos y cualquier operación no idempotente.
+</div>
+
+<h2>RNS5.8 Precarga y transiciones: que se sienta instantáneo</h2>
+
+<p>Una transición se percibe lenta por tres causas distintas, y solo una se arregla con animaciones:</p>
+
+<table>
+<thead><tr><th>Síntoma</th><th>Causa</th><th>Arreglo</th></tr></thead>
+<tbody>
+<tr><td>La animación se traba a mitad de camino</td><td>El JS thread está bloqueado montando la pantalla nueva</td><td><code>native-stack</code> (anima en el hilo nativo) + diferir trabajo pesado</td></tr>
+<tr><td>Llegás y ves un spinner 800 ms</td><td>El fetch arranca <em>después</em> de montar</td><td>Prefetch de datos al tocar, no al montar</td></tr>
+<tr><td>Toque → nada → aparece la pantalla</td><td>El primer render del componente es caro</td><td><code>preload()</code> del navegador, o alivianar el primer render</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 <code>native-stack</code> por default, siempre.</strong> <code>@react-navigation/native-stack</code> usa <code>react-native-screens</code>, que delega la transición a <code>UINavigationController</code> en iOS y a <code>Fragment</code> en Android: la animación corre en el <strong>hilo de UI nativo</strong> y no se traba aunque el JS esté ocupado. El stack en JS anima desde JavaScript y hereda cualquier jank del hilo. Usá el stack JS solo cuando necesites una transición que el nativo no ofrece — y sabiendo lo que estás pagando.
+</div>
+
+<pre><code class="lang-tsx">// React Navigation 7: montar la pantalla ANTES de navegar a ella
+function ItemLista({ pedido }: Props) {
+  const navigation = useNavigation();
+
+  return (
+    &lt;Pressable
+      // onPressIn dispara ~100–150 ms antes que onPress: es tiempo gratis
+      onPressIn={() =&gt; navigation.preload('Detalle', { pedidoId: pedido.id })}
+      onPress={() =&gt; navigation.navigate('Detalle', { pedidoId: pedido.id })}
+    &gt;
+      &lt;Fila pedido={pedido} /&gt;
+    &lt;/Pressable&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// Prefetch de DATOS: independiente del navegador, funciona en cualquiera de los dos
+import { useQueryClient } from '@tanstack/react-query';
+
+function ItemLista({ pedido }: Props) {
+  const qc = useQueryClient();
+  const precargar = () =&gt; qc.prefetchQuery({
+    queryKey: ['pedido', pedido.id],
+    queryFn: () =&gt; api.getPedido(pedido.id),
+    staleTime: 30_000,
+  });
+
+  // En Expo Router: &lt;Link href={`/pedidos/${pedido.id}`} onPressIn={precargar} /&gt;
+  return &lt;Pressable onPressIn={precargar} onPress={ir}&gt;&lt;Fila pedido={pedido} /&gt;&lt;/Pressable&gt;;
+}</code></pre>
+
+<div class="tip">
+  De los tres arreglos, el <strong>prefetch de datos con <code>onPressIn</code></strong> es el que mejor relación costo/beneficio tiene: son dos líneas, no toca la arquitectura, y convierte un spinner de 600 ms en una pantalla que ya tiene sus datos cuando termina la animación. Empezá por ahí antes de meterte con <code>preload</code> de pantallas.
+</div>
+
+<pre><code class="lang-tsx">// Diferir trabajo pesado hasta DESPUÉS de que termine la transición
+import { InteractionManager } from 'react-native';
+
+useFocusEffect(useCallback(() =&gt; {
+  let cancelado = false;
+  const tarea = InteractionManager.runAfterInteractions(() =&gt; {
+    if (!cancelado) calcularGraficoPesado();   // no compite con la animación
+  });
+  return () =&gt; { cancelado = true; tarea.cancel(); };
+}, []));</code></pre>
+
+<div class="warn">
+  <strong>Cuándo NO precargar.</strong> <code>preload</code> monta la pantalla de verdad: ejecuta sus efectos, pide sus datos y ocupa memoria. Precargar las cinco pestañas al arrancar hace que el arranque sea más lento y que la app consuma el doble de RAM para que <em>quizás</em> una transición se sienta mejor. Precargá <strong>el destino más probable del gesto que el usuario ya empezó</strong> — no un abanico de posibilidades.
+</div>
+
+<h2>RNS5.9 Accesibilidad de la navegación</h2>
+
+<p>La navegación es donde la accesibilidad se rompe primero, porque un cambio de pantalla que es obvio visualmente puede ser completamente invisible para un lector de pantalla.</p>
+
+<div class="step"><strong>1. El foco tiene que moverse.</strong> Al llegar a una pantalla nueva, TalkBack y VoiceOver deben empezar a leer desde arriba. El <code>native-stack</code> lo maneja bien en la mayoría de los casos porque usa contenedores nativos; los stacks en JS y los cambios de contenido dentro de una misma pantalla, no.</div>
+
+<pre><code class="lang-tsx">// Mover el foco del lector de pantalla al título al ganar foco
+import { AccessibilityInfo, findNodeHandle, Text, View } from 'react-native';
+
+function Pantalla({ titulo }: Props) {
+  const ref = useRef&lt;View&gt;(null);
+
+  useFocusEffect(useCallback(() =&gt; {
+    const t = setTimeout(() =&gt; {           // esperar a que termine la transición
+      const tag = findNodeHandle(ref.current);
+      if (tag) AccessibilityInfo.setAccessibilityFocus(tag);
+    }, 350);
+    return () =&gt; clearTimeout(t);
+  }, []));
+
+  return (
+    &lt;View ref={ref} accessible accessibilityRole="header"&gt;
+      &lt;Text&gt;{titulo}&lt;/Text&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<div class="step"><strong>2. El botón atrás de Android es parte de la navegación, no un extra.</strong> Si tu pantalla intercepta gestos, tiene un panel abierto o un formulario a medias, el back físico tiene que hacer lo obvio. Y tiene que hacerlo <strong>solo cuando la pantalla está enfocada</strong>.</div>
+
+<pre><code class="lang-tsx">// API moderna: addEventListener devuelve una suscripción con .remove()
+import { BackHandler } from 'react-native';
+
+useFocusEffect(useCallback(() =&gt; {
+  const sub = BackHandler.addEventListener('hardwareBackPress', () =&gt; {
+    if (panelAbierto) { cerrarPanel(); return true; }   // true = "yo me encargo"
+    return false;                                       // false = comportamiento normal
+  });
+  return () =&gt; sub.remove();
+}, [panelAbierto]));</code></pre>
+
+<div class="mistake">
+  Registrar el <code>BackHandler</code> en un <code>useEffect</code> con array vacío es un bug garantizado: como la pantalla nunca se desmonta al apilar otra encima, el handler <strong>sigue activo debajo</strong>. El usuario está tres pantallas más arriba, aprieta atrás, y se ejecuta la lógica de una pantalla que no está viendo. Va en <code>useFocusEffect</code>, sin excepciones.
+</div>
+
+<div class="step"><strong>3. El gesto de volver es un arma de doble filo.</strong> En iOS, deslizar desde el borde vuelve atrás. Si la pantalla tiene un formulario a medio llenar, ese gesto destruye el trabajo del usuario sin preguntar. Desactivarlo del todo también es malo: rompe la expectativa del sistema. Lo correcto es interceptar la salida y preguntar.</div>
+
+<pre><code class="lang-tsx">import { usePreventRemove } from '@react-navigation/native';
+
+function Formulario() {
+  const [sucio, setSucio] = useState(false);
+
+  usePreventRemove(sucio, ({ data }) =&gt; {
+    Alert.alert('¿Descartar cambios?', 'Perdés lo que escribiste.', [
+      { text: 'Seguir editando', style: 'cancel' },
+      { text: 'Descartar', style: 'destructive',
+        onPress: () =&gt; navigation.dispatch(data.action) },   // dejar salir
+    ]);
+  });
+}</code></pre>
+
+<div class="step"><strong>4. Respetá "reducir movimiento".</strong> Es una preferencia del sistema, no una opción de tu app: hay gente para quien las transiciones deslizantes provocan mareo real.</div>
+
+<pre><code class="lang-tsx">import { AccessibilityInfo } from 'react-native';
+
+function useReduceMotion() {
+  const [reducir, setReducir] = useState(false);
+  useEffect(() =&gt; {
+    AccessibilityInfo.isReduceMotionEnabled().then(setReducir);
+    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReducir);
+    return () =&gt; sub.remove();
+  }, []);
+  return reducir;
+}
+
+// &lt;Stack screenOptions={{ animation: reducir ? 'none' : 'default' }} /&gt;</code></pre>
+
+<div class="rule">
+  <strong>📌 Los tabs necesitan etiquetas de verdad.</strong> Un <code>tabBarIcon</code> sin <code>tabBarAccessibilityLabel</code> se anuncia como "botón" y nada más. Y si mostrás un badge de notificaciones, el número tiene que estar en la etiqueta: "Pedidos, 3 nuevos", no un punto rojo que solo existe para quien ve.
+</div>
+
+<h2>RNS5.10 Estructura de proyecto para una app grande</h2>
+
+<p>La organización por tipo de archivo (<code>screens/</code>, <code>components/</code>, <code>hooks/</code>, <code>services/</code>) funciona hasta las quince pantallas. Después, cada feature nueva te obliga a tocar cinco carpetas y cualquier cambio termina importando media app. La alternativa es organizar <strong>por feature</strong> y dejar la navegación como una capa fina de cableado:</p>
+
+<pre>src/
+├── app/                     ← rutas (Expo Router). SOLO layouts y wiring.
+│   ├── _layout.tsx
+│   └── (app)/(tabs)/pedidos/[id].tsx   → 5 líneas: importa y renderiza
+│
+├── features/
+│   ├── pedidos/
+│   │   ├── screens/         ← el componente de pantalla REAL vive acá
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── api/
+│   │   ├── model.ts
+│   │   └── index.ts         ← superficie pública: lo único que otros importan
+│   ├── checkout/
+│   └── auth/
+│
+├── navigation/              ← tipos, constantes de ruta, linking, guards
+│   ├── rutas.ts
+│   └── types.ts
+│
+└── shared/                  ← design system, utils, cliente HTTP
+    ├── ui/
+    └── lib/</pre>
+
+<pre><code class="lang-tsx">// app/(app)/(tabs)/pedidos/[id].tsx — el archivo de ruta es DELGADO
+export { DetallePedidoScreen as default } from '@/features/pedidos';</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla de dependencias, en una línea:</strong> <code>app/</code> importa de <code>features/</code>; <code>features/</code> importa de <code>shared/</code>; <strong>nada importa hacia arriba</strong> y <strong>dos features no se importan entre sí</strong>. Si <code>checkout</code> necesita algo de <code>pedidos</code>, ese algo pertenece a <code>shared/</code> — o las dos features en realidad son una.
+</div>
+
+<h3>Cómo se producen los imports circulares</h3>
+
+<p>La cadena es siempre la misma: la pantalla A quiere navegar a B, entonces importa B para tipar la navegación; B tiene un link de vuelta a A y la importa. Módulo A → módulo B → módulo A. En Metro eso no explota con un error claro: te devuelve <code>undefined</code> en el import, y el síntoma es <em>"Element type is invalid: expected a string but got: undefined"</em> — un error que no menciona en ningún lado la palabra "circular".</p>
+
+<pre><code class="lang-tsx">// ❌ Acopla pantallas entre sí
+import { DetallePedido } from '../screens/DetallePedido';
+navigation.navigate(DetallePedido.routeName, { pedidoId });
+
+// ✅ Las pantallas se referencian por NOMBRE, nunca por import
+// navigation/rutas.ts — un módulo hoja, sin dependencias
+export const RUTAS = {
+  pedidosLista:   '/pedidos',
+  pedidoDetalle:  (id: string) =&gt; `/pedidos/${id}`,
+  checkout:       '/checkout',
+} as const;
+
+// En cualquier pantalla:
+router.push(RUTAS.pedidoDetalle(pedido.id));</code></pre>
+
+<div class="mistake">
+  <strong>El barrel gigante.</strong> Un <code>features/index.ts</code> que re-exporta todo de todas las features convierte cualquier import en un import de la app entera: se rompe el tree-shaking, el arranque se hace más lento y aparecen ciclos donde no los esperabas. Barrel <strong>por feature</strong> (<code>features/pedidos/index.ts</code>), nunca uno que las junte todas.
+</div>
+
+<pre><code class="lang-json">// tsconfig.json — alias que hacen visible la regla de dependencias
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/features/*": ["src/features/*"],
+      "@/shared/*":   ["src/shared/*"],
+      "@/navigation/*": ["src/navigation/*"]
+    }
+  }
+}</code></pre>
+
+<pre><code class="lang-json">// .eslintrc.json — que el linter haga cumplir la arquitectura
+{
+  "rules": {
+    "import/no-cycle": ["error", { "maxDepth": 6 }],
+    "import/no-restricted-paths": ["error", {
+      "zones": [
+        { "target": "./src/features", "from": "./src/app",
+          "message": "Una feature NUNCA importa desde app/ (rutas)." },
+        { "target": "./src/shared", "from": "./src/features",
+          "message": "shared/ no puede depender de una feature." }
+      ]
+    }]
+  }
+}</code></pre>
+
+<div class="tip">
+  Escribir la regla arquitectónica en el linter es lo que hace la diferencia entre una convención y una restricción. Una convención documentada en el README dura hasta el primer sprint apurado; <code>import/no-cycle</code> corriendo en CI dura para siempre y no requiere que nadie se acuerde.
+</div>
+
+<h2>RNS5.11 Errores clásicos</h2>
+
+<div class="mistake"><strong>Anidar navegadores de más.</strong> Un stack dentro de un tab dentro de un drawer dentro de otro stack. Cada nivel agrega una capa de headers que hay que apagar, un historial propio que confunde al botón atrás, y una ruta más larga en la config de linking. <strong>Regla:</strong> si al navegar tenés que escribir <code>navigate('A', { screen: 'B', params: { screen: 'C' } })</code>, tu árbol tiene un nivel de más.</div>
+
+<div class="mistake"><strong>Datos en los params en vez de ids.</strong> Ya visto en RNS5.4: rompe la serialización, congela los datos y engorda el estado que persistís.</div>
+
+<div class="mistake"><strong>No limpiar suscripciones al perder foco.</strong> El GPS, el websocket y el <code>setInterval</code> siguen corriendo debajo de cinco pantallas. Se nota en la batería antes que en el profiler.</div>
+
+<div class="mistake"><strong>Poner el <code>NavigationContainer</code> en más de un lugar.</strong> Solo puede haber uno por árbol. Si necesitás un navegador aislado (por ejemplo dentro de un modal de una librería), React Navigation 7 tiene <code>NavigationIndependentTree</code> — pero antes preguntate si de verdad hace falta.</div>
+
+<div class="mistake"><strong>Usar <code>navigate</code> donde va <code>replace</code>.</strong> Después del login, después de completar un onboarding, después de confirmar un pago: el usuario no debe poder volver atrás a esa pantalla. <code>navigate</code> apila; <code>replace</code> reemplaza.</div>
+
+<div class="mistake"><strong>Poner el <code>Provider</code> del store adentro del navegador.</strong> Si el <code>QueryClientProvider</code> o el store viven dentro de una pantalla, se desmontan con ella y perdés toda la caché al navegar. Los providers globales van <strong>arriba</strong> del contenedor de navegación; los de flujo, en el layout de su pila (RNS5.4).</div>
+
+<div class="mistake"><strong>Asumir que <code>goBack()</code> siempre funciona.</strong> Si el usuario entró por un deep link, puede no haber nada atrás. Usá <code>navigation.canGoBack()</code> antes, y si no se puede, mandalo a la ruta ancla — o mejor, configurá <code>initialRouteName</code> y que el problema no exista.</div>
+
+<h2>🧑‍🎓 Worked Example — "vuelvo a la lista y veo datos viejos, y la app se hincha"</h2>
+
+<blockquote>App de logística con tabs (Inicio · Pedidos · Perfil) y un stack dentro de cada tab. Dos quejas de soporte: <strong>(1)</strong> "marco un pedido como entregado, vuelvo a la lista y sigue apareciendo pendiente"; <strong>(2)</strong> "después de un rato usándola se pone lenta y a veces se cierra sola". Los dos son el mismo bug de fondo.</blockquote>
+
+<p><strong>Paso 1 — Medir antes de tocar nada.</strong> El síntoma "se pone lenta" no se debate: se mide. La fuente de verdad es el sistema operativo, no una impresión.</p>
+
+<pre><code class="lang-bash"># Memoria REAL del proceso, medida por Android. Ejecutar en tres momentos:
+# (a) recién abierta  (b) tras 20 ciclos lista→detalle→atrás  (c) tras 5 min de reposo
+adb shell dumpsys meminfo com.miempresa.miapp | grep -E "TOTAL PSS|Native Heap|Views"
+
+# Guion reproducible: 20 ciclos con adb, para que la medición sea comparable
+for i in $(seq 1 20); do
+  adb shell input tap 540 600      # abrir el primer pedido de la lista
+  sleep 1
+  adb shell input keyevent 4       # botón atrás
+  sleep 1
+done</code></pre>
+
+<p>Números del arranque: <strong>TOTAL PSS 214 MB</strong> recién abierta, <strong>389 MB</strong> después de los 20 ciclos, y en reposo <strong>no baja</strong>. Eso descarta "es el GC que tarda": si en cinco minutos de reposo no libera nada, algo mantiene referencias vivas.</p>
+
+<p><strong>Paso 2 — Instrumentar el ciclo de vida.</strong> Pegamos el <code>useLifecycleLogger</code> de RNS5.2 en la lista y en el detalle, y hacemos tres ciclos:</p>
+
+<pre><code class="lang-bash">[Lista#a3f1]     MOUNT
+[Lista#a3f1]     focus
+[Lista#a3f1]     blur
+[Detalle#7c02]   MOUNT
+[Detalle#7c02]   focus
+[Detalle#7c02]   blur
+[Detalle#7c02]   UNMOUNT          ← el detalle SÍ se desmonta. Bien.
+[Lista#a3f1]     focus            ← ⚠️ focus, NO "MOUNT". La lista nunca se re-monta.
+[Detalle#9b41]   MOUNT            ← instancia NUEVA en el segundo ciclo
+…</code></pre>
+
+<p><strong>Paso 3 — Leer el resultado.</strong> Las dos quejas quedan explicadas por la misma línea de log:</p>
+
+<div class="step"><strong>Bug (1) — datos viejos.</strong> La lista carga en <code>useEffect(..., [])</code>. Como al volver del detalle recibe <code>focus</code> pero <strong>no</strong> se re-monta, ese efecto no vuelve a correr <em>nunca</em>. Los datos que se ven son los del primer montaje, de hace media hora.</div>
+
+<div class="step"><strong>Bug (2) — memoria.</strong> El detalle abre un <code>setInterval</code> de polling en <code>useEffect</code> con cleanup… pero la lista también tiene uno, en un <code>useEffect</code> de montaje, que <strong>nunca</strong> se limpia porque la lista nunca se desmonta. Peor: ese intervalo captura en su closure el array completo de pedidos, así que cada versión del array queda retenida. Y en <code>bottom-tabs</code>, con las tres pestañas ya visitadas, son tres listas montadas haciendo polling en paralelo, ninguna visible.</div>
+
+<pre><code class="lang-tsx">// ❌ El código original, con los dos bugs juntos
+function ListaPedidos() {
+  const [pedidos, setPedidos] = useState&lt;Pedido[]&gt;([]);
+
+  useEffect(() =&gt; {
+    api.getPedidos().then(setPedidos);           // ← bug 1: corre una sola vez
+
+    const id = setInterval(async () =&gt; {
+      const frescos = await api.getPedidos();
+      setPedidos([...pedidos, ...frescos]);      // ← bug 2: closure sobre `pedidos`
+    }, 5000);
+    // sin return: no hay cleanup, y aunque lo hubiera nunca se ejecutaría
+  }, []);
+
+  return &lt;FlatList data={pedidos} renderItem={renderItem} /&gt;;
+}</code></pre>
+
+<p><strong>Paso 4 — Corregir las dos causas, no los dos síntomas.</strong> La tentación es poner <code>unmountOnBlur</code> y listo. Eso baja la memoria y esconde el problema: seguirías teniendo un efecto que corre cuando no debe, y encima perderías el scroll de la lista cada vez que el usuario cambia de pestaña.</p>
+
+<pre><code class="lang-tsx">// ✅ Corregido: el polling vive con el foco; los datos, en la caché compartida
+import { useFocusEffect } from '@react-navigation/native';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+
+function ListaPedidos() {
+  const qc = useQueryClient();
+
+  // Los datos ya no son estado local: son caché con dueño único.
+  // Cualquier pantalla que invalide ['pedidos'] refresca ESTA lista.
+  const { data: pedidos = [] } = useQuery({
+    queryKey: ['pedidos'],
+    queryFn: api.getPedidos,
+    staleTime: 30_000,                    // no refetch si es reciente: batería y API
+  });
+
+  // El polling arranca al ganar foco y se APAGA al perderlo.
+  useFocusEffect(useCallback(() =&gt; {
+    qc.invalidateQueries({ queryKey: ['pedidos'] });   // al volver, refrescá una vez
+    const id = setInterval(
+      () =&gt; qc.invalidateQueries({ queryKey: ['pedidos'] }),
+      15_000                                            // 5s era innecesario
+    );
+    return () =&gt; clearInterval(id);                     // ← esto ahora SÍ se ejecuta
+  }, [qc]));
+
+  return &lt;FlatList data={pedidos} renderItem={renderItem} /&gt;;
+}</code></pre>
+
+<pre><code class="lang-tsx">// Y la mutación del detalle invalida la lista: el bug 1 desaparece por diseño
+const marcarEntregado = useMutation({
+  mutationFn: (id: string) =&gt; api.marcarEntregado(id),
+  onSuccess: (_, id) =&gt; {
+    qc.invalidateQueries({ queryKey: ['pedidos'] });      // la lista, donde esté
+    qc.invalidateQueries({ queryKey: ['pedido', id] });   // y este pedido
+  },
+});</code></pre>
+
+<p><strong>Paso 5 — Medir de nuevo, con el mismo guion.</strong> Sin la misma medición, "quedó mejor" no es un resultado:</p>
+
+<table>
+<thead><tr><th>Métrica (20 ciclos lista → detalle → atrás)</th><th>Antes</th><th>Después</th></tr></thead>
+<tbody>
+<tr><td>TOTAL PSS al arrancar</td><td>214 MB</td><td>209 MB</td></tr>
+<tr><td>TOTAL PSS tras 20 ciclos</td><td><strong>389 MB</strong></td><td><strong>231 MB</strong></td></tr>
+<tr><td>TOTAL PSS tras 5 min en reposo</td><td>387 MB (no baja)</td><td>212 MB (vuelve)</td></tr>
+<tr><td>Timers vivos con 3 pestañas visitadas</td><td>3</td><td>1 (solo la enfocada)</td></tr>
+<tr><td>Requests a <code>/pedidos</code> por minuto en background</td><td>36</td><td>0</td></tr>
+<tr><td>Dato desactualizado al volver del detalle</td><td>Siempre</td><td>Nunca</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 6 — Que no vuelva.</strong> El fix arregla dos pantallas; lo que evita la recaída es convertir la lección en una regla verificable:</p>
+
+<pre><code class="lang-tsx">// __tests__/navegacion/efectos-por-foco.test.tsx
+// Regresión: ningún intervalo debe sobrevivir a la pérdida de foco.
+import { render, act } from '@testing-library/react-native';
+
+jest.useFakeTimers();
+
+it('la lista no deja timers vivos al perder foco', () =&gt; {
+  const { unmount, rerender } = renderConNavegacion(&lt;ListaPedidos /&gt;, { enfocada: true });
+  expect(jest.getTimerCount()).toBeGreaterThan(0);      // con foco, hay polling
+
+  act(() =&gt; rerender(&lt;ListaPedidos /&gt;, { enfocada: false }));
+  expect(jest.getTimerCount()).toBe(0);                 // sin foco, cero
+
+  unmount();
+});</code></pre>
+
+<pre><code class="lang-json">// .eslintrc.json — prohibir el patrón que causó todo
+{
+  "rules": {
+    "no-restricted-syntax": ["error", {
+      "selector": "CallExpression[callee.name='useEffect'] CallExpression[callee.name=/^(setInterval|addEventListener)$/]",
+      "message": "Suscripciones y timers van en useFocusEffect, no en useEffect: la pantalla no se desmonta al navegar (RNS5.2)."
+    }]
+  }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección no es "usá <code>useFocusEffect</code>".</strong> Es que el ciclo de vida de una pantalla móvil <strong>no es el de un componente web</strong>, y que ese único hecho explica los datos viejos, la memoria que sube, la batería que se va y los requests fantasma. Cuando aparezca un bug raro en una app con navegación, la primera pregunta no es "¿qué está mal en esta pantalla?" sino <strong>"¿cuántas instancias de esta pantalla hay vivas ahora mismo, y qué están ejecutando?"</strong>.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Una pantalla carga datos en <code>useEffect(fn, [])</code>. El usuario navega al detalle, edita algo y vuelve. Ve el dato viejo. ¿Por qué, y por qué en React web esto no pasaba?</summary>
+<p>Porque en móvil <strong>volver no re-monta</strong>. Al hacer <code>push</code>, la lista quedó montada debajo del detalle; al hacer <code>pop</code>, el detalle se desmonta y la lista simplemente <strong>recupera el foco</strong>. El componente nunca se desmontó, así que su <code>useEffect</code> con array vacío no vuelve a correr jamás. En React web el router desmonta la ruta anterior, entonces volver es un montaje nuevo y el efecto corre otra vez — el patrón "cargo en useEffect vacío" funciona por accidente del modelo, no porque sea correcto. La corrección tiene dos niveles: <code>useFocusEffect</code> para reaccionar al foco, y —mejor— mover los datos a una caché compartida que la mutación invalida, de modo que la lista se entere del cambio sin depender de cuándo recupere el foco.</p></details>
+
+<details><summary>Llega un deep link a <code>/pedidos/42</code>, una ruta que requiere sesión, y el usuario no está logueado. Describí el flujo correcto de punta a punta.</summary>
+<p>El guard del layout protegido detecta que la sesión está en estado <code>anonimo</code> (no <code>cargando</code>: mientras carga, splash y nada más). Antes de redirigir, <strong>guarda la intención</strong> —el pathname— validada contra una allowlist de rutas internas, con timestamp. Redirige con <code>&lt;Redirect&gt;</code>, no con <code>navigate</code>, para que la ruta protegida no llegue a montarse ni quede en el historial. El usuario se loguea; al terminar, se <strong>lee y borra</strong> la intención (de un solo uso), se revalida contra la allowlist y se descarta si pasaron más de unos minutos. Se navega con <code>replace</code>, para que el login no quede atrás. Los dos detalles que no son opcionales: la allowlist —sin ella tenés un open redirect dentro de tu app— y el <code>initialRouteName</code> del stack de pedidos, para que el usuario aterrice en el detalle con un "atrás" que lo lleve a la lista y no a un callejón sin salida.</p></details>
+
+<details><summary>Tu app consume 380 MB después de veinte minutos de uso y no baja. Ya sabés que el problema está en la navegación. ¿Qué mirás, en qué orden?</summary>
+<p>Primero <strong>medir bien</strong>: <code>adb shell dumpsys meminfo</code> en tres momentos (arranque, tras N ciclos reproducibles, tras unos minutos en reposo). Si no baja en reposo, hay referencias vivas, no presión del GC. Segundo, <strong>contar instancias</strong>: un logger de <code>MOUNT</code>/<code>UNMOUNT</code>/<code>focus</code>/<code>blur</code> con la <code>route.key</code>, para ver qué se monta y qué nunca se desmonta. Tercero, buscar en las pantallas que nunca se desmontan los tres sospechosos habituales: timers e intervalos, suscripciones (websocket, GPS, event emitters) y closures que capturan arrays grandes. Cuarto, revisar dónde vive la caché de datos: si cada instancia de pantalla guarda su copia en <code>useState</code>, N pantallas apiladas son N copias. La corrección va siempre en ese orden —efectos por foco, datos en caché compartida— y recién al final, como optimización, <code>freezeOnBlur</code>. Congelar primero solo esconde el problema.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El árbol de navegadores es la arquitectura de la app</strong>, y es la decisión menos reversible que vas a tomar. Lo que se presenta encima de todo va en el stack raíz, no dentro de una pestaña.</li>
+  <li><strong>Hacer <code>push</code> no desmonta la pantalla anterior</strong>, y volver no la re-monta. Ese único hecho explica los datos viejos, la memoria que crece, los timers fantasma y la batería que se va.</li>
+  <li><code>useEffect</code> para setup de por vida; <code>useFocusEffect</code> + <code>useCallback</code> para todo lo que deba apagarse cuando la pantalla no se ve; <code>AppState</code> además, porque minimizar la app <strong>no</strong> dispara <code>blur</code>.</li>
+  <li><strong>Expo Router</strong> es el default razonable para apps nuevas con Expo en 2026: deep links casi gratis y URLs reales. <strong>React Navigation puro</strong> sigue ganando en árboles dinámicos, brownfield y rutas que no deberían ser URLs.</li>
+  <li>Por params viajan <strong>ids</strong>, nunca objetos: los params se serializan para persistir el estado, y un objeto además queda congelado. El estado de un flujo va en un provider del layout de esa pila.</li>
+  <li>Los <strong>universal links</strong> necesitan dominio verificado; el <strong>custom scheme</strong> lo puede secuestrar cualquier app, así que por ahí no viajan tokens. Todo path externo se valida contra una allowlist.</li>
+  <li>La sesión tiene <strong>tres</strong> estados —cargando, autenticado, anónimo— y el árbol condicional le gana a redirigir con <code>navigate</code> en los cinco problemas de la tabla de RNS5.6.</li>
+  <li>Un <strong>process kill</strong> borra todo el contexto de JS. Lo que quieras recuperar, escribilo a disco; versioná el estado persistido; y <strong>nunca</strong> restaures flujos de pago o verificación.</li>
+  <li>Para que se sienta instantáneo: <code>native-stack</code>, prefetch de datos en <code>onPressIn</code>, y recién después <code>preload</code> de pantallas — que cuesta memoria real.</li>
+  <li>Accesibilidad de navegación: mover el foco al cambiar de pantalla, <code>BackHandler</code> siempre dentro de <code>useFocusEffect</code>, interceptar el gesto de salida con datos sin guardar, y respetar "reducir movimiento".</li>
+  <li>Estructura por feature; <code>app/</code> → <code>features/</code> → <code>shared/</code> y nunca al revés; rutas por constante, no por import de la pantalla; la regla escrita en el linter, no en el README.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instrumentá con el <code>useLifecycleLogger</code> de RNS5.2 tres pantallas de una app tuya (una lista, un detalle y una pestaña). Navegá diez ciclos completos y armá una tabla con cuántas instancias de cada pantalla quedaron montadas al final. Explicá cada número.</li>
+  <li>Buscá en tu proyecto todos los <code>setInterval</code>, <code>addEventListener</code> y suscripciones que estén dentro de un <code>useEffect</code> de pantalla. Por cada uno decidí, con argumento escrito, si va en <code>useEffect</code>, en <code>useFocusEffect</code> o en el hook combinado con <code>AppState</code>. Agregá la regla <code>no-restricted-syntax</code> del worked example y arreglá lo que marque.</li>
+  <li>Tomá una pantalla que reciba un objeto por params y refactorizala para que reciba solo el id, con los datos saliendo de una caché compartida. Comprobá que al editar la entidad desde otra pantalla, la primera se actualiza sola.</li>
+  <li>Configurá universal links reales en un dominio propio: publicá <code>apple-app-site-association</code> y <code>assetlinks.json</code>, y verificá con <code>adb shell pm get-app-links</code> que el estado sea <em>verified</em>. Documentá qué fingerprint usaste y por qué.</li>
+  <li>Implementá el patrón de intención pendiente completo (allowlist, un solo uso, vencimiento) y escribí tests para tres casos: ruta permitida, ruta que no está en la allowlist, e intención vencida.</li>
+  <li>Activá "No mantener actividades" en las opciones de desarrollador de Android. Usá tu app hasta la tercera pantalla de un flujo, mandala a background, volvé. Documentá exactamente qué se perdió. Después implementá la restauración versionada y repetí la prueba, incluyendo el caso de un estado guardado que apunta a una ruta que ya no existe.</li>
+  <li>Medí una transición lenta de tu app con el guion de <code>dumpsys meminfo</code> y con el profiler. Aplicá los tres arreglos de RNS5.8 <strong>de a uno</strong>, midiendo entre cada paso, y armá la tabla antes/después. ¿Cuál de los tres dio el mayor retorno por línea escrita?</li>
+</ol>
+
+<section class="quiz" id="quizRNS5">
+  <style>
+    #quizRNS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS5 .q{margin-bottom:1.5rem}
+    #quizRNS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS5 .opt:hover{border-color:var(--accent)}
+    #quizRNS5 .opt:disabled{cursor:default}
+    #quizRNS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS5 .exp.show{display:block}
+    #quizRNS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Una pantalla de lista abre un websocket en <code>useEffect(fn, [])</code> con su <code>return</code> de cleanup bien escrito. El usuario navega al detalle y se queda ahí veinte minutos. ¿Qué pasa con el websocket?</p>
+    <button class="opt">Se cierra: el cleanup corre cuando la pantalla deja de estar visible</button>
+    <button class="opt">Sigue abierto: la lista nunca se desmontó, así que el cleanup nunca se ejecutó</button>
+    <button class="opt">Se cierra solo si el detalle está en otra pestaña</button>
+    <div class="exp">El cleanup de <code>useEffect</code> corre al <strong>desmontar</strong>, y hacer <code>push</code> no desmonta nada: la lista queda montada debajo del detalle, con su websocket abierto consumiendo datos y batería durante los veinte minutos. Para que se cierre al perder visibilidad hay que usar <code>useFocusEffect</code> (envuelto en <code>useCallback</code>), y además escuchar <code>AppState</code>, porque minimizar la app tampoco dispara <code>blur</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Un usuario abre <code>https://miapp.com/pedidos/42</code> desde un mensaje, sin sesión iniciada. ¿Cuál es el manejo correcto?</p>
+    <button class="opt">Redirigir al login y después a la home: la intención original ya se perdió</button>
+    <button class="opt">Montar la pantalla del pedido y mostrar un modal de login encima</button>
+    <button class="opt">Guardar la ruta validada contra una allowlist, redirigir al login, y post-login hacer <code>replace</code> al destino, borrando la intención guardada</button>
+    <div class="exp">Perder la intención es la causa directa de abandono en links compartidos, y montar la pantalla protegida antes de verificar la sesión la expone aunque sea por un instante. El patrón correcto captura el pathname en el guard, lo <strong>valida contra una allowlist</strong> —un path externo es entrada del atacante, y sin allowlist tenés un open redirect dentro de tu propia app—, y lo resuelve post-login con <code>replace</code>, borrándolo al leerlo para que sea de un solo uso y con vencimiento.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu app crece 8 MB por cada ciclo lista → detalle → atrás y no libera nada en reposo. Alguien propone activar <code>freezeOnBlur</code> en todas las pantallas. ¿Qué opinás?</p>
+    <button class="opt">No resuelve nada: congelar detiene re-renders, pero timers, suscripciones y memoria retenida siguen igual</button>
+    <button class="opt">Es la solución correcta: congelar libera la memoria de las pantallas sin foco</button>
+    <button class="opt">Sirve, pero solo en la Nueva Arquitectura</button>
+    <div class="exp">Congelar una pantalla evita que re-renderice cuando no se ve — es una optimización de CPU, no de memoria. Sus <code>setInterval</code>, sus listeners y todo lo que sus closures retienen siguen exactamente donde estaban. Si el crecimiento no baja en reposo, hay referencias vivas: primero se arregla el efecto que no se limpia y se mueven los datos a una caché compartida con dueño único; <code>freezeOnBlur</code> se agrega después, como optimización encima de un ciclo de vida ya correcto.</div>
+  </div>
+
+  <div class="score" id="scoreRNS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns4-modulos-nativos/lecture.html">← RNS4: Módulos nativos propios</a>
+  <a href="../rns6-offline-datos/lecture.html">RNS6: Offline-first y datos →</a>
+</nav>
+
+</div>
+</body>
+</html>

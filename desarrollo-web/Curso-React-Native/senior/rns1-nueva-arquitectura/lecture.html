@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS1 — La Nueva Arquitectura por dentro: JSI, Fabric y TurboModules · React Native Senior</title>
+  <meta name="description" content="Qué reemplazó al Bridge en React Native: JSI y los HostObjects, TurboModules con carga perezosa, el renderer Fabric con el shadow tree en C++, Codegen y la Strict TypeScript API de 0.86, y cómo migrar una app que se rompe en 0.82 bridgeless.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS1</span>
+  <span class="badge">⏱ 40–115 min</span>
+  <span class="badge">🎯 Pre-req: Curso de React Native M00–M12</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>RNS1 — La Nueva Arquitectura por dentro: JSI, Fabric y TurboModules</h1>
+
+<h2>RNS1.0 Por qué este módulo</h2>
+
+<p>Buscá hoy "cómo funciona React Native" y vas a encontrar, en la enorme mayoría de los resultados, la misma explicación: <em>"hay un puente asíncrono que serializa mensajes en JSON entre el hilo de JavaScript y el hilo nativo"</em>. Artículos de blog, respuestas de Stack Overflow, videos de conferencias, cursos pagos, y —lo más peligroso— asistentes de IA entrenados sobre todo eso.</p>
+
+<p>Ese puente <strong>ya no existe</strong>. No está desactivado, no está deprecado, no está detrás de un flag: fue <strong>eliminado del framework</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> React Native reemplazó su capa de comunicación entera. La pieza central es <strong>JSI</strong>, una API de C++ que le da a JavaScript <strong>referencias directas a objetos nativos</strong> a los que puede llamar <strong>de forma síncrona</strong>. Sobre JSI se construyeron <strong>TurboModules</strong> (los módulos nativos) y <strong>Fabric</strong> (el renderer). <strong>Codegen</strong> genera el pegamento tipado entre los dos mundos. Entendé JSI y el resto se deduce.
+</div>
+
+<p>Y hay una razón de coyuntura muy concreta para estudiarlo <em>ahora</em>:</p>
+
+<table>
+<thead><tr><th>Versión</th><th>Qué pasó</th></tr></thead>
+<tbody>
+<tr><td><strong>0.68</strong></td><td>La Nueva Arquitectura se puede activar. Experimental, dolorosa, poca gente la usa.</td></tr>
+<tr><td><strong>0.76</strong></td><td>Pasa a ser <strong>el default</strong>. Dejó de ser experimental.</td></tr>
+<tr><td><strong>0.82</strong></td><td><strong>El Bridge se elimina por completo.</strong> Poner <code>newArchEnabled=false</code> ya no hace nada: la propiedad se ignora y no hay camino de vuelta.</td></tr>
+<tr><td><strong>0.86</strong> (junio 2026)</td><td>Todo proyecto nuevo arranca <strong>bridgeless por default</strong>, con la <strong>Strict TypeScript API</strong>: los tipos se generan directamente del código fuente vía Codegen.</td></tr>
+</tbody>
+</table>
+
+<p>Del lado de Expo, la Nueva Arquitectura viene <strong>activada por default en el managed workflow desde el SDK 52</strong>. O sea: si arrancaste un proyecto en los últimos dos años, ya estás corriendo sobre esto, sepas o no cómo funciona.</p>
+
+<div class="rule">
+  <strong>📌 Lo que separa hoy a un senior de React Native</strong> no es saber más componentes. Es poder abrir un stack trace que menciona <code>TurboModuleRegistry</code>, <code>jsi::Runtime</code> o <code>ShadowNode</code> y saber en qué capa está el problema. Este módulo es el mapa de esas capas.
+</div>
+
+<h2>RNS1.1 La arquitectura vieja y su problema</h2>
+
+<p>Para entender por qué se rompió todo y se rehízo, hay que entender bien qué se rompió. La arquitectura original de React Native (2015–2024) tenía <strong>tres hilos</strong> y <strong>un cuello de botella</strong> entre ellos.</p>
+
+<pre>  ARQUITECTURA VIEJA (hasta 0.81)
+
+  ┌──────────────────┐     ┌───────────────┐     ┌──────────────────┐
+  │   JS THREAD      │     │    BRIDGE     │     │  NATIVE / UI     │
+  │                  │     │               │     │                  │
+  │  Tu código React │ ──▶ │  serializa a  │ ──▶ │  UIKit / Android │
+  │  JSC o Hermes    │     │     JSON      │     │      Views       │
+  │                  │ ◀── │  cola batched │ ◀── │  eventos, touch  │
+  └──────────────────┘     │  ASÍNCRONA    │     └──────────────────┘
+           │               └───────────────┘              ▲
+           │                                              │
+           ▼                                              │
+  ┌──────────────────┐                                    │
+  │  SHADOW THREAD   │  Yoga calcula el layout  ──────────┘
+  │  (árbol en C++)  │
+  └──────────────────┘</pre>
+
+<p>El <strong>Bridge</strong> era una cola de mensajes. Cada vez que JS quería hacer algo nativo —montar una vista, leer una preferencia, pedir la posición del scroll— el mensaje se <strong>serializaba a JSON</strong>, se metía en un lote y se entregaba del otro lado <strong>en algún momento posterior</strong>.</p>
+
+<pre><code class="lang-js">// Lo que realmente viajaba por el Bridge: arrays de números y strings.
+// Cada llamada era [moduleId, methodId, args, callbackId], en JSON.
+[
+  [7],                       // ids de módulos
+  [3],                       // ids de métodos
+  [["persist", "user_42"]],  // argumentos, YA serializados
+  118                        // id del callback que espera del otro lado
+]</code></pre>
+
+<p>Podías verlo con tus propios ojos, y todavía vale la pena hacerlo una vez en un proyecto viejo para entender la magnitud:</p>
+
+<pre><code class="lang-js">// Solo en la arquitectura vieja. En bridgeless esto ya no existe.
+import MessageQueue from 'react-native/Libraries/BatchedBridge/MessageQueue';
+
+MessageQueue.spy(info =&gt; {
+  console.log(info.type === 0 ? 'JS→N' : 'N→JS', info.module, info.method);
+});
+
+// Al scrollear una FlatList veías CIENTOS de líneas por segundo.
+// Cada una: serializar, encolar, esperar el próximo frame, deserializar.</code></pre>
+
+<h3>Las tres restricciones que imponía</h3>
+
+<div class="step"><strong>1. Todo era asíncrono, siempre.</strong> No existía forma de que JS le preguntara algo a lo nativo y recibiera la respuesta <em>en la misma línea</em>. Ni siquiera "¿cuánto mide esta vista?". Todo era callback o promesa, incluso lo trivial.</div>
+
+<div class="step"><strong>2. Todo pasaba por JSON.</strong> Un <code>ArrayBuffer</code> de una imagen, un objeto grande de configuración, una lista de 500 filas: todo se convertía a texto, se copiaba, y se parseaba del otro lado. El costo crecía con el tamaño del dato, no con la complejidad de la operación.</div>
+
+<div class="step"><strong>3. Todos los módulos nativos se cargaban al arrancar.</strong> Tu app importaba 40 librerías nativas y las 40 se inicializaban en el arranque, aunque el usuario nunca abriera la pantalla de la cámara.</div>
+
+<div class="mistake">
+  <strong>Los síntomas que producía, y que seguramente sufriste:</strong>
+  <ul>
+    <li><strong>Listas que se "cortan"</strong>: scrolleás rápido y ves celdas en blanco. El JS no llega a mandar las filas nuevas por el Bridge antes del próximo frame.</li>
+    <li><strong>Gestos con lag</strong>: arrastrás un elemento y sigue al dedo con retraso, porque cada evento de touch cruzaba el puente, JS decidía, y la respuesta volvía a cruzarlo.</li>
+    <li><strong>Arranque lento</strong>: segundos de splash screen inicializando módulos nativos que quizás nunca ibas a usar.</li>
+    <li><strong>Saltos de layout</strong> al medir una vista: como <code>measure()</code> era asíncrono, el primer render se hacía con datos viejos y después corregía.</li>
+  </ul>
+</div>
+
+<pre><code class="lang-tsx">// El síntoma clásico de la arquitectura vieja: medir para posicionar.
+// El componente se pintaba MAL una vez y después se corregía. Flicker.
+function Tooltip({ anchorRef }: { anchorRef: React.RefObject&lt;View&gt; }) {
+  const [pos, setPos] = useState&lt;{ x: number; y: number } | null&gt;(null);
+
+  useEffect(() =&gt; {
+    // measure() cruzaba el Bridge: la respuesta llegaba uno o más frames después
+    anchorRef.current?.measure((x, y, w, h, pageX, pageY) =&gt; {
+      setPos({ x: pageX, y: pageY + h });   // ...y recién acá re-renderizabas
+    });
+  }, []);
+
+  if (!pos) return null;                     // frame 1: nada
+  return &lt;View style={{ top: pos.y, left: pos.x }} /&gt;;  // frame 2+: aparece
+}</code></pre>
+
+<div class="info">
+  Nada de esto era un error de diseño estúpido. En 2015, el Bridge fue una decisión <strong>brillante</strong>: permitió que un motor de JavaScript cualquiera hablara con dos plataformas nativas distintas sin acoplarse a ninguna. El precio —serialización y asincronía— era aceptable para las apps de esa época. Diez años y varios órdenes de magnitud de expectativa después, dejó de serlo.
+</div>
+
+<h2>RNS1.2 JSI: la pieza que hizo posible todo lo demás</h2>
+
+<p><strong>JSI (JavaScript Interface)</strong> es una API de C++ ligera que abstrae "un motor de JavaScript". No es un puente: es una <strong>interfaz directa</strong>. Con JSI, código C++ puede crear valores de JS, leerlos, llamar funciones de JS, y —lo importante— <strong>instalar objetos propios dentro del runtime de JS</strong>.</p>
+
+<div class="analogy">
+  <strong>🔌 La analogía.</strong> El Bridge era un <em>servicio de correo</em>: escribías una carta (JSON), la despachabas, y en algún momento llegaba una respuesta. JSI es un <em>teléfono con línea directa</em>: agarrás el objeto del otro lado y lo llamás. La conversación pasa en el mismo instante, sin sobres ni traducción.
+</div>
+
+<p>Los tipos fundamentales de JSI son pocos y se entienden rápido:</p>
+
+<pre><code class="lang-cpp">#include &lt;jsi/jsi.h&gt;
+using namespace facebook;
+
+// jsi::Runtime  → el motor de JS en sí (Hermes, JSC, V8: da igual)
+// jsi::Value    → un valor de JS visto desde C++ (number, string, object, ...)
+// jsi::Object   → un objeto de JS
+// jsi::Function → una función de JS que C++ puede LLAMAR
+// jsi::String   → un string de JS
+
+void ejemplo(jsi::Runtime &amp;rt) {
+  // Crear valores de JS desde C++
+  jsi::Value numero = jsi::Value(42);
+  jsi::String texto = jsi::String::createFromUtf8(rt, "hola");
+
+  // Leer una propiedad global de JS
+  jsi::Value consola = rt.global().getProperty(rt, "console");
+
+  // Llamar a una función de JS desde C++, SIN serializar nada
+  jsi::Function log = consola.asObject(rt).getPropertyAsFunction(rt, "log");
+  log.call(rt, texto);
+}</code></pre>
+
+<h3>HostObject: el objeto nativo que JavaScript cree suyo</h3>
+
+<p>La pieza que cambia el juego es <code>jsi::HostObject</code>. Es una clase de C++ que se <strong>expone al runtime de JS como si fuera un objeto normal</strong>. Cuando JS lee una propiedad de ese objeto, se ejecuta tu código C++ <em>en ese mismo instante</em>, en el mismo hilo, sin cola ni serialización.</p>
+
+<pre><code class="lang-cpp">// Un almacén clave-valor nativo expuesto a JS como un objeto común.
+class AlmacenRapido : public jsi::HostObject {
+ public:
+  // Se llama cuando JS hace: almacen.loQueSea
+  jsi::Value get(jsi::Runtime &amp;rt, const jsi::PropNameID &amp;nombre) override {
+    auto prop = nombre.utf8(rt);
+
+    if (prop == "leer") {
+      return jsi::Function::createFromHostFunction(
+        rt, nombre, 1,
+        [this](jsi::Runtime &amp;rt, const jsi::Value &amp;, const jsi::Value *args, size_t n)
+            -&gt; jsi::Value {
+          if (n &lt; 1) return jsi::Value::undefined();
+          std::string clave = args[0].asString(rt).utf8(rt);
+          std::string valor = db_.get(clave);         // acceso nativo, acá mismo
+          return jsi::String::createFromUtf8(rt, valor);  // ← retorno SÍNCRONO
+        });
+    }
+    return jsi::Value::undefined();
+  }
+
+ private:
+  MiBaseDeDatos db_;
+};</code></pre>
+
+<p>Y del lado de JavaScript, se usa así:</p>
+
+<pre><code class="lang-tsx">// almacen es un HostObject: NO es un proxy, NO hay JSON, NO hay promesa.
+declare const almacen: { leer(clave: string): string };
+
+const tema = almacen.leer('tema');   // ← devuelve el valor. Ahora. Acá.
+console.log(tema);                   // 'oscuro'
+
+// Con el Bridge esto era, obligatoriamente:
+//   const tema = await NativeModules.Almacen.leer('tema');
+// y el await costaba, como mínimo, un ciclo del event loop.</code></pre>
+
+<div class="rule">
+  <strong>📌 El cambio conceptual.</strong> Antes, JS <em>enviaba mensajes</em> a lo nativo. Ahora, JS <strong>tiene punteros</strong> a objetos nativos y los invoca. Esa diferencia es la que habilita MMKV leyendo en microsegundos, Reanimated corriendo animaciones en el hilo de UI, Skia dibujando desde JS, y todo el resto de la Nueva Arquitectura.
+</div>
+
+<p>Instalar un HostObject en el runtime es una función de una línea que corre al arrancar la app:</p>
+
+<pre><code class="lang-cpp">// Se llama una vez, cuando el runtime de JS está listo.
+void instalar(jsi::Runtime &amp;rt) {
+  auto almacen = std::make_shared&lt;AlmacenRapido&gt;();
+  rt.global().setProperty(
+      rt, "__AlmacenRapido",
+      jsi::Object::createFromHostObject(rt, almacen));
+}
+// A partir de acá, en JS: global.__AlmacenRapido.leer('clave')</code></pre>
+
+<div class="warn">
+  <strong>Con la línea directa viene la responsabilidad.</strong> Una llamada síncrona por JSI <strong>bloquea el hilo de JS</strong> mientras dura. Si tu HostObject hace una consulta de red o lee 20 MB de disco de forma síncrona, congelaste la app entera. JSI te da la posibilidad de ser síncrono; <strong>no te obliga</strong>. Lo síncrono es para operaciones de microsegundos: leer una preferencia, consultar un caché en memoria, obtener una medida. Todo lo demás sigue siendo asíncrono, y está bien que lo sea.
+</div>
+
+<div class="info">
+  JSI es <strong>agnóstico del motor</strong>. Ese fue el otro gran objetivo: React Native ya no está casado con JavaScriptCore. Hermes es hoy el motor por defecto, pero la app podría correr sobre otro motor y JSI seguiría siendo la misma API. Esa independencia es la que permitió que Hermes evolucionara sin reescribir el framework.
+</div>
+
+<h2>RNS1.3 TurboModules: módulos nativos perezosos y tipados</h2>
+
+<p>Un <strong>módulo nativo</strong> es código Swift/Kotlin/ObjC/Java que exponés a JavaScript: el acceso a la cámara, al almacenamiento seguro, al Bluetooth. Los viejos <code>NativeModules</code> viajaban por el Bridge. Los <strong>TurboModules</strong> viajan por JSI.</p>
+
+<p>Así se veía un módulo nativo viejo desde JS — sin tipos, todo asíncrono, y con un fallo silencioso si el módulo no estaba:</p>
+
+<pre><code class="lang-tsx">import { NativeModules } from 'react-native';
+
+// NativeModules es un objeto plano SIN tipos: TypeScript no sabe nada de acá.
+const { InfoDispositivo } = NativeModules;
+
+// Si el módulo no está enlazado, InfoDispositivo es undefined y esto
+// explota en runtime con "Cannot read property 'obtenerId' of undefined".
+const id = await InfoDispositivo.obtenerId();   // any, siempre asíncrono</code></pre>
+
+<p>Un TurboModule empieza por su <strong>spec</strong>: un archivo de TypeScript que <em>declara el contrato</em>. Este archivo no es documentación — es la <strong>fuente de verdad</strong> desde la que Codegen genera las interfaces nativas.</p>
+
+<pre><code class="lang-tsx">// src/specs/NativeInfoDispositivo.ts
+// El prefijo "Native" en el nombre del archivo NO es decorativo:
+// es cómo Codegen encuentra los specs.
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+
+export interface Spec extends TurboModule {
+  // Síncrono: posible SOLO en la Nueva Arquitectura
+  obtenerId(): string;
+  obtenerNivelBateria(): number;
+
+  // Asíncrono cuando la operación lo amerita
+  obtenerHuellaSegura(): Promise&lt;string&gt;;
+
+  // Los tipos permitidos son un subconjunto: sin uniones arbitrarias,
+  // sin genéricos, sin tipos que Codegen no pueda mapear a nativo.
+  configurar(opciones: { modo: string; reintentos: number }): void;
+}
+
+// getEnforcing lanza un error CLARO al importar si el módulo no está.
+// Nada de "undefined" tres pantallas después.
+export default TurboModuleRegistry.getEnforcing&lt;Spec&gt;('InfoDispositivo');</code></pre>
+
+<pre><code class="lang-tsx">// Uso: tipado de punta a punta, y la llamada síncrona es real.
+import InfoDispositivo from './src/specs/NativeInfoDispositivo';
+
+const id: string = InfoDispositivo.obtenerId();          // sin await
+const bateria: number = InfoDispositivo.obtenerNivelBateria();
+
+// TypeScript te corrige acá, no en un crash del QA:
+// InfoDispositivo.obtenerIdd();  // ← Property 'obtenerIdd' does not exist</code></pre>
+
+<h3>Carga perezosa: el módulo se inicializa cuando lo tocás</h3>
+
+<p>Ésta es la diferencia que más se nota en el arranque. Los NativeModules viejos se registraban <strong>todos</strong> al iniciar la app. Un TurboModule se instancia la <strong>primera vez que JS accede a él</strong>.</p>
+
+<pre><code class="lang-cpp">// Simplificación del registro: nada se construye hasta el primer acceso.
+std::shared_ptr&lt;TurboModule&gt; TurboModuleManager::get(const std::string &amp;nombre) {
+  auto it = cache_.find(nombre);
+  if (it != cache_.end()) return it-&gt;second;   // ya instanciado
+
+  auto modulo = crearModulo(nombre);           // ← recién ACÁ se construye
+  cache_[nombre] = modulo;
+  return modulo;
+}</code></pre>
+
+<div class="tip">
+  Si tu app importa 40 librerías nativas y el usuario abre la pantalla de inicio, se inicializan las 3 o 4 que esa pantalla usa. Las otras 36 no cuestan nada hasta que hagan falta. <strong>Ahí está buena parte del 43% de mejora en arranque en frío</strong> que reporta la gente que migró.
+</div>
+
+<table>
+<thead><tr><th>Aspecto</th><th>NativeModules (viejo)</th><th>TurboModules (nuevo)</th></tr></thead>
+<tbody>
+<tr><td>Transporte</td><td>Bridge, JSON serializado</td><td>JSI, referencias directas</td></tr>
+<tr><td>Sincronía</td><td>Siempre asíncrono</td><td>Síncrono o asíncrono, a elección</td></tr>
+<tr><td>Carga</td><td>Todos al arrancar</td><td>Perezosa, al primer uso</td></tr>
+<tr><td>Tipos</td><td>Ninguno: <code>any</code> en JS, sin verificación</td><td>Contrato en TS/Flow, verificado en <strong>build</strong></td></tr>
+<tr><td>Módulo faltante</td><td><code>undefined</code>, error críptico en runtime</td><td><code>getEnforcing</code> falla claro y temprano</td></tr>
+<tr><td>Costo por llamada</td><td>Crece con el tamaño del payload</td><td>Prácticamente constante</td></tr>
+<tr><td>Datos binarios</td><td>Base64 sobre JSON 🤮</td><td><code>ArrayBuffer</code> compartido, sin copia</td></tr>
+<tr><td>Errores de contrato</td><td>Se descubren probando la app</td><td>Rompen la compilación</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error que más se ve al escribir un spec:</strong> usar tipos de TypeScript que Codegen no sabe traducir. Uniones como <code>string | number</code>, genéricos propios, <code>Record&lt;string, unknown&gt;</code>, enums complejos, tipos recursivos. El compilador de TS te deja escribirlos y <strong>Codegen falla después</strong>, con un mensaje que no siempre apunta al lugar correcto. Regla práctica: si no lo podés expresar en Java <em>y</em> en Objective-C sin pensar, no va en un spec.
+</div>
+
+<h2>RNS1.4 Fabric: el nuevo renderer</h2>
+
+<p><strong>Fabric</strong> es el sistema de renderizado. Su cambio estructural es que el <strong>shadow tree vive en C++</strong> y es compartido por las dos plataformas, en lugar de estar duplicado en Java y Objective-C.</p>
+
+<pre>  FABRIC: de tu JSX a píxeles
+
+  React Element Tree      React Shadow Tree        Host View Tree
+  (JavaScript)            (C++, inmutable)         (UIView / android.view)
+  ┌──────────────┐        ┌──────────────┐         ┌──────────────┐
+  │  &lt;View&gt;      │  ───▶  │  ShadowNode  │  ───▶   │   UIView     │
+  │   &lt;Text&gt;     │        │  + Yoga      │         │   UILabel    │
+  └──────────────┘        └──────────────┘         └──────────────┘
+       RENDER                  COMMIT                   MOUNT
+   (reconciliación)      (layout + promoción)     (aplicar mutaciones)</pre>
+
+<p>El renderizado ocurre en <strong>tres fases</strong>, y conviene tener los nombres claros porque son los que aparecen en los perfiles y en los errores:</p>
+
+<div class="step"><strong>1. Render.</strong> React reconcilia y produce un árbol de elementos. Fabric crea el <strong>React Shadow Tree</strong> correspondiente en C++, donde cada <code>ShadowNode</code> es <strong>inmutable</strong>: cambiar algo genera un nodo nuevo, no muta el existente.</div>
+
+<div class="step"><strong>2. Commit.</strong> Se calcula el layout con Yoga sobre el árbol nuevo y se lo <strong>promueve</strong> a ser el árbol vigente. Como los nodos son inmutables, se puede tener más de un árbol vivo a la vez sin corromper nada.</div>
+
+<div class="step"><strong>3. Mount.</strong> Se diffean el árbol viejo y el nuevo, se genera una lista de <strong>mutaciones</strong> (crear vista, actualizar prop, mover, borrar) y se aplican a las vistas nativas reales en el hilo de UI.</div>
+
+<pre><code class="lang-cpp">// La idea clave: los ShadowNode son inmutables y se clonan.
+// Por eso pueden coexistir dos versiones del árbol al mismo tiempo.
+class ShadowNode {
+ public:
+  // "Cambiar" un nodo = crear uno nuevo compartiendo lo que no cambió.
+  ShadowNode::Unshared clone(const ShadowNodeFragment &amp;fragment) const;
+
+  const Props::Shared &amp;getProps() const;
+  const SharedShadowNodeList &amp;getChildren() const;
+  const LayoutMetrics &amp;getLayoutMetrics() const;   // ← lo que calculó Yoga
+};</code></pre>
+
+<h3>Por qué recién ahora React Native aprovecha React 18/19</h3>
+
+<p>Las <em>concurrent features</em> de React —<code>Suspense</code>, <code>startTransition</code>, <code>useDeferredValue</code>— necesitan que React pueda <strong>preparar un render en segundo plano, pausarlo, descartarlo o priorizar otro</strong>. Con el Bridge eso era imposible: las mutaciones ya habían sido despachadas por una cola asíncrona y no se podían "deshacer". Con el shadow tree inmutable de Fabric, sí.</p>
+
+<pre><code class="lang-tsx">import { useDeferredValue, useState, useTransition } from 'react';
+import { TextInput, FlatList, Text } from 'react-native';
+
+function BuscadorDeProductos({ productos }: { productos: Producto[] }) {
+  const [texto, setTexto] = useState('');
+  // El input responde con prioridad ALTA; la lista se recalcula con BAJA.
+  const textoDiferido = useDeferredValue(texto);
+  const [pendiente, startTransition] = useTransition();
+
+  const filtrados = useMemo(
+    () =&gt; productos.filter(p =&gt; p.nombre.includes(textoDiferido)),
+    [productos, textoDiferido]
+  );
+
+  return (
+    &lt;&gt;
+      &lt;TextInput value={texto} onChangeText={setTexto} /&gt;
+      {pendiente &amp;&amp; &lt;Text&gt;Buscando…&lt;/Text&gt;}
+      &lt;FlatList data={filtrados} renderItem={renderProducto} /&gt;
+    &lt;/&gt;
+  );
+}
+// En la arquitectura vieja esto "andaba" pero no priorizaba de verdad:
+// el trabajo igual se encolaba en el Bridge y el input se trababa igual.</code></pre>
+
+<h3>Medición síncrona de layout</h3>
+
+<p>Recordá el <code>Tooltip</code> con flicker de RNS1.1. Con Fabric, el layout de un nodo se puede consultar <strong>en el momento</strong>, porque el árbol y sus <code>LayoutMetrics</code> están del lado de C++, accesibles vía JSI:</p>
+
+<pre><code class="lang-tsx">import { useLayoutEffect, useRef, useState } from 'react';
+import { View } from 'react-native';
+
+function Tooltip({ anchorRef }: { anchorRef: React.RefObject&lt;View&gt; }) {
+  const [pos, setPos] = useState&lt;{ x: number; y: number } | null&gt;(null);
+
+  // Con Fabric, measure resuelve contra el shadow tree en C++.
+  // La posición está lista ANTES de que el frame se pinte: sin flicker.
+  useLayoutEffect(() =&gt; {
+    anchorRef.current?.measure((x, y, w, h, pageX, pageY) =&gt; {
+      setPos({ x: pageX, y: pageY + h });
+    });
+  }, []);
+
+  if (!pos) return null;
+  return &lt;View style={{ position: 'absolute', top: pos.y, left: pos.x }} /&gt;;
+}</code></pre>
+
+<div class="info">
+  Fabric también trae <strong>view flattening</strong>: si un <code>&lt;View&gt;</code> existe solo para agrupar y no aporta nada visual (sin fondo, sin borde, sin opacidad, sin manejo de eventos), Fabric <strong>no crea la vista nativa</strong>. Es una optimización que antes se hacía a mano evitando anidar; ahora la hace el renderer. Por eso una jerarquía profunda hoy cuesta bastante menos que hace tres años.
+</div>
+
+<div class="warn">
+  <strong>Cuándo NO te va a salvar Fabric.</strong> Concurrent rendering prioriza trabajo de React; no acelera <em>tu</em> código. Si tu <code>renderItem</code> hace un <code>JSON.parse</code> de 2 MB por fila, o recalculás un array de 50.000 elementos en cada render, Fabric va a hacer exactamente el mismo trabajo lento, mejor priorizado. La arquitectura sube el techo; no arregla algoritmos. Eso es RNS2.
+</div>
+
+<h2>RNS1.5 Codegen: el pegamento se genera, no se escribe</h2>
+
+<p>Entre TypeScript y C++/Java/ObjC hay un abismo de tipos. <strong>Codegen</strong> lo cruza automáticamente: lee tus specs y <strong>genera</strong> las interfaces nativas que la implementación tiene que cumplir.</p>
+
+<pre><code class="lang-json">// package.json de tu librería o app
+{
+  "name": "mi-libreria-nativa",
+  "codegenConfig": {
+    "name": "MiLibreriaSpec",
+    "type": "all",
+    "jsSrcsDir": "src/specs",
+    "android": {
+      "javaPackageName": "com.milibreria"
+    }
+  }
+}</code></pre>
+
+<p>Ese bloque <code>codegenConfig</code> es, en la práctica, <strong>la señal más confiable de que una librería soporta la Nueva Arquitectura</strong>. Lo vamos a usar en el worked example.</p>
+
+<pre><code class="lang-bash"># Codegen corre solo durante el build, pero se puede invocar a mano
+# para ver qué produce (es lo primero que hago cuando algo no cierra):
+npx react-native codegen
+
+# Android: el output queda bajo
+#   android/app/build/generated/source/codegen/
+# iOS: se genera al instalar pods
+cd ios &amp;&amp; RCT_NEW_ARCH_ENABLED=1 bundle exec pod install</code></pre>
+
+<p>De un spec de TypeScript sale una clase base abstracta en C++ (y sus equivalentes en Java y ObjC) que tu implementación <strong>debe</strong> heredar:</p>
+
+<pre><code class="lang-cpp">// GENERADO por Codegen a partir de NativeInfoDispositivo.ts. No se edita.
+class JSI_EXPORT NativeInfoDispositivoCxxSpecJSI : public TurboModule {
+ public:
+  virtual jsi::String obtenerId(jsi::Runtime &amp;rt) = 0;
+  virtual double obtenerNivelBateria(jsi::Runtime &amp;rt) = 0;
+  virtual jsi::Value obtenerHuellaSegura(jsi::Runtime &amp;rt) = 0;
+  virtual void configurar(jsi::Runtime &amp;rt, jsi::Object opciones) = 0;
+
+ protected:
+  NativeInfoDispositivoCxxSpecJSI(std::shared_ptr&lt;CallInvoker&gt; jsInvoker);
+};</code></pre>
+
+<div class="rule">
+  <strong>📌 El valor real de Codegen no es ahorrar tipeo: es que el contrato se verifica en tiempo de compilación.</strong> Si renombrás un método en el spec y no lo actualizás en Kotlin, <strong>la app no compila</strong>. En la arquitectura vieja ese mismo error era un <code>undefined is not a function</code> que descubría un usuario en producción tres semanas después.
+</div>
+
+<h3>La Strict TypeScript API (0.86)</h3>
+
+<p>Históricamente, los tipos públicos de React Native se mantenían <strong>a mano</strong>, aparte del código real. El resultado predecible: tipos que decían una cosa y una implementación que hacía otra, props que existían en el código pero no en los tipos, y tipos que sobrevivían a APIs ya eliminadas.</p>
+
+<p>Desde <strong>0.86</strong>, la <strong>Strict TypeScript API</strong> genera los tipos públicos <strong>directamente del código fuente</strong>, usando la misma maquinaria de Codegen.</p>
+
+<pre><code class="lang-tsx">// Con la Strict API, los tipos vienen del código real.
+// Consecuencia práctica #1: si una prop no es pública, TS ya no te deja usarla.
+import { View } from 'react-native';
+
+&lt;View
+  style={{ flex: 1 }}
+  // @ts-expect-error — props internas que "andaban" ya no tipan
+  collapsable={false}
+/&gt;;
+
+// Consecuencia práctica #2: importar de rutas internas deja de funcionar.
+// ❌ import Foo from 'react-native/Libraries/Components/Foo';
+// ✅ import { Foo } from 'react-native';</code></pre>
+
+<div class="tip">
+  Al adoptar la Strict API vas a ver <strong>errores de TypeScript nuevos en código que "andaba bien"</strong>. Casi siempre son reales: estabas usando algo interno, algo deprecado, o una prop cuyo tipo estaba mal declarado hace años. Es la clase de migración que duele una tarde y evita bugs durante años. Migrá archivo por archivo, no de golpe.
+</div>
+
+<h2>RNS1.6 Bridgeless: qué significa en la práctica</h2>
+
+<p>"Bridgeless" es el estado final: <strong>no hay Bridge instanciado en absoluto</strong>. No es "el Bridge está ahí pero no lo usamos": el objeto no existe. En <strong>0.82 se eliminó del framework</strong>, y desde <strong>0.86</strong> todo proyecto nuevo arranca así por default.</p>
+
+<div class="danger">
+  <strong>⚠️ Poner <code>newArchEnabled=false</code> en 0.82+ no hace nada.</strong> La propiedad se <strong>ignora</strong> silenciosamente. Es el error más caro de esta migración: un equipo pone el flag, la app compila, asume que volvió al sistema viejo, y pasa dos días depurando por qué el comportamiento no cambia. <strong>No hay camino de vuelta.</strong> La única decisión disponible es en qué versión te quedás.
+</div>
+
+<p>Éste es el código que deja de funcionar. Vale la pena grepearlo en tu proyecto <em>hoy</em>:</p>
+
+<pre><code class="lang-tsx">// ❌ 1. El objeto global del Bridge: no existe
+console.log(global.__fbBatchedBridge);           // undefined
+
+// ❌ 2. Espiar la cola de mensajes: no hay cola
+import MessageQueue from 'react-native/Libraries/BatchedBridge/MessageQueue';
+MessageQueue.spy(true);                          // no observa nada
+
+// ❌ 3. Llamadas síncronas por el hook viejo del Bridge
+global.nativeCallSyncHook?.(moduleId, methodId, args);
+
+// ⚠️ 4. NativeModules sigue "andando" gracias a la capa de interop...
+import { NativeModules } from 'react-native';
+const { MiModuloViejo } = NativeModules;
+// ...pero sin carga perezosa, sin tipos, sin llamadas síncronas,
+// y es una capa de compatibilidad, no un destino.
+
+// ✅ Lo que corresponde hoy
+import MiModulo from './specs/NativeMiModulo';</code></pre>
+
+<p>Del lado nativo, lo que se rompe es todo lo que tocaba <code>RCTBridge</code> directamente:</p>
+
+<pre><code class="lang-bash"># El grep que hago siempre al auditar un proyecto que migra.
+# Cualquier resultado acá es un módulo nativo propio que hay que revisar:
+grep -rn "RCTBridge\|bridge.moduleForClass\|RCT_EXPORT_MODULE" ios/ --include=*.m --include=*.mm
+grep -rn "ReactContextBaseJavaModule\|getReactApplicationContext" android/ --include=*.java --include=*.kt
+
+# Y en JavaScript:
+grep -rn "__fbBatchedBridge\|MessageQueue\|nativeCallSyncHook\|NativeModules\." src/</code></pre>
+
+<div class="concept">
+  <strong>💡 La capa de interop es una rampa, no un puente nuevo.</strong> React Native incluye un <em>interop layer</em> que hace que muchos NativeModules y ViewManagers viejos sigan funcionando sobre la Nueva Arquitectura. Sirve para migrar sin parar el mundo. Pero un módulo que corre por interop <strong>no obtiene ninguno de los beneficios</strong>: no es perezoso, no es síncrono, no está tipado. Si medís la mejora de arranque y no aparece, la primera hipótesis es que tus módulos siguen entrando por la rampa.
+</div>
+
+<h2>RNS1.7 Migración: qué se rompe y cómo detectarlo antes</h2>
+
+<p>El ecosistema está hoy en <strong>~90% de compatibilidad</strong>. Ese número suena tranquilizador hasta que el 10% restante es justo la librería sobre la que se apoya tu feature principal.</p>
+
+<table>
+<thead><tr><th>Librería</th><th>Versión mínima compatible</th><th>Nota</th></tr></thead>
+<tbody>
+<tr><td>React Navigation</td><td><strong>7.2+</strong></td><td>Soporte pleno; revisá también <code>react-native-screens</code></td></tr>
+<tr><td>Reanimated</td><td><strong>3.5.1+</strong></td><td>Nació sobre JSI: es de las que mejor se llevan con Fabric</td></tr>
+<tr><td>Gesture Handler</td><td><strong>2.16.2+</strong></td><td>Va de la mano con la versión de Reanimated</td></tr>
+<tr><td>Vision Camera</td><td><strong>4.0+</strong></td><td>Frame processors ya usan JSI directamente</td></tr>
+<tr><td>Detox</td><td>Compatible</td><td>E2E funciona; revisá la sincronización en bridgeless</td></tr>
+<tr><td>Expo</td><td><strong>SDK 52+</strong></td><td>Nueva Arquitectura por default en managed workflow</td></tr>
+</tbody>
+</table>
+
+<h3>Los cuatro modos de fallar, en orden de frecuencia</h3>
+
+<div class="step"><strong>1. Librería nativa sin mantener.</strong> No tiene <code>codegenConfig</code>, no actualizó su podspec, el repo no tiene commits desde hace dos años. Es el caso más común y el más caro.</div>
+
+<div class="step"><strong>2. Módulo nativo propio escrito contra <code>RCTBridge</code>.</strong> Lo escribiste vos o alguien que ya no está. La buena noticia: lo controlás. La mala: hay que reescribirlo como TurboModule.</div>
+
+<div class="step"><strong>3. ViewManagers a mano.</strong> Componentes nativos personalizados registrados a la vieja usanza. Necesitan pasar a componentes de Fabric con su propio spec.</div>
+
+<div class="step"><strong>4. Suposiciones sobre el orden y el timing.</strong> Código que "andaba" porque el Bridge era asíncrono y le daba un frame de gracia. Sin esa latencia accidental, aparecen carreras que siempre estuvieron ahí. Es el más difícil de encontrar porque no rompe la compilación: rompe en producción, a veces.</div>
+
+<div class="mistake">
+  <strong>El error de proceso más caro:</strong> actualizar React Native y descubrir los problemas <em>compilando</em>. El inventario de compatibilidad se hace <strong>antes</strong> de tocar la versión, sobre el <code>package.json</code> que ya tenés. Toma veinte minutos y te dice si la migración es de una tarde o de un mes.
+</div>
+
+<h2>RNS1.8 Qué NO cambió</h2>
+
+<p>Después de tres secciones de C++, conviene decir lo obvio en voz alta:</p>
+
+<pre><code class="lang-tsx">// Esto se escribe EXACTAMENTE igual que en 2019.
+// Fabric, JSI y TurboModules están debajo, y no se notan.
+import { View, Text, Pressable, StyleSheet } from 'react-native';
+import { useState } from 'react';
+
+export function Contador() {
+  const [n, setN] = useState(0);
+  return (
+    &lt;View style={estilos.caja}&gt;
+      &lt;Text style={estilos.texto}&gt;Contador: {n}&lt;/Text&gt;
+      &lt;Pressable onPress={() =&gt; setN(n + 1)}&gt;
+        &lt;Text&gt;Sumar&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/View&gt;
+  );
+}
+
+const estilos = StyleSheet.create({
+  caja:  { padding: 16, gap: 8 },
+  texto: { fontSize: 18, fontWeight: '600' },
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 La Nueva Arquitectura es infraestructura, no una API nueva.</strong> Componentes, hooks, <code>StyleSheet</code>, flexbox, <code>FlatList</code>, navegación: todo igual. Los que la sienten en el día a día son tres perfiles: quien <strong>escribe módulos nativos</strong>, quien <strong>mantiene librerías</strong>, y quien <strong>persigue milisegundos</strong>. Para el resto, es el piso sobre el que ya está parado.
+</div>
+
+<div class="analogy">
+  <strong>🏗️ La analogía.</strong> Le cambiaron los cimientos y la instalación eléctrica al edificio. Los departamentos se ven igual y se usan igual. Pero ahora el ascensor no se traba, y si querés instalar una máquina industrial en el subsuelo, hay potencia para hacerlo.
+</div>
+
+<h2>RNS1.9 Cómo verificar en qué arquitectura corre tu app</h2>
+
+<p>Nunca lo asumas. Verificalo. Hay tres niveles de verificación, y los tres tienen sentido:</p>
+
+<p><strong>Nivel 1 — Configuración (lo que <em>debería</em> pasar):</strong></p>
+
+<pre><code class="lang-bash"># android/gradle.properties
+newArchEnabled=true          # ⚠️ en 0.82+ esto se IGNORA: siempre es true
+
+# ios/Podfile.properties.json o variable de entorno
+RCT_NEW_ARCH_ENABLED=1
+
+# Versión efectiva de React Native — el dato que manda
+npx react-native --version
+cat node_modules/react-native/package.json | grep '"version"'</code></pre>
+
+<p><strong>Nivel 2 — Runtime (lo que <em>realmente</em> pasa):</strong></p>
+
+<pre><code class="lang-tsx">// src/diagnostico/arquitectura.ts
+// Estos flags globales son INTERNOS y sin garantía de estabilidad entre
+// versiones. Por eso se aíslan acá: si cambian, se toca un solo archivo.
+export type Arquitectura = {
+  bridgeless: boolean;
+  fabric: boolean;
+  motor: string;
+  version: string;
+};
+
+export function inspeccionarArquitectura(): Arquitectura {
+  const g = globalThis as Record&lt;string, unknown&gt;;
+  return {
+    bridgeless: g.RN$Bridgeless === true,
+    fabric: g.nativeFabricUIManager != null,
+    motor: g.HermesInternal != null ? 'Hermes' : 'otro',
+    version: require('react-native/package.json').version,
+  };
+}
+
+// En el arranque de la app, en builds de desarrollo:
+if (__DEV__) console.table(inspeccionarArquitectura());</code></pre>
+
+<p><strong>Nivel 3 — Prueba automatizada (que no se degrade sola):</strong></p>
+
+<pre><code class="lang-tsx">// __tests__/arquitectura.test.ts
+// Lo que no está en CI, se rompe en silencio dentro de seis meses.
+import { inspeccionarArquitectura } from '../src/diagnostico/arquitectura';
+
+describe('arquitectura de ejecución', () =&gt; {
+  it('corre bridgeless con Fabric', () =&gt; {
+    const a = inspeccionarArquitectura();
+    expect(a.bridgeless).toBe(true);
+    expect(a.fabric).toBe(true);
+  });
+
+  it('usa Hermes', () =&gt; {
+    expect(inspeccionarArquitectura().motor).toBe('Hermes');
+  });
+});</code></pre>
+
+<div class="warn">
+  Estos tests <strong>no corren con el mock de Jest por defecto</strong>: en el entorno de Node esos globals no existen. Van en la suite de <strong>integración sobre dispositivo/emulador</strong> (Detox o similar), donde hay un runtime de React Native de verdad. Un test que pasa contra un mock de sí mismo no verifica nada — y es exactamente el tipo de falso positivo que este módulo intenta enseñarte a detectar.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "actualizamos a 0.82 y la app no arranca"</h2>
+
+<blockquote>Una app de logística en producción, React Native 0.79, ~180.000 usuarios. El equipo actualiza a 0.82 para tomar los parches de seguridad. La app <strong>compila</strong> en Android y <strong>crashea al abrir la pantalla de escaneo</strong>. En iOS ni siquiera compila. La pantalla de escaneo usa <code>rn-barcode-legacy@2.3.1</code>, una librería sin commits desde hace dos años.</blockquote>
+
+<p><strong>Paso 1 — Leer el error real, no el primero de la pila.</strong></p>
+
+<pre><code class="lang-bash"># Android: el crash de JS casi nunca es la causa raíz
+adb logcat -s ReactNativeJS:V ReactNative:V AndroidRuntime:E
+
+# Lo que aparece:
+#  Error: TurboModuleRegistry.getEnforcing(...): 'RNBarcodeLegacy'
+#  could not be found. Verify that a module by this name is registered
+#  in the native binary.
+
+# iOS: el error de compilación es más honesto
+xcodebuild -workspace ios/App.xcworkspace -scheme App 2&gt;&amp;1 | grep -A4 "error:"
+#  error: use of undeclared identifier 'RCTBridge'</code></pre>
+
+<div class="info">
+  Los dos errores dicen lo mismo desde ángulos distintos: <strong>la librería se escribió contra el Bridge</strong>. En Android la capa de interop la deja registrarse hasta que algo pide lo que no está; en iOS el símbolo <code>RCTBridge</code> directamente ya no existe y falla al compilar. iOS falla antes y mejor.
+</div>
+
+<p><strong>Paso 2 — Inventario: qué módulos nativos hay y cuáles están listos.</strong> No preguntes librería por librería en Google. Escaneá el <code>node_modules</code> buscando las señales objetivas de soporte:</p>
+
+<pre><code class="lang-js">// scripts/auditar-arquitectura.mjs
+// Heurística: una librería lista para la Nueva Arquitectura declara
+// codegenConfig, y/o su podspec usa install_modules_dependencies.
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+const RAIZ = 'node_modules';
+const paquetes = [];
+
+for (const nombre of readdirSync(RAIZ)) {
+  if (nombre.startsWith('.')) continue;
+  if (nombre.startsWith('@')) {
+    for (const sub of readdirSync(join(RAIZ, nombre))) {
+      paquetes.push(join(nombre, sub));
+    }
+  } else {
+    paquetes.push(nombre);
+  }
+}
+
+const filas = [];
+
+for (const p of paquetes) {
+  const dir = join(RAIZ, p);
+  const pkgPath = join(dir, 'package.json');
+  if (!existsSync(pkgPath)) continue;
+
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  const esNativo =
+    existsSync(join(dir, 'android')) ||
+    existsSync(join(dir, 'ios')) ||
+    readdirSync(dir).some(f =&gt; f.endsWith('.podspec'));
+  if (!esNativo) continue;
+
+  const tieneCodegen = Boolean(pkg.codegenConfig);
+  const podspec = readdirSync(dir).find(f =&gt; f.endsWith('.podspec'));
+  const podspecNuevo = podspec
+    ? readFileSync(join(dir, podspec), 'utf8').includes('install_modules_dependencies')
+    : false;
+
+  filas.push({
+    paquete: p,
+    version: pkg.version,
+    codegen: tieneCodegen ? '✅' : '❌',
+    podspec: podspecNuevo ? '✅' : '❌',
+    veredicto: tieneCodegen || podspecNuevo ? 'OK' : 'REVISAR',
+  });
+}
+
+filas.sort((a, b) =&gt; a.veredicto.localeCompare(b.veredicto));
+console.table(filas);
+console.log(`\n${filas.filter(f =&gt; f.veredicto === 'REVISAR').length} de ${filas.length} requieren revisión manual.`);</code></pre>
+
+<pre><code class="lang-bash">node scripts/auditar-arquitectura.mjs
+
+# Salida (recortada):
+# ┌──────────────────────────┬─────────┬─────────┬─────────┬──────────┐
+# │ paquete                  │ version │ codegen │ podspec │ veredicto│
+# ├──────────────────────────┼─────────┼─────────┼─────────┼──────────┤
+# │ rn-barcode-legacy        │ 2.3.1   │ ❌      │ ❌      │ REVISAR  │
+# │ react-native-fs          │ 2.20.0  │ ❌      │ ❌      │ REVISAR  │
+# │ react-native-reanimated  │ 3.16.1  │ ✅      │ ✅      │ OK       │
+# │ react-native-screens     │ 4.4.0   │ ✅      │ ✅      │ OK       │
+# └──────────────────────────┴─────────┴─────────┴─────────┴──────────┘
+# 2 de 23 requieren revisión manual.</code></pre>
+
+<div class="tip">
+  <strong>Éste es el paso que convierte un mes de incertidumbre en una tarde de trabajo.</strong> Pasás de "no sé qué se va a romper" a "se rompen exactamente dos paquetes, y sé cuáles". Cruzá el resultado con <code>reactnative.directory</code>, que tiene un filtro específico de Nueva Arquitectura mantenido por la comunidad. Guardá el script en el repo: sirve en cada actualización, no solo en ésta.
+</div>
+
+<p><strong>Paso 3 — Las tres salidas, con su costo real.</strong> Para cada paquete en rojo hay exactamente tres opciones:</p>
+
+<table>
+<thead><tr><th>Salida</th><th>Costo</th><th>Riesgo</th><th>Cuándo elegirla</th></tr></thead>
+<tbody>
+<tr><td><strong>A. Actualizar la librería</strong></td><td>Horas, si existe una versión compatible</td><td>Bajo — pero puede traer breaking changes propios</td><td>Siempre que exista. Es la primera que se evalúa.</td></tr>
+<tr><td><strong>B. Escribir un shim / TurboModule propio</strong></td><td>2–5 días por módulo, y lo mantenés vos para siempre</td><td>Medio — código nativo nuevo en tu superficie de bugs</td><td>La librería está muerta pero usás un 10% de su API</td></tr>
+<tr><td><strong>C. Reemplazarla</strong></td><td>1–2 semanas, incluye migrar datos y re-QA</td><td>Alto a corto plazo, <strong>bajo a largo plazo</strong></td><td>Hay una alternativa viva y mantenida</td></tr>
+<tr><td><s>D. Quedarse en 0.81</s></td><td>Cero hoy</td><td><strong>Creciente y sin techo</strong></td><td>Nunca como estrategia; solo como pausa con fecha</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ La opción D se elige sola si no decidís.</strong> Quedarse en la última versión con Bridge parece gratis: no toca código, no rompe nada. El costo aparece después, todo junto: parches de seguridad que no llegan, dependencias que suben su versión mínima, un SDK de Android o iOS que exige una versión más nueva del framework, y la migración que evitaste crece de dos semanas a dos meses. Si elegís esperar, que sea con <strong>fecha en el calendario</strong>, no "cuando haya tiempo".
+</div>
+
+<p><strong>Decisión del equipo:</strong></p>
+<ul>
+  <li><code>react-native-fs</code> → <strong>C</strong>. Existe alternativa mantenida y la superficie de uso era chica (leer y escribir archivos). Una semana.</li>
+  <li><code>rn-barcode-legacy</code> → <strong>B</strong>. Es el corazón del producto, la librería está muerta, no hay reemplazo con la misma precisión de lectura, y la app usa <strong>tres métodos</strong> de las cuarenta y pico que expone. Se escribe un TurboModule que envuelve el SDK nativo directamente.</li>
+</ul>
+
+<p><strong>Paso 4 — El shim: spec primero, implementación después.</strong></p>
+
+<pre><code class="lang-tsx">// src/specs/NativeEscaner.ts
+// Superficie MÍNIMA: exactamente los 3 métodos que la app usa.
+// Cada método extra acá es código nativo que mantenemos para siempre.
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+
+export interface Spec extends TurboModule {
+  iniciar(config: { formatos: string[]; torch: boolean }): Promise&lt;void&gt;;
+  detener(): void;
+  estaDisponible(): boolean;   // síncrono: es una consulta de microsegundos
+}
+
+export default TurboModuleRegistry.getEnforcing&lt;Spec&gt;('Escaner');</code></pre>
+
+<pre><code class="lang-tsx">// src/escaner/index.ts
+// Fachada: el resto de la app NO importa el TurboModule directamente.
+// Si mañana volvemos a una librería de terceros, se toca solo este archivo.
+import Native from '../specs/NativeEscaner';
+
+export const escaner = {
+  disponible: () =&gt; Native.estaDisponible(),
+  iniciar: (formatos: string[] = ['QR', 'EAN_13'], torch = false) =&gt;
+    Native.iniciar({ formatos, torch }),
+  detener: () =&gt; Native.detener(),
+};</code></pre>
+
+<div class="rule">
+  <strong>📌 La fachada no es ceremonia.</strong> Es lo que hace que la <em>próxima</em> decisión sea barata. Toda la app llama a <code>escaner.iniciar()</code>; ninguna pantalla sabe si abajo hay un TurboModule propio, una librería de terceros o un mock. Cambiar de opción B a opción A el día que aparezca un reemplazo digno cuesta un archivo.
+</div>
+
+<p><strong>Paso 5 — Dejar la verificación puesta, para que la decisión no se degrade sola.</strong></p>
+
+<pre><code class="lang-tsx">// e2e/arquitectura.e2e.ts — corre en Detox, sobre un dispositivo real
+import { by, element, expect as detoxExpect, device } from 'detox';
+
+describe('salud de la arquitectura', () =&gt; {
+  beforeAll(async () =&gt; {
+    await device.launchApp({ newInstance: true });
+  });
+
+  it('la app corre bridgeless y con Fabric', async () =&gt; {
+    // La pantalla de diagnóstico (solo en builds internos) muestra
+    // el resultado de inspeccionarArquitectura() con testIDs.
+    await element(by.id('menu-diagnostico')).tap();
+    await detoxExpect(element(by.id('arq-bridgeless'))).toHaveText('true');
+    await detoxExpect(element(by.id('arq-fabric'))).toHaveText('true');
+  });
+
+  it('el escáner responde de forma síncrona', async () =&gt; {
+    // Si el módulo cayera de nuevo en la capa de interop, estaDisponible()
+    // dejaría de ser síncrono y esta pantalla mostraría 'desconocido'.
+    await detoxExpect(element(by.id('escaner-disponible'))).not.toHaveText('desconocido');
+  });
+});</code></pre>
+
+<pre><code class="lang-bash"># Y el inventario entra al CI, para que una dependencia nueva
+# no reintroduzca en silencio un módulo del sistema viejo.
+# package.json:
+#   "scripts": { "audit:arch": "node scripts/auditar-arquitectura.mjs --strict" }
+
+# .github/workflows/ci.yml
+- name: Auditar arquitectura de dependencias nativas
+  run: npm run audit:arch          # sale con código 1 si aparece un REVISAR nuevo</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "escribí un shim".</strong> Es el orden: <strong>(1)</strong> leer el error real y no el primero de la pila, <strong>(2)</strong> convertir la incertidumbre en un inventario con evidencia antes de tocar código, <strong>(3)</strong> elegir por costo total y no por lo que duele menos hoy, y <strong>(4)</strong> dejar una verificación automática, porque una decisión de arquitectura sin test se convierte en folklore en seis meses.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el Bridge ya no existe, ¿por qué <code>NativeModules</code> sigue funcionando en muchas apps?</summary>
+<p>Por la <strong>capa de interop</strong>. React Native incluye una capa de compatibilidad que hace que los NativeModules y ViewManagers escritos para la arquitectura vieja sigan siendo invocables sobre la Nueva Arquitectura. Es una rampa de migración deliberada, no un Bridge disfrazado: no hay serialización a JSON ni cola asíncrona por debajo. Pero el módulo que pasa por ahí <strong>no obtiene ninguno de los beneficios</strong>: se inicializa en el arranque en vez de perezosamente, no puede exponer métodos síncronos, y no tiene contrato verificado por Codegen. Si migraste y no ves la mejora de arranque, la primera hipótesis es que tus módulos siguen entrando por la rampa. Y todo lo que tocaba <code>RCTBridge</code> <em>directamente</em> desde código nativo sí se rompe, sin rampa que valga.</p></details>
+
+<details><summary>¿Por qué JSI es un requisito para que Fabric y TurboModules existan, y no al revés?</summary>
+<p>Porque JSI es lo que permite que exista una <strong>referencia</strong> a un objeto nativo del lado de JS, en vez de un identificador que hay que despachar por una cola. TurboModules son, literalmente, HostObjects instalados en el runtime: sin JSI no hay forma de que <code>InfoDispositivo.obtenerId()</code> devuelva un valor en la misma expresión. Fabric necesita lo mismo para consultar el shadow tree en C++ de forma síncrona (medir layout) y para que React pueda mandar mutaciones sin pasar por una cola que no se puede cancelar. JSI es la capa 0; los otros dos son consumidores de esa capa. Por eso una librería como Reanimated, que ya usaba JSI desde antes, se adaptó a la Nueva Arquitectura mucho mejor que una que hablaba solo el protocolo del Bridge.</p></details>
+
+<details><summary>Estás en 0.83, ponés <code>newArchEnabled=false</code>, recompilás y el comportamiento no cambia. ¿Qué está pasando?</summary>
+<p>Exactamente lo esperado: <strong>desde 0.82 esa propiedad se ignora</strong>. El Bridge fue eliminado del framework, así que no hay un sistema viejo al que volver — el flag quedó como un residuo que no configura nada. Perder tiempo depurando por qué "no toma el flag" es uno de los errores más caros de esta migración, porque es una hipótesis que se siente razonable y consume días. La verificación correcta no es leer <code>gradle.properties</code> (config), sino consultar el runtime: <code>global.RN$Bridgeless</code> y <code>global.nativeFabricUIManager</code>. Config y runtime son cosas distintas, y cuando difieren, la que manda es el runtime. La única decisión real disponible en 0.82+ es <strong>en qué versión de React Native te quedás</strong>, no qué arquitectura usás.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>Bridge</strong> —cola asíncrona con serialización a JSON— <strong>fue eliminado en 0.82</strong>. Casi todo el material que vas a encontrar en internet lo explica como si todavía existiera. <code>newArchEnabled=false</code> hoy <strong>se ignora</strong>: no hay camino de vuelta.</li>
+  <li><strong>JSI</strong> es la capa 0: una API de C++ que le da a JS referencias directas a objetos nativos (<code>HostObject</code>) invocables <strong>de forma síncrona</strong>. Todo lo demás se apoya en eso. Con esa potencia viene la responsabilidad: una llamada síncrona lenta bloquea el hilo de JS.</li>
+  <li><strong>TurboModules</strong> = módulos nativos sobre JSI, con <strong>carga perezosa</strong> (de ahí buena parte del arranque más rápido) y contrato tipado verificado en build. <code>getEnforcing</code> falla claro y temprano; <code>NativeModules</code> fallaba con <code>undefined</code> en producción.</li>
+  <li><strong>Fabric</strong> = renderer con el <strong>shadow tree inmutable en C++</strong>, compartido entre plataformas. Habilita concurrent rendering de verdad, medición síncrona de layout y view flattening. No acelera tu código lento: sube el techo.</li>
+  <li><strong>Codegen</strong> genera las interfaces nativas desde los specs de TS/Flow. Un desajuste de contrato <strong>rompe la compilación</strong> en vez de romper en producción. La <strong>Strict TypeScript API</strong> de <strong>0.86</strong> extiende la idea a los tipos públicos, generándolos del código fuente.</li>
+  <li>Números de producción reportados: <strong>43% más rápido el arranque en frío, 39% mejor rendimiento de render, 25% menos memoria</strong>. Ecosistema ~90% compatible (React Navigation 7.2+, Reanimated 3.5.1+, Gesture Handler 2.16.2+, Vision Camera 4.0+, Detox; Expo SDK 52+ por default).</li>
+  <li><strong>Migrar</strong> se planifica con un <strong>inventario antes de tocar la versión</strong>: escaneá <code>node_modules</code> buscando <code>codegenConfig</code> y podspecs modernos. Tres salidas por paquete roto — actualizar, envolver con un shim, reemplazar — y la cuarta (no hacer nada) se elige sola si no decidís.</li>
+  <li><strong>Lo que NO cambió:</strong> seguís escribiendo React. Componentes, hooks, <code>StyleSheet</code>, navegación: idénticos. Esto es infraestructura.</li>
+  <li><strong>Verificá siempre en runtime</strong>, no en la config: <code>global.RN$Bridgeless</code> y <code>global.nativeFabricUIManager</code>, aislados en un módulo propio y cubiertos por un test de integración sobre dispositivo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Escribí el módulo <code>src/diagnostico/arquitectura.ts</code> de RNS1.9 en un proyecto real y agregá una pantalla de diagnóstico visible solo con <code>__DEV__</code>. Corrélo en Android y en iOS y compará el resultado con lo que dicen <code>gradle.properties</code> y el <code>Podfile</code>. Si config y runtime no coinciden, explicá por qué.</li>
+  <li>Adaptá el script <code>auditar-arquitectura.mjs</code> del worked example y corrélo sobre el proyecto más grande al que tengas acceso. Armá la tabla de resultados reales y clasificá cada paquete en rojo con una de las tres salidas (A/B/C), estimando el costo en días. No lo resuelvas: solo producí el inventario con evidencia.</li>
+  <li>Escribí el spec de TurboModule para un módulo hipotético de "preferencias del usuario" con al menos un método síncrono, uno asíncrono y uno que reciba un objeto. Después intentá <strong>a propósito</strong> meter un tipo que Codegen no soporte (por ejemplo <code>string | number</code>) y documentá el mensaje de error exacto que da.</li>
+  <li>Tomá una <code>FlatList</code> con al menos 1.000 elementos y una fila que haga trabajo pesado en el render. Medí el scroll, después envolvé el filtrado con <code>useDeferredValue</code> y volvé a medir. Explicá con números por qué mejoró o por qué <strong>no</strong> mejoró, conectándolo con la advertencia de RNS1.4.</li>
+  <li>Buscá en tu proyecto todo el código que asume el sistema viejo: <code>grep -rn "__fbBatchedBridge\|MessageQueue\|nativeCallSyncHook\|NativeModules\." src/</code>. Para cada resultado, decidí si es un uso legítimo vía interop, un residuo a borrar, o un módulo que hay que migrar a TurboModule.</li>
+  <li>Escribí la explicación de la Nueva Arquitectura en <strong>un párrafo, sin usar la palabra "puente"</strong>, dirigida a alguien que sabe React web pero nunca tocó React Native. Es más difícil de lo que parece, y es el mejor test de si lo entendiste.</li>
+  <li>Elegí una librería de <code>reactnative.directory</code> marcada como compatible con la Nueva Arquitectura, abrí su repositorio y encontrá tres cosas: su <code>codegenConfig</code>, al menos un archivo <code>Native*.ts</code> de spec, y el commit o PR donde hicieron la migración. Leé ese diff: es la mejor documentación gratuita que existe sobre cómo se migra de verdad.</li>
+</ol>
+
+<section class="quiz" id="quizRNS1">
+  <style>
+    #quizRNS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS1 .q{margin-bottom:1.5rem}
+    #quizRNS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS1 .opt:hover{border-color:var(--accent)}
+    #quizRNS1 .opt:disabled{cursor:default}
+    #quizRNS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS1 .exp.show{display:block}
+    #quizRNS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu app corre en React Native 0.83. Un compañero propone poner <code>newArchEnabled=false</code> en <code>gradle.properties</code> para "descartar que el problema sea la Nueva Arquitectura". ¿Qué le decís?</p>
+    <button class="opt">Que está bien, pero que hay que hacer lo mismo en el <code>Podfile</code> para que aplique en iOS</button>
+    <button class="opt">Que va a funcionar, aunque conviene borrar la carpeta <code>build/</code> primero</button>
+    <button class="opt">Que desde 0.82 esa propiedad se ignora: el Bridge fue eliminado y no hay sistema viejo al que volver</button>
+    <div class="exp">React Native <strong>0.82 eliminó el Bridge por completo</strong>. El flag quedó como residuo y no configura nada. Depurar por qué "no toma el flag" puede costar días sobre una hipótesis que se siente razonable. La verificación correcta es de <strong>runtime</strong>, no de config: <code>global.RN$Bridgeless</code> y <code>global.nativeFabricUIManager</code>. Cuando la configuración y el runtime dicen cosas distintas, manda el runtime.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Migraste a la Nueva Arquitectura y el arranque en frío casi no mejoró, aunque los benchmarks públicos hablan de ~43%. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">Tus módulos nativos siguen entrando por la capa de interop, así que no tienen carga perezosa</button>
+    <button class="opt">Fabric solo acelera el render, nunca el arranque</button>
+    <button class="opt">Falta habilitar Hermes: sin Hermes la Nueva Arquitectura no aporta nada</button>
+    <div class="exp">Buena parte de la mejora de arranque viene de que los <strong>TurboModules se instancian al primer uso</strong> en vez de todos al iniciar. Un módulo que corre por la <strong>capa de interop</strong> sigue registrándose como antes: no es perezoso, no es síncrono y no está tipado. La capa de interop es una rampa de migración, no un destino — verificalo auditando cuáles de tus dependencias nativas declaran <code>codegenConfig</code>.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Escribís un TurboModule y exponés <code>leerPerfilCompleto(): string</code> como método <strong>síncrono</strong>, porque JSI lo permite. Internamente lee un archivo de 8 MB del disco. ¿Cuál es el problema?</p>
+    <button class="opt">Ninguno: JSI está hecho justamente para eliminar la asincronía innecesaria</button>
+    <button class="opt">Una llamada síncrona por JSI bloquea el hilo de JS mientras dura, así que congelás la UI</button>
+    <button class="opt">Codegen no permite devolver <code>string</code> de forma síncrona, va a fallar la compilación</button>
+    <div class="exp">JSI te da la <em>posibilidad</em> de ser síncrono, no la obligación. Una llamada síncrona corre en el hilo de JS y lo <strong>bloquea</strong> hasta terminar: 8 MB de disco son decenas o cientos de milisegundos de app congelada. Lo síncrono es para operaciones de microsegundos —leer una preferencia, consultar un caché en memoria, obtener una medida—; todo lo que involucre disco grande, red o cómputo pesado sigue siendo asíncrono, y está bien que lo sea.</div>
+  </div>
+
+  <div class="score" id="scoreRNS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../rns2-rendimiento/lecture.html">RNS2: Rendimiento nativo →</a>
+</nav>
+
+</div>
+</body>
+</html>

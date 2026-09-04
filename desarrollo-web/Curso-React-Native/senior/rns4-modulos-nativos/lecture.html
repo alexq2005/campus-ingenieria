@@ -1,0 +1,1223 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS4 — Módulos nativos propios: TurboModules y Codegen · React Native Senior</title>
+  <meta name="description" content="Cuándo bajar a nativo y cuándo no, Codegen y la spec en TypeScript como fuente de la verdad, anatomía de un TurboModule en Kotlin y Swift, tipos soportados, síncrono vs asíncrono, Fabric Components, Expo Modules API, testeo, distribución y depuración de módulos de terceros.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS4</span>
+  <span class="badge">⏱ 45–125 min</span>
+  <span class="badge">🎯 Pre-req: RNS1</span>
+  <span class="badge">🔧 Nativo</span>
+</div>
+
+<article>
+
+<h1>RNS4 — Módulos nativos propios: TurboModules y Codegen</h1>
+
+<h2>RNS4.0 Por qué este módulo</h2>
+
+<p>Arranco con la parte incómoda: <strong>el 95% de las veces que creés que necesitás un módulo nativo, no lo necesitás</strong>. Hay una librería. Está en npm, la mantiene alguien, resuelve tu problema, y lo resuelve mejor de lo que lo vas a resolver vos en tres días peleándote con Gradle y con un <code>podspec</code>.</p>
+
+<p>Entonces, ¿por qué dedicarle un módulo entero? Por dos razones, y la segunda es la que de verdad te va a pagar el sueldo:</p>
+
+<ol>
+  <li><strong>Existe el 5% restante.</strong> Un SDK que el proveedor publica solo como binario nativo. Un sensor que ninguna librería expone. Una librería que sí existe pero que quedó en la arquitectura vieja y ya no compila. Un algoritmo cuyo costo en JS es prohibitivo y lo medís, no lo suponés.</li>
+  <li><strong>Vas a <em>usar</em> módulos nativos de terceros todos los días, y se rompen.</strong> El día que una librería crashea solo en release de Android, la diferencia entre un dev mid y uno senior es que el senior abre el <code>.kt</code>, lee, encuentra la línea, y escribe el <em>patch</em> o el PR. No espera seis semanas a que el mantenedor conteste.</li>
+</ol>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Escribir un TurboModule y leer el TurboModule de otra persona son <em>la misma habilidad</em>. Aprendés a escribir uno no porque vayas a escribir muchos, sino porque después de escribir uno dejás de ver <code>node_modules/&lt;lo-que-sea&gt;/android/</code> como una caja negra. Eso es lo que cambia tu techo como desarrollador de React Native.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>: el terreno se movió y buena parte de lo que vas a encontrar googleando ya es arqueología. <strong>React Native 0.82 eliminó el Bridge y los <code>NativeModules</code> viejos</strong>. No están deprecados: <em>no están</em>. Todo tutorial que hable de <code>RCTBridgeModule</code>, de <code>RCT_EXPORT_METHOD</code> sobre el bridge, o de leer <code>NativeModules.MiModulo</code> describe un sistema que ya no existe. Lo que hay hoy es <strong>TurboModules + Codegen</strong>, y desde <strong>0.86</strong> la <strong>Strict TypeScript API</strong>. Expo SDK 52 en adelante viene con la Nueva Arquitectura por defecto.</p>
+
+<h2>RNS4.1 Cuándo bajar a nativo, y cuándo definitivamente no</h2>
+
+<p>Esta es la tabla que deberías tener a mano antes de abrir Android Studio. Es honesta: la mayoría de las filas dicen que no.</p>
+
+<table>
+  <thead>
+    <tr><th>Situación</th><th>¿Nativo?</th><th>Razón</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Una API del sistema operativo sin ningún wrapper mantenido</td><td><strong>Sí</strong></td><td>Es la única puerta. No hay alternativa en JS.</td></tr>
+    <tr><td>Un SDK de un tercero que solo se distribuye como <code>.aar</code> / <code>.xcframework</code></td><td><strong>Sí</strong></td><td>Pagos, biometría de un fabricante, lectores de tarjetas, telemetría de un OEM.</td></tr>
+    <tr><td>Trabajo CPU-bound imposible en JS, <em>medido</em></td><td><strong>Sí</strong></td><td>Procesar cada frame de la cámara, criptografía pesada, decodificar un formato propietario.</td></tr>
+    <tr><td>Necesitás un hilo con garantías que JS no tiene (audio en tiempo real)</td><td><strong>Sí</strong></td><td>El hilo de JS no da latencia determinista. No es cuestión de optimizar.</td></tr>
+    <tr><td>La librería existe pero quedó en la arquitectura vieja y no compila</td><td><strong>Sí, o forkeala</strong></td><td>Caso muy común en 2026. Primero mirá si hay un fork vivo; puede ser 20 líneas de migración.</td></tr>
+    <tr><td>Existe una librería mantenida que hace el 90% de lo que necesitás</td><td><strong>No</strong></td><td>Contribuí el 10% que falta. Sale más barato que mantener dos plataformas.</td></tr>
+    <tr><td>Existe la librería pero "no me gusta su API"</td><td><strong>No</strong></td><td>Envolvela en un módulo de JS de 30 líneas con la API que te gusta.</td></tr>
+    <tr><td>"Nativo va a ser más rápido", sin haber perfilado</td><td><strong>No</strong></td><td>Casi siempre el cuello está en el render, en la lista o en la red. Ver RNS2.</td></tr>
+    <tr><td>Querés evitar sumar una dependencia</td><td><strong>No</strong></td><td>Cambiás una dependencia por código propio en dos lenguajes. Ese trueque casi nunca conviene.</td></tr>
+  </tbody>
+</table>
+
+<div class="warn">
+  <strong>El costo real de un módulo nativo no es escribirlo: es mantenerlo.</strong> Cada versión de React Native puede romperte la compilación. Cada nueva versión de Android puede cambiar el comportamiento de un permiso. Cada release de Xcode puede pedirte otra cosa. Un módulo nativo propio es un compromiso de años, en dos lenguajes, con dos toolchains, y con dos flotas de dispositivos donde probarlo. Escribilo cuando <em>tengas</em> que hacerlo, no cuando <em>quieras</em>.
+</div>
+
+<div class="rule">
+  <strong>📌 Regla de decisión.</strong> Antes de la primera línea de Kotlin, escribí en el PR o en el issue: <strong>(a)</strong> qué API o SDK necesitás exactamente; <strong>(b)</strong> qué librerías evaluaste y por qué ninguna sirve —con nombre y versión, no "no encontré nada"—; <strong>(c)</strong> si el motivo es rendimiento, el número medido y el número objetivo; <strong>(d)</strong> quién lo mantiene cuando vos no estés. Si no podés completar las cuatro, todavía no estás listo para escribirlo.
+</div>
+
+<h2>RNS4.2 Codegen: la especificación en TypeScript manda</h2>
+
+<p>Este es <em>el</em> cambio conceptual respecto de la arquitectura vieja, y conviene decirlo con todas las letras.</p>
+
+<p><strong>Antes:</strong> escribías el código nativo, lo marcabas con macros para exportarlo, y del lado de JS lo llamabas "a ciegas" a través de un objeto sin tipos. Si le pasabas un string donde esperaba un número, te enterabas en runtime, en un dispositivo, con un mensaje horrible.</p>
+
+<p><strong>Ahora:</strong> escribís un <strong>contrato en TypeScript</strong>, y <strong>Codegen</strong> —una herramienta que corre en tiempo de build— genera a partir de ese contrato las <em>clases base nativas de ambas plataformas</em>. Vos no escribís la clase: implementás la que se generó. Si tu implementación no coincide con el contrato, <strong>no compila</strong>.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> La spec de Codegen es a un módulo nativo lo que un archivo <code>.proto</code> es a gRPC, o lo que un esquema OpenAPI es a un cliente generado. La fuente de la verdad es un archivo de tipos, y las dos puntas se derivan de ahí. La dirección del flujo importa: <strong>del TypeScript hacia lo nativo</strong>, nunca al revés.
+</div>
+
+<h3>Una spec real</h3>
+
+<p>Este es el archivo entero. Es todo lo que hay que escribir para definir el contrato:</p>
+
+<pre><code class="lang-tsx">// src/NativeProximity.ts
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+import type { EventEmitter } from 'react-native/Libraries/Types/CodegenTypes';
+
+export type ProximityEvent = {
+  near: boolean;
+  distanceCm: number | null;   // null en iOS: el SO no lo expone
+  timestamp: number;
+};
+
+export interface Spec extends TurboModule {
+  /** ¿El dispositivo tiene sensor de proximidad usable? Barato, cacheado. */
+  isAvailable(): boolean;
+
+  /** Enciende el sensor y resuelve con la primera lectura. Toca hardware. */
+  start(): Promise&lt;ProximityEvent&gt;;
+
+  /** Apaga el sensor. */
+  stop(): void;
+
+  /** Última muestra en memoria. NO toca hardware: por eso puede ser síncrona. */
+  getLastSample(): ProximityEvent | null;
+
+  /** Evento tipado: Codegen genera el emisor nativo. */
+  readonly onProximityChange: EventEmitter&lt;ProximityEvent&gt;;
+}
+
+export default TurboModuleRegistry.getEnforcing&lt;Spec&gt;('NativeProximity');
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Las reglas del archivo de spec, que no son negociables.</strong>
+  <ul>
+    <li>El nombre del archivo <strong>tiene que empezar con <code>Native</code></strong> (para TurboModules) o terminar en <code>NativeComponent</code> (para vistas Fabric). Codegen los descubre por el nombre del archivo, no por su contenido.</li>
+    <li>Tiene que exportar una interfaz llamada exactamente <strong><code>Spec</code></strong> que extienda <code>TurboModule</code>.</li>
+    <li>El <code>export default</code> tiene que ser la llamada a <code>TurboModuleRegistry</code>.</li>
+    <li>No pongas lógica en este archivo. Es un contrato, no un módulo. La API "linda" para tus usuarios va en otro archivo que importa a este.</li>
+  </ul>
+</div>
+
+<p><code>getEnforcing</code> lanza un error claro si el módulo nativo no está registrado. Existe también <code>TurboModuleRegistry.get()</code>, que devuelve <code>null</code> en ese caso: usalo solo cuando el módulo es genuinamente opcional y tenés un camino alternativo escrito, no para "que no explote".</p>
+
+<h3>Prender Codegen</h3>
+
+<p>Codegen no adivina: se configura en el <code>package.json</code> de tu librería o de tu app.</p>
+
+<pre><code class="lang-tsx">{
+  "name": "react-native-proximity",
+  "version": "1.0.0",
+  "codegenConfig": {
+    "name": "RNProximitySpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.rnproximity"
+    },
+    "ios": {
+      "componentProvider": {}
+    }
+  }
+}</code></pre>
+
+<ul>
+  <li><code>name</code>: el nombre de la librería generada (Android) y del <em>pod</em> de specs (iOS). Por convención termina en <code>Spec</code>.</li>
+  <li><code>type</code>: <code>"modules"</code> (TurboModules), <code>"components"</code> (vistas Fabric) o <code>"all"</code>.</li>
+  <li><code>jsSrcsDir</code>: la carpeta que Codegen escanea buscando archivos <code>Native*.ts</code>.</li>
+  <li><code>javaPackageName</code>: el paquete Java/Kotlin donde va a quedar la clase abstracta generada. <strong>Tu implementación tiene que vivir en ese mismo paquete o importarla explícitamente.</strong></li>
+</ul>
+
+<p>Corre solo durante el build, pero podés dispararlo a mano para ver qué produce —y deberías, al menos una vez en la vida:</p>
+
+<pre><code class="lang-bash"># Genera el código nativo sin compilar la app entera
+npx react-native codegen
+
+# Android: queda acá
+ls android/app/build/generated/source/codegen/java/com/rnproximity/
+
+# iOS: queda acá (después de pod install)
+ls ios/build/generated/ios/</code></pre>
+
+<p>Del lado de Android, lo que sale es una clase abstracta como esta (recortada). Fijate que <strong>ya tiene los tipos</strong>: no hay un <code>ReadableMap</code> genérico donde debería haber un booleano.</p>
+
+<pre><code class="lang-kotlin">// GENERADO — no lo edites
+package com.rnproximity
+
+abstract class NativeProximitySpec(reactContext: ReactApplicationContext) :
+    ReactContextBaseJavaModule(reactContext), TurboModule {
+
+  abstract fun isAvailable(): Boolean
+  abstract fun start(promise: Promise)
+  abstract fun stop()
+  abstract fun getLastSample(): WritableMap?
+
+  // el emisor del evento también viene generado
+  fun emitOnProximityChange(value: WritableMap) { /* ... */ }
+}</code></pre>
+
+<div class="info">
+  <strong>Novedad de RN 0.86: la Strict TypeScript API.</strong> Hasta ahora Codegen leía un subconjunto acotado de TypeScript con reglas propias, y era fácil escribir tipos válidos para <code>tsc</code> que Codegen no entendía. Con la Strict TypeScript API, los tipos nativos se generan <strong>directamente desde el código fuente</strong> con la misma semántica de tipos que usa TypeScript, lo que reduce mucho la clase de errores "compila en TS pero Codegen no lo soporta". Si arrancás un módulo hoy, arrancalo sobre esta API.
+</div>
+
+<h2>RNS4.3 Anatomía de un TurboModule, capa por capa</h2>
+
+<p>Un TurboModule son cinco piezas. La primera ya la escribimos.</p>
+
+<table>
+  <thead><tr><th>#</th><th>Pieza</th><th>Dónde vive</th><th>Quién la escribe</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>La spec</td><td><code>src/NativeX.ts</code></td><td>Vos</td></tr>
+    <tr><td>2</td><td>La clase base nativa</td><td><code>build/generated/...</code></td><td><strong>Codegen</strong></td></tr>
+    <tr><td>3</td><td>La implementación Android</td><td><code>android/src/main/java/...</code></td><td>Vos, en Kotlin</td></tr>
+    <tr><td>4</td><td>La implementación iOS</td><td><code>ios/</code></td><td>Vos, en Swift + un puente ObjC++</td></tr>
+    <tr><td>5</td><td>El registro (package / <code>RCT_EXPORT_MODULE</code>)</td><td>Ambas plataformas</td><td>Vos, una vez</td></tr>
+  </tbody>
+</table>
+
+<h3>Android: implementar la clase generada</h3>
+
+<pre><code class="lang-kotlin">package com.rnproximity
+
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.module.annotations.ReactModule
+
+@ReactModule(name = ProximityModule.NAME)
+class ProximityModule(reactContext: ReactApplicationContext) :
+    NativeProximitySpec(reactContext), SensorEventListener {
+
+  companion object {
+    // TIENE que coincidir con el string de getEnforcing() en la spec
+    const val NAME = "NativeProximity"
+  }
+
+  private val sensorManager =
+      reactContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+  private val sensor: Sensor? =
+      sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+
+  private var lastSample: WritableMap? = null
+  private var pendingStart: Promise? = null
+
+  override fun getName() = NAME
+
+  override fun isAvailable(): Boolean = sensor != null
+
+  override fun start(promise: Promise) {
+    val s = sensor ?: return promise.reject(
+        "E_NO_SENSOR", "Este dispositivo no tiene sensor de proximidad")
+    pendingStart = promise
+    sensorManager.registerListener(this, s, SensorManager.SENSOR_DELAY_NORMAL)
+  }
+
+  override fun stop() {
+    sensorManager.unregisterListener(this)
+    pendingStart = null
+  }
+
+  override fun getLastSample(): WritableMap? = lastSample?.copy()
+
+  override fun onSensorChanged(event: SensorEvent) {
+    val cm = event.values[0].toDouble()
+    val max = sensor?.maximumRange?.toDouble() ?: cm
+    val map = Arguments.createMap().apply {
+      putBoolean("near", cm &lt; max)
+      putDouble("distanceCm", cm)
+      putDouble("timestamp", System.currentTimeMillis().toDouble())
+    }
+    lastSample = map
+    pendingStart?.resolve(map.copy()); pendingStart = null
+    emitOnProximityChange(map.copy())   // método generado por Codegen
+  }
+
+  override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { /* no aplica */ }
+
+  override fun invalidate() {   // se llama cuando muere el contexto de React
+    stop()
+    super.invalidate()
+  }
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error de novato #1 en Android:</strong> registrar un listener del sistema y no desregistrarlo nunca. Un <code>SensorEventListener</code>, un <code>BroadcastReceiver</code> o un <code>LocationListener</code> vivo mantiene una referencia a tu módulo, que mantiene una referencia al <code>ReactApplicationContext</code>, que mantiene la <code>Activity</code>. Resultado: fuga de memoria que sobrevive a recargas de Fast Refresh y a rotaciones de pantalla. <strong>Siempre sobreescribí <code>invalidate()</code> y limpiá ahí.</strong>
+</div>
+
+<p>Falta registrarlo. En la Nueva Arquitectura se hace con un <code>BaseReactPackage</code>, que a diferencia del viejo <code>ReactPackage</code> crea los módulos <strong>a demanda</strong> —esa es una de las ganancias de arranque de TurboModules: el módulo no se instancia hasta que JS lo pide por primera vez.</p>
+
+<pre><code class="lang-kotlin">package com.rnproximity
+
+import com.facebook.react.BaseReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.module.model.ReactModuleInfo
+import com.facebook.react.module.model.ReactModuleInfoProvider
+
+class ProximityPackage : BaseReactPackage() {
+
+  override fun getModule(name: String, ctx: ReactApplicationContext): NativeModule? =
+      if (name == ProximityModule.NAME) ProximityModule(ctx) else null
+
+  override fun getReactModuleInfoProvider() = ReactModuleInfoProvider {
+    mapOf(
+      ProximityModule.NAME to ReactModuleInfo(
+        ProximityModule.NAME,          // name
+        ProximityModule.NAME,          // className
+        false,                         // canOverrideExistingModule
+        false,                         // needsEagerInit
+        false,                         // isCxxModule
+        true                           // isTurboModule
+      )
+    )
+  }
+}</code></pre>
+
+<h3>iOS: Swift para la lógica, ObjC++ para el puente</h3>
+
+<p>Acá viene el detalle que ningún tutorial corto te cuenta: <strong>la clase base que genera Codegen para iOS es un protocolo de Objective-C acompañado de una clase C++</strong> (<code>NativeProximitySpecJSI</code>). Swift no puede conformar directamente a esa mezcla. El patrón real, el que usan las librerías serias, es de dos archivos: la lógica en Swift, y un <code>.mm</code> (Objective-C++) finito que hace de puente.</p>
+
+<pre><code class="lang-swift">// ios/ProximityCore.swift — toda la lógica vive acá, en Swift limpio
+import Foundation
+import UIKit
+
+@objc public class ProximityCore: NSObject {
+
+  @objc public static let shared = ProximityCore()
+
+  @objc public var onChange: (([String: Any]) -&gt; Void)?
+  private(set) var lastSample: [String: Any]?
+
+  @objc public func isAvailable() -&gt; Bool {
+    // iOS no expone el sensor crudo: se prende el monitoreo y se pregunta.
+    let device = UIDevice.current
+    device.isProximityMonitoringEnabled = true
+    let ok = device.isProximityMonitoringEnabled
+    device.isProximityMonitoringEnabled = false
+    return ok
+  }
+
+  @objc public func start() {
+    UIDevice.current.isProximityMonitoringEnabled = true
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(proximityChanged),
+      name: UIDevice.proximityStateDidChangeNotification,
+      object: nil)
+    proximityChanged()   // primera muestra inmediata
+  }
+
+  @objc public func stop() {
+    NotificationCenter.default.removeObserver(self)
+    UIDevice.current.isProximityMonitoringEnabled = false
+  }
+
+  @objc public func getLastSample() -&gt; [String: Any]? { lastSample }
+
+  @objc private func proximityChanged() {
+    let sample: [String: Any] = [
+      "near": UIDevice.current.proximityState,
+      "distanceCm": NSNull(),          // iOS NO da la distancia. Y está bien.
+      "timestamp": Date().timeIntervalSince1970 * 1000
+    ]
+    lastSample = sample
+    onChange?(sample)
+  }
+}</code></pre>
+
+<p>Y el puente. Es corto a propósito: cuanto más finito el <code>.mm</code>, menos código incómodo tenés que mantener.</p>
+
+<pre><code class="lang-swift">// ios/Proximity.mm — Objective-C++, solo pegamento
+#import "Proximity.h"
+#import "react_native_proximity-Swift.h"   // header generado desde Swift
+
+@implementation Proximity
+
+RCT_EXPORT_MODULE(NativeProximity)
+
+- (NSNumber *)isAvailable {
+  return @([ProximityCore.shared isAvailable]);
+}
+
+- (void)start:(RCTPromiseResolveBlock)resolve
+       reject:(RCTPromiseRejectBlock)reject {
+  ProximityCore.shared.onChange = ^(NSDictionary *sample) {
+    [self emitOnProximityChange:sample];
+  };
+  [ProximityCore.shared start];
+  resolve([ProximityCore.shared getLastSample]);
+}
+
+- (void)stop { [ProximityCore.shared stop]; }
+
+- (NSDictionary *)getLastSample { return [ProximityCore.shared getLastSample]; }
+
+// Esto es lo que conecta la clase con el JSI generado por Codegen
+- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)getTurboModule:
+    (const facebook::react::ObjCTurboModule::InitParams &amp;)params {
+  return std::make_shared&lt;facebook::react::NativeProximitySpecJSI&gt;(params);
+}
+
+@end</code></pre>
+
+<div class="tip">
+  <strong>Este puente de ObjC++ es exactamente el dolor que la Expo Modules API elimina</strong> (RNS4.7). Si tu módulo no necesita control fino sobre el JSI, ese es un argumento fuerte para no escribir un TurboModule puro.
+</div>
+
+<h3>Registro y autolinking</h3>
+
+<p>En Android hay que sumar el <code>ProximityPackage</code>. Si es una librería publicada, el <strong>autolinking</strong> lo hace por vos leyendo el <code>package.json</code>: no toques <code>MainApplication.kt</code>. En iOS, <code>RCT_EXPORT_MODULE(NativeProximity)</code> registra el módulo con ese nombre y CocoaPods hace el resto.</p>
+
+<pre><code class="lang-bash"># Después de tocar la spec o el codegenConfig, SIEMPRE:
+cd ios &amp;&amp; bundle exec pod install &amp;&amp; cd ..
+
+# Y en Android, cuando el generado quedó viejo:
+cd android &amp;&amp; ./gradlew clean &amp;&amp; cd ..
+
+# Verificar que el módulo quedó registrado, desde la app:
+# console.log(require('./src/NativeProximity').default.isAvailable())</code></pre>
+
+<div class="mistake">
+  <strong>"Cambié la spec y no pasa nada".</strong> El 90% de las veces es que Codegen no volvió a correr. La spec es una entrada de build, no un archivo que Metro recargue: Fast Refresh no la mira. Después de tocar un archivo <code>Native*.ts</code> o el <code>codegenConfig</code>, hay que <strong>recompilar la app nativa</strong>, y en iOS correr <code>pod install</code> otra vez.
+</div>
+
+<h2>RNS4.4 Tipos soportados: qué cruza el borde y qué no</h2>
+
+<p>JSI eliminó el bridge JSON asíncrono, pero <strong>no eliminó la conversión</strong>. Cuando pasás un objeto de JS a Kotlin, alguien construye un <code>ReadableMap</code>; cuando volvés, alguien construye un objeto de JS. Eso cuesta, y cuesta proporcional al tamaño del dato. La frase "con JSI ya no hay serialización" es marketing: lo que desapareció es el <em>batching</em> asíncrono, no la traducción.</p>
+
+<table>
+  <thead><tr><th>TypeScript</th><th>Kotlin</th><th>Swift / ObjC</th><th>Nota</th></tr></thead>
+  <tbody>
+    <tr><td><code>boolean</code></td><td><code>Boolean</code></td><td><code>NSNumber</code> / <code>Bool</code></td><td>—</td></tr>
+    <tr><td><code>number</code></td><td><code>Double</code></td><td><code>NSNumber</code> / <code>Double</code></td><td><strong>Siempre double</strong>. No hay enteros.</td></tr>
+    <tr><td><code>string</code></td><td><code>String</code></td><td><code>NSString</code></td><td>—</td></tr>
+    <tr><td>objeto tipado</td><td><code>ReadableMap</code> / <code>WritableMap</code></td><td><code>NSDictionary</code></td><td>Definilo con un <code>type</code>, no con <code>Object</code>.</td></tr>
+    <tr><td><code>Array&lt;T&gt;</code></td><td><code>ReadableArray</code></td><td><code>NSArray</code></td><td>Homogéneo. Nada de tuplas mixtas.</td></tr>
+    <tr><td><code>Promise&lt;T&gt;</code></td><td><code>Promise</code></td><td>resolve / reject blocks</td><td>El método pasa a ser asíncrono.</td></tr>
+    <tr><td><code>() =&gt; void</code></td><td><code>Callback</code></td><td><code>RCTResponseSenderBlock</code></td><td>Se puede llamar <strong>una sola vez</strong>.</td></tr>
+    <tr><td><code>T | null</code></td><td>tipo <code>?</code> nullable</td><td>opcional / <code>NSNull</code></td><td>Modelá el vacío explícitamente.</td></tr>
+    <tr><td><code>EventEmitter&lt;T&gt;</code></td><td><code>emitOnX(...)</code></td><td><code>[self emitOnX:...]</code></td><td>Codegen genera el emisor tipado.</td></tr>
+  </tbody>
+</table>
+
+<p>Y lo que <strong>no</strong> cruza, por más que TypeScript te deje escribirlo:</p>
+
+<ul>
+  <li><code>Date</code> — pasá milisegundos como <code>number</code> o un ISO-8601 como <code>string</code>.</li>
+  <li><code>Map</code>, <code>Set</code>, <code>bigint</code>, <code>symbol</code>, <code>unknown</code>.</li>
+  <li>Uniones arbitrarias (<code>string | number</code>). Las uniones de literales de string tienen soporte parcial; si dudás, usá <code>string</code> y validá.</li>
+  <li>Funciones dentro de objetos, instancias de clases, tipos recursivos.</li>
+  <li><code>undefined</code> como valor distinto de <code>null</code>. Del otro lado hay un solo vacío.</li>
+  <li><code>any</code> — Codegen lo acepta y te destruye exactamente el beneficio por el que existe. Si ves un <code>any</code> en una spec, es una revisión de código fallida.</li>
+</ul>
+
+<div class="danger">
+  <strong>La trampa de los números que muerde en producción.</strong> Un <code>number</code> de JS es un <em>double</em> IEEE-754: los enteros exactos llegan hasta 2<sup>53</sup>. Si tu SDK nativo devuelve un ID de 64 bits (un <code>Long</code> de Kotlin, un <code>Int64</code> de Swift), <strong>vas a perder precisión en silencio</strong> y dos registros distintos van a terminar con el mismo ID. No hay excepción, no hay warning. <strong>Los identificadores de 64 bits se pasan como <code>string</code>.</strong> Siempre.
+</div>
+
+<pre><code class="lang-kotlin">// MAL: el ID se corrompe al cruzar
+map.putDouble("transactionId", tx.id.toDouble())     // 9007199254740993 -&gt; 9007199254740992
+
+// BIEN: el borde es texto, la precisión se conserva
+map.putString("transactionId", tx.id.toString())</code></pre>
+
+<p>La otra decisión de diseño en el borde es <strong>el tamaño</strong>. Si tu módulo produce datos grandes —imágenes, audio, un buffer de sensores a 200 Hz— pasarlos como <code>Array&lt;number&gt;</code> es un desastre: se construye un array de JS elemento por elemento. Las tres salidas sanas:</p>
+
+<pre><code class="lang-tsx">// 1) Ruta de archivo: el nativo escribe, JS solo recibe un string
+processVideo(inputPath: string): Promise&lt;string&gt;;
+
+// 2) Handle opaco: el dato queda en memoria nativa, JS maneja un identificador
+openSession(): Promise&lt;string&gt;;
+readChunk(sessionId: string, n: number): Promise&lt;string&gt;;  // base64 acotado
+closeSession(sessionId: string): void;
+
+// 3) Agregar del lado nativo: no mandes 10.000 muestras, mandá la estadística
+getWindowStats(ms: number): Promise&lt;{ min: number; max: number; avg: number }&gt;;</code></pre>
+
+<div class="rule">
+  <strong>📌 Diseñá la spec para minimizar el tráfico, no para ser cómoda.</strong> Un buen módulo nativo tiene <em>pocas</em> llamadas que hacen <em>mucho</em>. Un módulo que expone <code>getX()</code>, <code>getY()</code>, <code>getZ()</code> por separado y que la app llama en un loop es un módulo mal diseñado, por más que cada llamada individual sea rápida.
+</div>
+
+<h2>RNS4.5 Síncrono vs asíncrono: el arma cargada de JSI</h2>
+
+<p>Con el Bridge viejo, <strong>todo</strong> era asíncrono: no había forma de que JS esperara una respuesta nativa. JSI cambió eso: ahora una llamada nativa puede ser síncrona, y devolver el valor en la misma expresión.</p>
+
+<p>La regla que lo decide es simple y está en la spec: <strong>si el método devuelve <code>Promise&lt;T&gt;</code>, Codegen lo genera asíncrono; si devuelve <code>T</code> directamente, lo genera síncrono</strong>.</p>
+
+<pre><code class="lang-tsx">export interface Spec extends TurboModule {
+  getDeviceModel(): string;                  // SÍNCRONO
+  readFile(path: string): Promise&lt;string&gt;;   // ASÍNCRONO
+}</code></pre>
+
+<p>Que se pueda no significa que convenga. <strong>Una llamada síncrona bloquea el hilo de JS mientras el código nativo corre.</strong> Si el hilo de JS está bloqueado, no procesa eventos, no corre efectos, no responde a toques y —si estás animando desde JS— perdés frames. Con un presupuesto de 16,6 ms por frame, un método síncrono de 40 ms te come dos frames y medio, todos los que se llame.</p>
+
+<div class="mistake">
+  <strong>El anti-patrón concreto.</strong> "Es un archivo chiquito, lo leo síncrono así el código queda más lindo":
+  <pre><code class="lang-tsx">// MAL — es I/O de disco en el hilo de JS
+const config = NativeConfig.readConfigSync();  // 8 ms en un iPhone nuevo,
+                                               // 60 ms en un Android de gama baja
+</code></pre>
+  El "archivo chiquito" en el dispositivo del percentil 95 de tus usuarios está en un almacenamiento eMMC lento, con la app compitiendo con otras cinco. Medí en <em>ese</em> dispositivo, no en el tuyo.
+</div>
+
+<table>
+  <thead><tr><th>Usá SÍNCRONO cuando…</th><th>Usá ASÍNCRONO cuando…</th></tr></thead>
+  <tbody>
+    <tr><td>El valor ya está en memoria (una constante, un flag, la última muestra cacheada)</td><td>Hay I/O: disco, red, base de datos</td></tr>
+    <tr><td>El costo medido es de microsegundos, no de milisegundos</td><td>Se enciende o se despierta hardware (cámara, sensor, GPS, NFC)</td></tr>
+    <tr><td>Lo necesitás durante el primer render y no querés un estado "cargando"</td><td>Hay que saltar de hilo (muchas APIs nativas exigen el main thread)</td></tr>
+    <tr><td>Es configuración leída una sola vez en el arranque</td><td>El costo depende del tamaño de la entrada</td></tr>
+    <tr><td>El fallo es imposible (no hay nada que rechazar)</td><td>Puede fallar y querés un <code>reject</code> con código de error</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio de una línea.</strong> Síncrono es aceptable cuando la respuesta a "¿puede tardar más de un milisegundo en el peor teléfono que soporto?" es <strong>no, con certeza</strong>. Ante la duda, <code>Promise</code>. Convertir un método síncrono en asíncrono después es un cambio <em>breaking</em> para todos tus usuarios; al revés no molesta a nadie.
+</div>
+
+<p>Y una aclaración que se malinterpreta seguido: <strong>una llamada síncrona no es "más rápida"</strong>. El trabajo nativo tarda lo mismo. Lo único que cambia es <em>quién espera</em>: en la asíncrona espera la promesa y el hilo de JS sigue trabajando; en la síncrona espera el hilo de JS entero. Elegís dónde poner el costo, no lo eliminás.</p>
+
+<h2>RNS4.6 Fabric Components vs TurboModules</h2>
+
+<p>Son dos mecanismos distintos y la gente los mezcla todo el tiempo. La regla es corta: <strong>si dibuja píxeles, es Fabric; si es un servicio, es TurboModule.</strong></p>
+
+<table>
+  <thead><tr><th></th><th>TurboModule</th><th>Fabric Component</th></tr></thead>
+  <tbody>
+    <tr><td>Qué es</td><td>Un objeto con funciones</td><td>Una vista nativa en el árbol de React</td></tr>
+    <tr><td>Se usa como</td><td><code>Modulo.hacerAlgo()</code></td><td><code>&lt;MiVista prop={…} /&gt;</code></td></tr>
+    <tr><td>Nombre del archivo de spec</td><td><code>NativeX.ts</code></td><td><code>XNativeComponent.ts</code></td></tr>
+    <tr><td>Participa del layout</td><td>No</td><td>Sí, con Yoga</td></tr>
+    <tr><td>Android</td><td>Clase que extiende el spec generado</td><td><code>ViewManager</code> + interfaz y delegado generados</td></tr>
+    <tr><td>iOS</td><td><code>RCT_EXPORT_MODULE</code> + <code>getTurboModule:</code></td><td><code>RCTViewComponentView</code> + <code>ComponentDescriptor</code></td></tr>
+    <tr><td>Ejemplos</td><td>Sensores, criptografía, un SDK de pagos</td><td>Un mapa, un reproductor de video, un chart nativo</td></tr>
+  </tbody>
+</table>
+
+<p>La spec de un componente Fabric se ve así. Notá que los tipos numéricos <strong>se declaran con precisión</strong>, cosa que en TurboModules no hace falta:</p>
+
+<pre><code class="lang-tsx">// src/GaugeViewNativeComponent.ts
+import type { ViewProps } from 'react-native';
+import type { HostComponent } from 'react-native';
+import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';
+import type {
+  Int32, Double, WithDefault, DirectEventHandler,
+} from 'react-native/Libraries/Types/CodegenTypes';
+
+type GaugeEvent = { readonly value: Double };
+
+export interface NativeProps extends ViewProps {
+  value: Double;
+  segments?: WithDefault&lt;Int32, 10&gt;;
+  color?: string;
+  onValueSettled?: DirectEventHandler&lt;GaugeEvent&gt;;
+}
+
+export default codegenNativeComponent&lt;NativeProps&gt;(
+  'GaugeView'
+) as HostComponent&lt;NativeProps&gt;;</code></pre>
+
+<p>Y del lado de Android, el <code>ViewManager</code> implementa dos cosas generadas: la <em>interfaz</em> (que garantiza que implementaste todos los setters de props) y el <em>delegado</em> (que rutea las props entrantes a esos setters).</p>
+
+<pre><code class="lang-kotlin">@ReactModule(name = GaugeViewManager.NAME)
+class GaugeViewManager : SimpleViewManager&lt;GaugeView&gt;(),
+    GaugeViewManagerInterface&lt;GaugeView&gt; {           // generada
+
+  companion object { const val NAME = "GaugeView" }
+
+  private val delegate = GaugeViewManagerDelegate(this)  // generado
+  override fun getDelegate() = delegate
+  override fun getName() = NAME
+
+  override fun createViewInstance(ctx: ThemedReactContext) = GaugeView(ctx)
+
+  override fun setValue(view: GaugeView, value: Double) { view.value = value }
+  override fun setSegments(view: GaugeView, value: Int) { view.segments = value }
+  override fun setColor(view: GaugeView, value: String?) { view.tint = value }
+}</code></pre>
+
+<div class="info">
+  Muchas librerías reales publican <strong>las dos cosas</strong>: un TurboModule para la parte de servicio (permisos, configuración global, estado del SDK) y uno o más Fabric Components para lo que se dibuja. En el <code>codegenConfig</code> eso se declara con <code>"type": "all"</code>.
+</div>
+
+<h2>RNS4.7 Expo Modules API: el 80% del resultado con el 20% del código</h2>
+
+<p>La <strong>Expo Modules API</strong> es una capa por encima de la Nueva Arquitectura que te deja escribir el módulo en <strong>Swift y Kotlin puros</strong>, con un DSL declarativo, <em>sin</em> spec de Codegen, <em>sin</em> <code>codegenConfig</code> y —esto es lo grande— <strong>sin una sola línea de Objective-C++</strong>.</p>
+
+<div class="info">
+  <strong>No hace falta usar el "managed workflow" de Expo.</strong> La Expo Modules API funciona en cualquier proyecto de React Native que tenga instalado el paquete <code>expo</code>. Es una confusión muy repetida y hace que equipos se coman semanas de ObjC++ sin necesidad.
+</div>
+
+<p>El mismo módulo de proximidad, entero, en Kotlin:</p>
+
+<pre><code class="lang-kotlin">// android/src/main/java/expo/modules/proximity/ProximityModule.kt
+package expo.modules.proximity
+
+import expo.modules.kotlin.modules.Module
+import expo.modules.kotlin.modules.ModuleDefinition
+
+class ProximityModule : Module() {
+  private val core by lazy { ProximityCore(appContext.reactContext!!) }
+
+  override fun definition() = ModuleDefinition {
+    Name("Proximity")
+
+    Events("onProximityChange")
+
+    Function("isAvailable") { core.isAvailable() }          // síncrona
+
+    AsyncFunction("start") {                                 // asíncrona
+      core.start { sample -&gt; sendEvent("onProximityChange", sample) }
+      core.lastSample()
+    }
+
+    Function("stop") { core.stop() }
+
+    Function("getLastSample") { core.lastSample() }
+
+    OnDestroy { core.stop() }
+  }
+}</code></pre>
+
+<p>Y en Swift:</p>
+
+<pre><code class="lang-swift">// ios/ProximityModule.swift
+import ExpoModulesCore
+
+public class ProximityModule: Module {
+  private let core = ProximityCore()
+
+  public func definition() -&gt; ModuleDefinition {
+    Name("Proximity")
+    Events("onProximityChange")
+
+    Function("isAvailable") { core.isAvailable() }
+
+    AsyncFunction("start") { () -&gt; [String: Any]? in
+      core.onChange = { [weak self] sample in
+        self?.sendEvent("onProximityChange", sample)
+      }
+      core.start()
+      return core.lastSample
+    }
+
+    Function("stop") { core.stop() }
+    Function("getLastSample") { core.lastSample }
+
+    OnDestroy { core.stop() }
+  }
+}</code></pre>
+
+<p>Del lado de JS, el consumo es igual de directo, y los tipos los escribís vos a mano en un <code>.ts</code>:</p>
+
+<pre><code class="lang-tsx">// index.ts
+import { requireNativeModule } from 'expo-modules-core';
+
+export type ProximityEvent = {
+  near: boolean;
+  distanceCm: number | null;
+  timestamp: number;
+};
+
+type ProximityModule = {
+  isAvailable(): boolean;
+  start(): Promise&lt;ProximityEvent | null&gt;;
+  stop(): void;
+  getLastSample(): ProximityEvent | null;
+  addListener(e: 'onProximityChange', cb: (v: ProximityEvent) =&gt; void): { remove(): void };
+};
+
+export default requireNativeModule&lt;ProximityModule&gt;('Proximity');</code></pre>
+
+<p>La comparación honesta, sin marketing para ningún lado:</p>
+
+<table>
+  <thead><tr><th>Criterio</th><th>TurboModule puro</th><th>Expo Modules API</th></tr></thead>
+  <tbody>
+    <tr><td>Lenguajes que tocás</td><td>TS + Kotlin + Swift + <strong>ObjC++</strong></td><td>TS + Kotlin + Swift</td></tr>
+    <tr><td>Archivos para un módulo simple</td><td>~6–8</td><td>~3</td></tr>
+    <tr><td>Líneas para el ejemplo de arriba</td><td>~180</td><td>~70</td></tr>
+    <tr><td>Tipos JS ↔ nativo</td><td><strong>Generados y verificados</strong> por Codegen</td><td>Escritos a mano: pueden desincronizarse</td></tr>
+    <tr><td>Config de build</td><td><code>codegenConfig</code>, podspec, gradle</td><td><code>expo-module.config.json</code></td></tr>
+    <tr><td>Métodos síncronos</td><td>Sí</td><td>Sí (<code>Function</code> vs <code>AsyncFunction</code>)</td></tr>
+    <tr><td>Vistas nativas</td><td>Fabric Components</td><td>Sí, con <code>View { }</code></td></tr>
+    <tr><td>Dependencias extra</td><td>Ninguna</td><td><code>expo</code> + <code>expo-modules-core</code></td></tr>
+    <tr><td>Control fino sobre JSI</td><td><strong>Total</strong></td><td>Acotado a lo que expone el DSL</td></tr>
+    <tr><td>Acoplamiento de versiones</td><td>Solo a React Native</td><td>A RN <strong>y</strong> al SDK de Expo</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Cómo elegir, en una frase.</strong> Si tu módulo envuelve una API del sistema o un SDK de un tercero —el caso común, el 90%— <strong>usá la Expo Modules API</strong>: menos código, menos superficie para romperse, mismo rendimiento. Escribí un TurboModule puro cuando publicás una librería que no quiere depender de Expo, cuando necesitás control fino sobre el JSI o sobre <code>HostObject</code>s, o cuando tu equipo ya mantiene un <em>stack</em> nativo grande y no quiere sumar otra capa.
+</div>
+
+<h2>RNS4.8 Testear un módulo nativo (y mockearlo desde JS)</h2>
+
+<p>Un módulo nativo tiene tres superficies de prueba, y son <strong>independientes</strong>. Confundirlas es la razón por la que hay librerías con el badge de 100% de cobertura que crashean en el primer dispositivo real.</p>
+
+<table>
+  <thead><tr><th>Capa</th><th>Herramienta</th><th>Qué valida</th><th>Qué NO valida</th></tr></thead>
+  <tbody>
+    <tr><td>Lógica nativa</td><td>JUnit + Robolectric / XCTest</td><td>Que tu algoritmo esté bien</td><td>Que el puente esté bien conectado</td></tr>
+    <tr><td>API de JS</td><td>Jest, con el módulo mockeado</td><td>Tu wrapper, hooks, manejo de errores</td><td><strong>Absolutamente nada nativo</strong></td></tr>
+    <tr><td>Integración</td><td>Maestro / Detox en dispositivo</td><td>Que todo junto funcione de verdad</td><td>Casos borde: es lento y caro</td></tr>
+  </tbody>
+</table>
+
+<p><strong>La condición previa para poder testear:</strong> mantené la clase que hereda del spec generado <em>finita</em> y poné la lógica en una clase común sin dependencias de React Native. Esa clase sí se testea sin emulador.</p>
+
+<pre><code class="lang-kotlin">// ProximityCoreTest.kt — JUnit puro, sin React Native, corre en milisegundos
+class ProximityCoreTest {
+
+  @Test
+  fun `near es true cuando la distancia es menor al rango maximo`() {
+    val core = ProximityCore(maxRangeCm = 5.0)
+    core.onRawValue(0.0)
+    assertTrue(core.lastSample()!!.near)
+  }
+
+  @Test
+  fun `near es false cuando la lectura iguala al rango maximo`() {
+    val core = ProximityCore(maxRangeCm = 5.0)
+    core.onRawValue(5.0)
+    assertFalse(core.lastSample()!!.near)
+  }
+
+  @Test
+  fun `stop limpia la ultima muestra para no servir datos viejos`() {
+    val core = ProximityCore(maxRangeCm = 5.0)
+    core.onRawValue(0.0); core.stop()
+    assertNull(core.lastSample())
+  }
+}</code></pre>
+
+<p>Del lado de JS, <strong>el mock va sobre el archivo de la spec, no sobre <code>NativeModules</code></strong> —que, recordá, ya no existe:</p>
+
+<pre><code class="lang-tsx">// __tests__/useProximity.test.tsx
+jest.mock('../src/NativeProximity', () =&gt; ({
+  __esModule: true,
+  default: {
+    isAvailable: jest.fn(() =&gt; true),
+    start: jest.fn(async () =&gt; ({ near: false, distanceCm: 5, timestamp: 0 })),
+    stop: jest.fn(),
+    getLastSample: jest.fn(() =&gt; null),
+    // el EventEmitter generado se consume como función: devuelve la suscripción
+    onProximityChange: jest.fn(() =&gt; ({ remove: jest.fn() })),
+  },
+}));
+
+import { renderHook, act, waitFor } from '@testing-library/react-native';
+import NativeProximity from '../src/NativeProximity';
+import { useProximity } from '../src/useProximity';
+
+it('libera el sensor al desmontar', async () =&gt; {
+  const { unmount } = renderHook(() =&gt; useProximity());
+  await waitFor(() =&gt; expect(NativeProximity.start).toHaveBeenCalled());
+  unmount();
+  expect(NativeProximity.stop).toHaveBeenCalledTimes(1);
+});</code></pre>
+
+<div class="tip">
+  <strong>Si publicás una librería, publicá también su mock.</strong> Es lo que separa una librería usable de una que todos terminan parcheando. Exportá <code>react-native-proximity/jest/mock</code> y documentá una línea en el README: <code>jest.mock('react-native-proximity', () =&gt; require('react-native-proximity/jest/mock'))</code>. Tus usuarios te lo van a agradecer y vos te ahorrás la mitad de los issues.
+</div>
+
+<div class="warn">
+  <strong>Una suite de Jest en verde no dice absolutamente nada sobre el código nativo.</strong> Estás testeando tu mock. La única prueba que valida el puente es correr la app de ejemplo en un dispositivo real, y por eso la app de ejemplo dentro del repo de la librería <strong>no es opcional</strong>: es tu única prueba de integración.
+</div>
+
+<pre><code class="lang-bash"># El único test que prueba el módulo de verdad
+cd example
+npx react-native run-android --mode=release   # release, no debug: ver RNS4.10
+npx maestro test .maestro/proximity.yaml</code></pre>
+
+<h2>RNS4.9 Distribución: publicar, versionar y sobrevivir a los upgrades de RN</h2>
+
+<p>No armes el esqueleto a mano. El generador oficial te deja el <code>codegenConfig</code>, el podspec, el <code>build.gradle</code>, la app de ejemplo y la configuración de <code>react-native-builder-bob</code> ya resueltos:</p>
+
+<pre><code class="lang-bash">npx create-react-native-library@latest react-native-proximity
+# elegí: "Turbo module" (Kotlin/Swift) o "Expo module"
+
+cd react-native-proximity
+yarn                      # instala el workspace, incluida la app de ejemplo
+yarn example android      # probá que compile ANTES de escribir nada tuyo</code></pre>
+
+<p>Las tres cosas que hay que entender del empaquetado:</p>
+
+<h3>1. El <code>codegenConfig</code> viaja en el paquete publicado</h3>
+
+<p>Codegen corre <strong>en el proyecto del consumidor</strong>, no en el tuyo. Por eso el <code>codegenConfig</code> y la carpeta <code>src/</code> con los archivos <code>Native*.ts</code> tienen que estar en el tarball de npm. Si tu <code>files</code> del <code>package.json</code> los excluye, la librería instala bien y falla al compilar con un error críptico sobre una clase que no existe.</p>
+
+<pre><code class="lang-tsx">{
+  "files": ["src", "lib", "android", "ios", "*.podspec", "!**/__tests__"],
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  }
+}</code></pre>
+
+<div class="mistake">
+  <strong><code>react-native</code> va en <code>peerDependencies</code>, nunca en <code>dependencies</code>.</strong> Si lo ponés como dependencia normal, el consumidor termina con dos copias de React Native en su árbol y obtiene errores imposibles de diagnosticar ("Invalid hook call", dos instancias del registro de módulos). Lo mismo vale para <code>react</code> y para <code>expo-modules-core</code>.
+</div>
+
+<h3>2. Alineá las versiones del toolchain con las del host</h3>
+
+<pre><code class="lang-bash"># android/build.gradle — tomá la versión de Kotlin del proyecto que te consume,
+# con un default por si no la define. NUNCA la fijes a la tuya.
+buildscript {
+  ext.kotlin_version = rootProject.ext.has("kotlinVersion")
+      ? rootProject.ext.get("kotlinVersion")
+      : "2.0.21"
+}
+
+android {
+  compileSdkVersion safeExtGet("compileSdkVersion", 35)
+  defaultConfig { minSdkVersion safeExtGet("minSdkVersion", 24) }
+}</code></pre>
+
+<p>Y en iOS, el podspec tiene una sola línea imprescindible: la que engancha las dependencias de la Nueva Arquitectura sin que las escribas a mano.</p>
+
+<pre><code class="lang-bash"># react-native-proximity.podspec
+Pod::Spec.new do |s|
+  s.name         = "react-native-proximity"
+  s.version      = package["version"]
+  s.platforms    = { :ios =&gt; "15.1" }
+  s.source_files = "ios/**/*.{h,m,mm,swift}"
+
+  install_modules_dependencies(s)   # &lt;- esto trae React-Core, JSI, codegen, todo
+end</code></pre>
+
+<h3>3. Versionar con honestidad</h3>
+
+<table>
+  <thead><tr><th>Cambio</th><th>Semver</th></tr></thead>
+  <tbody>
+    <tr><td>Agregás un método a la spec</td><td><strong>minor</strong></td></tr>
+    <tr><td>Cambiás un método de asíncrono a síncrono (o al revés)</td><td><strong>major</strong> — cambia la firma en JS</td></tr>
+    <tr><td>Cambiás un campo de un objeto del evento</td><td><strong>major</strong></td></tr>
+    <tr><td>Subís la versión mínima de React Native soportada</td><td><strong>major</strong></td></tr>
+    <tr><td>Subís <code>minSdkVersion</code> de Android o el target de iOS</td><td><strong>major</strong></td></tr>
+    <tr><td>Arreglás un crash sin tocar la spec</td><td><strong>patch</strong></td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La tabla de compatibilidad del README tiene que estar respaldada por CI.</strong> Si decís "soporta RN 0.82 a 0.86", tu pipeline tiene que <strong>compilar la app de ejemplo en las dos plataformas contra esas versiones</strong>. Sin eso, la tabla es un deseo. Compilar la app de ejemplo en una matriz de 3 versiones × 2 plataformas cuesta unos minutos de CI y te ahorra la clase de issue que dice "no compila" sin más datos.
+</div>
+
+<h2>RNS4.10 Depurar el módulo nativo de otro</h2>
+
+<p>Esta es, con diferencia, la habilidad de este módulo que más veces vas a usar. El escenario típico: <em>una librería anda perfecto en debug y crashea en el build de release de Android</em>. La app la usan 40.000 personas. El issue de GitHub tiene 6 meses.</p>
+
+<p>El método, en orden, sin saltear pasos:</p>
+
+<div class="step">
+  <strong>1. Conseguí el stack trace real, no el de JS.</strong> El error rojo de React Native casi nunca es la causa: es el síntoma.
+</div>
+
+<pre><code class="lang-bash"># Android — el crash nativo está acá, no en Metro
+adb logcat -c &amp;&amp; adb logcat *:E AndroidRuntime:E ReactNative:V ReactNativeJS:V
+
+# Filtrar solo tu app
+adb logcat --pid=$(adb shell pidof -s com.miapp)
+
+# iOS — Console.app conectado al dispositivo, o desde consola:
+xcrun simctl spawn booted log stream --predicate 'processImagePath endswith "MiApp"'</code></pre>
+
+<div class="step">
+  <strong>2. Encontrá el código. Está en tu disco.</strong> No es una caja negra: es texto.
+</div>
+
+<pre><code class="lang-bash"># La spec te dice el contrato exacto: empezá SIEMPRE por acá
+cat node_modules/react-native-loquesea/src/Native*.ts
+
+# La implementación de Android
+find node_modules/react-native-loquesea/android -name "*.kt" -o -name "*.java"
+
+# La implementación de iOS
+find node_modules/react-native-loquesea/ios -name "*.swift" -o -name "*.mm"
+
+# Lo que Codegen generó a partir de la spec (útil cuando el error es de tipos)
+find android/app/build/generated/source/codegen -name "*Spec.java"</code></pre>
+
+<div class="step">
+  <strong>3. Reproducilo en la app de ejemplo de la librería.</strong> Si ahí no falla, el problema es la interacción con <em>tu</em> proyecto —otra librería, una versión, una regla de build— y eso cambia por completo dónde buscar.
+</div>
+
+<div class="step">
+  <strong>4. Arreglalo local con <code>patch-package</code>, y después mandá el PR.</strong> En ese orden: primero destrabás tu release, después contribuís.
+</div>
+
+<pre><code class="lang-bash"># editás node_modules/react-native-loquesea/android/.../Loquesea.kt
+npx patch-package react-native-loquesea
+# queda patches/react-native-loquesea+2.3.1.patch, versionalo en git
+# y agregá "postinstall": "patch-package" al package.json</code></pre>
+
+<p>Las causas que explican la mayoría de los casos:</p>
+
+<table>
+  <thead><tr><th>Síntoma</th><th>Causa probable</th><th>Cómo confirmarlo</th></tr></thead>
+  <tbody>
+    <tr><td>Anda en debug, crashea en release (Android)</td><td><strong>R8/ProGuard</strong> borró u ofuscó una clase que se resuelve por reflexión</td><td><code>ClassNotFoundException</code> / <code>NoSuchMethodError</code> en logcat</td></tr>
+    <tr><td><code>null is not an object</code> al llamar un método</td><td>El módulo no quedó registrado (autolinking, o falta <code>pod install</code>)</td><td>Loguear el objeto del <code>getEnforcing</code></td></tr>
+    <tr><td>Falla solo en una plataforma</td><td>Permiso faltante en <code>AndroidManifest.xml</code> o en <code>Info.plist</code></td><td>Leer el manifiesto de la librería</td></tr>
+    <tr><td><code>NullPointerException</code> intermitente</td><td>El nativo devuelve <code>null</code> donde la spec declara un tipo no nullable</td><td>Comparar spec vs implementación, campo por campo</td></tr>
+    <tr><td>"Must be called from main thread"</td><td>Una API de UI llamada desde el hilo de JS</td><td>El propio mensaje lo dice; envolver en <code>runOnUiThread</code> / <code>DispatchQueue.main</code></td></tr>
+    <tr><td>Jank al usar el módulo</td><td>Un método síncrono haciendo I/O (RNS4.5)</td><td>Perfilar el hilo de JS</td></tr>
+    <tr><td>Falla solo en algunos dispositivos</td><td>El hardware no existe; la librería no chequea disponibilidad</td><td><code>isAvailable()</code> en el dispositivo que falla</td></tr>
+  </tbody>
+</table>
+
+<p>El caso de R8 merece su propia regla porque es el más frecuente y el más confuso: <strong>R8 no corre en builds de debug</strong>, por eso el bug aparece recién en release y muchas veces recién en producción.</p>
+
+<pre><code class="lang-bash"># android/app/proguard-rules.pro
+-keep class com.loquesea.** { *; }
+-keepclassmembers class * extends com.facebook.react.bridge.ReactContextBaseJavaModule { *; }
+-keepattributes *Annotation*</code></pre>
+
+<div class="rule">
+  <strong>📌 Probá el build de release antes de publicar, siempre.</strong> Un porcentaje enorme de los "bugs de producción" con módulos nativos son bugs de R8 que un solo <code>--mode=release</code> local hubiera encontrado. Ponelo en el checklist de release y en el CI.
+</div>
+
+<h2>RNS4.11 Worked example: un sensor que ninguna librería te da</h2>
+
+<p>El caso: una app de telemedicina necesita apagar la pantalla cuando el usuario se lleva el teléfono a la oreja durante una consulta, y además registrar los eventos de proximidad para detectar llamadas interrumpidas. Necesitamos el <strong>sensor de proximidad</strong>.</p>
+
+<h3>Paso 0 — Verificar que hace falta (el paso que todos saltean)</h3>
+
+<p>Antes de escribir nada, la búsqueda:</p>
+
+<ul>
+  <li><code>expo-sensors</code> expone acelerómetro, giroscopio, magnetómetro, barómetro, podómetro. <strong>Proximidad no.</strong></li>
+  <li><code>react-native-proximity</code> existe: última publicación de hace años, escrito sobre <code>RCTBridgeModule</code>. En RN 0.82+ <strong>no compila</strong>, porque el Bridge ya no está.</li>
+  <li>Hay dos forks; ninguno migrado, ninguno con commits en los últimos doce meses.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Este es el escenario más común de 2026, y hay que nombrarlo:</strong> la librería <em>existe</em>, pero pertenece a la arquitectura muerta. La decisión no es "escribo un módulo nativo desde cero" contra "uso la librería": es <strong>"migro el fork" contra "escribo uno chico y correcto"</strong>. Acá el módulo son ~150 líneas, la librería vieja arrastra código de compatibilidad que ya no aplica, y el fork tendría que pasar por mi revisión igual. Escribo uno propio, y lo documento en el PR con estas tres viñetas.
+</div>
+
+<h3>Paso 1 — Diseñar el contrato antes que el código</h3>
+
+<p>Acá está la decisión de diseño de verdad, y es de <em>modelado</em>, no de programación. Las dos plataformas <strong>no dan lo mismo</strong>:</p>
+
+<table>
+  <thead><tr><th></th><th>Android</th><th>iOS</th></tr></thead>
+  <tbody>
+    <tr><td>API</td><td><code>SensorManager</code> + <code>TYPE_PROXIMITY</code></td><td><code>UIDevice.proximityState</code></td></tr>
+    <tr><td>Qué devuelve</td><td><strong>Centímetros</strong> (aunque la mayoría de los teléfonos son binarios)</td><td><strong>Solo un booleano</strong></td></tr>
+    <tr><td>Rango máximo</td><td>Se consulta con <code>maximumRange</code></td><td>No existe el concepto</td></tr>
+    <tr><td>Disponibilidad</td><td>El sensor puede no existir</td><td>Depende del modelo; se detecta probando</td></tr>
+  </tbody>
+</table>
+
+<p>Tres opciones y sus consecuencias:</p>
+
+<ol>
+  <li><strong>Exponer solo el mínimo común</strong> (<code>near: boolean</code>). API limpia, pero tirás información que Android sí tiene y algún día alguien la va a necesitar.</li>
+  <li><strong>Exponer todo y que el consumidor lo resuelva</strong> con <code>Platform.OS</code>. Traslada la complejidad a cada punto de uso: el peor lugar posible.</li>
+  <li><strong>Exponer el común como no nullable y lo específico como nullable.</strong> <code>near: boolean</code> siempre; <code>distanceCm: number | null</code>, con <code>null</code> en iOS.</li>
+</ol>
+
+<div class="rule">
+  <strong>📌 Elegimos la 3, y esa es la lección transferible.</strong> El tipo <code>number | null</code> hace que la diferencia de plataformas sea <strong>visible en el sistema de tipos</strong>: TypeScript obliga a manejar el caso <code>null</code> en el punto de uso, y nadie puede olvidarse. La spec es el lugar donde decidís <em>cuánta diferencia de plataforma se filtra hacia arriba</em>. Un <code>as number</code> ahí es una decisión de arquitectura tomada con un casteo.
+</div>
+
+<h3>Paso 2 — La spec</h3>
+
+<p>Es exactamente la de RNS4.2, y ahora se entiende cada línea:</p>
+
+<pre><code class="lang-tsx">// src/NativeProximity.ts
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+import type { EventEmitter } from 'react-native/Libraries/Types/CodegenTypes';
+
+export type ProximityEvent = {
+  near: boolean;              // común a las dos plataformas
+  distanceCm: number | null;  // null en iOS: la diferencia es explícita
+  timestamp: number;          // ms desde epoch, NO un Date
+};
+
+export interface Spec extends TurboModule {
+  isAvailable(): boolean;                 // síncrono: valor cacheado
+  start(): Promise&lt;ProximityEvent&gt;;       // async: despierta hardware
+  stop(): void;                            // síncrono: no espera nada
+  getLastSample(): ProximityEvent | null;  // síncrono: memoria
+  readonly onProximityChange: EventEmitter&lt;ProximityEvent&gt;;
+}
+
+export default TurboModuleRegistry.getEnforcing&lt;Spec&gt;('NativeProximity');</code></pre>
+
+<h3>Paso 3 — La decisión síncrono / asíncrono, con el argumento</h3>
+
+<p>Este es el punto que en una entrevista senior distingue una respuesta memorizada de una razonada. Método por método:</p>
+
+<table>
+  <thead><tr><th>Método</th><th>Decisión</th><th>Argumento</th></tr></thead>
+  <tbody>
+    <tr><td><code>isAvailable()</code></td><td><strong>Síncrono</strong></td><td>En Android es un <code>getDefaultSensor()</code> que devuelve un objeto ya cargado por el sistema: nanosegundos. Además se llama durante el primer render para decidir si mostrar la feature, y una promesa ahí obligaría a un estado "cargando" para algo que no carga nada.</td></tr>
+    <tr><td><code>start()</code></td><td><strong>Asíncrono</strong></td><td>Registra un listener y <em>espera la primera muestra del hardware</em>. Ese tiempo lo decide el sensor: en gama baja se midieron hasta 300 ms. Síncrono acá serían ~18 frames perdidos. Además puede fallar (sin sensor) y necesitamos un <code>reject</code> con código.</td></tr>
+    <tr><td><code>stop()</code></td><td><strong>Síncrono</strong>, y devuelve <code>void</code></td><td>Desregistrar un listener no espera nada. Y es importante que sea síncrono: se llama en el <em>cleanup</em> de un <code>useEffect</code>, que no puede esperar promesas. Un <code>stop()</code> asíncrono es una fuga esperando a pasar.</td></tr>
+    <tr><td><code>getLastSample()</code></td><td><strong>Síncrono</strong></td><td>Devuelve un objeto que ya está en memoria nativa. El único costo es construir el mapa: microsegundos. Ni siquiera toca el sensor.</td></tr>
+    <tr><td>Eventos</td><td><strong>Push</strong></td><td>El hardware decide cuándo hay novedad. Hacer <em>polling</em> desde JS a 60 Hz para leer un valor que cambia dos veces por minuto es desperdiciar batería y hilo de JS.</td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La heurística detrás de toda la tabla.</strong> Síncrono es para <em>leer estado que ya existe</em>. Asíncrono es para <em>provocar que algo pase</em>. Si el método hace que el mundo cambie —enciende, escribe, pide, conecta— devolvé una promesa. Si solo cuenta cómo está el mundo ahora mismo, puede ser síncrono.
+</div>
+
+<h3>Paso 4 — Android en Kotlin</h3>
+
+<p>La implementación completa está en RNS4.3. Lo que importa acá es la separación: la clase <code>ProximityModule</code> es puro pegamento con React Native, y la lógica de decidir <code>near</code> vive en una clase que se testea sin emulador.</p>
+
+<pre><code class="lang-kotlin">// ProximityCore.kt — sin dependencias de React Native: testeable con JUnit
+class ProximityCore(private val maxRangeCm: Double) {
+  private var last: Sample? = null
+  var onChange: ((Sample) -&gt; Unit)? = null
+
+  data class Sample(val near: Boolean, val distanceCm: Double?, val timestamp: Long)
+
+  fun onRawValue(cm: Double) {
+    val s = Sample(
+      near = cm &lt; maxRangeCm,     // la regla: "cerca" es cualquier cosa bajo el rango
+      distanceCm = cm,
+      timestamp = System.currentTimeMillis())
+    last = s
+    onChange?.invoke(s)
+  }
+
+  fun lastSample(): Sample? = last
+  fun stop() { last = null; onChange = null }   // no servir datos viejos
+}</code></pre>
+
+<h3>Paso 5 — iOS en Swift</h3>
+
+<p>Mismo criterio: <code>ProximityCore.swift</code> (RNS4.3) tiene la lógica y el <code>.mm</code> es un puente de veinte líneas. Y fijate el detalle de modelado: <code>distanceCm</code> se llena con <code>NSNull()</code>, no con <code>0</code>.</p>
+
+<div class="mistake">
+  <strong>El bug sutil que casi se cuela.</strong> La tentación era poner <code>"distanceCm": 0</code> en iOS "para que el tipo sea siempre número". Habría sido <strong>un dato falso</strong>: cero centímetros significa "el objeto está tocando el sensor", que es exactamente lo contrario de "no sé". Cualquier consumidor que hiciera <code>if (distanceCm &lt; 1)</code> tendría un falso positivo permanente en todos los iPhone. <strong>La ausencia de dato se modela como ausencia, nunca como un valor por defecto plausible.</strong>
+</div>
+
+<h3>Paso 6 — La API que consume la app</h3>
+
+<p>La spec no es la API pública. Encima va un hook que resuelve el ciclo de vida, que es donde están los bugs reales:</p>
+
+<pre><code class="lang-tsx">// src/useProximity.ts
+import { useEffect, useState } from 'react';
+import NativeProximity, { type ProximityEvent } from './NativeProximity';
+
+export function useProximity(enabled: boolean = true) {
+  const [sample, setSample] = useState&lt;ProximityEvent | null&gt;(null);
+  const [error, setError] = useState&lt;Error | null&gt;(null);
+
+  useEffect(() =&gt; {
+    if (!enabled || !NativeProximity.isAvailable()) return;
+
+    let cancelado = false;
+    const sub = NativeProximity.onProximityChange((e) =&gt; {
+      if (!cancelado) setSample(e);
+    });
+
+    NativeProximity.start()
+      .then((first) =&gt; { if (!cancelado) setSample(first); })
+      .catch((e) =&gt; { if (!cancelado) setError(e as Error); });
+
+    return () =&gt; {
+      cancelado = true;      // evita el setState sobre un componente desmontado
+      sub.remove();          // primero el listener
+      NativeProximity.stop();// después el hardware: síncrono, corre siempre
+    };
+  }, [enabled]);
+
+  return {
+    near: sample?.near ?? false,
+    distanceCm: sample?.distanceCm ?? null,   // null en iOS, y el tipo lo dice
+    available: NativeProximity.isAvailable(),
+    error,
+  };
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El orden del cleanup no es cosmético.</strong> Primero <code>sub.remove()</code>, después <code>stop()</code>. Al revés, hay una ventana en la que el sensor todavía puede emitir un último evento hacia un listener vivo cuyo componente ya no existe. En Android eso es un warning; en iOS, con un <code>self</code> mal capturado, es un crash.
+</div>
+
+<h3>Paso 7 — ¿Cuánto código habría sido con la Expo Modules API?</h3>
+
+<p>La comparación real de este módulo, contando líneas de verdad:</p>
+
+<table>
+  <thead><tr><th>Archivo</th><th>TurboModule</th><th>Expo Modules API</th></tr></thead>
+  <tbody>
+    <tr><td>Spec / tipos de TS</td><td>28 (con Codegen)</td><td>22 (a mano)</td></tr>
+    <tr><td>Android — pegamento con RN</td><td>62</td><td>24</td></tr>
+    <tr><td>Android — <code>ReactPackage</code></td><td>24</td><td><strong>0</strong></td></tr>
+    <tr><td>Android — lógica (<code>Core</code>)</td><td>26</td><td>26</td></tr>
+    <tr><td>iOS — lógica en Swift</td><td>45</td><td>45</td></tr>
+    <tr><td>iOS — puente ObjC++ (<code>.h</code> + <code>.mm</code>)</td><td><strong>38</strong></td><td><strong>0</strong></td></tr>
+    <tr><td>iOS — módulo Expo</td><td>—</td><td>22</td></tr>
+    <tr><td>Config de build</td><td>podspec + gradle + <code>codegenConfig</code></td><td><code>expo-module.config.json</code></td></tr>
+    <tr><td><strong>Total aproximado</strong></td><td><strong>~223 líneas, 4 lenguajes</strong></td><td><strong>~139 líneas, 3 lenguajes</strong></td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Y ahora el veredicto honesto.</strong> Para <em>esta</em> app —una app de producto que ya usa Expo— la Expo Modules API es la respuesta correcta: 40% menos código, cero ObjC++, y el equipo puede mantenerlo sin un especialista en iOS. Lo que <strong>no</strong> cambia entre las dos versiones es lo único difícil: las 26 y 45 líneas de lógica de cada plataforma y, sobre todo, la <strong>decisión de modelado</strong> del Paso 1. Ninguna API te ahorra pensar cómo se ve el sensor desde JS. Elegí un TurboModule puro si vas a publicar esto como librería independiente de Expo, o si necesitás control fino sobre el JSI.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué la spec de TypeScript es la fuente de la verdad y no la implementación nativa?</summary>
+<p>Porque el contrato entre JS y nativo tiene que existir en <strong>un solo lugar</strong>, y ese lugar es el que las dos puntas pueden verificar. Codegen genera desde la spec las clases base de Android e iOS: si tu Kotlin no implementa un método declarado, o lo implementa con otra firma, <strong>el build falla</strong>. En la arquitectura vieja el contrato era implícito —vivía en la cabeza de quien escribió el módulo— y las discrepancias aparecían en runtime, en un dispositivo, como un error incomprensible. Además de la seguridad de tipos, tener la spec como fuente única te da una segunda cosa: leer <code>src/Native*.ts</code> de cualquier librería te dice en treinta segundos <em>exactamente</em> qué expone y con qué tipos, sin abrir código nativo.</p></details>
+
+<details><summary>Tu módulo tiene un método síncrono que anda perfecto en tu iPhone y produce jank en Android de gama baja. ¿Qué revisás y qué cambiás?</summary>
+<p>Primero medís lo que tarda el método <em>en ese dispositivo</em>, no en el tuyo: un log con timestamps a cada lado de la llamada nativa alcanza. Si supera el orden del milisegundo, el diagnóstico es el del módulo: una llamada síncrona bloquea el hilo de JS, y con 16,6 ms de presupuesto por frame cualquier cosa que tarde decenas de milisegundos te hace perder frames <em>cada vez que se llama</em>. La corrección es cambiar la firma de la spec a <code>Promise&lt;T&gt;</code>, lo que hace que Codegen lo genere asíncrono. Ojo: <strong>eso es un cambio breaking</strong> —major en semver—, y esa es justamente la razón para elegir asíncrono cuando dudás: pasar de asíncrono a síncrono después no le molesta a nadie, al revés rompe a todos tus usuarios. Alternativa sin romper la API si el valor lo permite: calcularlo de forma anticipada en el arranque y que el método síncrono solo lea la caché.</p></details>
+
+<details><summary>Una librería de terceros anda en debug y crashea en release de Android. Antes de abrir un issue, ¿qué hacés?</summary>
+<p>Uno: consigo el stack trace <em>nativo</em> con <code>adb logcat</code>, porque el error rojo de React Native es el síntoma, no la causa. Dos: si dice <code>ClassNotFoundException</code> o <code>NoSuchMethodError</code>, la hipótesis principal es <strong>R8/ProGuard</strong> —que no corre en debug, y por eso el bug aparece recién en release— borrando u ofuscando una clase que la librería resuelve por reflexión; se confirma agregando una regla <code>-keep</code> para el paquete de la librería y recompilando. Tres: leo el código en <code>node_modules/&lt;lib&gt;/android/</code>, que está en mi disco y no es una caja negra, empezando por la spec en <code>src/Native*.ts</code>. Cuatro: intento reproducirlo en la app de ejemplo de la librería; si ahí no falla, el problema es la interacción con mi proyecto. Recién con todo eso abro un issue —que ahora incluye stack trace, causa probable y reproducción— o directamente el PR. Mientras tanto me destrabo con <code>patch-package</code>.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El 95% de las veces <strong>no necesitás un módulo nativo</strong>: hay librería. Este módulo es para el 5% restante y, sobre todo, para saber <strong>leer y arreglar</strong> los módulos de terceros que ya usás.</li>
+  <li>El Bridge y los <code>NativeModules</code> viejos <strong>no existen desde RN 0.82</strong>. Todo lo que encuentres sobre <code>RCTBridgeModule</code> es arqueología.</li>
+  <li><strong>Codegen invierte la dirección</strong>: escribís la spec en TypeScript y se generan las clases base nativas de ambas plataformas. Si tu implementación no coincide, no compila. RN 0.86 suma la <strong>Strict TypeScript API</strong>.</li>
+  <li>El archivo de spec tiene reglas rígidas: nombre que empieza con <code>Native</code>, interfaz <code>Spec</code>, y <code>codegenConfig</code> en el <code>package.json</code> —que además tiene que <strong>viajar en el paquete publicado</strong>.</li>
+  <li>Un TurboModule son cinco piezas: spec, clase generada, Kotlin, Swift + puente ObjC++, y registro. En iOS <strong>Swift no puede conformar al spec generado</strong>: siempre hay un <code>.mm</code> en el medio.</li>
+  <li><strong>JSI no eliminó la serialización</strong>, eliminó el batching asíncrono. Los datos grandes se pasan por ruta de archivo, handle opaco o agregación nativa; los <strong>IDs de 64 bits, como <code>string</code></strong>, siempre.</li>
+  <li><strong>Síncrono para leer estado que ya existe; asíncrono para provocar que algo pase.</strong> Una llamada síncrona bloquea el hilo de JS y no acelera nada: solo mueve quién espera. Ante la duda, <code>Promise</code>: pasar a síncrono después no rompe a nadie, al revés sí.</li>
+  <li><strong>Fabric Components</strong> son vistas en el árbol de React con layout de Yoga; <strong>TurboModules</strong> son servicios. Si dibuja píxeles, Fabric.</li>
+  <li>La <strong>Expo Modules API</strong> resuelve el caso común con ~40% menos código y cero ObjC++, y funciona en proyectos de RN sin managed workflow. Cede control fino del JSI y suma un acoplamiento de versiones. Para envolver un SDK o una API del sistema, suele ser la respuesta correcta.</li>
+  <li>Testeá en tres capas: lógica nativa con JUnit/XCTest, API de JS con Jest sobre un mock del archivo de la spec, e integración en dispositivo real. <strong>Jest en verde no dice nada del código nativo.</strong> Si publicás una librería, publicá su mock.</li>
+  <li>Depurar módulos de terceros es una habilidad concreta: logcat primero, código en <code>node_modules</code> después —está en tu disco—, reproducir en la app de ejemplo, <code>patch-package</code> para destrabarte y PR upstream. <strong>R8 no corre en debug</strong>: probá el release antes de publicar.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Elegí una librería nativa que ya uses (<code>react-native-mmkv</code>, <code>react-native-device-info</code>, la que sea). Abrí su archivo <code>src/Native*.ts</code> y escribí, sin ejecutar nada, qué métodos son síncronos y cuáles asíncronos. Después revisá su implementación en Kotlin y decidí si estás de acuerdo con cada elección. Anotá al menos una que hubieras hecho distinto y por qué.</li>
+  <li>Corré <code>npx react-native codegen</code> en un proyecto tuyo y abrí el código generado para Android y para iOS. Encontrá la clase abstracta que corresponde a una spec concreta y mapeá cada método de la spec con su firma generada, incluyendo cómo se tradujo un <code>Promise</code>.</li>
+  <li>Escribí una spec para un módulo que exponga el nivel de batería y el estado de carga, con la restricción de que la información disponible <strong>no es la misma en las dos plataformas</strong>. Decidí qué campos son nullables y justificá cada decisión en un comentario. No implementes nada: el ejercicio es el modelado.</li>
+  <li>Implementá el módulo del ejercicio 3 con la Expo Modules API, en Kotlin y Swift, con la app de ejemplo de <code>create-react-native-library</code>. Contá las líneas reales que escribiste.</li>
+  <li>Tomá el mismo módulo y agregale un método síncrono que a propósito tarde 50 ms (un <code>Thread.sleep</code> alcanza). Llamalo desde un componente que esté animando y filmá el resultado. Después pasalo a <code>Promise</code> y volvé a filmar. Guardá los dos videos: es la mejor explicación de RNS4.5 que vas a tener.</li>
+  <li>Elegí un módulo nativo cualquiera de tu <code>node_modules</code> y hacé build de release de Android con R8 activo. Si no rompe, buscá en su <code>proguard-rules.pro</code> (o en su <code>consumer-rules.pro</code>) qué reglas <code>-keep</code> trae y explicá qué pasaría sin cada una.</li>
+  <li>Escribí el mock de Jest para el módulo del ejercicio 4, publicalo como <code>&lt;tu-lib&gt;/jest/mock</code>, y escribí dos tests con él: uno que verifique que el hook libera el recurso al desmontarse y otro que verifique el manejo del caso "el hardware no está disponible".</li>
+</ol>
+
+<section class="quiz" id="quizRNS4">
+  <style>
+    #quizRNS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS4 .q{margin-bottom:1.5rem}
+    #quizRNS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS4 .opt:hover{border-color:var(--accent)}
+    #quizRNS4 .opt:disabled{cursor:default}
+    #quizRNS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success)}
+    #quizRNS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger);opacity:.65}
+    #quizRNS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS4 .exp.show{display:block}
+    #quizRNS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu módulo tiene dos métodos: uno devuelve la última muestra ya cacheada en memoria nativa, y otro enciende el sensor y espera la primera lectura (~200 ms en gama baja). ¿Cómo los declarás en la spec?</p>
+    <button class="opt">Los dos síncronos: JSI permite llamadas síncronas y son más rápidas que una promesa</button>
+    <button class="opt">El cacheado síncrono; el que despierta el hardware devolviendo <code>Promise</code></button>
+    <button class="opt">Los dos con <code>Promise</code>, porque en TurboModules no existen los métodos síncronos</button>
+    <div class="exp">Síncrono es para leer estado que ya existe; asíncrono para provocar que algo pase. El cacheado son microsegundos y encima suele necesitarse durante el primer render. El que espera al hardware, síncrono, bloquearía el hilo de JS ~200 ms: con 16,6 ms por frame son unos 12 frames perdidos <em>cada vez</em>. Y además puede fallar, así que necesitás un <code>reject</code> con código de error. Una llamada síncrona no es "más rápida": el trabajo nativo tarda lo mismo, solo cambia quién espera.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Una librería nativa de terceros funciona perfecto en debug y crashea con <code>ClassNotFoundException</code> solo en el build de release de Android. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">La spec de Codegen está mal escrita y genera una clase con otro nombre</button>
+    <button class="opt">Falta un permiso en el <code>AndroidManifest.xml</code> de la librería</button>
+    <button class="opt">R8/ProGuard eliminó u ofuscó una clase que se resuelve por reflexión, y falta la regla <code>-keep</code></button>
+    <div class="exp">La pista decisiva es "solo en release": <strong>R8 no corre en builds de debug</strong>. Si la spec estuviera mal, no compilaría en ninguno de los dos modos; si faltara un permiso, fallaría igual en debug. R8 elimina y renombra clases que "nadie usa" según el análisis estático, y las que se resuelven por reflexión —muy comunes en el registro de módulos nativos— son invisibles para ese análisis. Se confirma en dos minutos agregando <code>-keep class com.lib.** { *; }</code> y recompilando. De ahí la regla: probá el build de release <em>antes</em> de publicar.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. En la Nueva Arquitectura, ¿cuál es la fuente de la verdad del contrato entre JS y el código nativo?</p>
+    <button class="opt">La especificación en TypeScript: Codegen genera desde ahí las clases base de Android e iOS</button>
+    <button class="opt">La implementación en Kotlin, que después se refleja a mano en un archivo de tipos <code>.d.ts</code></button>
+    <button class="opt">Un archivo JSON que Metro produce en tiempo de build a partir del código nativo</button>
+    <div class="exp">La dirección importa: <strong>del TypeScript hacia lo nativo</strong>. Codegen lee los archivos <code>Native*.ts</code> declarados en <code>codegenConfig</code> y produce una clase abstracta en Android y un protocolo ObjC más glue C++ en iOS. Tu implementación hereda de lo generado, así que una discrepancia de firma <strong>rompe el build</strong> en vez de aparecer en runtime en un dispositivo. Ese es el cambio conceptual respecto de la arquitectura vieja, donde el contrato era implícito. Como efecto secundario práctico: leer el <code>src/Native*.ts</code> de cualquier librería te dice en treinta segundos qué expone y con qué tipos.</div>
+  </div>
+
+  <div class="score" id="scoreRNS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns3-animaciones-gestos/lecture.html">← RNS3: Animaciones y gestos</a>
+  <a href="../rns5-navegacion-arquitectura/lecture.html">RNS5: Navegación y arquitectura →</a>
+</nav>
+
+</div>
+</body>
+</html>

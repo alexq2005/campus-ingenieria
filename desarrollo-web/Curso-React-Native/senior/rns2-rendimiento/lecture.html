@@ -1,0 +1,1028 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS2 — Rendimiento nativo: hilos, listas y medición · React Native Senior</title>
+  <meta name="description" content="El presupuesto de 16,6 ms, los hilos de la Nueva Arquitectura, arranque en frío y Hermes, listas virtualizadas y recicladas, memoria de imágenes, y las herramientas de medición que contestan cada pregunta.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS2</span>
+  <span class="badge">⏱ 45–120 min</span>
+  <span class="badge">🎯 Pre-req: RNS1</span>
+  <span class="badge">📊 Performance</span>
+</div>
+
+<article>
+
+<h1>RNS2 — Rendimiento nativo: hilos, listas y medición</h1>
+
+<h2>RNS2.0 Por qué este módulo</h2>
+
+<p>En web, una página que tarda 300 ms de más en responder es "un poco lenta". En un celular, esos mismos 300 ms son una app que se siente <strong>rota</strong>. La diferencia no es de grado: es de percepción. El usuario tiene el dedo apoyado sobre el vidrio, la respuesta del sistema es física, y cuando el contenido no sigue al dedo el cerebro lo registra antes de que la persona pueda ponerlo en palabras. No dice "esto tarda 300 ms". Dice "esta app es mala".</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El rendimiento en móvil no es un problema de "hacer las cosas más rápido". Es un problema de <strong>presupuesto por frame</strong>: tenés 16,6 milisegundos para producir cada cuadro, y el trabajo que no entra en esa ventana se ve. Todo lo que sigue —hilos, listas, imágenes, arranque— son formas distintas de la misma pregunta: <em>¿quién se está comiendo el presupuesto?</em>
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>. Con la Nueva Arquitectura por defecto desde <strong>RN 0.76</strong>, el Bridge eliminado en <strong>0.82</strong> y el modo <em>bridgeless</em> total en <strong>0.86</strong>, buena parte del folclore de optimización de React Native quedó obsoleto. Los números de producción reportados en la migración —<strong>43% más rápido el arranque en frío, 39% mejor el render, 25% menos memoria</strong>— no llegaron porque alguien optimizó mejor su código: llegaron porque cambió el motor debajo. Eso significa dos cosas. Primero: si venías arrastrando trucos de la era del Bridge, muchos ya no aplican. Segundo: el piso subió, y con él subió lo que se espera de vos.</p>
+
+<div class="rule">
+  <strong>📌 Regla que atraviesa todo el módulo.</strong> Nunca optimices sin medir, y nunca midas en tu iPhone nuevo. Cada afirmación de este módulo se puede verificar con una herramienta concreta en menos de diez minutos. Si no podés medirlo, no es rendimiento: es superstición.
+</div>
+
+<h2>RNS2.1 Los hilos: quién hace qué y qué lo bloquea</h2>
+
+<p>En RNS1 viste la arquitectura. Acá te interesa una sola cosa de ella: <strong>qué corre en cada hilo</strong>, porque los síntomas de un problema de rendimiento son completamente distintos según qué hilo esté saturado, y el diagnóstico empieza por ahí.</p>
+
+<pre><code>┌──────────────────────────────────────────────────────────────────┐
+│  HILO JS  (Hermes)                                               │
+│  · Tu código React: render(), hooks, efectos                     │
+│  · Handlers de eventos (onPress, onChangeText)                   │
+│  · Callbacks de red, timers, lógica de negocio                   │
+│  · Reducers, parsing de JSON, validaciones                       │
+│  ▶ Si se bloquea: la app "no responde". Los toques se encolan.   │
+│    El scroll nativo SIGUE andando (lo maneja el SO), pero el     │
+│    contenido nuevo no aparece → filas en blanco.                 │
+└──────────────────────────────────────────────────────────────────┘
+                    │  JSI: llamadas directas C++ ↔ JS
+                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  RENDERER C++  (shadow tree, Yoga)                               │
+│  · Construye y diffea el árbol de sombra                         │
+│  · Calcula layout con Yoga (flexbox)                             │
+│  · Prepara el "commit" con las mutaciones a aplicar              │
+│  ▶ Corre en hilos propios, fuera del hilo JS.                    │
+│    Por eso el layout ya no compite con tu lógica de React.       │
+└──────────────────────────────────────────────────────────────────┘
+                    │  mount: aplicar mutaciones
+                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  HILO UI / MAIN  (UIKit / Android View system)                   │
+│  · Crea, actualiza y destruye las vistas nativas reales          │
+│  · Dibuja, compone y entrega el frame a la GPU                   │
+│  · Procesa gestos y animaciones del sistema                      │
+│  ▶ Si se bloquea: NADA se mueve. Ni el scroll, ni un spinner.    │
+│    Este es el bloqueo que el usuario percibe como "se colgó".    │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre>
+
+<p>La distinción entre los dos bloqueos es la herramienta de diagnóstico más barata que tenés, y se hace sin abrir ninguna herramienta:</p>
+
+<table>
+<thead><tr><th>Síntoma observable</th><th>Hilo sospechoso</th><th>Causa típica</th></tr></thead>
+<tbody>
+<tr><td>El scroll se mueve pero aparecen filas vacías</td><td>JS</td><td>Render de ítems demasiado caro, o trabajo pesado en un efecto</td></tr>
+<tr><td>Tocás un botón y tarda medio segundo en responder</td><td>JS</td><td>Handler bloqueante: parseo, cálculo, escritura sincrónica</td></tr>
+<tr><td>Todo se congela, incluso el indicador de carga</td><td>UI / Main</td><td>Trabajo nativo pesado, decodificación de imágenes gigantes, layout de una jerarquía enorme</td></tr>
+<tr><td>La animación se traba pero la app responde</td><td>UI</td><td>Animación manejada desde JS en vez de nativa (RNS3)</td></tr>
+<tr><td>Todo bien hasta que abrís cierta pantalla y ya no se recupera</td><td>Memoria</td><td>Fuga o imágenes sin liberar; el sistema empieza a hacer <em>swap</em> y a matar procesos</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El nuevo modo de fallar.</strong> Con JSI, JavaScript puede llamar a C++ de forma <strong>sincrónica</strong>. Eso es una ventaja enorme —desapareció la serialización asincrónica del Bridge— pero también significa que una llamada nativa lenta ahora <em>bloquea el hilo JS de verdad</em>, sin la cola asincrónica que antes lo amortiguaba. Si escribís un TurboModule que hace I/O de disco de forma sincrónica y lo llamás desde un handler de scroll, congelaste la app. En la era del Bridge esa llamada te habría llegado tarde; ahora te bloquea. Lo vemos en detalle en RNS4.
+</div>
+
+<h2>RNS2.2 El presupuesto de 16,6 ms</h2>
+
+<p>A 60 cuadros por segundo, cada cuadro dura <strong>16,66 ms</strong>. A 120 Hz —ProMotion en iPhone, y ya la norma en la gama media alta de Android— dura <strong>8,33 ms</strong>. Ese número es un plazo duro: si el frame no está listo cuando la pantalla lo pide, la pantalla vuelve a mostrar el anterior. Eso es un <em>frame dropeado</em>, y es lo que el usuario llama "tirones".</p>
+
+<pre><code>Presupuesto real de un frame a 60 Hz (16,66 ms)
+
+├─ Overhead del sistema (compositor, VSync, input)   ~3-4 ms   ← no es tuyo
+├─ Hilo UI: layout nativo, draw, entrega a la GPU    ~3-5 ms
+├─ Renderer C++: diff del shadow tree + Yoga         ~1-3 ms
+└─ TU CÓDIGO JS                                      ~5-8 ms   ← todo lo que te queda
+                                                     ────────
+                                                      16,66 ms
+
+A 120 Hz todo esto se divide por dos: te quedan ~3-4 ms de JS.
+</code></pre>
+
+<div class="mistake">
+  <strong>El error de razonamiento más común.</strong> "Mi función tarda 40 ms, no es nada." No es nada <em>una vez</em>. Pero 40 ms son <strong>2,4 frames perdidos</strong>. Si esa función corre en cada evento de scroll —que se dispara decenas de veces por segundo— no perdiste 40 ms: perdiste el scroll entero. En performance móvil, la unidad no es el milisegundo: es el frame.
+</div>
+
+<p>La matemática de los frames perdidos es implacable y conviene tenerla internalizada:</p>
+
+<table>
+<thead><tr><th>Bloqueo del hilo JS</th><th>Frames perdidos a 60 Hz</th><th>Cómo lo describe el usuario</th></tr></thead>
+<tbody>
+<tr><td>16 ms</td><td>1</td><td>Nada. Es imperceptible.</td></tr>
+<tr><td>50 ms</td><td>3</td><td>"A veces salta un poco"</td></tr>
+<tr><td>100 ms</td><td>6</td><td>"Va a tirones"</td></tr>
+<tr><td>300 ms</td><td>18</td><td>"Se traba"</td></tr>
+<tr><td>1000 ms</td><td>60</td><td>"Se colgó" / cierra la app</td></tr>
+</tbody>
+</table>
+
+<p>Medirlo dentro de la app es sencillo y sirve para instrumentar los caminos calientes en desarrollo:</p>
+
+<pre><code class="lang-tsx">// utils/frameBudget.ts
+const FRAME_60 = 16.66;
+
+export function medirBloqueo&lt;T&gt;(etiqueta: string, fn: () =&gt; T): T {
+  const t0 = performance.now();
+  const resultado = fn();
+  const dt = performance.now() - t0;
+
+  if (dt &gt; FRAME_60) {
+    const frames = Math.round(dt / FRAME_60);
+    console.warn(`[perf] ${etiqueta}: ${dt.toFixed(1)}ms — ${frames} frame(s) perdidos`);
+  }
+  return resultado;
+}
+
+// Uso en un camino caliente
+const filtrados = medirBloqueo('filtrarProductos', () =&gt;
+  productos.filter((p) =&gt; p.categoria === categoriaActiva),
+);</code></pre>
+
+<div class="tip">
+  Envolvé esto en <code>if (__DEV__)</code> para que no llegue a producción, o usá el paquete <code>react-native-performance</code>, que expone la <code>Performance API</code> del navegador (<code>performance.mark</code>, <code>performance.measure</code>, <code>PerformanceObserver</code>) sobre React Native y te permite mandar las marcas a tu backend de telemetría con el mismo vocabulario que usás en web.
+</div>
+
+<h2>RNS2.3 Arranque en frío: todo lo que pasa antes del primer pixel</h2>
+
+<p>El arranque es la única métrica de rendimiento que <strong>todos</strong> tus usuarios experimentan, todos los días. Y es la que más fácilmente se degrada sin que nadie lo note, porque cada dependencia nueva le agrega unos milisegundos y nadie mide el acumulado.</p>
+
+<pre><code>ARRANQUE EN FRÍO — el usuario tocó el ícono
+
+  t=0    │ El SO crea el proceso
+         │  · fork/zygote en Android, exec en iOS
+         │  · carga de librerías dinámicas
+   ~150ms│
+         ▼
+         │ Inicialización nativa
+         │  · Application/AppDelegate, SDKs de terceros
+         │  · ← ACÁ SE ESCONDEN LOS ANALYTICS Y EL CRASH REPORTER
+   ~300ms│
+         ▼
+         │ Arranque del runtime JS (Hermes)
+         │  · mmap del bytecode precompilado  ← barato
+   ~350ms│
+         ▼
+         │ Ejecución del bundle
+         │  · TODOS los imports de nivel superior corren acá
+         │  · ← ACÁ SE ESCONDE EL 80% DE LOS PROBLEMAS
+   ~700ms│
+         ▼
+         │ Primer render de React + commit + mount
+   ~900ms│
+         ▼
+  TTID   │ ▓▓▓ PRIMER PIXEL — se fue el splash
+         │ (Time To Initial Display)
+         │
+         │ Fetch de datos, hidratación, imágenes
+         ▼
+  TTI    │ ▓▓▓ LA APP RESPONDE Y MUESTRA CONTENIDO REAL
+  ~2,1s  │ (Time To Interactive)
+</code></pre>
+
+<div class="rule">
+  <strong>📌 TTID no es TTI, y confundirlos es cómo se hace trampa.</strong> El <strong>TTID</strong> es cuándo se ve el primer pixel de tu app. El <strong>TTI</strong> es cuándo el usuario puede realmente usarla. Podés bajar el TTID a 400 ms mostrando un esqueleto vacío y no haber mejorado absolutamente nada para el usuario: simplemente movés la espera a un lugar más lindo. Reportá siempre los dos, o no reportes ninguno.
+</div>
+
+<h3>Cómo se mide de verdad</h3>
+
+<pre><code class="lang-bash"># Android — el número oficial del sistema, sin instrumentar nada.
+# TotalTime es el arranque en frío hasta el primer frame.
+adb shell am force-stop com.miapp
+adb shell am start -W -n com.miapp/.MainActivity
+
+# Salida:
+#   Status: ok
+#   ThisTime: 912
+#   TotalTime: 912     ← TTID en ms
+#   WaitTime: 934
+
+# Diez corridas seguidas: lo que importa es la MEDIANA, no la mejor.
+for i in $(seq 1 10); do
+  adb shell am force-stop com.miapp
+  adb shell am start -W -n com.miapp/.MainActivity | grep TotalTime
+done</code></pre>
+
+<pre><code class="lang-bash"># iOS — variable de entorno de Xcode: imprime el desglose de arranque
+# Edit Scheme ▸ Run ▸ Arguments ▸ Environment Variables
+DYLD_PRINT_STATISTICS = 1
+
+# En la consola vas a ver el tiempo de carga de dylibs, rebase/binding,
+# inicializadores de ObjC/Swift... TODO lo que pasa ANTES de tu main().</code></pre>
+
+<p>Para el TTI —que es el número que le importa al negocio— hay que instrumentarlo vos, porque solo tu app sabe cuándo el contenido está realmente listo:</p>
+
+<pre><code class="lang-tsx">// App.tsx
+import performance from 'react-native-performance';
+
+export default function App() {
+  return (
+    &lt;DataProvider&gt;
+      &lt;PantallaInicio /&gt;
+    &lt;/DataProvider&gt;
+  );
+}
+
+// PantallaInicio.tsx — marcamos cuando hay CONTENIDO, no cuando hay layout
+function PantallaInicio() {
+  const { productos, cargando } = useProductos();
+
+  useEffect(() =&gt; {
+    if (!cargando &amp;&amp; productos.length &gt; 0) {
+      // nativeLaunchStart es el instante en que arrancó el proceso nativo
+      const tti = performance.now() - performance.timeOrigin;
+      performance.measure('TTI', 'nativeLaunchStart');
+      telemetria.registrar('app.tti_ms', tti);
+    }
+  }, [cargando, productos.length]);
+
+  // ...
+}</code></pre>
+
+<h3>Las palancas reales, en orden de rendimiento por hora invertida</h3>
+
+<div class="step"><strong>1. Auditá los imports de nivel superior.</strong> Todo <code>import</code> en la raíz de tu bundle se ejecuta durante el arranque, aunque la pantalla que lo usa esté a tres toques de distancia. Un SDK de pagos, una librería de gráficos, un pack de íconos completo: cada uno cuesta milisegundos en cada arranque, para todos los usuarios, aunque el 95% nunca llegue a esa pantalla.</div>
+
+<div class="step"><strong>2. Diferí todo lo que no bloquea el primer contenido.</strong> Analytics, crash reporting (¡no del todo — necesitás capturar crashes tempranos!), feature flags no críticos, precarga de datos secundarios. La herramienta es <code>InteractionManager.runAfterInteractions</code> o un <code>setTimeout(fn, 0)</code> honesto.</div>
+
+<div class="step"><strong>3. Achicá el bundle.</strong> Menos bytecode es menos tiempo de carga y menos memoria. Analizá qué hay adentro antes de creer que "no es tanto".</div>
+
+<div class="step"><strong>4. Cargá pantallas bajo demanda.</strong> React Navigation ya monta las pantallas de forma perezosa; lo que hay que evitar es importar sus módulos pesados desde el árbol raíz.</div>
+
+<div class="step"><strong>5. Hacé el splash honesto.</strong> Un splash que se va cuando hay contenido real es correcto. Un splash que se va a los 800 ms fijos para "sentirse rápido" y deja al usuario mirando una pantalla vacía es peor que no tener splash.</div>
+
+<pre><code class="lang-tsx">// Diferir trabajo que NO bloquea el primer contenido útil
+import { InteractionManager } from 'react-native';
+
+useEffect(() =&gt; {
+  const tarea = InteractionManager.runAfterInteractions(() =&gt; {
+    // Corre cuando terminaron las animaciones/interacciones pendientes
+    analytics.inicializar();
+    precargarCatalogoSecundario();
+    sincronizarFeatureFlags();
+  });
+  return () =&gt; tarea.cancel();
+}, []);</code></pre>
+
+<pre><code class="lang-tsx">// Import perezoso de un módulo caro: el costo se paga solo si se usa
+async function abrirEscaner() {
+  // El bundler lo separa; NO se ejecuta durante el arranque
+  const { escanearCodigo } = await import('../servicios/escanerQR');
+  const codigo = await escanearCodigo();
+  navigation.navigate('Producto', { codigo });
+}</code></pre>
+
+<pre><code class="lang-bash"># ¿Qué hay realmente adentro de tu bundle?
+npx react-native bundle \
+  --platform android \
+  --dev false \
+  --entry-file index.js \
+  --bundle-output /tmp/bundle.js \
+  --sourcemap-output /tmp/bundle.map
+
+npx react-native-bundle-visualizer
+# Abre un treemap: vas a encontrar la librería de 400 KB que nadie recuerda haber agregado</code></pre>
+
+<h2>RNS2.4 Hermes: por qué el arranque mejora tanto</h2>
+
+<p>Hermes es el motor de JavaScript de React Native, y su diseño está optimizado para exactamente una cosa: <strong>arrancar rápido en un dispositivo con poca memoria</strong>. No compite con V8 en velocidad pico de ejecución sostenida, y esa concesión es deliberada.</p>
+
+<div class="concept">
+  <strong>💡 La idea central de Hermes.</strong> Los motores JS tradicionales reciben texto fuente y tienen que <em>parsearlo</em> en cada arranque antes de poder ejecutar nada. Hermes mueve ese trabajo al momento del build: tu JavaScript se compila a <strong>bytecode</strong> durante la compilación de la app, se empaqueta como un archivo binario, y en tiempo de arranque el motor simplemente lo mapea a memoria (<code>mmap</code>) y empieza a ejecutar. No hay parseo. No hay compilación. Es la diferencia entre leer un libro y desenrollarlo.
+</div>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Motor con parseo en runtime</th><th>Hermes</th></tr></thead>
+<tbody>
+<tr><td>Qué se envía en el bundle</td><td>Texto JavaScript</td><td>Bytecode precompilado (<code>.hbc</code>)</td></tr>
+<tr><td>Trabajo en el arranque</td><td>Parsear + compilar todo</td><td><code>mmap</code> del binario, ejecución directa</td></tr>
+<tr><td>Memoria en el arranque</td><td>Alta: el AST vive en el heap</td><td>Baja: el bytecode se lee del archivo mapeado</td></tr>
+<tr><td>Compilación de funciones</td><td>Ansiosa o perezosa según motor</td><td>Perezosa: solo lo que se llama</td></tr>
+<tr><td>JIT</td><td>Sí</td><td>No — intérprete optimizado</td></tr>
+<tr><td>Velocidad pico sostenida</td><td>Mayor en cálculo intensivo largo</td><td>Menor, pero irrelevante en apps de UI</td></tr>
+</tbody>
+</table>
+
+<p>Verificar que efectivamente estás corriendo sobre Hermes toma un segundo, y conviene hacerlo antes de sacar cualquier conclusión de un benchmark:</p>
+
+<pre><code class="lang-tsx">// Hermes inyecta este objeto global. Si es undefined, NO estás en Hermes.
+const enHermes = typeof global.HermesInternal === 'object' &amp;&amp; global.HermesInternal !== null;
+
+console.log('Motor JS:', enHermes ? 'Hermes' : 'JSC/otro');
+
+// El detalle fino de la build:
+console.log(global.HermesInternal?.getRuntimeProperties?.());
+// { "OSS Release Version": "...", "Bytecode Version": 96, ... }</code></pre>
+
+<pre><code class="lang-bash"># Compilar a bytecode a mano, para inspeccionar o para medir tamaños
+npx hermesc -emit-binary -out index.hbc index.bundle
+ls -lh index.bundle index.hbc
+
+# Perfilado de muestreo del hilo JS, directo desde el dispositivo.
+# Se activa desde el Dev Menu ▸ "Start/Stop Sampling Profiler",
+# después se baja el trace y se convierte al formato de Chrome:
+npx react-native profile-hermes ./perfiles
+# Abrí el .cpuprofile resultante en React Native DevTools o en Chrome DevTools</code></pre>
+
+<div class="warn">
+  <strong>El perfil de Hermes es el hilo JS, y solo el hilo JS.</strong> Si el problema está en la decodificación de imágenes, en el layout de Yoga o en el hilo UI, este perfil te va a mostrar un hilo JS relajado y no vas a encontrar nada. Ahí hay que salir a Perfetto o a Instruments (RNS2.8). Elegir la herramienta equivocada es la forma más común de perder una tarde entera.
+</div>
+
+<h2>RNS2.5 Listas: la sección que más importa</h2>
+
+<p>Si tuvieras que aprender una sola cosa de este módulo, es esta. En una app de contenido —que es casi toda app— <strong>la lista es la pantalla</strong>. Es donde el usuario pasa el 80% del tiempo, es donde el scroll expone cada milisegundo desperdiciado, y es donde se concentran los problemas de memoria.</p>
+
+<h3>Por qué un ScrollView con 500 ítems es un bug, no una decisión</h3>
+
+<p><code>ScrollView</code> monta <strong>todos</strong> sus hijos de una vez, antes de mostrar nada. No es una optimización pendiente: es su contrato. Con 500 productos, eso significa 500 componentes React montados, 500 subárboles en el shadow tree, y varios miles de vistas nativas creadas y en memoria simultáneamente.</p>
+
+<pre><code class="lang-tsx">// 🔴 BUG. No "código mejorable": bug.
+function Catalogo({ productos }: { productos: Producto[] }) {
+  return (
+    &lt;ScrollView&gt;
+      {productos.map((p) =&gt; (
+        &lt;TarjetaProducto key={p.id} producto={p} /&gt;
+      ))}
+    &lt;/ScrollView&gt;
+  );
+}
+// 500 productos × ~8 vistas nativas por tarjeta = 4.000 vistas
+// El hilo JS se bloquea en el render inicial durante segundos.
+// El hilo UI se bloquea creando las vistas.
+// La memoria sube y no baja mientras la pantalla exista.</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla operativa.</strong> <code>ScrollView</code> es para contenido <strong>finito y conocido</strong>: un formulario, una pantalla de detalle, una configuración con 15 filas. En el momento en que la cantidad de ítems depende de datos —de una API, de la base local, del usuario— la respuesta es una lista virtualizada. Sin excepciones, sin "por ahora son pocos".
+</div>
+
+<h3>FlatList: virtualización por montaje y desmontaje</h3>
+
+<p><code>FlatList</code> (sobre <code>VirtualizedList</code>) mantiene montada solo una ventana alrededor de lo visible y desmonta el resto. Es la solución correcta en la enorme mayoría de los casos, <em>si le das lo que necesita</em>. Sus props no son ajustes cosméticos: cada una elimina una clase específica de trabajo.</p>
+
+<table>
+<thead><tr><th>Prop</th><th>Default</th><th>Qué elimina</th><th>Cuándo tocarla</th></tr></thead>
+<tbody>
+<tr><td><code>keyExtractor</code></td><td>usa <code>item.key</code> o el índice</td><td>Re-montajes espurios cuando cambia el orden o se inserta al principio</td><td><strong>Siempre.</strong> Devolvé un ID estable del dominio, nunca el índice</td></tr>
+<tr><td><code>getItemLayout</code></td><td>—</td><td>La medición <code>onLayout</code> de cada fila: la lista ya sabe dónde va cada una</td><td>Siempre que la altura sea fija o calculable. Habilita <code>scrollToIndex</code> instantáneo</td></tr>
+<tr><td><code>windowSize</code></td><td>21</td><td>Filas montadas fuera de pantalla (21 = 10 pantallas arriba + 10 abajo + la visible)</td><td>Bajalo a 5–11 si las filas son caras; subilo si ves blancos al scrollear rápido</td></tr>
+<tr><td><code>initialNumToRender</code></td><td>10</td><td>Trabajo en el primer render</td><td>Ajustalo a cuántas filas <em>realmente</em> entran en pantalla, ni una más</td></tr>
+<tr><td><code>maxToRenderPerBatch</code></td><td>10</td><td>Bloqueos largos del hilo JS durante el scroll</td><td>Bajalo si el scroll salta; subilo si aparecen blancos</td></tr>
+<tr><td><code>updateCellsBatchingPeriod</code></td><td>50 ms</td><td>Frecuencia con que se procesan lotes nuevos</td><td>Subilo para menos trabajo por segundo a costa de más blancos</td></tr>
+<tr><td><code>removeClippedSubviews</code></td><td><code>true</code> en Android</td><td>El costo de <em>dibujar</em> vistas fuera del viewport</td><td>Con cuidado: en iOS y con contenido complejo puede causar filas en blanco o desaparecidas</td></tr>
+<tr><td><code>onEndReachedThreshold</code></td><td>2</td><td>Fetch tardío en paginación infinita</td><td>0.5–1 suele dar una experiencia más suave</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// ✅ FlatList bien puesta: cada prop elimina una clase de trabajo
+import { FlatList, View, Text } from 'react-native';
+import { memo, useCallback } from 'react';
+
+const ALTO_FILA = 96;
+
+// 1. El ítem memoizado, en su propio componente y FUERA del render del padre.
+const Fila = memo(function Fila({ producto }: { producto: Producto }) {
+  return (
+    &lt;View style={{ height: ALTO_FILA }}&gt;
+      &lt;Text&gt;{producto.nombre}&lt;/Text&gt;
+      &lt;Text&gt;{producto.precio}&lt;/Text&gt;
+    &lt;/View&gt;
+  );
+});
+
+export function Catalogo({ productos }: { productos: Producto[] }) {
+  // 2. renderItem estable: si se recrea en cada render, memo() no sirve de nada
+  const renderItem = useCallback(
+    ({ item }: { item: Producto }) =&gt; &lt;Fila producto={item} /&gt;,
+    [],
+  );
+
+  // 3. Key del dominio, jamás el índice
+  const keyExtractor = useCallback((item: Producto) =&gt; item.id, []);
+
+  // 4. Altura conocida ⇒ cero mediciones
+  const getItemLayout = useCallback(
+    (_: unknown, index: number) =&gt; ({
+      length: ALTO_FILA,
+      offset: ALTO_FILA * index,
+      index,
+    }),
+    [],
+  );
+
+  return (
+    &lt;FlatList
+      data={productos}
+      renderItem={renderItem}
+      keyExtractor={keyExtractor}
+      getItemLayout={getItemLayout}
+      initialNumToRender={8}
+      maxToRenderPerBatch={8}
+      windowSize={9}
+      removeClippedSubviews
+    /&gt;
+  );
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error que anula todo lo anterior.</strong> Definir <code>renderItem</code> como una función inline en el JSX (<code>renderItem={({item}) =&gt; &lt;Fila .../&gt;}</code>). Cada render del padre crea una función nueva, la <code>FlatList</code> la ve como una prop distinta, y todas tus filas memoizadas se vuelven a renderizar. Es el equivalente de poner el <code>memo()</code> y después desconectarlo. Lo mismo vale para pasar objetos literales en <code>contentContainerStyle</code> o en las props del ítem.
+</div>
+
+<h3>Dónde FlatList deja de alcanzar</h3>
+
+<p><code>FlatList</code> <strong>desmonta y vuelve a montar</strong>. Eso significa que en cada scroll el hilo JS tiene que renderizar componentes nuevos, y el hilo UI tiene que crear y destruir vistas nativas. Con filas simples es imperceptible. Con filas complejas —imagen, varios textos, badges, botones— el costo de montaje aparece como blancos y micro-tirones, especialmente en el <em>fling</em> rápido de un Android de gama media.</p>
+
+<p><strong>FlashList</strong>, de Shopify, ataca exactamente eso: en vez de destruir la fila que salió de pantalla, la <strong>recicla</strong> reasignándole datos nuevos. La vista nativa nunca se destruye, y el componente React se reutiliza. Es la misma técnica que usan <code>RecyclerView</code> en Android y <code>UICollectionView</code> en iOS desde hace más de una década.</p>
+
+<pre><code class="lang-tsx">// FlashList v2 — reescrita sobre la Nueva Arquitectura.
+// A diferencia de v1, ya NO necesita estimatedItemSize: mide sola.
+import { FlashList } from '@shopify/flash-list';
+
+export function Catalogo({ productos }: { productos: Producto[] }) {
+  return (
+    &lt;FlashList
+      data={productos}
+      keyExtractor={(item) =&gt; item.id}
+      renderItem={({ item }) =&gt; &lt;Fila producto={item} /&gt;}
+      // Ayuda al reciclado cuando hay filas de FORMAS distintas:
+      // así solo se reutilizan vistas del mismo tipo.
+      getItemType={(item) =&gt; (item.destacado ? 'destacado' : 'normal')}
+    /&gt;
+  );
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Lo que el reciclado te obliga a cambiar.</strong> Si la vista se reutiliza, <strong>el estado local del componente sobrevive al cambio de datos</strong>. Una fila con <code>useState</code> de "expandido" puede aparecer expandida en un producto que nunca tocaste, porque heredó la vista de otro. La regla con listas recicladas: el estado por ítem vive <em>fuera</em> de la fila (en el store, en el padre, indexado por ID), o usás una <code>key</code> de reciclado para forzar el reinicio. Este bug es sutil, no aparece en desarrollo con 5 ítems, y aparece en producción con 2.000.
+</div>
+
+<h3>La tabla de decisión</h3>
+
+<table>
+<thead><tr><th>Opción</th><th>Usala cuando</th><th>Costo real</th></tr></thead>
+<tbody>
+<tr><td><code>ScrollView</code></td><td>Contenido finito y conocido: formularios, detalles, ajustes</td><td>Cero complejidad. Se rompe apenas la cantidad depende de datos</td></tr>
+<tr><td><code>FlatList</code></td><td>El caso por defecto: listas de datos con filas de complejidad moderada</td><td>Está en el core, sin dependencia. Monta/desmonta: cuesta en filas caras</td></tr>
+<tr><td><code>FlashList</code></td><td>Miles de ítems, filas complejas, o el scroll ya se siente mal medido</td><td>Dependencia externa. Obliga a sacar el estado local de las filas. Migración de 1–3 h</td></tr>
+<tr><td><code>SectionList</code></td><td>Listas agrupadas con encabezados pegajosos</td><td>Misma familia que FlatList, con los mismos cuidados</td></tr>
+<tr><td>Paginación explícita</td><td>Cuando el dataset completo no debería estar en el cliente</td><td>Menos elegante que el scroll infinito, pero acota memoria y red por diseño</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>El orden correcto de intervención.</strong> Primero medí. Después arreglá la <code>FlatList</code> (keys, <code>getItemLayout</code>, memoización, ventana). Solo si con eso no alcanza, migrá a <code>FlashList</code>. Empezar por la migración es cambiar de librería para arrastrar los mismos problemas: una fila que renderiza caro, renderiza caro en cualquier lista.
+</div>
+
+<h2>RNS2.6 Re-renders: lo mismo que React, pero se paga más caro</h2>
+
+<p>Todo lo que sabés del reconciliador de React aplica igual acá. Si necesitás refrescar la teoría —el algoritmo de diffing, por qué la identidad referencial importa, cuándo <code>memo</code> ayuda y cuándo estorba— está desarrollado en <a href="../../../Curso-React/senior/rs1-reconciliador/lecture.html">RS1: El reconciliador, por dentro</a> del track de React Senior. Acá nos importa lo que <strong>cambia</strong> en móvil.</p>
+
+<div class="concept">
+  <strong>💡 Por qué el mismo re-render cuesta más en un celular.</strong> En web, un re-render que no cambia el DOM es casi gratis: React compara y no toca nada. En React Native, ese mismo render dispara la reconstrucción del subárbol del shadow tree en C++, el recálculo de layout con Yoga y una operación de <em>commit</em>, todo sobre un CPU que tiene entre un tercio y un sexto de la potencia de una notebook, con la mitad del ancho de banda de memoria y un presupuesto térmico que lo va frenando a medida que el usuario usa la app. El render que en tu Mac medía 2 ms, en un Android de gama media mide 15.
+</div>
+
+<pre><code class="lang-tsx">// 🔴 El clásico: el contexto de "carrito" re-renderiza TODA la app
+//    cada vez que cambia cualquier cosa del carrito.
+const CarritoContext = createContext(null);
+
+function CarritoProvider({ children }) {
+  const [items, setItems] = useState([]);
+  const [cupon, setCupon] = useState(null);
+
+  // Objeto nuevo en CADA render ⇒ todos los consumidores se re-renderizan
+  return (
+    &lt;CarritoContext.Provider value={{ items, setItems, cupon, setCupon }}&gt;
+      {children}
+    &lt;/CarritoContext.Provider&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// ✅ Separar el estado que cambia seguido del que casi no cambia,
+//    y estabilizar el value.
+const ItemsContext = createContext&lt;Producto[]&gt;([]);
+const AccionesContext = createContext&lt;Acciones | null&gt;(null);
+
+function CarritoProvider({ children }: { children: ReactNode }) {
+  const [items, setItems] = useState&lt;Producto[]&gt;([]);
+
+  // Las acciones NUNCA cambian de identidad ⇒ quien solo usa acciones
+  // no se entera de los cambios en items.
+  const acciones = useMemo&lt;Acciones&gt;(
+    () =&gt; ({
+      agregar: (p: Producto) =&gt; setItems((prev) =&gt; [...prev, p]),
+      quitar: (id: string) =&gt; setItems((prev) =&gt; prev.filter((x) =&gt; x.id !== id)),
+    }),
+    [],
+  );
+
+  return (
+    &lt;AccionesContext.Provider value={acciones}&gt;
+      &lt;ItemsContext.Provider value={items}&gt;{children}&lt;/ItemsContext.Provider&gt;
+    &lt;/AccionesContext.Provider&gt;
+  );
+}</code></pre>
+
+<div class="info">
+  Con React 19 —disponible desde RN 0.78— entra en juego el <strong>React Compiler</strong>, que memoiza automáticamente lo que hoy hacés a mano con <code>useMemo</code>, <code>useCallback</code> y <code>memo</code>. Es una mejora real y vale la pena adoptarlo. Pero no resuelve el problema estructural: si tu contexto agrupa estado que cambia a distinta frecuencia, el compilador no puede inventar la separación que vos no hiciste. <strong>La arquitectura de estado sigue siendo tuya.</strong>
+</div>
+
+<p>Para <em>ver</em> los re-renders en vez de suponerlos, abrí React Native DevTools (Dev Menu ▸ <em>Open DevTools</em>, o <code>j</code> en la terminal de Metro), pestaña <strong>Profiler</strong>, y activá <em>"Highlight updates when components render"</em>. Si al tipear una letra en un buscador se ilumina media pantalla, encontraste el problema sin escribir una línea de código.</p>
+
+<h2>RNS2.7 Imágenes: la causa número uno de consumo de memoria</h2>
+
+<p>Casi todos los reportes de "la app usa 800 MB" terminan en el mismo lugar. Y la razón es una sola cuenta que casi nadie hace:</p>
+
+<div class="rule">
+  <strong>📌 La memoria de una imagen no tiene nada que ver con el peso del archivo.</strong> Un JPEG de 400 KB, una vez <em>decodificado</em> para poder dibujarse, ocupa <code>ancho × alto × 4 bytes</code> en RAM. Da igual cuánto pesaba comprimido: la compresión sirve para la red, no para la memoria.
+</div>
+
+<pre><code>MATEMÁTICA DE LA MEMORIA DE IMÁGENES
+
+  Foto de producto: 2400 × 2400 px, JPEG de 380 KB en el servidor
+  Decodificada:  2400 × 2400 × 4 bytes  =  23,04 MB en RAM
+
+  Se muestra en una miniatura de 120 × 120 dp
+  En un dispositivo @3x eso son 360 × 360 px reales
+  Necesaria:      360 ×  360 × 4 bytes  =   0,52 MB
+
+  ▶ Desperdicio: 44× por imagen.
+  ▶ Con 30 imágenes en memoria: 691 MB en vez de 15,5 MB.
+</code></pre>
+
+<p>Ese factor de 44 es lo que separa una app que consume 700 MB de una que consume 180. Y no se arregla con más caché ni con menos filas: se arregla <strong>no decodificando píxeles que nunca se van a ver</strong>.</p>
+
+<pre><code class="lang-tsx">// 🔴 Pide la imagen original y la decodifica entera para mostrarla en 120dp
+&lt;Image source={{ uri: producto.fotoUrl }} style={{ width: 120, height: 120 }} /&gt;</code></pre>
+
+<pre><code class="lang-tsx">// ✅ Pedirle al CDN la imagen del tamaño que realmente vas a mostrar.
+//    Esta es la optimización con mejor relación esfuerzo/impacto del módulo.
+import { PixelRatio } from 'react-native';
+
+function urlDimensionada(url: string, anchoDp: number) {
+  // Convertimos dp a píxeles físicos del dispositivo
+  const px = PixelRatio.getPixelSizeForLayoutSize(anchoDp);
+  return `${url}?w=${px}&amp;q=75&amp;fm=webp`;   // sintaxis típica de Cloudinary/imgix
+}
+
+&lt;Image
+  source={{ uri: urlDimensionada(producto.fotoUrl, 120) }}
+  style={{ width: 120, height: 120 }}
+/&gt;</code></pre>
+
+<pre><code class="lang-tsx">// ✅ expo-image: caché en disco y memoria, placeholder, transición,
+//    y —clave en listas recicladas— recyclingKey.
+import { Image } from 'expo-image';
+
+&lt;Image
+  source={urlDimensionada(producto.fotoUrl, 120)}
+  style={{ width: 120, height: 120 }}
+  contentFit="cover"
+  transition={150}
+  placeholder={{ blurhash: producto.blurhash }}
+  cachePolicy="memory-disk"
+  // Sin esto, al reciclar la fila se ve por un instante la foto ANTERIOR
+  recyclingKey={producto.id}
+/&gt;</code></pre>
+
+<table>
+<thead><tr><th>Formato</th><th>Peso relativo</th><th>Soporte</th><th>Cuándo usarlo</th></tr></thead>
+<tbody>
+<tr><td>JPEG</td><td>Referencia</td><td>Universal</td><td>Fallback seguro para fotos</td></tr>
+<tr><td>PNG</td><td>Muy pesado en fotos</td><td>Universal</td><td>Solo cuando necesitás transparencia sin pérdida</td></tr>
+<tr><td>WebP</td><td>~25–35% menos que JPEG</td><td>iOS 14+, Android 4.3+ (universal en la práctica)</td><td><strong>El default sensato hoy</strong></td></tr>
+<tr><td>AVIF</td><td>~50% menos que JPEG</td><td>iOS 16+, Android 12+</td><td>Con negociación de contenido y fallback a WebP</td></tr>
+<tr><td>SVG</td><td>Diminuto</td><td>Requiere <code>react-native-svg</code></td><td>Íconos y vectores. Nunca fotos</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>La caché sin límite es una fuga de memoria con buen marketing.</strong> Una caché de imágenes en memoria que crece sin tope termina en un <em>out of memory kill</em> del sistema — que en Android se ve como "la app se cerró sola" y no genera ningún crash report útil. Definí un tope explícito, medilo, y limpiá la caché de memoria en <code>AppState</code> <code>'background'</code> si tu app maneja muchas imágenes grandes.
+</div>
+
+<h2>RNS2.8 Medición: qué contesta cada herramienta</h2>
+
+<p>Elegir mal la herramienta es la forma más eficiente de perder un día entero. Cada una responde una pregunta distinta y ninguna las responde todas:</p>
+
+<table>
+<thead><tr><th>Herramienta</th><th>Qué pregunta contesta</th><th>Qué NO ve</th></tr></thead>
+<tbody>
+<tr><td><strong>Perf Monitor</strong> (Dev Menu)<br><em>gratis, 5 segundos</em></td><td>"¿Cuántos FPS lleva UI y cuántos JS ahora mismo?" Te dice <em>en qué hilo</em> está el problema</td><td>Por qué. Solo da el síntoma, no la causa</td></tr>
+<tr><td><strong>React Native DevTools</strong><br><em>reemplazó a Flipper desde 0.76</em></td><td>"¿Qué componentes renderizan, cuántas veces y por qué?" Profiler de React + consola + sampling de Hermes</td><td>Todo lo nativo: layout, GPU, decodificación de imágenes</td></tr>
+<tr><td><strong>Perfetto</strong> (Android)<br><em>sucesor de systrace</em></td><td>"¿Qué hace cada hilo, microsegundo a microsegundo?" Traza el sistema completo: JS, UI, GPU, binder</td><td>Requiere aprender a leer trazas. Curva de aprendizaje real</td></tr>
+<tr><td><strong>Xcode Instruments</strong> (iOS)</td><td><em>Time Profiler</em>: dónde se va el CPU nativo. <em>Allocations</em>: qué crece en memoria. <em>Animation Hitches</em>: qué frames se perdieron y por qué</td><td>El detalle interno de React. Necesitás Mac</td></tr>
+<tr><td><strong>Android Studio Profiler</strong></td><td>CPU, memoria (heap dump y allocation tracking), red y energía, en vivo</td><td>El detalle de React. Es pesado de correr</td></tr>
+<tr><td><strong>Macrobenchmark</strong> (Android)</td><td>"¿El arranque empeoró respecto del release anterior?" Automatizable en CI</td><td>Diagnóstico. Te dice que empeoró, no dónde</td></tr>
+<tr><td><strong><code>react-native-performance</code></strong></td><td>"¿Cuánto tarda esto en los teléfonos reales de mis usuarios?" Telemetría en producción</td><td>El detalle fino. Es para agregados y percentiles</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Perfetto: traza del sistema completo en Android.
+# 1) Grabar (10 s) mientras hacés scroll en el dispositivo
+adb shell perfetto -o /data/misc/perfetto-traces/trace -t 10s \
+  sched freq idle am wm gfx view binder_driver hal dalvik
+
+# 2) Bajarla y abrirla en ui.perfetto.dev
+adb pull /data/misc/perfetto-traces/trace ./trace.perfetto-trace
+
+# Qué buscar en la traza:
+#   · "mqt_js"  → el hilo JS de React Native. Huecos largos = bloqueo.
+#   · "RenderThread" → si está saturado, el problema es de dibujo/GPU.
+#   · Frames marcados en rojo en la pista "Frames" = frames perdidos.</code></pre>
+
+<pre><code class="lang-bash"># Memoria en vivo, sin abrir Android Studio.
+# La línea TOTAL PSS es el número que te importa.
+adb shell dumpsys meminfo com.miapp | head -25
+
+# Monitoreo continuo: una muestra por segundo mientras hacés scroll
+while true; do
+  adb shell dumpsys meminfo com.miapp | grep "TOTAL PSS"
+  sleep 1
+done</code></pre>
+
+<pre><code class="lang-tsx">// Telemetría de producción: sin esto, "mejoró" es una opinión.
+import performance, { PerformanceObserver } from 'react-native-performance';
+
+const observador = new PerformanceObserver((lista) =&gt; {
+  lista.getEntries().forEach((entrada) =&gt; {
+    telemetria.registrar(`perf.${entrada.name}`, entrada.duration, {
+      modelo: DeviceInfo.getModel(),
+      version_os: DeviceInfo.getSystemVersion(),
+      version_app: DeviceInfo.getVersion(),
+    });
+  });
+});
+observador.observe({ entryTypes: ['measure', 'mark'] });
+
+// En el código:
+performance.mark('catalogo:inicio');
+await cargarCatalogo();
+performance.measure('catalogo:carga', 'catalogo:inicio');</code></pre>
+
+<div class="tip">
+  <strong>Reportá percentiles, no promedios.</strong> Un TTI promedio de 1,8 s puede esconder que el p95 es de 9 s en los dispositivos viejos — que suelen ser justamente los de tus usuarios con menos alternativas y más probabilidad de desinstalar. El promedio te tranquiliza; el <strong>p95</strong> te dice la verdad.
+</div>
+
+<h2>RNS2.9 Medir en el dispositivo correcto</h2>
+
+<p>Este es el error metodológico que invalida más trabajo de optimización, y es completamente gratuito de evitar.</p>
+
+<div class="mistake">
+  <strong>Probar solo en un iPhone nuevo es engañarse con método.</strong> El chip de un iPhone reciente y su ancho de banda de memoria te dan un margen tan grande que absorbe silenciosamente errores que en un Android de gama media son catastróficos. Una lista mal construida corre a 60 fps en un iPhone 16 Pro y a 22 fps en el teléfono que efectivamente usa la mayor parte de tus usuarios. No optimizaste nada: elegiste no verlo.
+</div>
+
+<p>La solución es una política explícita de dispositivos de referencia, escrita y acordada con el equipo:</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Rol</th><th>Qué se mide ahí</th></tr></thead>
+<tbody>
+<tr><td><strong>Gama media Android</strong><br>(2–4 GB RAM, ~3 años)</td><td><strong>El dispositivo de referencia.</strong> Si acá anda bien, anda bien en todos lados</td><td>Todos los números que reportás. Este es el que define si algo pasa o no pasa</td></tr>
+<tr><td>Gama baja Android<br>(2 GB, Android Go)</td><td>Piso de supervivencia</td><td>Que la app no sea matada por el sistema. Que arranque en menos de 5 s</td></tr>
+<tr><td>iPhone reciente</td><td>Verificación de que <em>funciona</em></td><td>Corrección funcional y visual. <strong>Nunca</strong> conclusiones de rendimiento</td></tr>
+<tr><td>iPhone de 4–5 años</td><td>Realidad de iOS</td><td>La distribución real de iOS es más vieja de lo que sugiere el marketing</td></tr>
+<tr><td>Emulador / Simulador</td><td>Desarrollo diario</td><td><strong>Nada</strong> de rendimiento. Corre sobre tu CPU de escritorio: miente en ambas direcciones</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Verificar en qué condiciones estás midiendo REALMENTE
+adb shell getprop ro.product.model
+adb shell cat /proc/cpuinfo | grep -m1 "model name"
+
+# ⚠️ Batería y temperatura frenan el CPU y arruinan la comparación.
+# Si el teléfono está caliente o por debajo del 20%, tus números no valen.
+adb shell dumpsys battery | grep -E "level|temperature"
+
+# Modo ahorro de energía activo = throttling agresivo garantizado
+adb shell settings get global low_power</code></pre>
+
+<div class="warn">
+  <strong>El throttling térmico rompe los benchmarks en silencio.</strong> Corré la misma prueba tres veces seguidas en un teléfono y la tercera va a ser más lenta que la primera, sin que hayas cambiado nada. Dejá enfriar el dispositivo entre corridas, descartá la primera medición (caché fría) y reportá la <strong>mediana de al menos cinco</strong>. Si tus dos números —antes y después— no vienen de la misma metodología, no son comparables y no prueban nada.
+</div>
+
+<h2>RNS2.10 Cuándo NO optimizar (y cómo poner un presupuesto)</h2>
+
+<p>La optimización tiene un costo que casi nunca se contabiliza: código más difícil de leer, más difícil de cambiar, con más lugares donde meter un bug. Ese costo es real y permanente, y solo se justifica si a cambio hay una mejora que el usuario percibe.</p>
+
+<div class="rule">
+  <strong>📌 Los cuatro casos en que no hay que optimizar.</strong>
+  <br>• <strong>No medís el problema.</strong> Si no podés mostrar el número antes, no vas a poder mostrar la mejora después.
+  <br>• <strong>El usuario no lo percibe.</strong> Bajar un render de 3 ms a 1 ms es invisible. Bajar de 300 a 100 se siente.
+  <br>• <strong>No es el cuello de botella.</strong> Optimizar el 5% del tiempo total tiene un techo del 5%, hagas lo que hagas.
+  <br>• <strong>El costo es una API pública peor.</strong> Un componente ilegible que ahorra 2 ms es deuda técnica con disfraz de mérito.
+</div>
+
+<p>Lo que sí funciona es lo contrario del heroísmo puntual: fijar un <strong>presupuesto de performance</strong> con números concretos, medirlo en cada release y tratar la violación como un bug con dueño y prioridad — no como una tarea de "mejoras" que nunca se prioriza.</p>
+
+<pre><code class="lang-tsx">// perf-budget.ts — el presupuesto vive en el repo, versionado y discutible
+export const PRESUPUESTO = {
+  // Todos los umbrales se miden en el DISPOSITIVO DE REFERENCIA
+  arranque: {
+    ttid_ms: 1200,      // primer pixel
+    tti_ms: 2500,       // contenido real y app interactiva
+  },
+  listas: {
+    fps_p50: 55,        // mediana durante scroll sostenido
+    fps_p05: 45,        // el peor 5% de los frames
+    blancos_max: 0,     // filas vacías visibles al scrollear: cero
+  },
+  memoria: {
+    reposo_mb: 180,
+    pico_mb: 320,       // tras recorrer las 3 pantallas principales
+  },
+  bundle: {
+    android_kb: 4500,
+    ios_kb: 4200,
+  },
+} as const;</code></pre>
+
+<pre><code class="lang-bash"># El presupuesto que no se verifica automáticamente no es un presupuesto:
+# es una intención. Un gate simple en CI:
+#
+#  1. Build de release
+#  2. Instalar en un dispositivo/emulador fijo del runner
+#  3. 10 arranques en frío con `am start -W`, tomar la mediana
+#  4. Comparar contra PRESUPUESTO.arranque.ttid_ms
+#  5. Fallar el pipeline si se excede, con el delta en el mensaje
+#
+# El objetivo no es perseguir el número perfecto:
+# es que NADIE pueda degradarlo sin enterarse.</code></pre>
+
+<h2>🧑‍🎓 Worked Example — "la lista de productos va a tirones y come 700 MB"</h2>
+
+<blockquote>Catálogo de 2.000 productos con foto. En el iPhone del equipo de desarrollo "va bien". En el Moto G de soporte, el scroll va a 20 fps, aparecen filas en blanco constantemente y a los dos minutos el sistema mata la app. Un reporte de usuario dice: "se cierra sola cuando busco". Nadie sabe por dónde empezar.</blockquote>
+
+<p><strong>Paso 1 — Establecer la línea de base en el dispositivo correcto.</strong> Antes de mirar una sola línea de código: tres números, en el dispositivo de referencia, con metodología repetible.</p>
+
+<pre><code class="lang-bash"># Dispositivo de referencia: Moto G (4 GB RAM, Android 13)
+# Enfriado, batería &gt; 50%, sin modo ahorro.
+
+# (a) TTI — mediana de 10 arranques en frío
+for i in $(seq 1 10); do
+  adb shell am force-stop com.tienda
+  adb shell am start -W -n com.tienda/.MainActivity | grep TotalTime
+done
+# mediana: 4.812 ms
+
+# (b) Memoria — recorriendo el catálogo durante 60 s
+adb shell dumpsys meminfo com.tienda | grep "TOTAL PSS"
+# TOTAL PSS: 712.483 kB   → ~700 MB
+
+# (c) FPS — Perf Monitor en pantalla mientras se scrollea
+# UI: 58 fps  ·  JS: 19 fps   ← el hilo JS es el que se está ahogando</code></pre>
+
+<div class="info">
+  El dato de (c) ya es un diagnóstico. <strong>UI a 58 y JS a 19</strong> significa que el sistema puede dibujar sin problema, pero <em>tu código</em> no le está entregando contenido a tiempo. Descarta de entrada las hipótesis de GPU, de animaciones y de dibujo. Y las filas en blanco son la firma exacta de una lista que no llega a renderizar lo que ya se hizo visible.
+</div>
+
+<p><strong>Paso 2 — Encontrar la causa, no adivinarla.</strong> Con React Native DevTools ▸ Profiler, grabando 5 segundos de scroll:</p>
+
+<pre><code>PERFIL DEL HILO JS DURANTE EL SCROLL (5 s)
+
+  TarjetaProducto (render)         2.140 ms   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  61%
+    └─ Image (montaje/decodificación) 1.680 ms
+  formatearPrecio                    410 ms   ▓▓▓▓                12%
+  CatalogoScreen (re-render)         380 ms   ▓▓▓                 11%
+  otros                              560 ms   ▓▓▓▓▓               16%
+                                   ─────────
+                                    3.490 ms de 5.000 ms  → 70% ocupado
+
+  · 1.240 montajes de TarjetaProducto en 5 segundos de scroll.
+  · Ningún desmontaje reutiliza nada: cada fila se construye de cero.</code></pre>
+
+<p>Y el <code>dumpsys meminfo</code> completo confirma la otra mitad de la historia:</p>
+
+<pre><code>              Pss(KB)
+  Native Heap  489.220   ← 69% del total: acá viven los bitmaps decodificados
+  Dalvik Heap   84.110
+  Graphics      98.440
+  ...
+  TOTAL PSS    712.483</code></pre>
+
+<p><strong>Paso 3 — La cuenta que explica los 700 MB.</strong> Se inspecciona una URL de imagen del catálogo y aparece el problema: se pide el original.</p>
+
+<pre><code>  Origen:   https://cdn.tienda.com/productos/1234.jpg
+  Tamaño:   2400 × 2400 px  (JPEG de 380 KB)
+  Decodificada:  2400 × 2400 × 4 =  23,04 MB
+
+  Se muestra en 110 × 110 dp, dispositivo @3x → 330 × 330 px reales
+  Necesaria:      330 ×  330 × 4 =   0,44 MB
+
+  Desperdicio: 52× por imagen.
+  Con ~21 imágenes vivas: 484 MB en vez de 9 MB.
+                          ▲ coincide con los 489 MB del Native Heap ✅</code></pre>
+
+<div class="rule">
+  <strong>📌 Dos causas, no una.</strong> Las imágenes a resolución completa explican la <strong>memoria</strong>. La falta de reciclado —1.240 montajes en 5 segundos, cada uno disparando una decodificación nueva— explica los <strong>fps</strong>. Están relacionadas (cada montaje decodifica una imagen gigante) pero son arreglos distintos. Arreglar solo una deja la mitad del problema en pie, y ese es el momento en que alguien concluye que "la optimización no sirvió".
+</div>
+
+<p><strong>Paso 4 — Los dos arreglos.</strong></p>
+
+<pre><code class="lang-tsx">// ARREGLO A — pedir la imagen del tamaño que se va a mostrar.
+// Este solo cambio ataca el 69% del uso de memoria.
+import { PixelRatio } from 'react-native';
+import { Image } from 'expo-image';
+
+const LADO_DP = 110;
+const LADO_PX = PixelRatio.getPixelSizeForLayoutSize(LADO_DP); // 330 en @3x
+
+function FotoProducto({ producto }: { producto: Producto }) {
+  return (
+    &lt;Image
+      source={`${producto.fotoUrl}?w=${LADO_PX}&amp;h=${LADO_PX}&amp;fit=cover&amp;fm=webp&amp;q=75`}
+      style={{ width: LADO_DP, height: LADO_DP }}
+      contentFit="cover"
+      cachePolicy="memory-disk"
+      placeholder={{ blurhash: producto.blurhash }}
+      recyclingKey={producto.id}   // imprescindible con reciclado
+    /&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// ARREGLO B — reciclar en vez de montar y desmontar.
+import { FlashList } from '@shopify/flash-list';
+import { memo, useCallback } from 'react';
+
+const TarjetaProducto = memo(function TarjetaProducto({
+  producto,
+}: {
+  producto: Producto;
+}) {
+  return (
+    &lt;View style={estilos.fila}&gt;
+      &lt;FotoProducto producto={producto} /&gt;
+      &lt;View style={estilos.info}&gt;
+        &lt;Text numberOfLines={2}&gt;{producto.nombre}&lt;/Text&gt;
+        {/* precio ya formateado en el selector del store, NO en el render */}
+        &lt;Text style={estilos.precio}&gt;{producto.precioFormateado}&lt;/Text&gt;
+      &lt;/View&gt;
+    &lt;/View&gt;
+  );
+});
+
+export function Catalogo({ productos }: { productos: Producto[] }) {
+  const renderItem = useCallback(
+    ({ item }: { item: Producto }) =&gt; &lt;TarjetaProducto producto={item} /&gt;,
+    [],
+  );
+
+  return (
+    &lt;FlashList
+      data={productos}
+      renderItem={renderItem}
+      keyExtractor={useCallback((item: Producto) =&gt; item.id, [])}
+      getItemType={(item) =&gt; (item.destacado ? 'destacado' : 'normal')}
+    /&gt;
+  );
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El bug que apareció al migrar.</strong> <code>TarjetaProducto</code> tenía un <code>useState</code> para "mostrar descripción completa". Con reciclado, al scrollear aparecían productos expandidos que nadie había tocado: la fila heredaba la vista —y el estado— de otro producto. La corrección fue mover ese estado a un <code>Set</code> de IDs expandidos en el store del catálogo, indexado por <code>producto.id</code>. Con <code>FlatList</code> el bug no existía porque cada fila se montaba de cero; el reciclado lo hizo visible. <strong>Toda migración a listas recicladas debe auditar el estado local de las filas antes de mergear.</strong>
+</div>
+
+<p><strong>Paso 5 — Medición final, misma metodología.</strong> Mismo dispositivo, mismo procedimiento, mismas diez corridas:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Antes</th><th>Después</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td><strong>FPS del hilo JS</strong> (scroll sostenido, p50)</td><td>19 fps</td><td>57 fps</td><td>🟢 +200%</td></tr>
+<tr><td><strong>FPS del hilo JS</strong> (p05, el peor 5%)</td><td>8 fps</td><td>48 fps</td><td>🟢 +500%</td></tr>
+<tr><td><strong>Memoria</strong> (TOTAL PSS tras 60 s de scroll)</td><td>712 MB</td><td>168 MB</td><td>🟢 −76%</td></tr>
+<tr><td><strong>TTI</strong> (mediana de 10 arranques en frío)</td><td>4.812 ms</td><td>1.940 ms</td><td>🟢 −60%</td></tr>
+<tr><td>Filas en blanco durante el <em>fling</em></td><td>constantes</td><td>ninguna observada</td><td>🟢</td></tr>
+<tr><td>Cierres por falta de memoria (7 días)</td><td>340</td><td>2</td><td>🟢 −99%</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  El TTI bajó de 4,8 s a 1,9 s <strong>sin haber tocado el arranque</strong>. La causa: la pantalla inicial <em>es</em> el catálogo, y el TTI incluía la decodificación de las primeras veinte imágenes gigantes. Este tipo de efecto cruzado es habitual, y es la razón por la que conviene medir siempre las tres métricas juntas: si solo hubieras medido fps, te habrías perdido la mejor noticia del cambio.
+</div>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá FlashList y expo-image".</strong> Es el orden: <strong>medir en el dispositivo correcto → localizar el hilo → encontrar la causa con un perfil → hacer la cuenta que explica el número → arreglar las causas (en plural) → volver a medir con la misma metodología</strong>. Ese procedimiento funciona igual para un problema que no tiene nada que ver con listas. Las librerías cambian cada dos años; el procedimiento, no.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>El scroll de tu lista se mueve suave pero aparecen filas en blanco. ¿Qué hilo está saturado y por qué esa combinación?</summary>
+<p>El <strong>hilo JS</strong>. El scroll en sí lo maneja el sistema operativo sobre el hilo UI: mientras la vista contenedora ya existe, el movimiento sigue siendo fluido aunque JavaScript esté completamente bloqueado. Pero el <em>contenido</em> de las filas nuevas lo tiene que producir React, y eso ocurre en el hilo JS. Cuando ese hilo no llega, la lista te muestra el placeholder vacío. La confirmación cuesta cinco segundos con el Perf Monitor: vas a ver UI cerca de 60 y JS muy por debajo. Si en cambio <em>ambos</em> están bajos, el problema es nativo —decodificación de imágenes, layout de una jerarquía enorme, un TurboModule sincrónico— y el perfil de Hermes no te lo va a mostrar.</p></details>
+
+<details><summary>¿Por qué una imagen de 380 KB puede ocupar 23 MB de RAM, y qué implica eso para el diseño de tus pantallas?</summary>
+<p>Porque el peso del archivo es el tamaño <em>comprimido</em>, que sirve para la transferencia por red. Para dibujarla, el sistema tiene que descomprimirla a un bitmap de <code>ancho × alto × 4 bytes</code> (RGBA). Una foto de 2400×2400 son 23,04 MB decodificados, sin importar cuánto pesaba el JPEG. La implicancia de diseño es directa: <strong>lo que determina tu consumo de memoria es la resolución de la imagen, no su peso</strong>. Por eso la optimización con mejor relación esfuerzo/impacto es pedirle al CDN la imagen dimensionada al tamaño real de display (calculado con <code>PixelRatio</code>), y por eso una lista con miniaturas puede consumir cientos de megabytes aunque el total descargado sean unos pocos.</p></details>
+
+<details><summary>Tenés una FlatList con problemas de rendimiento. ¿Migrás a FlashList directamente? ¿Por qué sí o por qué no?</summary>
+<p>No como primer paso. Primero hay que agotar lo que <code>FlatList</code> ya ofrece —<code>keyExtractor</code> con ID del dominio, <code>getItemLayout</code> si la altura es conocida, el ítem en un componente memoizado, <code>renderItem</code> estable con <code>useCallback</code>, y una ventana ajustada— porque son cambios de bajo riesgo y sin dependencias nuevas. Sobre todo: una fila que renderiza caro va a renderizar caro en cualquier lista, así que migrar sin arreglar la fila cambia de librería y arrastra el problema. <code>FlashList</code> se justifica cuando, ya con la <code>FlatList</code> bien puesta, el costo de <strong>montar y desmontar</strong> sigue siendo el cuello de botella —lo confirmás en el profiler viendo cientos de montajes por segundo de scroll—. Y hay que presupuestar el costo de la migración: con reciclado, todo estado local dentro de la fila se convierte en un bug latente y tiene que moverse afuera, indexado por ID.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El rendimiento móvil es un problema de <strong>presupuesto por frame</strong>: 16,6 ms a 60 Hz, 8,3 ms a 120 Hz, de los cuales tu JavaScript dispone realmente de 5–8 ms. La unidad de medida no es el milisegundo, es el frame perdido.</li>
+  <li>Tres hilos, tres síntomas distintos. <strong>JS bloqueado</strong> → filas en blanco, toques que no responden. <strong>UI bloqueado</strong> → todo congelado, ni el spinner gira. El Perf Monitor te dice cuál en cinco segundos y descarta media docena de hipótesis.</li>
+  <li>El <strong>arranque en frío</strong> se degrada de a un import por vez. Distinguí <strong>TTID</strong> (primer pixel) de <strong>TTI</strong> (app usable) y reportá los dos: bajar solo el TTID es mover la espera de lugar.</li>
+  <li><strong>Hermes</strong> mejora el arranque porque envía bytecode precompilado y lo mapea a memoria en vez de parsear texto. Su profiler ve el hilo JS y nada más.</li>
+  <li><strong>Listas</strong>: <code>ScrollView</code> solo para contenido finito y conocido. <code>FlatList</code> bien configurada es el default correcto. <code>FlashList</code> cuando el costo de montar/desmontar es el cuello de botella — con la contrapartida de que el estado local de las filas tiene que salir de ahí.</li>
+  <li><strong>Imágenes</strong>: la memoria es <code>ancho × alto × 4 bytes</code> decodificados, no el peso del archivo. Pedir la imagen dimensionada al display es la optimización con mejor relación esfuerzo/impacto de todo el módulo.</li>
+  <li><strong>Los re-renders</strong> de React cuestan igual conceptualmente pero se pagan más caro: cada uno arrastra shadow tree, layout y commit sobre un CPU con presupuesto térmico. El React Compiler ayuda; la arquitectura de estado sigue siendo tuya.</li>
+  <li><strong>Medí en un Android de gama media.</strong> Un iPhone reciente y un emulador tienen tanto margen que absorben errores que en producción son catastróficos. Mediana de cinco corridas, dispositivo frío, y percentiles en vez de promedios.</li>
+  <li><strong>No optimices</strong> lo que no medís, lo que el usuario no percibe, lo que no es el cuello de botella, o cuando el precio es una API peor. Poné un presupuesto numérico versionado y verificalo en CI: lo que no se verifica automáticamente se degrada solo.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Medí el arranque en frío de una app tuya con <code>adb shell am start -W</code>, diez corridas, y reportá la mediana y el p90. Después agregá un <code>import</code> de una librería pesada en el archivo raíz —sin usarla— y volvé a medir. Cuantificá cuánto cuesta un import "gratis".</li>
+  <li>Construí deliberadamente la versión mala: un <code>ScrollView</code> con 500 filas. Medí TTI, memoria y fps. Migralo a <code>FlatList</code> con <code>getItemLayout</code> y memoización, y volvé a medir. Armá la tabla antes/después con <em>tus</em> números, no con los del módulo.</li>
+  <li>Tomá una lista existente y calculá, con <code>PixelRatio</code>, la memoria decodificada real de sus imágenes. Compará ese número contra el <code>Native Heap</code> que reporta <code>adb shell dumpsys meminfo</code>. ¿La cuenta cierra? Si no cierra, ¿qué falta en tu modelo?</li>
+  <li>Con React Native DevTools ▸ Profiler y <em>"Highlight updates"</em> activado, encontrá un componente que se re-renderice sin necesidad al tipear en un input. Arreglalo y demostrá con el profiler que dejó de renderizar. Documentá cuál era la causa exacta.</li>
+  <li>Grabá una traza de Perfetto de 10 segundos de scroll en un Android. Identificá el hilo <code>mqt_js</code> y medí el hueco más largo. Convertilo a frames perdidos y contrastalo con lo que <em>se ve</em> en pantalla.</li>
+  <li>Escribí el <code>perf-budget.ts</code> de un proyecto tuyo con números que puedas defender, medidos en tu dispositivo de referencia. Después escribí el script que lo verifica y hacé que falle a propósito para comprobar que el gate realmente funciona.</li>
+  <li>Migrá una <code>FlatList</code> con filas que tengan estado local a <code>FlashList</code>. Documentá cada bug de reciclado que aparezca, cómo lo detectaste y cómo lo resolviste. Este ejercicio vale más por los bugs que encuentres que por la migración en sí.</li>
+</ol>
+
+<section class="quiz" id="quizRNS2">
+  <style>
+    #quizRNS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS2 .q{margin-bottom:1.5rem}
+    #quizRNS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS2 .opt:hover{border-color:var(--accent)}
+    #quizRNS2 .opt:disabled{cursor:default}
+    #quizRNS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS2 .exp.show{display:block}
+    #quizRNS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. El Perf Monitor muestra UI a 59 fps y JS a 17 fps mientras scrolleás una lista. ¿Qué descartás inmediatamente?</p>
+    <button class="opt">Que el problema esté en el render de los ítems de la lista</button>
+    <button class="opt">Que el problema sea de GPU, de dibujo o de animaciones nativas</button>
+    <button class="opt">Que las imágenes tengan algo que ver con el problema</button>
+    <div class="exp">Un hilo UI a 59 fps significa que el sistema está dibujando y componiendo sin dificultad: la GPU, el compositor y las animaciones nativas están sanos. El que no llega es el hilo JS, o sea <em>tu código</em>: render de ítems demasiado caro, trabajo en un efecto, o montajes masivos por falta de reciclado. Cinco segundos de Perf Monitor eliminaron media docena de hipótesis antes de abrir ninguna herramienta pesada.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu app consume 700 MB en una lista con miniaturas de 110×110 dp. Los JPEG del servidor pesan 380 KB cada uno. ¿Cuál es la explicación más probable?</p>
+    <button class="opt">380 KB × la cantidad de productos ya da 700 MB: es esperable</button>
+    <button class="opt">La caché de disco de las imágenes se está contabilizando como RAM</button>
+    <button class="opt">Se descargan a resolución completa y se decodifican enteras: la memoria es ancho × alto × 4 bytes, no el peso del archivo</button>
+    <div class="exp">El peso comprimido solo importa para la red. Para dibujarse, la imagen se descomprime a un bitmap de <code>ancho × alto × 4</code> bytes: una foto de 2400×2400 son 23 MB en RAM aunque el JPEG pese 380 KB. Mostrada en 110 dp sobre un dispositivo @3x se necesitan 330×330 px, es decir 0,44 MB — un desperdicio de más de 50×. La corrección es pedirle al CDN la imagen dimensionada al display real, calculado con <code>PixelRatio</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Migrás una <code>FlatList</code> a <code>FlashList</code> y aparecen filas con la descripción expandida que nadie tocó. ¿Qué pasó?</p>
+    <button class="opt">El reciclado reutiliza la vista y el estado local del ítem sobrevive al cambio de datos: ese estado tiene que vivir fuera de la fila, indexado por ID</button>
+    <button class="opt">Falta configurar <code>estimatedItemSize</code> en la FlashList</button>
+    <button class="opt">Es un bug conocido de FlashList que se arregla actualizando la versión</button>
+    <div class="exp">Es la contrapartida directa del reciclado. <code>FlatList</code> monta y desmonta, así que cada fila arrancaba con estado limpio; <code>FlashList</code> reutiliza la vista y le reasigna datos, y el <code>useState</code> de la fila anterior sigue ahí. El arreglo es sacar el estado por ítem al store o al padre —un <code>Set</code> de IDs expandidos, por ejemplo— y usar <code>recyclingKey</code> en las imágenes para evitar el mismo efecto visual. No aparece en desarrollo con cinco ítems y sí en producción con dos mil: toda migración a listas recicladas tiene que auditar el estado local de las filas antes de mergear.</div>
+  </div>
+
+  <div class="score" id="scoreRNS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns1-nueva-arquitectura/lecture.html">← RNS1: La Nueva Arquitectura</a>
+  <a href="../rns3-animaciones-gestos/lecture.html">RNS3: Animaciones y gestos →</a>
+</nav>
+
+</div>
+</body>
+</html>

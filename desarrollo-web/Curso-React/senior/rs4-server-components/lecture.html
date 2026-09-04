@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS4 — Server Components a fondo · React Senior</title>
+  <meta name="description" content="El modelo mental de RSC, el payload que viaja por el cable, el límite use client y la serialización, composición por children, Server Functions y su chequeo de autorización, cascadas de datos, caché y revalidación, y cuándo RSC no conviene.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS4</span>
+  <span class="badge">⏱ 40–120 min</span>
+  <span class="badge">🎯 Pre-req: RS2</span>
+  <span class="badge">🖥️ RSC</span>
+</div>
+
+<article>
+
+<h1>RS4 — Server Components a fondo</h1>
+
+<h2>RS4.0 Por qué este módulo</h2>
+
+<p>Casi todo el material que vas a encontrar sobre React Server Components arranca mal. Dice algo como "es SSR pero mejor", o "es una forma de renderizar en el servidor". Las dos frases son falsas, y creerlas te lleva a escribir código que técnicamente compila pero que no aprovecha nada de lo que RSC ofrece — o peor, que arrastra medio árbol al cliente sin que te des cuenta.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> SSR y RSC responden preguntas distintas. <strong>SSR pregunta "¿dónde genero el primer HTML?"</strong> — y la respuesta no cambia el hecho de que ese componente después se hidrata y vive en el cliente. <strong>RSC pregunta "¿qué componentes tienen que existir en el cliente?"</strong> — y para muchos la respuesta es <em>ninguno, nunca</em>. Un Server Component no se hidrata porque no está allá: lo que viaja es su <em>resultado</em>.
+</div>
+
+<p>Esa diferencia es la que produce el número que todo el mundo cita. Migrar una app del directorio <code>pages/</code> al directorio <code>app/</code> con Server Components da, típicamente, <strong>alrededor de un 40% menos de JavaScript en el bundle</strong>. No porque el compilador sea más listo, sino porque una parte del código que antes <em>tenía</em> que llegar al navegador ahora simplemente no llega: la librería de markdown, el cliente del ORM, el formateador de fechas con sus tres locales, el SDK del CMS. Todo eso corre una vez, en el servidor, y lo que cruza la red es texto ya resuelto.</p>
+
+<p>A septiembre de 2026 esto ya no es material experimental. <strong>RSC y Server Functions son estables en React 19</strong>, y la versión estable de la librería es <strong>React 19.2</strong>. Dejó de ser una apuesta de framework para ser parte del modelo del lenguaje: cambia dónde vive tu código, no solo cómo lo empaquetás.</p>
+
+<div class="warn">
+  <strong>Advertencia de expectativas.</strong> RSC no hace tu app más rápida por decreto. Hace posible <em>otra</em> arquitectura, y en esa arquitectura hay trampas nuevas: cascadas de fetch invisibles, props que no serializan, cachés que devuelven contenido viejo y funciones de servidor que son endpoints públicos sin que nadie lo escriba. Este módulo es tanto sobre lo que ganás como sobre lo que se rompe.
+</div>
+
+<h2>RS4.1 El modelo mental: tres cosas distintas que suenan iguales</h2>
+
+<p>Antes de escribir una línea, hay que separar tres conceptos que la industria mezcla todo el tiempo. La confusión no es tuya: los tres involucran "un servidor" y "React".</p>
+
+<table>
+<thead><tr><th></th><th>SSR clásico</th><th>Server Component</th><th>Client Component</th></tr></thead>
+<tbody>
+<tr><td><strong>Dónde corre el código</strong></td><td>Servidor <em>y</em> cliente (dos veces)</td><td>Solo servidor (una vez)</td><td>Servidor (opcional) y cliente</td></tr>
+<tr><td><strong>Qué viaja por el cable</strong></td><td>HTML + el bundle JS del componente</td><td>Un payload RSC serializado</td><td>Su bundle JS + props serializadas</td></tr>
+<tr><td><strong>¿Se hidrata?</strong></td><td>Sí, siempre</td><td>Nunca</td><td>Sí</td></tr>
+<tr><td><strong>¿Puede tener estado?</strong></td><td>Sí</td><td>No</td><td>Sí</td></tr>
+<tr><td><strong>¿Puede leer la base de datos?</strong></td><td>Solo en <code>getServerSideProps</code>, fuera del componente</td><td>Sí, adentro del componente</td><td>No</td></tr>
+<tr><td><strong>Costo en bundle</strong></td><td>Todo el componente y sus deps</td><td><strong>Cero</strong></td><td>Todo el componente y sus deps</td></tr>
+<tr><td><strong>Se re-renderiza cuando…</strong></td><td>Cambia el estado del cliente</td><td>El servidor lo vuelve a pedir</td><td>Cambia estado o props</td></tr>
+</tbody>
+</table>
+
+<p>La fila que importa es la última de costos. En SSR clásico, el servidor renderiza tu componente a HTML <em>y además</em> te manda el código del componente para que el cliente lo vuelva a ejecutar y "adopte" ese HTML. Pagás el trabajo dos veces y pagás el transporte del código. Es el precio de tener interactividad.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> SSR es mandar una torta ya horneada <em>junto con</em> la receta y los ingredientes, porque el que la recibe va a necesitar decorarla en vivo. RSC es preguntarse cuáles partes del pedido realmente hay que decorar: la base va horneada y punto, y solo mandás receta e ingredientes para el glaseado. La caja pesa menos porque decidiste qué necesitaba llegar crudo.
+</div>
+
+<p>En código, un Server Component es simplemente un componente que puede ser <code>async</code> y hablar con recursos del servidor sin ceremonia:</p>
+
+<pre><code class="lang-tsx">// app/productos/[slug]/page.tsx  — Server Component por defecto
+import { db } from "@/lib/db";
+import { marked } from "marked";          // ~40 KB que NUNCA llegan al cliente
+
+export default async function PaginaProducto({
+  params,
+}: {
+  params: Promise&lt;{ slug: string }&gt;;
+}) {
+  const { slug } = await params;
+  const producto = await db.producto.findUnique({ where: { slug } });
+
+  if (!producto) return &lt;p&gt;No existe.&lt;/p&gt;;
+
+  return (
+    &lt;article&gt;
+      &lt;h1&gt;{producto.nombre}&lt;/h1&gt;
+      {/* marked corre acá, en el server. El cliente recibe HTML resuelto. */}
+      &lt;div dangerouslySetInnerHTML={{ __html: marked(producto.descripcionMd) }} /&gt;
+    &lt;/article&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 En una app RSC, todo componente es Server Component salvo que digas lo contrario.</strong> Es el default invertido respecto de lo que venías haciendo. No hay directiva <code>"use server"</code> para marcar un componente de servidor — esa directiva significa otra cosa (RS4.5). El servidor es el piso; <code>"use client"</code> es la puerta de salida.
+</div>
+
+<p>Y sí: SSR y RSC conviven. En una app moderna con el App Router, un Server Component produce el payload RSC, los Client Components dentro de ese árbol se renderizan a HTML en el servidor (eso <em>es</em> SSR) y después se hidratan en el navegador. No son alternativas: son dos capas del mismo pipeline.</p>
+
+<pre><code class="lang-tsx">// Lo que pasa en una sola request, en orden:
+//
+// 1. El servidor ejecuta los Server Components  → produce el payload RSC
+// 2. Con ese payload, el servidor renderiza HTML → eso es SSR (incluye los Client Components)
+// 3. El navegador pinta el HTML                  → hay contenido visible
+// 4. Llega el bundle de los Client Components    → React hidrata SOLO esos
+// 5. El payload RSC queda disponible para las navegaciones siguientes</code></pre>
+
+<h2>RS4.2 El RSC payload: qué viaja realmente por el cable</h2>
+
+<p>Acá es donde la mayoría de la gente deja de entender, porque el payload RSC no es HTML ni es JSON común. Es un formato de streaming, línea por línea, donde cada línea es una fila numerada que el cliente va incorporando a medida que llega. Se lo suele llamar <em>Flight</em>.</p>
+
+<p>Podés verlo con tus propios ojos. En una app con App Router, pedile a una ruta el payload en vez del HTML:</p>
+
+<pre><code class="lang-bash">curl -s 'http://localhost:3000/productos/teclado?_rsc=1' \
+     -H 'RSC: 1' | head -40</code></pre>
+
+<p>Lo que sale se parece a esto (simplificado y con nombres en español para que se lea):</p>
+
+<pre><code class="lang-text">0:I["(app-pages-browser)/./components/Galeria.tsx",["static/chunks/galeria.js"],"default"]
+1:["$","article",null,{"children":[
+     ["$","h1",null,{"children":"Teclado mecánico"}],
+     ["$","$L0",null,{"imagenes":["/a.webp","/b.webp"],"alt":"Teclado"}],
+     "$L2"
+   ]}]
+2:["$","section",null,{"children":[["$","h2",null,{"children":"Reseñas"}], "…"]}]</code></pre>
+
+<p>Leelo con calma, porque cada pieza explica una propiedad del sistema:</p>
+
+<ul>
+  <li><strong>Fila <code>0:I[...]</code></strong> — una <em>referencia a componente cliente</em>. No es el componente: es una tarjeta que dice "esto está en el chunk <code>galeria.js</code>, exportado como <code>default</code>". El cliente sabe qué bajar y cuándo.</li>
+  <li><strong>Fila <code>1</code></strong> — el árbol de elementos ya renderizado. <code>["$","h1",null,{...}]</code> es la forma serializada de un elemento React: tipo, key, props. El <code>h1</code> viene resuelto porque es un Server Component; no hay código para él.</li>
+  <li><strong><code>"$L0"</code></strong> — "acá va lo que definió la fila 0". Así se referencia al Client Component <em>dentro</em> del árbol, con sus props ya serializadas al lado.</li>
+  <li><strong><code>"$L2"</code></strong> — un hueco: "esto llega después". La conexión sigue abierta y la fila 2 aparece cuando el servidor termina de resolver esa parte. <strong>Eso es el streaming.</strong></li>
+</ul>
+
+<div class="concept">
+  <strong>💡 Por qué el formato tiene que ser este y no HTML.</strong> Con HTML, el cliente recibe pintura: no puede saber qué parte del árbol cambió sin volver a parsear todo y adivinar. Con el payload RSC, el cliente recibe la <em>descripción del árbol de React</em>, así que puede hacer un reconcile real contra el árbol que ya tiene. Por eso una navegación o una revalidación puede actualizar una rama sin tirar el estado del cliente que está al lado: el input donde estabas escribiendo sigue con su texto, el acordeón sigue abierto.
+</div>
+
+<p>Esa es la propiedad de la que sale casi todo el resto del módulo:</p>
+
+<div class="rule">
+  <strong>📌 El payload RSC permite actualizaciones parciales que preservan el estado del cliente.</strong> Un <code>router.refresh()</code> o una revalidación después de una Server Function vuelve a pedir el payload del servidor y React lo mezcla con lo que ya hay. No es una recarga: es un re-render con datos frescos donde solo cambia lo que cambió.
+</div>
+
+<p>Y también sale de ahí la primera restricción dura. Si todo lo que cruza tiene que expresarse como filas de ese formato, entonces <strong>todo lo que cruza tiene que ser serializable</strong>. Ese es el tema de la sección siguiente, y es el error número uno de todo el ecosistema.</p>
+
+<h2>RS4.3 El límite: <code>"use client"</code> y la serialización</h2>
+
+<p>La directiva <code>"use client"</code> no significa "este componente corre solo en el cliente". Significa algo más preciso y más importante:</p>
+
+<div class="concept">
+  <strong>💡 Qué hace realmente <code>"use client"</code>.</strong> Marca un <strong>punto de entrada al bundle del cliente</strong>. El archivo que la lleva, y <em>todo lo que ese archivo importa</em>, y todo lo que esos archivos importan, entra al grafo de módulos del navegador. No es una anotación sobre un componente: es una raíz de dependencias.
+</div>
+
+<p>Se pone una sola vez, arriba del archivo, y se hereda hacia abajo por importación:</p>
+
+<pre><code class="lang-tsx">"use client";                    // ← primera línea del archivo, antes de los imports
+
+import { useState } from "react";
+import { formatearFecha } from "@/lib/fechas";   // esto también entra al bundle
+
+export function Acordeon({ titulo, children }: {
+  titulo: string;
+  children: React.ReactNode;
+}) {
+  const [abierto, setAbierto] = useState(false);
+  return (
+    &lt;section&gt;
+      &lt;button onClick={() =&gt; setAbierto(v =&gt; !v)}&gt;{titulo}&lt;/button&gt;
+      {abierto &amp;&amp; children}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error más caro y más silencioso:</strong> poner <code>"use client"</code> en un archivo <em>barril</em> (<code>components/index.ts</code>) que reexporta cuarenta componentes. Con una línea acabás de mandar cuarenta componentes y sus dependencias al navegador, incluidos los que nadie usa en esa página. El bundle crece, nadie ve un error, y el número que mirás en el dashboard empeora sin causa aparente. <strong>Nunca pongas la directiva en un barril.</strong>
+</div>
+
+<h3>Props serializables: la regla que rompe a todo el mundo</h3>
+
+<p>Cuando un Server Component le pasa props a un Client Component, esas props tienen que viajar dentro del payload. Y no todo se puede escribir en un payload.</p>
+
+<pre><code class="lang-tsx">// ✅ Cruzan el límite sin problema
+&lt;Widget
+  texto="hola"                        // string
+  cantidad={42}                       // number, bigint
+  activo={true}                       // boolean
+  nada={null}                         // null / undefined
+  lista={[1, 2, 3]}                   // Array
+  objeto={{ a: 1, b: { c: 2 } }}      // objeto plano
+  fecha={new Date()}                  // Date
+  conjunto={new Set([1, 2])}          // Set, Map, TypedArray, ArrayBuffer
+  formulario={formData}               // FormData
+  promesa={promesaDeDatos}            // ¡Promise! (se resuelve en el cliente)
+  hijos={&lt;p&gt;JSX ya resuelto&lt;/p&gt;}      // elementos React
+  onGuardar={guardarEnDB}             // función marcada con "use server"
+/&gt;</code></pre>
+
+<pre><code class="lang-tsx">// ❌ NO cruzan: rompen en tiempo de render
+&lt;Widget
+  onClick={() =&gt; console.log("hola")}   // función común → error
+  formatear={(n) =&gt; n.toFixed(2)}       // idem
+  usuario={usuarioDeLaClaseUsuario}     // instancia de clase → se pierde el prototipo
+  simbolo={Symbol("id")}                // Symbol no registrado
+  cliente={prismaClient}                // objetos con métodos y estado interno
+/&gt;</code></pre>
+
+<p>El mensaje que ves cuando lo hacés mal es este, y ahora ya sabés exactamente qué significa:</p>
+
+<pre><code class="lang-bash">Error: Functions cannot be passed directly to Client Components
+unless you explicitly expose it by marking it with "use server".
+  &lt;... onClick={function onClick}&gt;
+                ^^^^^^^^^^^^^^^^^</code></pre>
+
+<div class="danger">
+  <strong>Por qué una función no puede cruzar.</strong> Una función es código más su <em>closure</em>: las variables que capturó del ámbito donde se creó. Serializar eso significaría mandar el código y el entorno, es decir, mandar el servidor al cliente. El sistema no lo intenta. Te ofrece la única alternativa honesta: si querés que el cliente invoque algo del servidor, exponelo explícitamente como <strong>Server Function</strong> — y ahí lo que viaja no es la función sino un <em>identificador</em> que el cliente usa para llamarla por red.
+</div>
+
+<h3>Los dos arreglos correctos</h3>
+
+<p>Cuando chocás con el límite, hay exactamente dos salidas legítimas. La primera: <strong>mover el handler adentro del Client Component</strong>, que es donde pertenece.</p>
+
+<pre><code class="lang-tsx">// ❌ Server Component intentando pasar un handler
+export default async function Pagina() {
+  const items = await db.items.findMany();
+  return &lt;Lista items={items} onSeleccionar={(id) =&gt; console.log(id)} /&gt;;
+}
+
+// ✅ El handler nace donde se usa
+"use client";
+export function Lista({ items }: { items: Item[] }) {
+  return (
+    &lt;ul&gt;
+      {items.map((it) =&gt; (
+        &lt;li key={it.id} onClick={() =&gt; console.log(it.id)}&gt;{it.nombre}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<p>La segunda: <strong>pasar datos, no comportamiento</strong>. Si el Client Component necesita formatear, mandale el valor ya formateado o el dato crudo, nunca el formateador.</p>
+
+<pre><code class="lang-tsx">// ❌ pasás la función de formateo
+&lt;Precio valor={p.centavos} formatear={fmt} /&gt;
+
+// ✅ formateás en el servidor y pasás el resultado
+&lt;Precio texto={fmt(p.centavos)} /&gt;
+
+// ✅ o pasás el dato y el cliente trae su propio formateador
+&lt;Precio centavos={p.centavos} moneda="ARS" /&gt;</code></pre>
+
+<div class="warn">
+  <strong>Ojo con el "todo serializado" como excusa para mandar de más.</strong> Un objeto de Prisma con 40 columnas serializa perfecto y por eso nadie te avisa que estás mandando el <code>costo_proveedor</code> y el <code>margen</code> al navegador. <strong>El payload RSC es público:</strong> cualquiera lo lee en la pestaña Network. Seleccioná los campos antes de cruzar el límite, siempre.
+</div>
+
+<pre><code class="lang-tsx">// ❌ el registro entero viaja al navegador, con todo lo que no debería salir
+const producto = await db.producto.findUnique({ where: { slug } });
+return &lt;Ficha producto={producto} /&gt;;
+
+// ✅ solo lo que la UI necesita
+const producto = await db.producto.findUnique({
+  where: { slug },
+  select: { id: true, nombre: true, precio: true, imagenes: true },
+});
+return &lt;Ficha producto={producto} /&gt;;</code></pre>
+
+<h2>RS4.4 Composición: pasar Server Components como <code>children</code></h2>
+
+<p>Este patrón es la mitad del módulo. Si te llevás una sola técnica de RS4, que sea esta.</p>
+
+<p>El problema aparece apenas necesitás algo interactivo cerca de la raíz: un layout con tema oscuro, un tab bar, un panel colapsable, un provider de contexto. La reacción natural es marcar ese componente con <code>"use client"</code>… y ahí explotó todo, porque <strong>todo lo que un Client Component <em>importa</em> se vuelve cliente</strong>.</p>
+
+<pre><code class="lang-tsx">// ❌ El anti-patrón. Panel es cliente → importa Feed → Feed se vuelve cliente
+"use client";
+
+import { useState } from "react";
+import { Feed } from "./Feed";          // Feed usaba la DB y marked… ya no puede
+
+export function Panel() {
+  const [tab, setTab] = useState("todo");
+  return (
+    &lt;div&gt;
+      &lt;nav&gt;{/* botones que cambian tab */}&lt;/nav&gt;
+      &lt;Feed filtro={tab} /&gt;             {/* ← arrastrado al bundle */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p>El resultado es una bola de nieve: <code>Feed</code> ya no puede ser <code>async</code>, ya no puede tocar la base, y sus dependencias (el ORM, el parser de markdown) o bien viajan al navegador o bien te obligan a reescribir todo con <code>useEffect</code>. Un solo <code>"use client"</code> mal puesto convierte media app en cliente.</p>
+
+<div class="rule">
+  <strong>📌 La regla que lo resuelve: <em>importar</em> arrastra, <em>recibir</em> no.</strong> Un Client Component no puede <code>import</code> un Server Component, pero <strong>sí puede recibirlo como <code>children</code> o como cualquier prop de tipo <code>ReactNode</code></strong>. Cuando lo recibe, ya viene renderizado desde el servidor: el cliente solo lo coloca en un hueco del árbol. Nada de ese subárbol entra al bundle.
+</div>
+
+<p>La versión correcta separa el "envase" interactivo del "contenido" de servidor:</p>
+
+<pre><code class="lang-tsx">// components/Panel.tsx  — SOLO el envase es cliente
+"use client";
+
+import { useState, type ReactNode } from "react";
+
+export function Panel({
+  tabs,
+  contenido,
+}: {
+  tabs: string[];
+  contenido: Record&lt;string, ReactNode&gt;;   // ← huecos, no importaciones
+}) {
+  const [tab, setTab] = useState(tabs[0]);
+  return (
+    &lt;div&gt;
+      &lt;nav&gt;
+        {tabs.map((t) =&gt; (
+          &lt;button key={t} onClick={() =&gt; setTab(t)} aria-current={t === tab}&gt;
+            {t}
+          &lt;/button&gt;
+        ))}
+      &lt;/nav&gt;
+      &lt;div&gt;{contenido[tab]}&lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// app/page.tsx — Server Component: acá se arma el contenido
+import { Panel } from "@/components/Panel";
+import { Feed } from "@/components/Feed";           // sigue siendo de servidor
+import { Estadisticas } from "@/components/Estadisticas";
+
+export default function Pagina() {
+  return (
+    &lt;Panel
+      tabs={["Feed", "Estadísticas"]}
+      contenido={{
+        Feed: &lt;Feed filtro="todo" /&gt;,               {/* ← ya renderizado en server */}
+        "Estadísticas": &lt;Estadisticas /&gt;,
+      }}
+    /&gt;
+  );
+}</code></pre>
+
+<p>El caso más común de todos es el provider de contexto, y se resuelve igual:</p>
+
+<pre><code class="lang-tsx">// components/Proveedores.tsx
+"use client";
+import { ThemeProvider } from "@/lib/tema";
+
+export function Proveedores({ children }: { children: React.ReactNode }) {
+  return &lt;ThemeProvider&gt;{children}&lt;/ThemeProvider&gt;;
+}
+
+// app/layout.tsx  — sigue siendo Server Component
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    &lt;html lang="es"&gt;
+      &lt;body&gt;
+        &lt;Proveedores&gt;{children}&lt;/Proveedores&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>Cómo pensarlo.</strong> El Client Component no "contiene" al Server Component: le reserva un <strong>agujero</strong>. En el payload, ese agujero es un <code>children</code> que ya viene con el árbol resuelto adentro. Por eso el orden mental correcto es: <em>empujá el <code>"use client"</code> lo más abajo y lo más a las hojas que puedas</em>, y donde necesites envolver, envolvé por composición.
+</div>
+
+<h3>Verificar que funcionó (no confiar)</h3>
+
+<p>Esto no se declara, se mide. Después de reorganizar la composición, mirá el tamaño real por ruta:</p>
+
+<pre><code class="lang-bash"># Next.js imprime First Load JS por ruta al buildear
+next build
+
+# Route (app)                        Size    First Load JS
+# ┌ ○ /                              1.2 kB       94.3 kB
+# ├ ● /productos/[slug]              3.8 kB      118.6 kB     ← mirá este número
+# └ ○ /panel                        27.4 kB      219.1 kB     ← acá hay un barril</code></pre>
+
+<pre><code class="lang-bash"># Y si un número no cierra, abrí el grafo y buscá qué lo trajo
+ANALYZE=true next build      # con @next/bundle-analyzer configurado</code></pre>
+
+<h2>RS4.5 Server Functions: potentes y peligrosas</h2>
+
+<p>Una <strong>Server Function</strong> es una función que se define en el servidor y que el cliente puede invocar como si fuera local. La directiva es <code>"use server"</code> — que, insisto, no marca componentes de servidor sino <em>funciones expuestas al cliente</em>.</p>
+
+<pre><code class="lang-tsx">// app/acciones.ts
+"use server";                      // todo lo exportado de acá es invocable por red
+
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+export async function agregarReseña(slug: string, texto: string) {
+  await db.reseña.create({ data: { productoSlug: slug, texto } });
+  revalidatePath(`/productos/${slug}`);
+}</code></pre>
+
+<pre><code class="lang-tsx">// components/FormReseña.tsx
+"use client";
+import { agregarReseña } from "@/app/acciones";
+
+export function FormReseña({ slug }: { slug: string }) {
+  return (
+    &lt;form action={async (fd: FormData) =&gt; {
+      await agregarReseña(slug, String(fd.get("texto")));
+    }}&gt;
+      &lt;textarea name="texto" required /&gt;
+      &lt;button type="submit"&gt;Publicar&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<p>Se lee como una llamada a función. <strong>No lo es.</strong> Lo que el cliente importa no es el cuerpo de <code>agregarReseña</code>: es un identificador opaco. Al invocarla, el runtime hace un <code>POST</code> al servidor con ese identificador y los argumentos serializados. Miralo vos mismo en la pestaña Network:</p>
+
+<pre><code class="lang-bash">POST /productos/teclado
+Next-Action: 7f3a1c9e0b2d4a6f8c1e5b7d9a0f2c4e6b8d1a3f
+Content-Type: text/plain;charset=UTF-8
+
+["teclado","muy buen producto"]</code></pre>
+
+<div class="danger">
+  <strong>🔒 Una Server Function es un endpoint HTTP público.</strong> No hay ninguna diferencia de seguridad entre esa función y una ruta de API que hubieras escrito a mano. El identificador es adivinable/observable, cualquiera puede reproducir ese <code>POST</code> con <code>curl</code>, y <strong>los argumentos vienen del cliente</strong>, así que son datos hostiles hasta que los valides. El hecho de que el formulario esté escondido detrás de un <code>if (esAdmin)</code> en la UI no protege absolutamente nada: la UI es sugerencia, no control de acceso.
+</div>
+
+<p>La consecuencia práctica es que <strong>la autorización va adentro de la función</strong>, en su primera línea, sin excepciones:</p>
+
+<pre><code class="lang-tsx">"use server";
+
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { getSesion } from "@/lib/auth";
+import { revalidateTag } from "next/cache";
+
+const Entrada = z.object({
+  slug: z.string().min(1).max(120),
+  texto: z.string().min(10).max(2000),
+  puntaje: z.number().int().min(1).max(5),
+});
+
+export async function agregarReseña(datosCrudos: unknown) {
+  // 1. AUTENTICACIÓN — ¿quién sos?
+  const sesion = await getSesion();
+  if (!sesion) throw new Error("No autenticado");
+
+  // 2. VALIDACIÓN — los argumentos vienen del cliente, son hostiles
+  const datos = Entrada.parse(datosCrudos);
+
+  // 3. AUTORIZACIÓN — ¿podés hacer ESTO, sobre ESTE recurso?
+  const compro = await db.pedido.findFirst({
+    where: { usuarioId: sesion.userId, items: { some: { slug: datos.slug } } },
+  });
+  if (!compro) throw new Error("Solo compradores verificados pueden reseñar");
+
+  // 4. Recién ahora, el efecto
+  await db.reseña.create({
+    data: { ...datos, autorId: sesion.userId },   // el autor sale de la SESIÓN
+  });
+  revalidateTag(`reseñas:${datos.slug}`);
+}</code></pre>
+
+<div class="mistake">
+  <strong>El bug clásico:</strong> aceptar <code>autorId</code> como argumento. Si la función recibe quién sos en vez de deducirlo de la sesión, cualquiera publica reseñas —o transfiere plata— en nombre de otro con un <code>curl</code>. <strong>La identidad nunca viene del cliente.</strong> Sale de la sesión, del token verificado, del contexto del servidor. Los argumentos solo llevan <em>qué</em> hacer, jamás <em>quién</em> lo hace.
+</div>
+
+<p>Los cuatro pasos de arriba (autenticar → validar → autorizar → actuar) son el mismo orden que ya viste fuera de React. Si te quedan dudas sobre el diseño de la capa de permisos —modelos RBAC vs ABAC, el problema del <em>IDOR</em>, dónde poner el chequeo de propiedad del recurso— este módulo asume esos temas y no los repite:</p>
+
+<ul>
+  <li><a href="../../../../track-senior/modulo-04-seguridad-auth/lecture.html">Track Senior · Módulo 04 — Seguridad y autenticación</a>: sesiones, tokens, y por qué el chequeo de frontend no es un chequeo.</li>
+  <li><a href="../../../../sistemas/Curso-Ciberseguridad/m03-autorizacion/lecture.html">Ciberseguridad · M03 — Autorización</a>: modelos de permisos, autorización a nivel de objeto y las fallas de control de acceso roto.</li>
+</ul>
+
+<h3>Estado de la acción en la UI</h3>
+
+<p>Del lado del cliente, React 19 trae los hooks para manejar el ciclo de vida de una acción sin escribir un reducer a mano:</p>
+
+<pre><code class="lang-tsx">"use client";
+import { useActionState } from "react";
+import { useFormStatus } from "react-dom";
+import { agregarReseña } from "@/app/acciones";
+
+function Boton() {
+  const { pending } = useFormStatus();        // lee el &lt;form&gt; padre
+  return &lt;button disabled={pending}&gt;{pending ? "Enviando…" : "Publicar"}&lt;/button&gt;;
+}
+
+export function FormReseña({ slug }: { slug: string }) {
+  const [estado, accion] = useActionState(
+    async (_previo: string | null, fd: FormData) =&gt; {
+      try {
+        await agregarReseña({
+          slug,
+          texto: String(fd.get("texto")),
+          puntaje: Number(fd.get("puntaje")),
+        });
+        return null;
+      } catch (e) {
+        return e instanceof Error ? e.message : "Error";
+      }
+    },
+    null
+  );
+
+  return (
+    &lt;form action={accion}&gt;
+      &lt;textarea name="texto" required /&gt;
+      &lt;input name="puntaje" type="number" min="1" max="5" required /&gt;
+      &lt;Boton /&gt;
+      {estado &amp;&amp; &lt;p role="alert"&gt;{estado}&lt;/p&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>Devolvé errores, no los tires al vacío.</strong> Una excepción sin capturar dentro de una Server Function llega al cliente con el mensaje ofuscado en producción (React lo reemplaza por un digest). Está bien para errores inesperados, pero pésimo para errores de negocio esperables: capturalos y devolvelos como valor, como en el ejemplo. Y cuidado con lo contrario — <strong>nunca</strong> devuelvas el mensaje crudo de una excepción de base de datos: filtra nombres de tablas y estructura.
+</div>
+
+<h2>RS4.6 Cascadas de datos: el problema clásico de RSC</h2>
+
+<p>Los Server Components son <code>async</code>, y eso los vuelve trivialmente fáciles de escribir… y trivialmente fáciles de encadenar mal. La cascada (<em>waterfall</em>) es el modo de falla característico de RSC.</p>
+
+<pre><code class="lang-tsx">// ❌ Tres viajes SECUENCIALES. El total es la suma, no el máximo.
+export default async function Pagina({ params }) {
+  const { slug } = await params;
+  const producto = await db.producto.findUnique({ where: { slug } });  // 120 ms
+  const reseñas  = await db.reseña.findMany({ where: { slug } });      // 180 ms
+  const stock    = await inventario.consultar(slug);                   // 200 ms
+  //                                                          total ≈ 500 ms
+  return &lt;Ficha producto={producto} reseñas={reseñas} stock={stock} /&gt;;
+}</code></pre>
+
+<p>Las tres consultas no dependen entre sí: solo dependen de <code>slug</code>. Se pueden disparar juntas.</p>
+
+<pre><code class="lang-tsx">// ✅ Tres viajes EN PARALELO. El total es el más lento.
+export default async function Pagina({ params }) {
+  const { slug } = await params;
+  const [producto, reseñas, stock] = await Promise.all([
+    db.producto.findUnique({ where: { slug } }),
+    db.reseña.findMany({ where: { slug } }),
+    inventario.consultar(slug),
+  ]);
+  //                                                          total ≈ 200 ms
+  return &lt;Ficha producto={producto} reseñas={reseñas} stock={stock} /&gt;;
+}</code></pre>
+
+<p>Pero <code>Promise.all</code> tiene un límite: iguala a todos al más lento. Si las reseñas tardan 800 ms y el producto 100 ms, el usuario espera 800 ms para ver el título. La herramienta correcta ahí es <strong>Suspense</strong>: mostrás lo rápido de entrada y dejás que lo lento llegue por streaming.</p>
+
+<pre><code class="lang-tsx">import { Suspense } from "react";
+
+export default async function Pagina({ params }) {
+  const { slug } = await params;
+  const producto = await db.producto.findUnique({ where: { slug } });  // rápido: se espera
+
+  return (
+    &lt;&gt;
+      &lt;Ficha producto={producto} /&gt;
+
+      {/* lento: NO se espera. Se pinta el fallback y el contenido llega después */}
+      &lt;Suspense fallback={&lt;EsqueletoReseñas /&gt;}&gt;
+        &lt;Reseñas slug={slug} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}
+
+async function Reseñas({ slug }: { slug: string }) {
+  const reseñas = await db.reseña.findMany({ where: { slug } });   // 800 ms
+  return &lt;ul&gt;{reseñas.map((r) =&gt; &lt;li key={r.id}&gt;{r.texto}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La técnica avanzada: iniciar la promesa sin esperarla.</strong> Si un dato lento se necesita <em>abajo</em> en el árbol, disparalo <em>arriba</em> y pasá la promesa hacia abajo sin <code>await</code>. El pedido arranca ya; el <code>await</code> ocurre recién donde hace falta. Es la forma de tener paralelismo real sin aplanar la composición.
+</div>
+
+<pre><code class="lang-tsx">export default async function Pagina({ params }) {
+  const { slug } = await params;
+
+  const pReseñas = db.reseña.findMany({ where: { slug } });   // ← SIN await: ya arrancó
+  const producto = await db.producto.findUnique({ where: { slug } });
+
+  return (
+    &lt;&gt;
+      &lt;Ficha producto={producto} /&gt;
+      &lt;Suspense fallback={&lt;EsqueletoReseñas /&gt;}&gt;
+        &lt;Reseñas promesa={pReseñas} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}
+
+async function Reseñas({ promesa }: { promesa: Promise&lt;Reseña[]&gt; }) {
+  const reseñas = await promesa;      // el viaje ya venía en camino
+  return &lt;ul&gt;{reseñas.map((r) =&gt; &lt;li key={r.id}&gt;{r.texto}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+<div class="info">
+  Una promesa también puede cruzar el límite hacia un Client Component y desenvolverse ahí con el hook <code>use()</code>. Sirve cuando querés que el <em>fallback</em> y la interactividad vivan en el cliente pero el <em>fetch</em> arranque en el servidor. Es potente y conviene usarlo con moderación: complica el razonamiento sobre dónde falla qué.
+</div>
+
+<div class="mistake">
+  <strong>La cascada oculta:</strong> componentes anidados donde cada uno hace su propio <code>await</code>. <code>&lt;Layout&gt;</code> pide el usuario, <code>&lt;Sidebar&gt;</code> pide sus proyectos, <code>&lt;Lista&gt;</code> pide sus tareas. Cada nivel espera al anterior porque React renderiza de arriba hacia abajo, y como cada archivo se lee lindo por separado, nadie ve la cascada. <strong>Se detecta con trazas, no leyendo código.</strong> Instrumentá con OpenTelemetry o mirá el waterfall de la request en las devtools del framework.
+</div>
+
+<h2>RS4.7 Caché y revalidación: por qué esto confunde a todo el mundo</h2>
+
+<p>Si hay una parte de RSC que genera issues de GitHub, es el caching. Y la razón es que no hay <em>un</em> caché: hay varias capas que se pisan, con dueños distintos y tiempos de vida distintos.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Dónde vive</th><th>Qué guarda</th><th>Cómo se invalida</th></tr></thead>
+<tbody>
+<tr><td>Memoización de request</td><td>Servidor, durante <em>una</em> request</td><td>El mismo <code>fetch</code>/función repetido</td><td>Sola, al terminar la request</td></tr>
+<tr><td>Caché de datos</td><td>Servidor, persistente</td><td>Resultados de fetch con tags/TTL</td><td><code>revalidateTag</code>, <code>revalidatePath</code>, TTL</td></tr>
+<tr><td>Caché de ruta llena</td><td>Servidor, en build/ISR</td><td>HTML + payload RSC de rutas estáticas</td><td><code>revalidatePath</code>, redeploy, TTL</td></tr>
+<tr><td>Caché de router</td><td><strong>Cliente</strong>, en memoria</td><td>Payloads RSC ya visitados</td><td><code>router.refresh()</code>, navegación, tiempo</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El origen de la confusión.</strong> Cuando alguien dice "cambié el dato y la página sigue mostrando lo viejo", la pregunta correcta no es "¿cómo apago el caché?" sino <strong>"¿cuál de las cuatro capas me está devolviendo esto?"</strong>. Un <code>revalidatePath</code> impecable en el servidor no arregla nada si lo que estás viendo salió del caché de router del navegador. Y al revés: un <code>router.refresh()</code> vuelve a pedir al servidor, que te devuelve el mismo dato viejo si la caché de datos no se invalidó.
+</div>
+
+<p>La forma de resolverlo es etiquetar lo que se cachea, para poder invalidarlo con precisión quirúrgica en vez de tirar todo abajo:</p>
+
+<pre><code class="lang-tsx">// lib/datos.ts — lecturas etiquetadas
+export async function traerReseñas(slug: string) {
+  const res = await fetch(`${API}/productos/${slug}/reseñas`, {
+    next: { tags: [`reseñas:${slug}`, "reseñas"], revalidate: 3600 },
+  });
+  return res.json();
+}
+
+export async function traerProducto(slug: string) {
+  const res = await fetch(`${API}/productos/${slug}`, {
+    next: { tags: [`producto:${slug}`], revalidate: 86400 },  // cambia poco
+  });
+  return res.json();
+}</code></pre>
+
+<pre><code class="lang-tsx">"use server";
+import { revalidateTag, revalidatePath } from "next/cache";
+
+export async function agregarReseña(datos: Entrada) {
+  // … auth + validación + escritura …
+
+  revalidateTag(`reseñas:${datos.slug}`);   // ✅ solo las reseñas de ESE producto
+  // revalidateTag("reseñas");              // 😬 todas las reseñas del sitio
+  // revalidatePath("/", "layout");         // 🚨 la bomba nuclear: TODO el sitio
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>revalidateTag</code> vs <code>revalidatePath</code>.</strong> <code>revalidateTag</code> invalida <em>datos</em>: cualquier ruta que haya leído ese tag se regenera. <code>revalidatePath</code> invalida <em>una ruta concreta</em>. Preferí tags: un dato suele aparecer en varias páginas (el detalle, el listado, el sitemap) y con tags las alcanzás todas sin enumerarlas. Usá <code>revalidatePath</code> cuando lo que cambió es la <em>forma</em> de la página, no un dato.
+</div>
+
+<p>Cuando un dato no debe cachearse nunca —un carrito, un saldo, un panel con datos de la sesión— hay que decirlo explícitamente:</p>
+
+<pre><code class="lang-tsx">// Nivel fetch: este pedido nunca se cachea
+const res = await fetch(url, { cache: "no-store" });
+
+// Nivel ruta: esta ruta siempre se renderiza dinámica
+export const dynamic = "force-dynamic";
+
+// Nivel ruta: revalidar como máximo cada 60 s (ISR)
+export const revalidate = 60;</code></pre>
+
+<div class="warn">
+  <strong>Leer cookies o headers vuelve la ruta dinámica.</strong> En cuanto un Server Component hace <code>await cookies()</code> o <code>await headers()</code>, el framework no puede prerenderizar esa ruta: depende de la request. Es correcto y deseable, pero es la causa número uno de "¿por qué mi página dejó de ser estática?" — y suele estar escondida tres niveles abajo, dentro de un helper de sesión. <strong>Aislá esas lecturas en el componente más chico posible</strong> y envolvelo en Suspense para que el resto de la página siga siendo estático.
+</div>
+
+<pre><code class="lang-tsx">// ❌ toda la página se vuelve dinámica por el saludo
+export default async function Pagina() {
+  const sesion = await getSesion();      // lee cookies acá arriba
+  return (
+    &lt;&gt;
+      &lt;p&gt;Hola {sesion?.nombre}&lt;/p&gt;
+      &lt;CatalogoEstatico /&gt;               {/* ya no se puede prerenderizar */}
+    &lt;/&gt;
+  );
+}
+
+// ✅ solo el saludo es dinámico; el catálogo sigue estático
+export default function Pagina() {
+  return (
+    &lt;&gt;
+      &lt;Suspense fallback={&lt;span&gt;…&lt;/span&gt;}&gt;
+        &lt;Saludo /&gt;                       {/* acá adentro se leen las cookies */}
+      &lt;/Suspense&gt;
+      &lt;CatalogoEstatico /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h2>RS4.8 Qué NO podés hacer en un Server Component</h2>
+
+<p>La lista es corta y se deduce de una sola premisa: <strong>el componente corre una vez, en un proceso de servidor, y después deja de existir</strong>. No hay "después" para él.</p>
+
+<table>
+<thead><tr><th>No podés</th><th>Por qué</th><th>Qué hacés en su lugar</th></tr></thead>
+<tbody>
+<tr><td><code>useState</code>, <code>useReducer</code></td><td>No hay re-render local: el componente ya terminó</td><td>Client Component en la hoja que necesita el estado</td></tr>
+<tr><td><code>useEffect</code>, <code>useLayoutEffect</code></td><td>Los efectos corren después del montaje, y no hay montaje</td><td>El trabajo va directo en el cuerpo <code>async</code>, o en un Client Component</td></tr>
+<tr><td><code>onClick</code>, <code>onChange</code>…</td><td>No hay listener que registrar: no hay DOM ahí</td><td>Client Component, o <code>&lt;form action={serverFn}&gt;</code></td></tr>
+<tr><td><code>useContext</code></td><td>No hay árbol vivo con providers</td><td>Pasar props, o leer el contexto en un Client Component</td></tr>
+<tr><td><code>window</code>, <code>document</code>, <code>localStorage</code></td><td>No existen en Node</td><td>Client Component (y <code>useEffect</code> si necesitás el DOM montado)</td></tr>
+<tr><td>Custom hooks con estado</td><td>Heredan la restricción de los hooks que usan</td><td>Convertirlos en función pura, o moverlos al cliente</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>Lo que sí podés y no es obvio:</strong> usar <code>async/await</code> directo en el componente, leer variables de entorno privadas sin miedo a filtrarlas, importar librerías pesadas sin costo de bundle, hacer consultas SQL, leer del sistema de archivos, y usar <code>cache()</code> de React para deduplicar una función cara dentro de la misma request. Un Server Component se parece más a un <em>template de servidor</em> que a un componente de React clásico — y eso es exactamente lo que es.
+</div>
+
+<h2>RS4.9 Cuándo RSC no conviene</h2>
+
+<p>La parte que casi nadie escribe. RSC es una arquitectura, y como toda arquitectura tiene un dominio de aplicabilidad fuera del cual estorba.</p>
+
+<table>
+<thead><tr><th>Situación</th><th>¿RSC?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>E-commerce, blog, docs, marketing, dashboards con mucha lectura</td><td>✅ Ideal</td><td>Mucho contenido, poca interactividad por pantalla, SEO importa</td></tr>
+<tr><td>Editor colaborativo, canvas, DAW, juego, IDE web</td><td>❌ Estorba</td><td>Casi todo es estado del cliente; el servidor no aporta y el límite molesta</td></tr>
+<tr><td>App interna detrás de login, sin SEO, con datos en vivo</td><td>⚠️ Depende</td><td>Ganás poco: casi todo es dinámico y ya autenticado. Medí antes de migrar</td></tr>
+<tr><td>SPA servida como estáticos (S3, GitHub Pages, CDN sola)</td><td>❌ Imposible</td><td>RSC necesita un runtime de servidor que ejecute los componentes</td></tr>
+<tr><td>Móvil con React Native</td><td>❌ Fuera de alcance</td><td>El modelo apunta a la web; el ecosistema no está ahí</td></tr>
+<tr><td>Equipo chico sin experiencia de backend ni infra</td><td>⚠️ Cuidado</td><td>Sumás un servidor que hay que operar, monitorear, escalar y pagar</td></tr>
+<tr><td>App existente grande con mucho <code>useEffect</code> de fetch</td><td>⚠️ Incremental</td><td>Migrá ruta por ruta. Un <em>big bang</em> acá termina mal</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>El costo que nunca sale en los benchmarks.</strong> RSC te devuelve un servidor a mantener. Antes tenías archivos estáticos en un CDN y un backend con el que hablabas por HTTP; ahora tenés un proceso que renderiza React, con su memoria, su latencia p99, su cold start, sus timeouts y su factura por invocación. Si el equipo no tiene con qué operar eso —observabilidad, alertas, un plan de rollback— el ahorro de 40% de bundle se lo come el primer incidente de producción.
+</div>
+
+<div class="rule">
+  <strong>📌 El criterio en una línea.</strong> Preguntate <em>qué fracción de esta pantalla necesita estado del cliente</em>. Si es baja (una ficha de producto, un artículo, un listado), RSC gana claramente. Si es alta (un editor, un tablero drag-and-drop), estás pagando complejidad arquitectónica para mover al servidor un 5% del árbol.
+</div>
+
+<h2>🧑‍🎓 Worked Example — página de producto con reseñas</h2>
+
+<blockquote>Una página de producto tarde 2,8 s hasta el primer contenido y manda 340 KB de JS. Es la ruta con más tráfico del sitio y la que más convierte. Objetivo: bajar las dos cosas sin perder ninguna funcionalidad.</blockquote>
+
+<h3>Paso 1 — La versión que hay (todo cliente)</h3>
+
+<pre><code class="lang-tsx">"use client";
+import { useState, useEffect } from "react";
+import { marked } from "marked";              // 42 KB
+import { format } from "date-fns";            // 18 KB + locale
+import { es } from "date-fns/locale";
+
+export default function PaginaProducto({ slug }: { slug: string }) {
+  const [producto, setProducto] = useState(null);
+  const [reseñas, setReseñas]   = useState([]);
+  const [stock, setStock]       = useState(null);
+
+  useEffect(() =&gt; {
+    fetch(`/api/productos/${slug}`).then(r =&gt; r.json()).then(setProducto);
+  }, [slug]);
+
+  useEffect(() =&gt; {
+    if (!producto) return;                    // ← espera al producto
+    fetch(`/api/productos/${producto.id}/reseñas`).then(r =&gt; r.json()).then(setReseñas);
+    fetch(`/api/stock/${producto.id}`).then(r =&gt; r.json()).then(setStock);
+  }, [producto]);
+
+  if (!producto) return &lt;Esqueleto /&gt;;
+
+  return (
+    &lt;article&gt;
+      &lt;h1&gt;{producto.nombre}&lt;/h1&gt;
+      &lt;div dangerouslySetInnerHTML={{ __html: marked(producto.descripcionMd) }} /&gt;
+      &lt;Galeria imagenes={producto.imagenes} /&gt;
+      &lt;p&gt;{stock?.disponible ? "En stock" : "Sin stock"}&lt;/p&gt;
+      &lt;ul&gt;
+        {reseñas.map(r =&gt; (
+          &lt;li key={r.id}&gt;
+            {r.texto} — {format(new Date(r.fecha), "d 'de' MMMM", { locale: es })}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+      &lt;FormReseña productoId={producto.id} /&gt;
+    &lt;/article&gt;
+  );
+}</code></pre>
+
+<p><strong>Diagnóstico, con números y no con opinión:</strong></p>
+
+<ol>
+  <li><strong>Cascada de red de tres saltos.</strong> HTML vacío → bundle JS → <code>/api/productos</code> → <code>/api/reseñas</code>. Nada se ve hasta que terminan los tres. Y como <code>/api/stock</code> depende de <code>producto.id</code>, también espera, aunque el <code>slug</code> alcanzaba.</li>
+  <li><strong>60 KB de librerías que el usuario no necesita.</strong> <code>marked</code> parsea un markdown que <em>ya está escrito</em> y no cambia. <code>date-fns</code> con locale formatea fechas <em>del pasado</em>. Ese trabajo no tiene por qué ocurrir en el dispositivo del usuario.</li>
+  <li><strong>SEO nulo.</strong> El HTML inicial es un esqueleto. Lo que indexa el buscador depende de que ejecute el JS.</li>
+</ol>
+
+<h3>Paso 2 — Dibujar el árbol antes de tocar código</h3>
+
+<pre><code class="lang-text">PaginaProducto ................... server   (async, lee la DB)
+├── Titulo + descripción ......... server   (marked corre acá, 0 KB al cliente)
+├── Galeria ...................... CLIENTE  (zoom, swipe, teclado)
+├── Stock ........................ server   (Suspense: es el más lento)
+├── Reseñas ...................... server   (Suspense: 800 ms)
+│   └── FechaRelativa ............ server   (format corre acá, 0 KB)
+└── FormReseña ................... CLIENTE  (useActionState + validación en vivo)
+    └── agregarReseña() .......... SERVER FUNCTION (con auth adentro)</code></pre>
+
+<p>Dos componentes de cliente en toda la página. Todo lo demás es servidor. Ese dibujo es la decisión de arquitectura completa; lo que sigue es transcribirlo.</p>
+
+<h3>Paso 3 — La página, con datos en paralelo y streaming</h3>
+
+<pre><code class="lang-tsx">// app/productos/[slug]/page.tsx — Server Component
+import { Suspense } from "react";
+import { marked } from "marked";
+import { traerProducto, traerReseñas, traerStock } from "@/lib/datos";
+import { Galeria } from "@/components/Galeria";        // "use client" adentro
+import { FormReseña } from "@/components/FormReseña";  // "use client" adentro
+
+export default async function PaginaProducto({
+  params,
+}: { params: Promise&lt;{ slug: string }&gt; }) {
+  const { slug } = await params;
+
+  // Arrancan YA, sin await: los tres viajes van en paralelo desde el primer ms
+  const pReseñas = traerReseñas(slug);
+  const pStock   = traerStock(slug);
+  const producto = await traerProducto(slug);          // el rápido sí se espera
+
+  return (
+    &lt;article&gt;
+      &lt;h1&gt;{producto.nombre}&lt;/h1&gt;
+      &lt;div dangerouslySetInnerHTML={{ __html: marked(producto.descripcionMd) }} /&gt;
+
+      &lt;Galeria imagenes={producto.imagenes} alt={producto.nombre} /&gt;
+
+      &lt;Suspense fallback={&lt;span&gt;Consultando stock…&lt;/span&gt;}&gt;
+        &lt;Stock promesa={pStock} /&gt;
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;EsqueletoReseñas /&gt;}&gt;
+        &lt;Reseñas promesa={pReseñas} /&gt;
+      &lt;/Suspense&gt;
+
+      &lt;FormReseña slug={slug} /&gt;
+    &lt;/article&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// Server Components auxiliares: no cuestan un byte de bundle
+async function Stock({ promesa }: { promesa: Promise&lt;{ disponible: boolean }&gt; }) {
+  const { disponible } = await promesa;
+  return &lt;p&gt;{disponible ? "En stock" : "Sin stock"}&lt;/p&gt;;
+}
+
+async function Reseñas({ promesa }: { promesa: Promise&lt;Reseña[]&gt; }) {
+  const reseñas = await promesa;
+  const fmt = new Intl.DateTimeFormat("es-AR", { dateStyle: "long" });
+  return (
+    &lt;ul&gt;
+      {reseñas.map((r) =&gt; (
+        &lt;li key={r.id}&gt;{r.texto} — {fmt.format(new Date(r.fecha))}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>Detalle que vale 18 KB:</strong> <code>date-fns</code> desapareció y en su lugar hay <code>Intl.DateTimeFormat</code>, que viene con la plataforma. Al mover el formateo al servidor, la pregunta "¿qué librería uso?" cambió de respuesta — en Node la API nativa alcanza y sobra. Muchas dependencias del frontend existen solo porque el navegador viejo no las tenía.
+</div>
+
+<h3>Paso 4 — La Server Function, con su autorización adentro</h3>
+
+<pre><code class="lang-tsx">// app/productos/acciones.ts
+"use server";
+
+import { z } from "zod";
+import { revalidateTag } from "next/cache";
+import { db } from "@/lib/db";
+import { getSesion } from "@/lib/auth";
+
+const NuevaReseña = z.object({
+  slug: z.string().min(1).max(120),
+  texto: z.string().trim().min(10).max(2000),
+  puntaje: z.coerce.number().int().min(1).max(5),
+});
+
+export async function agregarReseña(_previo: unknown, fd: FormData) {
+  // 1. ¿Quién sos? — de la sesión, NUNCA de los argumentos
+  const sesion = await getSesion();
+  if (!sesion) return { error: "Iniciá sesión para reseñar" };
+
+  // 2. ¿Los datos son válidos? — vienen del cliente: hostiles por defecto
+  const parseo = NuevaReseña.safeParse(Object.fromEntries(fd));
+  if (!parseo.success) return { error: "Revisá los campos" };
+  const datos = parseo.data;
+
+  // 3. ¿Podés hacer ESTO sobre ESTE recurso? — autorización a nivel de objeto
+  const compro = await db.pedido.findFirst({
+    where: { usuarioId: sesion.userId, items: { some: { slug: datos.slug } } },
+    select: { id: true },
+  });
+  if (!compro) return { error: "Solo compradores verificados pueden reseñar" };
+
+  const yaReseñó = await db.reseña.findFirst({
+    where: { autorId: sesion.userId, productoSlug: datos.slug },
+    select: { id: true },
+  });
+  if (yaReseñó) return { error: "Ya publicaste una reseña de este producto" };
+
+  // 4. Recién ahora, el efecto
+  await db.reseña.create({
+    data: {
+      productoSlug: datos.slug,
+      texto: datos.texto,
+      puntaje: datos.puntaje,
+      autorId: sesion.userId,            // ← de la sesión, no del formulario
+    },
+  });
+
+  revalidateTag(`reseñas:${datos.slug}`);
+  return { ok: true };
+}</code></pre>
+
+<div class="danger">
+  <strong>Reproducí el ataque antes de dar esto por bueno.</strong> Con la función publicada, cualquiera puede mandar el <code>POST</code> a mano sin pasar por tu formulario. Probalo con <code>curl</code>: sin cookie de sesión tiene que fallar en el paso 1; con una sesión de alguien que no compró el producto, en el paso 3. <strong>Si pasa alguno de los dos, tu control de acceso vive en el frontend y no existe.</strong> El detalle de estos modelos está en <a href="../../../../track-senior/modulo-04-seguridad-auth/lecture.html">S-04 (Seguridad y autenticación)</a> y <a href="../../../../sistemas/Curso-Ciberseguridad/m03-autorizacion/lecture.html">M03 de Ciberseguridad (Autorización)</a>.
+</div>
+
+<h3>Paso 5 — Medir, que es lo único que cuenta</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Todo cliente</th><th>RSC</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>First Load JS (ruta)</td><td>340 KB</td><td>112 KB</td><td><strong>−67%</strong></td></tr>
+<tr><td>Componentes hidratados</td><td>14</td><td>2</td><td>−12</td></tr>
+<tr><td>Saltos de red hasta ver contenido</td><td>4 (HTML → JS → API → API)</td><td>1</td><td>−3</td></tr>
+<tr><td>Primer contenido con sentido</td><td>~2,8 s</td><td>~0,7 s</td><td><strong>−75%</strong></td></tr>
+<tr><td>Reseñas visibles</td><td>~3,4 s</td><td>~1,5 s (streaming)</td><td>−56%</td></tr>
+<tr><td>HTML indexable sin JS</td><td>No</td><td>Sí</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá RSC".</strong> Es que la ganancia salió de <strong>tres decisiones separadas</strong> y conviene saber cuál aportó qué: <em>(a)</em> mover el trabajo que no necesita el usuario al servidor bajó el bundle; <em>(b)</em> disparar los fetch en paralelo eliminó la cascada; <em>(c)</em> Suspense sacó lo lento del camino crítico. Las tres se pueden hacer mal dentro de RSC y quedar peor que antes. Y ninguna de las tres se declara: se mide con <code>next build</code> y con el waterfall de la request.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué un Client Component no puede importar un Server Component, pero sí recibirlo como <code>children</code>?</summary>
+<p>Porque son dos mecanismos distintos. <strong>Importar</strong> es una relación en el grafo de módulos que resuelve el bundler: si un archivo cliente importa otro, ese otro tiene que existir en el bundle del navegador, y un Server Component no puede existir ahí (usa la DB, secretos, APIs de Node). <strong>Recibir como <code>children</code></strong> es una relación en el árbol de React en tiempo de render: quien construye ese elemento es el Server Component padre, en el servidor, y lo que el Client Component recibe es un subárbol <em>ya renderizado</em> — en el payload es un valor, no una referencia a código. Por eso la regla práctica es empujar el <code>"use client"</code> hacia las hojas y envolver por composición: el envase es cliente, el contenido sigue siendo servidor.</p></details>
+
+<details><summary>Publicás una Server Function que borra un comentario y el botón solo se muestra a los moderadores. ¿Alcanza?</summary>
+<p>No, y no alcanza por un margen enorme. Esa función es un endpoint HTTP público: al buildear queda expuesta con un identificador que cualquiera puede leer en el payload o en la pestaña Network, y reproducir con <code>curl</code> sin pasar jamás por tu UI. Esconder el botón cambia lo que se ve, no lo que se puede invocar. El chequeo tiene que estar <strong>adentro de la función</strong>, en este orden: autenticar (¿hay sesión válida?), validar los argumentos (vienen del cliente, son hostiles), autorizar contra el recurso concreto (¿este usuario puede borrar <em>este</em> comentario?) y recién ahí ejecutar. Y la identidad del que actúa sale siempre de la sesión, nunca de un argumento.</p></details>
+
+<details><summary>Tu página hace tres <code>await</code> seguidos y tarda 600 ms. ¿Cuándo <code>Promise.all</code> es la respuesta correcta y cuándo no?</summary>
+<p><code>Promise.all</code> sirve cuando los tres pedidos son <strong>independientes</strong> (dependen solo de datos que ya tenés, como el <code>slug</code>): pasás de 600 ms a lo que tarde el más lento. No sirve en dos casos. Uno: si hay dependencia real —necesitás el <code>id</code> del producto para pedir el stock— ahí no hay paralelismo posible sin cambiar la API. Dos: si uno de los tres es mucho más lento que los otros, <code>Promise.all</code> iguala a todos para abajo y el usuario espera 800 ms para ver un título que estaba listo en 100 ms. En ese caso la respuesta es <strong>Suspense</strong>: esperás lo rápido, envolvés lo lento y lo dejás llegar por streaming. La variante fina es iniciar la promesa arriba sin <code>await</code> y pasarla hacia abajo, para que el viaje arranque temprano y el <code>await</code> ocurra donde el dato se usa.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>RSC <strong>no es SSR mejorado</strong>. SSR decide dónde se genera el primer HTML; RSC decide <strong>qué componentes existen en el cliente</strong>. Un Server Component no se hidrata porque no está allá.</li>
+  <li>Lo que viaja es el <strong>payload RSC</strong>: filas numeradas con el árbol serializado, referencias a chunks de cliente (<code>$L0</code>) y huecos que llegan después. De ese formato salen el streaming y las actualizaciones parciales que preservan el estado del cliente.</li>
+  <li><code>"use client"</code> marca un <strong>punto de entrada al bundle</strong>, no un componente. Todo lo que ese archivo importa entra al navegador — por eso nunca va en un barril.</li>
+  <li>Las props que cruzan el límite tienen que ser <strong>serializables</strong>. Una función común no cruza porque es código más closure; la única forma legítima es exponerla como Server Function.</li>
+  <li><strong>Importar arrastra, recibir no.</strong> Pasá Server Components como <code>children</code> o props <code>ReactNode</code> para no llevarte el árbol entero al cliente. Es el patrón que más bundle ahorra.</li>
+  <li>Una <strong>Server Function es un endpoint público</strong>: autenticar → validar → autorizar sobre el recurso → actuar. La identidad sale de la sesión, jamás de los argumentos.</li>
+  <li>La <strong>cascada</strong> es el modo de falla propio de RSC. Se rompe con <code>Promise.all</code> cuando los pedidos son independientes, y con <strong>Suspense</strong> cuando uno es mucho más lento.</li>
+  <li>Hay <strong>cuatro cachés</strong>, no uno. Antes de pelear con el caching, identificá cuál te está devolviendo lo viejo. Etiquetá con <code>tags</code> e invalidá con <code>revalidateTag</code>.</li>
+  <li>RSC brilla en contenido con poca interactividad; estorba en editores, canvas y SPAs sin servidor. <strong>Y te devuelve un servidor para operar</strong> — ese costo no aparece en ningún benchmark.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Levantá una app con App Router y capturá el payload RSC de una ruta con <code>curl -H 'RSC: 1'</code>. Identificá en la salida: una fila <code>I[...]</code> de referencia a cliente, una referencia <code>$L</code> dentro del árbol y un hueco que llegue después. Explicá con tus palabras qué provoca cada uno.</li>
+  <li>Tomá un componente tuyo que tenga <code>"use client"</code> cerca de la raíz y reescribilo con el patrón de <code>children</code>. Corré <code>next build</code> antes y después y anotá el <em>First Load JS</em> de esa ruta en las dos versiones. Si no bajó, buscá qué otra cosa está arrastrando el bundle.</li>
+  <li>Provocá a propósito el error de props no serializables pasando una función desde un Server Component. Leé el mensaje completo. Después arreglalo de las dos maneras (mover el handler al cliente, y exponerlo como Server Function) y explicá cuál corresponde en tu caso.</li>
+  <li>Escribí una página con tres <code>await</code> secuenciales y medí el tiempo total. Convertila a <code>Promise.all</code>, medí de nuevo. Después meté el más lento en un <code>&lt;Suspense&gt;</code> y medí el tiempo hasta el primer contenido visible. Armá una tabla con tus tres números.</li>
+  <li>Implementá una Server Function que modifique un recurso que pertenece a un usuario. Después atacala con <code>curl</code>: (a) sin cookie de sesión, (b) con la sesión de otro usuario, (c) con argumentos fuera de rango. Documentá en qué paso frenó cada intento. Si alguno pasó, arreglalo y volvé a probar.</li>
+  <li>Etiquetá dos lecturas con <code>tags</code> distintos que aparezcan en dos rutas. Invalidá una sola con <code>revalidateTag</code> y verificá que la otra ruta siga sirviendo el valor cacheado. Después repetí con <code>revalidatePath("/", "layout")</code> y observá la diferencia de alcance.</li>
+  <li>Encontrá en tu app una ruta que se volvió dinámica sin que lo quisieras. Rastreá qué lectura de <code>cookies()</code> o <code>headers()</code> la causó —probablemente esté escondida dentro de un helper— y aislala en el componente más chico posible con Suspense. Confirmá con <code>next build</code> que la ruta volvió a ser estática.</li>
+</ol>
+
+<section class="quiz" id="quizRS4">
+  <style>
+    #quizRS4{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS4 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS4 .q{margin-bottom:1.5rem}
+    #quizRS4 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS4 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS4 .opt:hover{border-color:var(--accent)}
+    #quizRS4 .opt:disabled{cursor:default}
+    #quizRS4 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS4 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS4 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS4 .exp.show{display:block}
+    #quizRS4 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un Client Component necesita mostrar adentro un componente que lee la base de datos. ¿Cuál es la solución correcta?</p>
+    <button class="opt">Importar el componente de servidor desde el archivo con <code>"use client"</code></button>
+    <button class="opt">Marcar también el componente de datos con <code>"use client"</code> y moverlo a <code>useEffect</code></button>
+    <button class="opt">Recibirlo como <code>children</code> (o prop <code>ReactNode</code>) desde un Server Component padre</button>
+    <div class="exp">Importar lo arrastra al bundle del cliente, donde no puede existir; convertirlo a cliente te devuelve la cascada de <code>useEffect</code> y manda el ORM al navegador. La salida es la composición: el Client Component reserva un hueco (<code>children</code>) y el Server Component padre lo llena con un subárbol <strong>ya renderizado</strong>. En el payload eso es un valor, no una referencia a código — cero bytes de bundle.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>2. Exponés una Server Function que cambia el rol de un usuario, y el botón solo aparece si <code>sesion.rol === "admin"</code>. ¿Qué falta?</p>
+    <button class="opt">Nada: si el botón no se renderiza, la función no se puede invocar</button>
+    <button class="opt">Verificar el rol <strong>adentro</strong> de la función: es un endpoint público invocable con <code>curl</code></button>
+    <button class="opt">Agregar <code>"use client"</code> al archivo de acciones para que no quede expuesto</button>
+    <div class="exp">La Server Function se compila a un endpoint HTTP con un identificador visible en el payload y en la pestaña Network. Cualquiera lo reproduce sin tocar tu UI. Esconder el botón cambia lo que se ve, no lo que se puede invocar. El chequeo va adentro y en orden: autenticar, validar los argumentos, autorizar contra el recurso concreto, y recién entonces actuar — con la identidad tomada de la sesión, nunca de un argumento. Ver <a href="../../../../sistemas/Curso-Ciberseguridad/m03-autorizacion/lecture.html">M03 de Ciberseguridad</a>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu página hace <code>await</code> del producto (100 ms) y después <code>await</code> de las reseñas (800 ms). Ambos dependen solo del <code>slug</code>. ¿Cuál es la mejor mejora para el primer contenido visible?</p>
+    <button class="opt">Iniciar el pedido de reseñas sin <code>await</code>, esperar solo el producto y envolver las reseñas en <code>&lt;Suspense&gt;</code></button>
+    <button class="opt">Un <code>Promise.all</code> con los dos, para que terminen juntos</button>
+    <button class="opt">Pasar los dos fetch a <code>useEffect</code> en un Client Component</button>
+    <div class="exp"><code>Promise.all</code> arregla la cascada pero iguala a todos al más lento: el usuario espera 800 ms para ver un título que estaba listo en 100 ms. Iniciar la promesa lenta sin <code>await</code> hace que el viaje arranque en el primer milisegundo, el título se pinta a los ~100 ms, y las reseñas llegan por streaming al hueco del <code>Suspense</code>. Mover todo a <code>useEffect</code> es volver al problema original: reintroduce la cascada de red y suma bundle.</div>
+  </div>
+
+  <div class="score" id="scoreRS4"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS4');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS4').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS5.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs3-compiler/lecture.html">← RS3: React Compiler</a>
+  <a href="../rs5-data-cache/lecture.html">RS5: Data fetching y caché →</a>
+</nav>
+
+</div>
+</body>
+</html>

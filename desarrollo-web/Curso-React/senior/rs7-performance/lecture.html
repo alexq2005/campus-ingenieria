@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS7 — Performance: medir antes de tocar · React Senior</title>
+  <meta name="description" content="Las tres cosas distintas que llamamos performance, Core Web Vitals 2026 (LCP, INP, CLS), campo vs laboratorio, el Profiler de React DevTools a fondo, análisis de bundle y code splitting, virtualización de listas, imágenes y fuentes, el costo de la hidratación y presupuestos de performance en CI.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS7</span>
+  <span class="badge">⏱ 50–135 min</span>
+  <span class="badge">🎯 Pre-req: RS1, RS3</span>
+  <span class="badge">📊 Performance</span>
+</div>
+
+<article>
+
+<h1>RS7 — Performance: medir antes de tocar</h1>
+
+<h2>RS7.0 Por qué este módulo</h2>
+
+<p>"Está lento" no es un diagnóstico. Es un síntoma reportado por alguien que no tiene por qué saber qué lo causa, dicho sobre un sistema donde por lo menos seis cosas distintas pueden producir esa misma sensación. Tratarlo como diagnóstico —"está lento, entonces hay que memoizar"— es la razón por la cual una enorme proporción del trabajo de optimización que se hace en React <strong>no mueve la aguja</strong>: ataca algo que no era el problema, agrega complejidad permanente y deja el problema real intacto.</p>
+
+<p>Este módulo es, antes que una lista de técnicas, un <strong>método</strong>. La técnica sin el método es peligrosa: te da herramientas para hacer cambios que parecen productivos, que se ven bien en el code review, y que no cambian nada de lo que el usuario percibe. Hay una asimetría cruel acá: <em>medir</em> es aburrido, invisible en el PR y difícil de vender; <em>optimizar</em> se siente productivo y queda lindo en el diff. Justamente por eso el sesgo del equipo promedio es saltar a optimizar.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La performance web no es una magnitud: son <strong>tres problemas distintos</strong> —carga, interactividad y estabilidad visual— con causas distintas, métricas distintas y arreglos distintos. La mayoría de las optimizaciones de React que se hacen apuntan a la <em>interactividad</em>, mientras que la mayoría de las quejas reales de los usuarios vienen de la <em>carga</em>. Y la carga casi nunca se arregla con React: se arregla con red, bytes, imágenes y fuentes.
+</div>
+
+<p>Hay además una razón de coyuntura. El paisaje cambió en dos frentes concretos: <strong>INP</strong> reemplazó a FID como la métrica oficial de interactividad, y eso hizo mucho más difícil aprobar el examen —FID medía solo la latencia hasta el primer procesamiento del primer input, que es la parte fácil; INP mide la interacción completa, la peor de la sesión, hasta que el pixel se pinta—. Y del lado de React, el <strong>Compiler 1.0</strong> automatizó la clase entera de optimizaciones que antes hacíamos a mano (RS3), con <strong>25% a 40% menos de re-renders innecesarios</strong> reportados por el equipo. En 2026, si tu plan de performance empieza con "voy a agregar <code>useMemo</code>", estás resolviendo un problema que la herramienta ya resolvió mejor que vos, y probablemente no era ese el problema.</p>
+
+<div class="rule">
+  <strong>📌 La regla de oro de este módulo, y la única que hay que memorizar:</strong> no se toca una línea de código de performance sin un <strong>número anterior</strong>, una <strong>hipótesis explícita</strong> de qué lo causa, y un <strong>número posterior</strong> medido de la misma manera. Si no podés escribir esas tres cosas en una oración, todavía no sabés qué estás arreglando.
+</div>
+
+<h2>RS7.1 Las tres cosas distintas que llamamos "performance"</h2>
+
+<p>Cuando un usuario dice "va lenta", puede estar describiendo cualquiera de estas tres experiencias, que no tienen nada que ver entre sí:</p>
+
+<table>
+  <thead>
+    <tr><th>Dimensión</th><th>Qué siente el usuario</th><th>Causa dominante</th><th>Métrica</th><th>Herramienta</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Carga inicial</strong></td>
+      <td>"tarda en aparecer"</td>
+      <td>Bytes por la red: JS, imágenes, fuentes, CSS; latencia del servidor; cascadas de requests</td>
+      <td>LCP, TTFB, FCP</td>
+      <td>Panel Network, analizador de bundle, WebPageTest</td>
+    </tr>
+    <tr>
+      <td><strong>Interactividad</strong></td>
+      <td>"clickeo y no pasa nada"</td>
+      <td>Main thread bloqueado: re-renders caros, tareas largas, handlers pesados, scripts de terceros</td>
+      <td>INP, TBT, long tasks</td>
+      <td>Profiler de React, panel Performance, LoAF</td>
+    </tr>
+    <tr>
+      <td><strong>Percepción / estabilidad</strong></td>
+      <td>"salta todo", "no sé si funcionó"</td>
+      <td>Contenido insertado sin espacio reservado; falta de feedback inmediato</td>
+      <td>CLS, latencia de feedback</td>
+      <td>Layout Shift Regions, grabación de video</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>La distinción no es académica: <strong>determina dónde buscar</strong>. Si tu problema es carga inicial, podés memoizar componentes hasta que se te caigan los dedos y no vas a cambiar un milisegundo, porque el usuario todavía está esperando que bajen 900 KB de JavaScript. Si tu problema es interactividad, podés comprimir imágenes toda la semana y el click va a seguir sintiéndose pegajoso, porque el main thread sigue trabado 400 ms por tecla.</p>
+
+<div class="analogy">
+  <strong>🔎 La analogía del restaurante.</strong> <em>Carga</em> es cuánto tardan en traerte la comida desde que entrás. <em>Interactividad</em> es cuánto tarda el mozo en reaccionar cuando levantás la mano. <em>Percepción</em> es que no te muevan la mesa mientras estás por apoyar el vaso. Contratar más cocineros no arregla que el mozo no te mire, y el mozo más atento del mundo no acelera el horno. Cada dimensión tiene su cuello de botella y su arreglo.
+</div>
+
+<p>Hay una cuarta categoría que la gente mete en la bolsa y conviene sacar: el <strong>costo de mantenimiento</strong> de la propia optimización. Un código virtualizado, code-splitteado y memoizado a mano es más rápido y también más difícil de leer, de testear y de modificar. Ese costo es real, es permanente y lo paga tu equipo todas las semanas. Si la ganancia es de 12 ms que nadie percibe, el trade es malo aunque el número mejore.</p>
+
+<h2>RS7.2 Core Web Vitals 2026: LCP, INP y CLS</h2>
+
+<p>Las Core Web Vitals son el intento de Google de reducir "¿esto se siente rápido?" a tres números medibles en el navegador de gente real. Se pueden criticar —y hay críticas válidas— pero tienen una ventaja enorme: son un lenguaje común. Cuando decís "el INP p75 está en 340 ms", cualquiera del rubro entiende exactamente qué pasa y qué tan mal está.</p>
+
+<table>
+  <thead>
+    <tr><th>Métrica</th><th>Qué mide</th><th>Bueno</th><th>Mejorable</th><th>Malo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>LCP</strong> — Largest Contentful Paint</td><td>Cuándo se pinta el elemento de contenido más grande del viewport</td><td>≤ 2,5 s</td><td>2,5–4,0 s</td><td>&gt; 4,0 s</td></tr>
+    <tr><td><strong>INP</strong> — Interaction to Next Paint</td><td>La latencia de la <em>peor</em> interacción de la visita (aprox.), de input a pixel pintado</td><td>≤ 200 ms</td><td>200–500 ms</td><td>&gt; 500 ms</td></tr>
+    <tr><td><strong>CLS</strong> — Cumulative Layout Shift</td><td>Cuánto se movió el contenido visible sin que el usuario lo pidiera</td><td>≤ 0,1</td><td>0,1–0,25</td><td>&gt; 0,25</td></tr>
+  </tbody>
+</table>
+
+<div class="info">
+  Los umbrales se evalúan sobre el <strong>percentil 75 de las visitas reales</strong>, no sobre el promedio y no sobre tu máquina. El p75 es una elección deliberada: la mediana esconde a la cuarta parte peor de tus usuarios, que suelen ser los del teléfono viejo y la red mala. Si tu p50 está impecable y tu p75 está en rojo, no tenés un sitio rápido con algunos casos raros: tenés un sitio que <strong>anda mal para uno de cada cuatro</strong>.
+</div>
+
+<h3>LCP: casi siempre es una imagen, casi nunca es React</h3>
+
+<p>El LCP identifica el bloque de contenido más grande del viewport —normalmente una imagen hero, un banner o un titular grande— y mide cuándo termina de pintarse. Se descompone en cuatro tramos, y esa descomposición es la mitad del diagnóstico: <strong>TTFB</strong> (esperando al servidor), <strong>delay de carga del recurso</strong> (el tiempo entre que el navegador podría haber pedido la imagen y efectivamente la pidió), <strong>duración de carga</strong> (bajarla) y <strong>delay de render</strong> (tenerla y todavía no pintarla, típicamente porque el JS que la monta no llegó).</p>
+
+<p>En una SPA de React el patrón clásico es tener el <em>delay de carga</em> y el <em>delay de render</em> por las nubes: la imagen hero no está en el HTML inicial, así que el navegador no sabe que existe hasta que bajó, parseó y ejecutó el bundle, montó el árbol y recién ahí insertó el <code>&lt;img&gt;</code>. El preload scanner del navegador —que es la optimización más potente que tiene— queda inutilizado porque no hay nada que escanear.</p>
+
+<h3>INP: la métrica que hizo difícil el examen</h3>
+
+<p>INP mide la interacción completa: desde que el usuario toca hasta que el navegador pinta el siguiente frame que refleja el resultado. Se divide en tres partes:</p>
+
+<pre><code class="lang-text">┌──────────────┬────────────────────────┬──────────────────┐
+│ input delay  │  processing time       │ presentation     │
+│              │                        │ delay            │
+└──────────────┴────────────────────────┴──────────────────┘
+  el main thread   tus handlers +          layout, paint,
+  estaba ocupado   el render de React      composite
+  con otra cosa    (esto es lo tuyo)
+</code></pre>
+
+<p>Los tres tramos fallan por razones distintas, y por eso la <strong>atribución</strong> importa tanto. Si el <em>input delay</em> es el grande, el problema no es tu handler: es que algo más tenía tomado el main thread cuando el usuario clickeó —un script de analytics, la hidratación, un <code>useEffect</code> pesado de otro componente—. Si el grande es el <em>processing time</em>, ahí sí es React: un re-render caro, un <code>onChange</code> que hace trabajo O(n) sobre una lista larga. Si el grande es el <em>presentation delay</em>, el trabajo de JS terminó rápido pero el navegador tarda en pintar: DOM gigante, CSS costoso, o un <code>&lt;details&gt;</code> con diez mil nodos que se abre de golpe.</p>
+
+<div class="warn">
+  <strong>La trampa de INP en SPAs.</strong> Históricamente las Core Web Vitals se atribuyen a una <em>carga de página</em>. En una SPA, navegar de <code>/productos</code> a <code>/productos/42</code> <strong>no</strong> es una carga de página: es una interacción. Eso significa dos cosas incómodas. Primero, que el LCP de tus rutas internas no se mide en ningún lado — el LCP de tu sitio es el de la <em>primera</em> vista. Segundo, que una navegación interna lenta se registra como una <strong>interacción de 900 ms</strong>, o sea que te destruye el INP. La Soft Navigations API existe para arreglar esto y sigue en evolución; mientras tanto, cuando tu INP es horrible y no encontrás el handler culpable, revisá si el culpable es una transición de ruta.
+</div>
+
+<h3>CLS: el que más barato se arregla</h3>
+
+<p>CLS suma el impacto de cada movimiento inesperado de contenido visible. Es la métrica más fácil de las tres porque las causas son un catálogo corto y conocido: imágenes sin <code>width</code>/<code>height</code>, fuentes web que cambian las métricas del texto al cargar, banners y avisos insertados arriba del contenido, y —el más frecuente en React— <strong>un skeleton de un tamaño y un contenido real de otro</strong>.</p>
+
+<h2>RS7.3 Datos de campo vs datos de laboratorio</h2>
+
+<p>Esta es la sección que separa a quien mide de quien cree que mide. Hay dos formas de obtener números y responden preguntas distintas:</p>
+
+<table>
+  <thead><tr><th></th><th>Laboratorio (lab)</th><th>Campo (field / RUM)</th></tr></thead>
+  <tbody>
+    <tr><td>Qué es</td><td>Lighthouse, WebPageTest, tu panel Performance</td><td>Métricas recolectadas de usuarios reales; CrUX</td></tr>
+    <tr><td>Responde</td><td>"¿por qué es lento?"</td><td>"¿es lento, para quién y cuánto?"</td></tr>
+    <tr><td>Ventaja</td><td>Reproducible, con traza completa, corre en CI</td><td>Es la verdad: dispositivos, redes y comportamiento reales</td></tr>
+    <tr><td>Debilidad</td><td>Un solo dispositivo, una sola red, una sola ruta, sin caché real, sin usuario real</td><td>Sin traza: te dice que dolió, no dónde</td></tr>
+    <tr><td>INP</td><td><strong>No lo mide</strong> (usa TBT como proxy)</td><td>Lo mide de verdad</td></tr>
+  </tbody>
+</table>
+
+<div class="mistake">
+  <strong>Por qué Lighthouse en tu notebook miente.</strong> No es un bug: es que tu notebook no es tu usuario. Corrés en una máquina de desarrollo con CPU de sobra, sobre fibra, con la caché caliente, contra <code>localhost</code> sin latencia real, con extensiones de Chrome inyectando scripts, en una sola ruta y sin tocar nada. Tu usuario del p75 está en un Android de gama media de hace tres años, en una red móvil con 120 ms de latencia, con la batería en 15% y el sistema haciendo throttling térmico. Además, y esto es lo decisivo: <strong>Lighthouse no puede medir INP</strong>, porque INP requiere que alguien interactúe. Un 100 de Lighthouse es perfectamente compatible con un INP p75 de 600 ms.
+</div>
+
+<p>La respuesta no es tirar Lighthouse: es entender para qué sirve cada uno. <strong>El campo te dice qué arreglar; el laboratorio te dice por qué.</strong> El flujo correcto es: mirás RUM, ves que INP está en rojo en móvil en la ruta de checkout, y recién ahí abrís el laboratorio con throttling y reproducís <em>esa</em> interacción en <em>esa</em> ruta.</p>
+
+<h3>Medir el campo con <code>web-vitals</code></h3>
+
+<p>La librería oficial <code>web-vitals</code> es minúscula y hace lo correcto: usa las APIs nativas del navegador, maneja los casos raros (bfcache, pestañas ocultas, páginas descargadas) y en su build de <em>atribución</em> te dice además qué elemento fue el culpable.</p>
+
+<pre><code class="lang-jsx">// src/rum.js — se importa una sola vez, en el entry de la app.
+import { onLCP, onINP, onCLS, onTTFB } from "web-vitals/attribution";
+
+function enviar(metrica) {
+  const cuerpo = JSON.stringify({
+    nombre: metrica.name,          // "LCP" | "INP" | "CLS" | "TTFB"
+    valor: metrica.value,
+    rating: metrica.rating,        // "good" | "needs-improvement" | "poor"
+    id: metrica.id,
+    ruta: location.pathname,       // clave: sin esto no sabés QUÉ pantalla duele
+    // La atribución es la mitad del valor de todo esto:
+    attribution: metrica.attribution,
+    // Contexto del dispositivo, para poder segmentar después:
+    conexion: navigator.connection?.effectiveType,
+    memoria: navigator.deviceMemory,
+    cpu: navigator.hardwareConcurrency,
+  });
+
+  // sendBeacon sobrevive a que el usuario cierre la pestaña; fetch no siempre.
+  if (navigator.sendBeacon) navigator.sendBeacon("/api/rum", cuerpo);
+  else fetch("/api/rum", { body: cuerpo, method: "POST", keepalive: true });
+}
+
+onLCP(enviar);
+onINP(enviar);
+onCLS(enviar);
+onTTFB(enviar);</code></pre>
+
+<p>El campo <code>attribution</code> es lo que convierte esto de un termómetro en un diagnóstico. Para LCP te da el selector CSS del elemento culpable y los cuatro subtramos; para INP te da el tipo de evento, el selector del target y el desglose input/processing/presentation; para CLS te da el elemento que más se movió.</p>
+
+<pre><code class="lang-jsx">// Ejemplo de lo que llega para un INP malo, ya con atribución:
+{
+  nombre: "INP", valor: 512, rating: "poor", ruta: "/pedidos",
+  attribution: {
+    interactionTarget: "#buscador",     // el input del buscador
+    interactionType: "keyboard",
+    inputDelay: 24,                     // el main thread estaba casi libre
+    processingDuration: 431,            // ⬅ acá está el problema: es NUESTRO código
+    presentationDelay: 57,
+    longAnimationFrameEntries: [ /* LoAF: scripts, con URL y línea */ ]
+  }
+}</code></pre>
+
+<div class="tip">
+  <strong>Long Animation Frames (LoAF)</strong> es la pieza que faltaba para depurar INP en campo. Un frame largo trae la lista de scripts que lo causaron, con URL, nombre de función y duración. Es lo más parecido a un stack trace de performance que vas a conseguir de usuarios reales, y suele ser la única forma de descubrir que el 40% de tu INP lo produce un script de terceros que nadie recuerda haber agregado.
+</div>
+
+<pre><code class="lang-jsx">// Observar frames largos directamente, sin librería:
+new PerformanceObserver((list) =&gt; {
+  for (const frame of list.getEntries()) {
+    // blockingDuration: cuánto de ese frame bloqueó de verdad al usuario
+    if (frame.blockingDuration &gt; 50) {
+      console.log(frame.duration, frame.blockingDuration, frame.scripts);
+    }
+  }
+}).observe({ type: "long-animation-frame", buffered: true });</code></pre>
+
+<h3>CrUX: el campo que ya tenés sin instrumentar nada</h3>
+
+<p>El <strong>Chrome UX Report</strong> es el dataset público de Google con métricas reales de usuarios de Chrome que optaron por compartirlas, agregadas en una ventana móvil de 28 días. No necesitás instalar nada: si tu sitio tiene tráfico suficiente, ya estás ahí.</p>
+
+<pre><code class="lang-bash"># Los p75 reales de tu sitio, sin instrumentar una línea:
+curl -s "https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=$CRUX_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"origin":"https://tuapp.com","formFactor":"PHONE"}' \
+  | jq '.record.metrics | to_entries[] | {metrica: .key, p75: .value.percentiles.p75}'</code></pre>
+
+<div class="rule">
+  <strong>📌 CrUX es un piso, no un techo.</strong> Ventana de 28 días (o sea: lento para ver el efecto de un deploy), solo Chrome (no iOS Safari, que en muchos productos es la mitad del tráfico), solo si superás un umbral de tráfico, y agregado por origen o por URL — nunca por segmento de negocio. Es excelente para saber <em>si</em> tenés un problema y comparar con la competencia. Para saber <em>cuál</em> de tus rutas y <em>qué</em> usuarios, necesitás tu propio RUM.
+</div>
+
+<h2>RS7.4 React DevTools Profiler a fondo</h2>
+
+<p>Cuando el campo te dijo que el problema es interactividad y el laboratorio te confirmó que el tiempo se va en JavaScript, ahí recién entra el Profiler. Es la herramienta correcta para <em>una</em> pregunta, y hay que usarla para esa: <strong>¿qué componentes se renderizan durante esta interacción, cuánto tardan y por qué se renderizaron?</strong></p>
+
+<p>Antes de grabar, activá en la rueda de configuración del Profiler la opción <strong>"Record why each component rendered while profiling"</strong>. Sin eso, la mitad del valor de la herramienta está apagada. Y grabá <strong>una interacción</strong>, no "un rato de uso": empezás a grabar, hacés una cosa concreta (escribir tres letras en el buscador), parás. Una grabación de treinta segundos con veinte interacciones mezcladas es imposible de leer.</p>
+
+<h3>Las tres vistas y para qué sirve cada una</h3>
+
+<table>
+  <thead><tr><th>Vista</th><th>Qué muestra</th><th>Se usa para responder</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Flamegraph</strong></td><td>El árbol de componentes de <em>un</em> commit; el ancho es el tiempo, el gris es "no se renderizó"</td><td>"¿Qué parte del árbol se renderizó cuando toqué esto?" — es la vista de <em>forma</em></td></tr>
+    <tr><td><strong>Ranked</strong></td><td>Los componentes de ese commit ordenados por duración propia</td><td>"¿Cuál fue el caro?" — es la vista de <em>quién paga</em></td></tr>
+    <tr><td><strong>Timeline de commits</strong></td><td>Cada barra es un commit; la altura es su duración</td><td>"¿Cuántos commits produjo una tecla?" — es la vista de <em>cuántas veces</em></td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El número que casi nadie mira y es el más importante: la cantidad de commits.</strong> Si escribís tres letras y ves veinticuatro barras en la timeline, no tenés un problema de componentes caros: tenés un problema de <em>frecuencia</em> —algo dispara renders de más—, y ninguna memoización lo va a resolver. Antes de preguntarte "¿cuánto tarda?", preguntate "¿cuántas veces?". Un componente de 3 ms renderizado ochenta veces por tecla es peor que uno de 80 ms renderizado una vez.
+</div>
+
+<h3>"Why did this render?"</h3>
+
+<p>Al seleccionar un componente en un commit, el panel derecho te muestra la razón. Las razones posibles son pocas y cada una apunta a un arreglo distinto:</p>
+
+<table>
+  <thead><tr><th>Razón que muestra DevTools</th><th>Qué significa</th><th>Dónde mirar</th></tr></thead>
+  <tbody>
+    <tr><td><em>Props changed (data, onSelect)</em></td><td>El padre le pasó props distintas — <strong>distintas por identidad</strong>, no necesariamente por valor</td><td>El padre: ¿está creando el objeto/función en el render? (RS3)</td></tr>
+    <tr><td><em>Hooks changed</em></td><td>Un <code>useState</code>/<code>useReducer</code>/<code>useSyncExternalStore</code> propio cambió</td><td>El estado está bien ubicado? ¿o vive más arriba de lo que debería? (RS6)</td></tr>
+    <tr><td><em>Context changed</em></td><td>El <code>value</code> de un provider ancestro cambió de identidad</td><td>El provider: ¿el value es un objeto literal creado en cada render?</td></tr>
+    <tr><td><em>The parent component rendered</em></td><td>Nada suyo cambió: se renderizó porque su padre lo hizo</td><td>Normal y casi siempre barato. Solo importa si el subárbol es caro</td></tr>
+  </tbody>
+</table>
+
+<div class="mistake">
+  <strong>"The parent component rendered" no es un bug.</strong> Es el comportamiento por defecto de React y en la enorme mayoría de los casos es <em>gratis</em>: renderizar un componente que devuelve poco JSX cuesta microsegundos y el reconciliador descarta el trabajo sin tocar el DOM (RS1). El error clásico del que recién descubre el Profiler es ver un mar de componentes amarillos y salir a envolver todo en <code>memo</code>. Lo que importa no es <em>si</em> se renderizó, sino <strong>si eso costó tiempo medible</strong>. Ordená por Ranked: si el más caro del commit son 0,4 ms, no tenés un problema de renders.
+</div>
+
+<h3>El <code>&lt;Profiler&gt;</code> programático: para medir sin humano</h3>
+
+<p>DevTools es interactivo, y eso significa que no sirve para regresiones. El componente <code>&lt;Profiler&gt;</code> de React expone los mismos datos por callback, y con eso podés medir en un test o mandar métricas a tu RUM.</p>
+
+<pre><code class="lang-jsx">import { Profiler } from "react";
+
+function alRenderizar(id, phase, actualDuration, baseDuration, startTime, commitTime) {
+  // phase: "mount" | "update" | "nested-update"
+  // actualDuration: lo que costó ESTE commit (con memoización aplicada)
+  // baseDuration: lo que costaría SIN ninguna memoización
+  // La relación entre ambos es la que te dice si memoizar sirvió de algo:
+  //   actual ≈ base  → la memoización no está ahorrando nada
+  //   actual ≪ base  → está ahorrando mucho
+  if (actualDuration &gt; 16) {           // más de un frame a 60fps
+    reportarRUM({ id, phase, actualDuration, baseDuration });
+  }
+}
+
+&lt;Profiler id="TablaPedidos" onRender={alRenderizar}&gt;
+  &lt;TablaPedidos pedidos={pedidos} /&gt;
+&lt;/Profiler&gt;</code></pre>
+
+<div class="warn">
+  El <code>&lt;Profiler&gt;</code> <strong>agrega overhead</strong>: en el build de producción estándar los callbacks no se ejecutan salvo que uses un bundle con profiling habilitado. No lo dejes envolviendo medio árbol "por si acaso" — envolvé la frontera que te interesa medir, medí, y sacalo o dejalo detrás de un flag.
+</div>
+
+<h3>Un test de regresión que cuenta renders</h3>
+
+<p>Los números del Profiler son de un momento; el CI es para siempre. La forma más barata de que una mejora no se degrade sola es un test que cuente renders:</p>
+
+<pre><code class="lang-jsx">test("escribir en el buscador no re-renderiza las 200 filas", async () =&gt; {
+  const renders = new Map();
+  const contar = (id) =&gt; renders.set(id, (renders.get(id) ?? 0) + 1);
+
+  render(&lt;PanelPedidos pedidos={FIXTURE_200} onRenderFila={contar} /&gt;);
+  renders.clear();                       // ignoramos el mount
+
+  await user.type(screen.getByRole("searchbox"), "abc");
+
+  // Antes del arreglo: 600 (200 filas × 3 teclas).
+  expect(renders.size).toBe(0);
+});</code></pre>
+
+<h2>RS7.5 El bundle: lo que casi siempre es el problema real</h2>
+
+<p>Si tu queja es "tarda en cargar", el 80% de las veces la respuesta está acá y no en React. El JavaScript es el recurso más caro de la web por byte: a diferencia de una imagen, que solo hay que bajar y decodificar, el JS hay que bajarlo, parsearlo, compilarlo y ejecutarlo — y todo eso pasa en el main thread, o sea que además bloquea.</p>
+
+<h3>Paso 1: mirarlo. En serio, mirarlo</h3>
+
+<p>La cantidad de equipos que optimizan sin haber visto nunca un treemap de su bundle es asombrosa. Es literalmente un comando:</p>
+
+<pre><code class="lang-bash"># Vite / Rollup — treemap interactivo, con gzip y brotli:
+npx vite-bundle-visualizer
+
+# Cualquier build con sourcemaps — atribuye cada byte a su archivo original:
+npx source-map-explorer 'dist/assets/*.js'
+
+# Next.js:
+ANALYZE=true npm run build
+
+# Y el número más honesto de todos, el que ve el usuario:
+npx brotli-size dist/assets/index-*.js</code></pre>
+
+<div class="rule">
+  <strong>📌 Comparen siempre bytes comprimidos.</strong> "La librería pesa 300 KB" casi siempre es el tamaño <em>minificado sin comprimir</em>, que es un número que ningún usuario experimenta: la red transfiere brotli o gzip, y ahí esos 300 KB suelen ser 70–90 KB. Pero ojo con la lectura opuesta: el <strong>costo de parseo y ejecución escala con el tamaño descomprimido</strong>, no con el comprimido. Los 300 KB sí los paga la CPU. Por eso hay que mirar los dos números: el comprimido predice el tiempo de red, el descomprimido predice el tiempo de CPU.
+</div>
+
+<h3>Paso 2: code splitting por ruta</h3>
+
+<p>El split por ruta es la optimización de mejor relación beneficio/complejidad que existe en frontend, y en 2026 es prácticamente gratis con cualquier router moderno. La idea es obvia una vez dicha: el usuario que entra al home no necesita el código del panel de administración.</p>
+
+<pre><code class="lang-jsx">import { lazy, Suspense } from "react";
+import { Routes, Route } from "react-router";
+
+// Cada lazy() se convierte en un chunk separado en el build.
+const Home      = lazy(() =&gt; import("./rutas/Home"));
+const Panel     = lazy(() =&gt; import("./rutas/Panel"));      // pesado: gráficos
+const Reportes  = lazy(() =&gt; import("./rutas/Reportes"));   // pesado: PDF + tablas
+
+export function App() {
+  return (
+    &lt;Suspense fallback={&lt;EsqueletoDeRuta /&gt;}&gt;
+      &lt;Routes&gt;
+        &lt;Route path="/"          element={&lt;Home /&gt;} /&gt;
+        &lt;Route path="/panel"     element={&lt;Panel /&gt;} /&gt;
+        &lt;Route path="/reportes"  element={&lt;Reportes /&gt;} /&gt;
+      &lt;/Routes&gt;
+    &lt;/Suspense&gt;
+  );
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error que convierte el split en una regresión:</strong> poner el <code>&lt;Suspense&gt;</code> con un fallback que ocupa un tamaño distinto al contenido real. Acabás de cambiar 40 KB de bundle por un salto de layout que te sube el CLS. Y el error hermano: splitear tan fino que cada navegación dispara cinco requests en cascada — cada chunk es un round-trip, y en una red móvil con 150 ms de latencia, cinco chunks secuenciales son 750 ms de nada.
+</div>
+
+<h3>Paso 3: precargar antes de que haga falta</h3>
+
+<p>Un chunk lazy tiene un costo: la primera vez que lo necesitás, hay que ir a buscarlo. La solución es adelantarse a la intención del usuario: cuando pasa el mouse por encima del link, ya sabemos con alta probabilidad adónde va.</p>
+
+<pre><code class="lang-jsx">const Reportes = lazy(() =&gt; import("./rutas/Reportes"));
+
+// La misma promesa: importar dos veces no baja dos veces, el módulo se cachea.
+const precargarReportes = () =&gt; import("./rutas/Reportes");
+
+&lt;Link
+  to="/reportes"
+  onMouseEnter={precargarReportes}
+  onFocus={precargarReportes}         // ⬅ no te olvides del teclado
+&gt;
+  Reportes
+&lt;/Link&gt;</code></pre>
+
+<h3>Paso 4: split por componente, no solo por ruta</h3>
+
+<p>Dentro de una ruta también hay código que la mayoría de los usuarios nunca ejecuta: el editor de texto enriquecido que se abre en un modal, el visor de PDF, el mapa, el gráfico de la pestaña que casi nadie abre. Esos son candidatos ideales, porque el usuario ya <em>hizo un gesto</em> antes de necesitarlos y tenés unos cientos de milisegundos de cobertura psicológica.</p>
+
+<pre><code class="lang-tsx">const EditorRico = lazy(() =&gt; import("./EditorRico"));   // ~180 KB de dependencias
+
+function FormularioNota() {
+  const [editando, setEditando] = useState(false);
+
+  return editando ? (
+    &lt;Suspense fallback={&lt;textarea className="editor-placeholder" readOnly /&gt;}&gt;
+      &lt;EditorRico /&gt;
+    &lt;/Suspense&gt;
+  ) : (
+    // El fallback tiene EXACTAMENTE el mismo alto que el editor real: CLS = 0.
+    &lt;textarea
+      className="editor-placeholder"
+      onFocus={() =&gt; setEditando(true)}
+      placeholder="Escribí una nota…"
+    /&gt;
+  );
+}</code></pre>
+
+<h3>Paso 5: tree shaking, y por qué a veces no funciona</h3>
+
+<p>El tree shaking elimina las exportaciones que nadie importa. Es análisis estático, y como todo análisis estático, es <strong>conservador</strong>: ante la duda, se queda con el código. Las tres razones por las que falla:</p>
+
+<pre><code class="lang-jsx">// ❌ RAZÓN 1: barrel files. index.js re-exporta 200 componentes.
+import { Boton } from "@/componentes";
+// El bundler tiene que evaluar el módulo entero para saber qué exporta.
+// Si CUALQUIERA de esos 200 tiene un side effect, se queda todo.
+
+// ✅ Importá desde el módulo concreto:
+import { Boton } from "@/componentes/Boton";
+
+// ❌ RAZÓN 2: la librería publica CommonJS. `require` es dinámico:
+// nadie puede probar estáticamente qué se usa, así que entra todo.
+const _ = require("libreria-vieja");
+
+// ❌ RAZÓN 3: side effects en el nivel superior del módulo.
+// El bundler no puede probar que borrar esto no cambia el comportamiento.
+window.MI_GLOBAL = configurar();      // efecto observable
+Prototipo.prototype.metodo = ...;     // parche de prototipo
+import "./estilos.css";               // efecto REAL: no se puede sacudir</code></pre>
+
+<pre><code class="lang-bash"># La declaración con la que tu librería le promete al bundler que puede podar:
+# package.json
+{
+  "sideEffects": false,                      // "ningún módulo tiene efectos"
+  "sideEffects": ["*.css", "./src/polyfills.js"]   // o la lista de los que sí
+}</code></pre>
+
+<div class="danger">
+  <strong>Poner <code>"sideEffects": false</code> cuando no es verdad es de los bugs más difíciles de encontrar de todo el frontend.</strong> El bundler elimina un módulo que parecía no usarse, y con él se va un registro de un plugin, un parche de prototipo o un import de CSS. El síntoma aparece en producción, en una ruta específica, sin error en consola: simplemente algo dejó de tener estilos o un componente no se registró. Verificá módulo por módulo antes de declararlo.
+</div>
+
+<h3>Paso 6: las dependencias pesadas y cómo encontrarlas</h3>
+
+<p>El treemap te muestra el <em>qué</em>. Lo que sigue es decidir. Casi siempre hay tres salidas, en este orden de preferencia:</p>
+
+<pre><code class="lang-jsx">// CASO CLÁSICO: una librería de fechas importada entera para formatear.
+import moment from "moment";                       // ~290 KB sin comprimir
+moment(fecha).format("DD/MM/YYYY");
+
+// SALIDA 1 — la plataforma ya lo hace. 0 KB.
+new Intl.DateTimeFormat("es-AR", { dateStyle: "short" }).format(fecha);
+
+// SALIDA 2 — misma funcionalidad, modular y tree-shakeable. ~2 KB de lo usado.
+import { format } from "date-fns";
+import { es } from "date-fns/locale";
+format(fecha, "dd/MM/yyyy", { locale: es });
+
+// SALIDA 3 — no se puede sacar, pero se puede diferir: que no esté en el
+// bundle inicial y se cargue cuando la pantalla que la usa se monte.
+const Graficos = lazy(() =&gt; import("./Graficos"));  // arrastra la librería pesada</code></pre>
+
+<pre><code class="lang-bash"># Detectar dependencias que ya no usa nadie, y exports muertos:
+npx knip                    # dependencias, exports y archivos sin usar
+npx depcheck                # dependencias declaradas y no importadas
+
+# ¿Cuánto pesa una librería ANTES de instalarla?
+npx bundlejs-cli "date-fns/format"   # o pegala en bundlephobia.com</code></pre>
+
+<div class="tip">
+  El costo de una dependencia no es solo su tamaño: son sus <strong>dependencias transitivas</strong>, su superficie de mantenimiento y su riesgo de seguridad. Antes de <code>npm install</code> para algo de veinte líneas, la pregunta correcta es "¿esto lo hace la plataforma?". <code>Intl</code>, <code>URL</code>, <code>structuredClone</code>, <code>crypto.randomUUID</code>, <code>Array.prototype.at</code>, <code>Object.groupBy</code>: media docena de librerías populares de hace cinco años hoy son APIs nativas.
+</div>
+
+<h2>RS7.6 Listas grandes: cuándo memoizar no alcanza</h2>
+
+<p>La lista larga es el caso donde React efectivamente <em>es</em> el cuello de botella, y donde la memoización tiene un techo duro. El razonamiento es aritmético: memoizar evita <strong>recalcular</strong> filas que no cambiaron, pero no evita <strong>tener</strong> esas filas en el DOM. Si tu tabla tiene 10.000 filas de 8 nodos cada una, tenés 80.000 nodos en el documento; ese costo lo pagás en el mount, en cada layout, en cada repaint y en la memoria, memoizado o no.</p>
+
+<table>
+  <thead><tr><th>Cantidad de ítems</th><th>Qué hacer</th><th>Por qué</th></tr></thead>
+  <tbody>
+    <tr><td>&lt; 100</td><td>Nada. Renderizá y seguí</td><td>El costo es ruido; virtualizar acá es puro daño</td></tr>
+    <tr><td>100 – 500</td><td>Compiler (RS3) y filas baratas</td><td>Suele alcanzar sobradamente. Medí antes de creer que no</td></tr>
+    <tr><td>500 – 2.000</td><td>Zona gris: medí. Probá <code>content-visibility: auto</code> primero</td><td>Depende del peso de cada fila. Una fila con avatar, tooltip y menú cuesta 20× una de texto</td></tr>
+    <tr><td>&gt; 2.000</td><td>Virtualizar</td><td>El costo del DOM domina todo lo demás</td></tr>
+  </tbody>
+</table>
+
+<p>Antes de virtualizar, existe una opción de una línea de CSS que resuelve muchos casos de la zona gris: <code>content-visibility: auto</code> le dice al navegador que se saltee el layout y el paint de lo que está fuera de pantalla. Los nodos siguen en el DOM —así que <code>Ctrl+F</code>, el lector de pantalla y el anclaje del scroll siguen funcionando— pero no se pintan.</p>
+
+<pre><code class="lang-bash">/* Cada fila se saltea layout y paint mientras esté fuera del viewport.
+   contain-intrinsic-size evita que la barra de scroll salte: es el alto
+   que el navegador debe ASUMIR para el contenido que todavía no midió. */
+.fila-pedido {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
+}</code></pre>
+
+<h3>Virtualizar: qué es y qué cuesta</h3>
+
+<p>Virtualizar (o <em>windowing</em>) es renderizar solo las filas visibles más un colchón, y simular la altura total con un contenedor vacío para que la barra de scroll mienta convincentemente.</p>
+
+<pre><code class="lang-tsx">import { useVirtualizer } from "@tanstack/react-virtual";
+
+function TablaPedidos({ pedidos }: { pedidos: Pedido[] }) {
+  const contenedor = useRef&lt;HTMLDivElement&gt;(null);
+
+  const virtual = useVirtualizer({
+    count: pedidos.length,               // 20.000
+    getScrollElement: () =&gt; contenedor.current,
+    estimateSize: () =&gt; 48,              // alto estimado de fila, en px
+    overscan: 8,                         // filas de colchón arriba y abajo
+  });
+
+  return (
+    &lt;div ref={contenedor} style={{ height: 600, overflow: "auto" }}
+         role="grid" aria-rowcount={pedidos.length}&gt;
+      {/* El espaciador que le da al scroll su altura real */}
+      &lt;div style={{ height: virtual.getTotalSize(), position: "relative" }}&gt;
+        {virtual.getVirtualItems().map((v) =&gt; (
+          &lt;div
+            key={pedidos[v.index].id}
+            role="row"
+            aria-rowindex={v.index + 1}   {/* ⬅ sin esto, el lector de pantalla
+                                               dice "fila 3 de 12" mintiendo */}
+            style={{
+              position: "absolute", top: 0, left: 0, width: "100%",
+              height: v.size, transform: `translateY(${v.start}px)`,
+            }}
+          &gt;
+            &lt;Fila pedido={pedidos[v.index]} /&gt;
+          &lt;/div&gt;
+        ))}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>La virtualización no es gratis, y su costo se paga en cosas que no aparecen en ninguna métrica de performance:</strong>
+  <ul>
+    <li><strong>Accesibilidad:</strong> el DOM miente sobre cuántos elementos hay. Sin <code>aria-rowcount</code>/<code>aria-rowindex</code> (o <code>aria-setsize</code>/<code>aria-posinset</code> en listas), el lector de pantalla anuncia "3 de 12" cuando hay 20.000.</li>
+    <li><strong>Buscar en la página:</strong> <code>Ctrl+F</code> del navegador deja de encontrar lo que no está renderizado. Para tablas de datos esto suele ser un rechazo directo de los usuarios, y hay que compensarlo con un buscador propio.</li>
+    <li><strong>Scroll anchoring y "volver atrás":</strong> restaurar la posición del scroll al volver de un detalle se vuelve un problema propio, con estado propio.</li>
+    <li><strong>Alturas variables:</strong> si las filas no miden todas lo mismo, hay que medirlas dinámicamente, y ahí aparecen los saltitos del scrollbar.</li>
+    <li><strong>Ctrl+P, copiar y pegar, capturas:</strong> imprimir una tabla virtualizada imprime lo visible.</li>
+  </ul>
+</div>
+
+<div class="rule">
+  <strong>📌 El orden correcto ante una lista lenta:</strong> (1) ¿de verdad hace falta mostrar 20.000 filas, o el usuario quiere <em>buscar</em>? Paginar o filtrar en el servidor resuelve el problema borrándolo. (2) ¿La fila es innecesariamente cara? Diez nodos y un tooltip por fila multiplicado por mil es tu problema real. (3) <code>content-visibility</code>. (4) Recién ahí, virtualizar.
+</div>
+
+<h2>RS7.7 Imágenes y fuentes: donde vive tu LCP</h2>
+
+<p>Repetimos el dato porque es el que más cambia dónde buscás: <strong>el elemento LCP es una imagen en la enorme mayoría de las páginas</strong>. Y en las que no lo es, suele ser un titular grande cuya fuente todavía no cargó. Es decir: tu métrica de carga más importante casi nunca depende de React.</p>
+
+<h3>La imagen hero, bien hecha</h3>
+
+<pre><code class="lang-jsx">// ❌ Lo típico: sin dimensiones (CLS), sin prioridad (el navegador no sabe
+//    que es la importante) y con lazy loading en la imagen MÁS importante.
+&lt;img src="/hero.jpg" alt="" loading="lazy" /&gt;
+
+// ✅ Cada atributo resuelve un problema concreto:
+&lt;img
+  src="/hero-800.avif"
+  srcSet="/hero-400.avif 400w, /hero-800.avif 800w, /hero-1600.avif 1600w"
+  sizes="(max-width: 640px) 100vw, 800px"
+  width={800} height={450}      // reserva el espacio ⇒ CLS = 0
+  fetchPriority="high"          // ⬅ subila al frente de la cola
+  decoding="async"              // no bloquear el hilo decodificando
+  alt="Panel de pedidos en vivo"
+/&gt;
+
+// Y para TODAS las demás, las que están debajo del pliegue:
+&lt;img src="/tarjeta.avif" width={320} height={180} loading="lazy" alt="…" /&gt;</code></pre>
+
+<div class="mistake">
+  <strong>Poner <code>loading="lazy"</code> en la imagen hero es el autogol más frecuente de la web moderna.</strong> Suena a optimización, y es literalmente lo contrario: le estás diciendo al navegador que difiera el recurso que define tu LCP. La regla es simple y no tiene excepciones prácticas: <strong>lazy solo por debajo del pliegue</strong>. Lo que se ve al entrar va sin <code>lazy</code>, y lo más grande va con <code>fetchpriority="high"</code>.
+</div>
+
+<p>El otro problema del LCP en SPAs es de <em>descubribilidad</em>: si la imagen la inserta React después de hidratar, el navegador se entera tarde. Dos arreglos, ambos baratos: que la imagen venga en el HTML del servidor (RS4), o declararla como preload en el <code>&lt;head&gt;</code> para que el preload scanner la vea antes de ejecutar una línea de JS.</p>
+
+<pre><code class="lang-jsx">// En el head del documento, no en el componente:
+&lt;link rel="preload" as="image" href="/hero-800.avif" fetchpriority="high"
+      imagesrcset="/hero-400.avif 400w, /hero-800.avif 800w" imagesizes="100vw" /&gt;</code></pre>
+
+<h3>Fuentes: dos milisegundos de descuido, medio punto de CLS</h3>
+
+<p>Las fuentes web producen los dos síntomas más molestos de la carga: el <strong>FOIT</strong> (texto invisible mientras la fuente baja) y el <strong>FOUT</strong> (texto que se re-dibuja y se re-acomoda cuando la fuente llega). El segundo es CLS puro.</p>
+
+<pre><code class="lang-bash">@font-face {
+  font-family: "Inter";
+  src: url("/fuentes/inter.woff2") format("woff2");
+  font-display: swap;      /* muestra el fallback ya, cambia cuando llega */
+  /* La parte que casi nadie hace: ajustar el fallback para que ocupe
+     EXACTAMENTE lo mismo que la fuente real ⇒ el swap no mueve nada. */
+  size-adjust: 107%;
+  ascent-override: 90%;
+  descent-override: 22%;
+}
+
+/* En el head, para que el preload scanner la pida junto con el HTML.
+   crossorigin es OBLIGATORIO en fuentes: sin él, se baja dos veces. */
+&lt;link rel="preload" as="font" type="font/woff2"
+      href="/fuentes/inter.woff2" crossorigin /&gt;</code></pre>
+
+<table>
+  <thead><tr><th><code>font-display</code></th><th>Comportamiento</th><th>Cuándo usarlo</th></tr></thead>
+  <tbody>
+    <tr><td><code>swap</code></td><td>Fallback inmediato, cambia cuando llega la fuente</td><td>Por defecto para texto de contenido</td></tr>
+    <tr><td><code>optional</code></td><td>Ventana de ~100 ms; si no llegó, no la usa en esta visita</td><td>Cuando el CLS importa más que la tipografía exacta</td></tr>
+    <tr><td><code>block</code></td><td>Texto invisible hasta 3 s</td><td>Casi nunca. Iconos tipográficos, y ni eso</td></tr>
+  </tbody>
+</table>
+
+<h2>RS7.8 Hidratación: el costo que no aparece en el Profiler</h2>
+
+<p>La hidratación es el proceso de tomar el HTML que mandó el servidor y "encenderlo": recorrer el árbol de componentes en el cliente, reconstruir el estado interno de React y enganchar los event listeners. El costo es proporcional al <strong>tamaño del árbol</strong>, no a cuánto cambió, y ocurre en un momento pésimo: cuando el usuario ya ve la página y por lo tanto ya empezó a intentar interactuar.</p>
+
+<div class="concept">
+  <strong>💡 El "valle inquietante" de la hidratación.</strong> Hay una ventana en la que la página se ve completa y no responde nada. El usuario clickea, no pasa nada, clickea de nuevo. Eso no aparece como error en ningún lado, pero destruye el INP: el <em>input delay</em> se va a las nubes porque el main thread está ocupado hidratando. Es la razón por la cual una página con LCP excelente puede sentirse rota.
+</div>
+
+<p>Las tres formas de reducirlo, de menos a más estructural:</p>
+
+<ul>
+  <li><strong>Streaming SSR con <code>&lt;Suspense&gt;</code></strong> (RS2): en vez de hidratar todo de una, React hidrata por fragmentos y prioriza el que el usuario tocó. Una sola tarea larga se convierte en varias cortas, y entre ellas el navegador puede atender al usuario.</li>
+  <li><strong>Server Components</strong> (RS4): el código que corre solo en el servidor <em>no se hidrata porque no existe en el cliente</em>. No es que se hidrate más rápido: es que ese árbol no participa. Es la reducción cualitativa, no cuantitativa.</li>
+  <li><strong>Empujar el <code>"use client"</code> hacia las hojas</strong>: si marcás como cliente un componente alto del árbol, todo lo que cuelga de él se va al cliente aunque no lo necesite.</li>
+</ul>
+
+<pre><code class="lang-tsx">// ❌ La página entera se vuelve cliente por un botón.
+"use client";
+export default function PaginaProducto({ producto }) {
+  const [abierto, setAbierto] = useState(false);
+  return (
+    &lt;article&gt;
+      &lt;DescripcionLarga texto={producto.descripcion} /&gt;   {/* estático */}
+      &lt;TablaEspecificaciones specs={producto.specs} /&gt;    {/* estático */}
+      &lt;button onClick={() =&gt; setAbierto(true)}&gt;Compartir&lt;/button&gt;
+    &lt;/article&gt;
+  );
+}
+
+// ✅ Server Component; solo el botón cruza al cliente.
+export default function PaginaProducto({ producto }) {
+  return (
+    &lt;article&gt;
+      &lt;DescripcionLarga texto={producto.descripcion} /&gt;   {/* 0 KB de JS */}
+      &lt;TablaEspecificaciones specs={producto.specs} /&gt;    {/* 0 KB de JS */}
+      &lt;BotonCompartir url={producto.url} /&gt;               {/* "use client" acá */}
+    &lt;/article&gt;
+  );
+}</code></pre>
+
+<h2>RS7.9 El Compiler primero, la mano después</h2>
+
+<p>Si al terminar de medir concluiste que sí, que el problema son re-renders, el orden de las medidas cambió respecto de lo que se enseñaba hasta 2024. Hoy la primera medida no es escribir <code>useMemo</code>: es <strong>verificar que el Compiler esté cubriendo ese componente</strong> (RS3).</p>
+
+<pre><code class="lang-bash"># 1. ¿Está activo y qué cobertura tiene?
+npx react-compiler-healthcheck@latest
+#   Successfully compiled 112 out of 130 components.
+
+# 2. ¿POR QUÉ quedaron 18 afuera? El linter te da archivo, línea y motivo.
+npx eslint src --rule 'react-hooks/react-compiler: error'</code></pre>
+
+<p>El razonamiento es de costo: memoizar a mano es trabajo permanente, propenso a errores y que envejece mal (nadie audita los <code>useMemo</code> viejos). El Compiler hace lo mismo, mejor, en build time, y con el beneficio adicional de que <strong>cuando no puede optimizar un componente te está señalando un problema real</strong> —una mutación, un efecto en el render, una violación de las Reglas de React— que probablemente ya era un bug latente.</p>
+
+<div class="rule">
+  <strong>📌 El orden de intervención ante un problema confirmado de re-renders:</strong> (1) que el Compiler cubra el componente; (2) si no lo cubre, arreglar <em>por qué</em>, no memoizar encima; (3) revisar si el estado está en el lugar correcto — el estado demasiado arriba causa más re-renders que cualquier falta de memo (RS6); (4) revisar si el problema es de <em>prioridad</em> y no de cantidad, y ahí la respuesta es <code>useDeferredValue</code> o <code>startTransition</code> (RS2); (5) recién entonces, <code>memo</code> manual en una frontera concreta y justificada por escrito.
+</div>
+
+<h2>RS7.10 Presupuestos de performance</h2>
+
+<p>Todo lo anterior es una foto. Sin un mecanismo que la sostenga, la performance se degrada sola: cada sprint alguien agrega una dependencia de 30 KB con una buena razón, y en seis meses el bundle se duplicó sin que nadie tomara una sola mala decisión. Un <strong>presupuesto</strong> convierte "tratemos de no engordar" en un número que rompe el build.</p>
+
+<pre><code class="lang-bash"># .size-limit.json — el presupuesto más barato de implementar que existe.
+[
+  { "name": "entry inicial", "path": "dist/assets/index-*.js",
+    "limit": "170 kB", "gzip": true },
+  { "name": "vendor",        "path": "dist/assets/vendor-*.js",
+    "limit": "120 kB", "gzip": true },
+  { "name": "CSS",           "path": "dist/assets/*.css",
+    "limit": "35 kB",  "gzip": true }
+]</code></pre>
+
+<pre><code class="lang-bash"># En el CI: falla el build si alguien se pasa, y comenta el diff en el PR.
+- run: npm run build
+- run: npx size-limit --json | tee size.json
+- run: npx lhci autorun    # Lighthouse CI con assertions de laboratorio</code></pre>
+
+<pre><code class="lang-bash"># lighthouserc.json — presupuestos de laboratorio.
+# OJO: son señales de regresión, NO predicciones del campo.
+{
+  "ci": {
+    "collect": { "url": ["http://localhost:4173/", "http://localhost:4173/pedidos"],
+                 "numberOfRuns": 5 },
+    "assert": {
+      "assertions": {
+        "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "total-blocking-time":      ["error", { "maxNumericValue": 300 }],
+        "cumulative-layout-shift":  ["error", { "maxNumericValue": 0.1 }],
+        "resource-summary:script:size": ["error", { "maxNumericValue": 350000 }]
+      }
+    }
+  }
+}</code></pre>
+
+<div class="tip">
+  <strong>Cinco corridas, no una.</strong> Lighthouse tiene una varianza considerable entre corridas, sobre todo en runners compartidos de CI. Un umbral evaluado sobre una sola corrida produce fallos intermitentes, y un CI que falla al azar es un CI que el equipo aprende a ignorar — que es peor que no tenerlo. Usá la mediana de varias corridas y umbrales con margen.
+</div>
+
+<p>El presupuesto de campo es el otro lado, y es el que realmente importa: una alerta que se dispara cuando el p75 de INP o LCP de una ruta cruza el umbral durante N días. El de CI evita que empeore; el de campo detecta lo que el CI no puede ver.</p>
+
+<h2>RS7.11 Cuándo NO optimizar</h2>
+
+<p>Cerramos con la sección que más plata ahorra, porque la optimización tiene un costo que casi nunca se contabiliza: <strong>complejidad permanente</strong>. Cada memo manual es una lista de dependencias que alguien tiene que mantener correcta. Cada lista virtualizada es un componente que se testea peor y se rompe distinto. Cada chunk lazy es un estado de carga más que diseñar y un modo de falla más que manejar.</p>
+
+<table>
+  <thead><tr><th>Situación</th><th>Por qué NO</th></tr></thead>
+  <tbody>
+    <tr><td>No tenés un número anterior</td><td>No vas a poder demostrar que mejoró. Y sin demostrarlo, es fe</td></tr>
+    <tr><td>La ganancia medida es &lt; 5 ms</td><td>Está por debajo del ruido de medición y muy por debajo de lo perceptible</td></tr>
+    <tr><td>Es una pantalla que abren tres personas por mes</td><td>El backoffice interno no necesita virtualización</td></tr>
+    <tr><td>Estás memoizando componentes triviales</td><td>El costo de comparar props puede superar al de renderizar</td></tr>
+    <tr><td>El código queda ilegible</td><td>Vas a pagar ese costo todas las semanas; la ganancia se cobra una vez</td></tr>
+    <tr><td>Todavía no probaste la solución de producto</td><td>Paginar en el servidor le gana a virtualizar 20.000 filas, siempre</td></tr>
+  </tbody>
+</table>
+
+<div class="mistake">
+  <strong>Las tres optimizaciones que más se hacen y menos sirven:</strong> (1) envolver todo en <code>memo</code> "por las dudas" —con el Compiler activo, además, es trabajo duplicado—; (2) <code>useCallback</code> sobre funciones que se pasan a elementos DOM nativos, donde la identidad no cambia absolutamente nada; (3) splitear en veinte chunks minúsculos, cambiando bytes por round-trips. Las tres se ven bien en el PR. Ninguna mueve una métrica.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "la app va lenta"</h2>
+
+<p>Panel de pedidos de una empresa de logística. React 19.2, Vite, SPA sin SSR. Soporte reporta lo de siempre: <em>"la app va lenta, sobre todo a la mañana"</em>. El equipo ya tenía un plan antes de mirar nada: "hay que memoizar la tabla y virtualizar las filas". Vamos a hacerlo al revés.</p>
+
+<h3>Paso 1 — Empezar por el campo, no por el código</h3>
+
+<pre><code class="lang-text">RUM, últimos 14 días, p75 por ruta (móvil + escritorio):
+
+ruta          LCP      INP     CLS    sesiones
+/login        1,9 s    120 ms  0,02    12.400
+/pedidos      4,1 s    180 ms  0,04    38.900   ⬅ acá está el dolor
+/pedidos/:id  1,4 s    140 ms  0,01    31.200   (navegación interna: sin carga)
+/reportes     4,4 s    210 ms  0,03     2.100
+
+Segmentado /pedidos por tipo de conexión:
+  4g   → LCP p75 3,2 s
+  3g   → LCP p75 7,8 s   ⬅ y el 22% del tráfico está acá
+</code></pre>
+
+<p>Primera conclusión, y ya cambia el plan entero: el problema <strong>no es interactividad</strong>. INP 180 ms está en verde. El problema es <strong>LCP: carga</strong>. Toda la hipótesis inicial del equipo —memoizar, virtualizar— apuntaba a una dimensión que estaba sana. Y el "sobre todo a la mañana" del reporte de soporte era el turno con más gente en red móvil.</p>
+
+<h3>Paso 2 — Descartar React con evidencia, no con intuición</h3>
+
+<p>Igual hay que verificarlo, porque "INP en verde" es un agregado y podría estar escondiendo la interacción específica de la que se queja la gente. Profiler, grabando exactamente una cosa: escribir "gonz" en el buscador de la tabla de 800 filas.</p>
+
+<pre><code class="lang-text">React DevTools Profiler — /pedidos, tipear "gonz" (4 teclas)
+
+commits: 4                              ⬅ uno por tecla: correcto
+commit más lento: 11,4 ms
+duración total: 38,2 ms
+
+Ranked (commit más lento):
+  TablaPedidos      6,1 ms
+  FilaPedido ×34    3,9 ms   (34 = las visibles; el resto no cambió)
+  Buscador          0,7 ms
+
+Why did this render? → TablaPedidos: "Hooks changed" (el texto del filtro)
+</code></pre>
+
+<div class="rule">
+  <strong>📌 Este es el resultado más valioso de todo el ejercicio, y es un resultado negativo.</strong> Cuatro commits para cuatro teclas es el número correcto. 11,4 ms es menos de un frame a 60 fps. Ninguna fila que no cambió se re-renderizó. El Compiler ya está haciendo su trabajo. <strong>Memoizar acá no habría dado absolutamente nada</strong>, y virtualizar 800 filas habría agregado un problema de accesibilidad para ahorrar milisegundos que nadie percibe. El plan original habría consumido dos semanas y producido cero mejora en la métrica que estaba en rojo.
+</div>
+
+<h3>Paso 3 — Ir donde apunta la métrica: la red</h3>
+
+<pre><code class="lang-text">Panel Network — /pedidos, caché vacía, Fast 3G:
+
+recurso                          transferido   descomprimido   tiempo
+index-a3f1.js                     412 kB        1,42 MB        3.180 ms  ⬅
+index-8c2d.css                     28 kB          142 kB          290 ms
+hero-panel.png                    186 kB              —           940 ms
+inter-var.woff2                    41 kB              —           210 ms
+GET /api/pedidos?page=1            22 kB              —           380 ms
+
+LCP: 4.140 ms  →  elemento: div.tabla-pedidos
+  TTFB               180 ms
+  delay de carga   3.260 ms   ⬅ el 79% del LCP: esperando el JS
+  carga del recurso   —
+  delay de render    700 ms
+</code></pre>
+
+<p>El diagnóstico queda cerrado: el elemento LCP es la tabla, la tabla no existe hasta que el bundle se baja y ejecuta, y el bundle son <strong>412 kB comprimidos / 1,42 MB para parsear</strong>. El usuario mira una pantalla vacía durante tres segundos y pico esperando JavaScript.</p>
+
+<h3>Paso 4 — Abrir el bundle</h3>
+
+<pre><code class="lang-bash">npx vite-bundle-visualizer</code></pre>
+
+<pre><code class="lang-text">Composición del entry (descomprimido, 1,42 MB):
+
+  ██████████████████████████  moment + locales     742 kB   (52%)
+  ████████                    react + react-dom    268 kB   (19%)
+  ██████                      libreria-graficos    198 kB   (14%)  ⬅ /reportes
+  ███                         nuestro código        94 kB    (7%)
+  ██                          router + utils        68 kB    (5%)
+  ██                          otros                 50 kB    (3%)
+</code></pre>
+
+<p>Ahí está. Una librería de fechas ocupa <strong>más de la mitad del bundle</strong> — y arrastra sus 120 locales porque el import es del paquete entero. Y una librería de gráficos que solo usa <code>/reportes</code> (2.100 sesiones) viaja en el entry que bajan las 38.900 sesiones de <code>/pedidos</code>. Buscamos los usos:</p>
+
+<pre><code class="lang-bash">$ grep -rn "from \"moment\"" src/ | wc -l
+7
+
+$ grep -rhn "moment(" src/ | grep -o '\.\w*(' | sort | uniq -c
+     31 .format(
+      4 .fromNow(
+      2 .diff(</code></pre>
+
+<p>Siete archivos, tres métodos. 742 kB para formatear fechas y decir "hace 3 horas".</p>
+
+<h3>Paso 5 — Los dos cambios</h3>
+
+<pre><code class="lang-jsx">// src/lib/fechas.js — un módulo propio, 0 dependencias, ~40 líneas.
+const fmtFecha = new Intl.DateTimeFormat("es-AR", { dateStyle: "short" });
+const fmtRel   = new Intl.RelativeTimeFormat("es-AR", { numeric: "auto" });
+
+export const formatearFecha = (d) =&gt; fmtFecha.format(d);
+
+export function haceCuanto(fecha, ahora = Date.now()) {
+  const seg = Math.round((fecha - ahora) / 1000);
+  const unidades = [["second",60],["minute",60],["hour",24],["day",7],["week",4.35],["month",12]];
+  let v = seg;
+  for (const [u, factor] of unidades) {
+    if (Math.abs(v) &lt; factor) return fmtRel.format(Math.round(v), u);
+    v /= factor;
+  }
+  return fmtRel.format(Math.round(v), "year");
+}</code></pre>
+
+<pre><code class="lang-jsx">// src/App.jsx — la ruta pesada, fuera del entry.
+const Reportes = lazy(() =&gt; import("./rutas/Reportes"));  // se lleva los gráficos
+
+// index.html — la tabla es el LCP, así que su request no puede esperar al JS.
+&lt;link rel="preload" as="fetch" href="/api/pedidos?page=1" crossorigin /&gt;</code></pre>
+
+<h3>Paso 6 — Volver a medir, de la misma forma</h3>
+
+<pre><code class="lang-text">Fast 3G, caché vacía, mediana de 5 corridas — antes / después
+
+entry transferido        412 kB   →   118 kB    (−71%)
+entry descomprimido     1,42 MB   →   404 kB    (−72%)
+LCP (laboratorio)        4.320 ms →  1.910 ms
+INP (laboratorio)          180 ms →    175 ms   (sin cambios: no era eso)
+build                       14 s  →     12 s
+
+RUM, p75 de /pedidos, 14 días después del deploy:
+  LCP  4,1 s → 1,8 s      ✅ de "malo" a "bueno"
+  INP  180 ms → 175 ms    (igual: nunca fue el problema)
+  CLS  0,04 → 0,04
+  3g:  LCP 7,8 s → 2,9 s  ⬅ el segmento que peor la pasaba, ahora usable
+</code></pre>
+
+<pre><code class="lang-bash"># Paso 7 — que no vuelva. El presupuesto que rompe el build:
+# .size-limit.json
+[{ "name": "entry", "path": "dist/assets/index-*.js",
+   "limit": "130 kB", "gzip": true }]</code></pre>
+
+<div class="rule">
+  <strong>📌 La moraleja, que es el módulo entero en una oración:</strong> el problema estaba en la <strong>red</strong>, no en React. El plan original —memoizar la tabla y virtualizar las filas— era técnicamente correcto, estaba bien intencionado, y habría costado dos semanas para mejorar cero, porque atacaba una dimensión que ya estaba en verde. Lo único que cambió el resultado fue el orden: <strong>medir el campo, formar una hipótesis, verificarla en el laboratorio, y recién entonces tocar código</strong>. El descubrimiento no lo hizo una técnica avanzada de React: lo hizo un treemap que nadie había abierto nunca.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Lighthouse te da 98 de performance y el equipo festeja. Al día siguiente soporte sigue recibiendo quejas de lentitud. ¿Cómo puede ser?</summary>
+<p>Perfectamente posible, y por dos razones independientes. La primera: <strong>Lighthouse no mide INP</strong>, porque INP requiere que alguien interactúe y Lighthouse carga la página y la mira. Usa TBT como proxy de laboratorio, que correlaciona pero no es lo mismo — un 98 es compatible con un INP p75 de 600 ms en campo. La segunda: Lighthouse corre <em>una</em> ruta, en <em>un</em> dispositivo, en <em>una</em> red, sin caché real y sin usuario. Tu p75 real está en un Android de gama media con red móvil, probablemente en una ruta interna que Lighthouse nunca visitó. El uso correcto de Lighthouse no es como boletín de calificaciones sino como <strong>detector de regresiones en CI</strong> y como herramienta de diagnóstico una vez que el campo ya te dijo dónde mirar. La pregunta "¿somos lentos?" solo la contesta el campo (CrUX o tu propio RUM); "¿por qué?" la contesta el laboratorio.</p></details>
+
+<details><summary>Tenés una tabla de 800 filas que "se siente pesada". ¿Virtualizás?</summary>
+<p>Todavía no: 800 filas está en la zona gris donde la respuesta depende de qué tan cara es <em>cada</em> fila, y eso hay que medirlo. El orden correcto es: <strong>(1)</strong> ¿el usuario necesita ver 800 filas o necesita <em>encontrar</em> una? Si es lo segundo, paginar o filtrar en el servidor elimina el problema en vez de administrarlo. <strong>(2)</strong> Profiler: ¿el problema es que cada fila cuesta mucho, o que se renderizan todas cuando no hace falta? Son arreglos opuestos. <strong>(3)</strong> ¿Cuántos nodos tiene una fila? Ocho nodos con un tooltip y un menú por fila son 6.400 nodos; adelgazar la fila suele rendir más que virtualizar. <strong>(4)</strong> <code>content-visibility: auto</code> con <code>contain-intrinsic-size</code>: una línea de CSS que se saltea layout y paint de lo que está fuera de pantalla y <em>no</em> rompe <code>Ctrl+F</code> ni los lectores de pantalla. Recién si nada de eso alcanza, virtualizar — sabiendo que el costo real de la virtualización no se paga en milisegundos sino en accesibilidad, búsqueda del navegador, restauración de scroll e impresión.</p></details>
+
+<details><summary>El INP de tu app está en 480 ms. Antes de mirar código, ¿qué mirás?</summary>
+<p>La <strong>atribución</strong>, que te dice cuál de los tres tramos domina — y cada uno lleva a un lugar completamente distinto. Si el grande es el <em>input delay</em>, el problema no es tu handler: algo tenía tomado el main thread cuando el usuario tocó (hidratación, un script de terceros, un efecto pesado de otro componente), y las entradas de <strong>LoAF</strong> te dan la URL y la función culpable. Si el grande es el <em>processing time</em>, ahí sí es tu código React, y el Profiler es la herramienta. Si el grande es el <em>presentation delay</em>, el JS terminó rápido y lo caro es pintar: DOM enorme, CSS costoso, un contenedor que revela miles de nodos de golpe. Y hay una cuarta posibilidad muy fácil de pasar por alto en una SPA: que la "interacción" de 480 ms sea en realidad una <strong>navegación de ruta</strong>, porque un cambio de ruta en una SPA se registra como interacción y no como carga de página. Si tu INP es malo y no encontrás ningún handler que lo explique, revisá las transiciones de ruta antes de seguir buscando.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>"Está lento" no es un diagnóstico.</strong> No se toca una línea sin un número anterior, una hipótesis explícita y un número posterior medido igual. Sin esas tres cosas, es fe.</li>
+  <li>Hay <strong>tres performances distintas</strong>: carga (bytes y red), interactividad (main thread) y estabilidad visual. Se miden distinto y se arreglan distinto. La mayoría de las optimizaciones de React apuntan a la segunda; la mayoría de las quejas vienen de la primera.</li>
+  <li><strong>Core Web Vitals 2026:</strong> LCP ≤ 2,5 s, <strong>INP ≤ 200 ms</strong> (reemplazó a FID y es mucho más exigente), CLS ≤ 0,1 — siempre al <strong>p75 de usuarios reales</strong>, no al promedio y no en tu notebook.</li>
+  <li><strong>El campo dice qué arreglar; el laboratorio dice por qué.</strong> Lighthouse no puede medir INP y corre una ruta en un dispositivo con caché caliente. CrUX te da el p75 real sin instrumentar nada; <code>web-vitals/attribution</code> más LoAF te dan el culpable con selector y línea.</li>
+  <li>En el <strong>Profiler</strong>, el número que casi nadie mira es la <strong>cantidad de commits</strong>: un problema de frecuencia no se arregla memoizando. Y <em>"The parent component rendered"</em> no es un bug: lo que importa no es si se renderizó, sino si costó tiempo medible.</li>
+  <li><strong>El bundle es el sospechoso número uno de la carga.</strong> Miralo con un treemap antes de teorizar. Split por ruta y por componente, precarga en <code>hover</code>/<code>focus</code>, y cuidado con los barrel files y los <code>sideEffects</code> mal declarados, que rompen el tree shaking en silencio.</li>
+  <li><strong>Comparen bytes comprimidos para la red y descomprimidos para la CPU.</strong> Son dos costos distintos y la gente reporta uno solo.</li>
+  <li><strong>Virtualizar recién arriba de ~2.000 ítems</strong>, y sabiendo que el costo se paga en accesibilidad, <code>Ctrl+F</code>, scroll anchoring e impresión. Antes: paginar en el servidor, adelgazar la fila, <code>content-visibility: auto</code>.</li>
+  <li><strong>Tu LCP casi siempre es una imagen o una fuente</strong>, no React. Dimensiones explícitas contra CLS, <code>fetchpriority="high"</code> en el hero, <code>loading="lazy"</code> solo por debajo del pliegue, <code>font-display</code> con métricas de fallback ajustadas.</li>
+  <li><strong>La hidratación es cara y llega en el peor momento</strong>: el usuario ya ve la página. Streaming con Suspense (RS2) la parte en tareas cortas; los Server Components (RS4) directamente eliminan árboles enteros del cliente.</li>
+  <li>Ante re-renders confirmados, <strong>el Compiler va primero</strong> (RS3): verificá cobertura con el healthcheck y arreglá <em>por qué</em> un componente quedó afuera en vez de memoizar encima.</li>
+  <li><strong>Los presupuestos en CI</strong> (<code>size-limit</code>, Lighthouse CI con mediana de 5 corridas) son lo que impide que la mejora se degrade sola sprint a sprint.</li>
+  <li><strong>La optimización tiene un costo permanente en complejidad</strong> y la ganancia se cobra una vez. Ganancias por debajo de 5 ms, pantallas con tres usuarios y código ilegible: no.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Instrumentá <code>web-vitals/attribution</code> en una app real, mandá las métricas a un endpoint propio con la <code>ruta</code> y el <code>effectiveType</code>, y dejalo correr una semana. Después armá la tabla de p75 por ruta y por tipo de conexión. Contestá con números: ¿cuál de las tres dimensiones está peor y en qué ruta? Compará ese resultado con lo que vos <em>creías</em> antes de medir.</li>
+  <li>Consultá la API de CrUX para tu sitio y para dos competidores, en <code>PHONE</code> y <code>DESKTOP</code>. Armá la comparación de los tres vitals. Después corré Lighthouse en tu máquina sobre la misma URL y documentá <strong>cuánto</strong> difieren los números y <strong>por qué</strong> difieren en cada métrica.</li>
+  <li>Grabá con el Profiler exactamente una interacción (tipear tres letras en un buscador). Anotá: cantidad de commits, duración del commit más lento, top 3 de la vista Ranked, y la razón de render de cada uno. Después contestá por escrito: ¿el problema, si lo hay, es de <em>frecuencia</em> o de <em>costo</em>? Justificá con los números, no con la impresión.</li>
+  <li>Abrí el treemap de tu bundle y hacé el inventario de las cinco dependencias más grandes: para cada una, cuántos archivos la importan, qué métodos usan realmente (con <code>grep</code>) y cuál de las tres salidas corresponde (la hace la plataforma / reemplazo modular / diferir). Ejecutá la que dé mejor relación beneficio/riesgo y medí antes y después en KB comprimidos y descomprimidos.</li>
+  <li>Tomá una lista de 3.000 ítems y medí las cuatro variantes en el mismo dispositivo con throttling 4× de CPU: sin nada, con la fila adelgazada, con <code>content-visibility: auto</code> y virtualizada. Reportá tiempo de mount, INP al hacer scroll y cantidad de nodos del DOM. Después listá qué se rompió en la versión virtualizada (probá <code>Ctrl+F</code>, un lector de pantalla y <code>Ctrl+P</code>) y qué haría falta para arreglarlo.</li>
+  <li>Encontrá el elemento LCP de tu página con <code>web-vitals</code> y desglosá sus cuatro subtramos. Aplicá los arreglos que correspondan (<code>fetchpriority</code>, preload, dimensiones, formato moderno, sacar un <code>loading="lazy"</code> mal puesto) y volvé a medir en Fast 3G con la mediana de cinco corridas. ¿Qué porcentaje del LCP era <em>delay de carga</em> antes y después?</li>
+  <li>Poné <code>size-limit</code> y Lighthouse CI en el pipeline con umbrales apenas por encima de tus números actuales. Después abrí un PR que importe deliberadamente una librería pesada y <strong>verificá que el CI falla</strong>. Si no falla, tu presupuesto es decorativo. Documentá en el README qué hacer cuando falla legítimamente (subir el umbral con justificación, o splitear).</li>
+</ol>
+
+<section class="quiz" id="quizRS7">
+  <style>
+    #quizRS7{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS7 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS7 .q{margin-bottom:1.5rem}
+    #quizRS7 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS7 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS7 .opt:hover{border-color:var(--accent)}
+    #quizRS7 .opt:disabled{cursor:default}
+    #quizRS7 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS7 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS7 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS7 .exp.show{display:block}
+    #quizRS7 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu app saca 97 en Lighthouse pero los usuarios se quejan de que "clickeás y no pasa nada". ¿Cuál es la explicación más probable?</p>
+    <button class="opt">El puntaje de Lighthouse está mal calculado; hay que correrlo en modo incógnito</button>
+    <button class="opt">Lighthouse no mide INP —usa TBT como proxy de laboratorio— así que un puntaje alto es compatible con un INP p75 malo en campo</button>
+    <button class="opt">Los usuarios están exagerando: si Lighthouse da 97, la app es rápida</button>
+    <div class="exp">INP requiere que <strong>alguien interactúe</strong>, y Lighthouse carga la página y la observa: no clickea, no tipea, no hace scroll. Lo mejor que puede ofrecer es TBT (Total Blocking Time), que correlaciona con la interactividad pero no la mide. Además Lighthouse corre una sola ruta, en un solo dispositivo, en una sola red, sin caché real — mientras que tu p75 vive en un Android de gama media con red móvil, probablemente en una ruta interna que Lighthouse nunca visitó. La regla operativa: <strong>el campo (CrUX o tu RUM) dice si sos lento y para quién; el laboratorio dice por qué</strong>. Un puntaje alto de Lighthouse no es evidencia contra una queja de campo.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. El Profiler muestra que al tipear una letra se producen 4 commits, el más lento de 11 ms, y que ninguna fila que no cambió se re-renderizó. El LCP p75 de esa ruta está en 4,1 s. ¿Qué hacés?</p>
+    <button class="opt">Envolver la tabla en <code>memo</code> y virtualizar las filas, que es lo que se hace con tablas grandes</button>
+    <button class="opt">Agregar <code>useDeferredValue</code> al buscador para bajar de 11 ms a 6 ms</button>
+    <button class="opt">Dejar React en paz: el Profiler descartó la interactividad. El LCP en rojo apunta a carga, así que el próximo paso es el panel Network y el treemap del bundle</button>
+    <div class="exp">Este es exactamente el punto del módulo. El Profiler produjo un <strong>resultado negativo valiosísimo</strong>: 4 commits para 4 teclas es correcto, 11 ms es menos de un frame a 60 fps, y la memoización ya está funcionando. Memoizar o virtualizar acá no mejoraría nada medible, y agregaría complejidad permanente —la virtualización rompe <code>Ctrl+F</code>, complica los lectores de pantalla y la impresión— para ahorrar milisegundos que nadie percibe. La métrica en rojo es LCP, que es <strong>carga</strong>: otra dimensión, otras causas, otras herramientas. Ahí se va con el panel Network y el analizador de bundle, que es donde suele aparecer la librería de 700 kB importada entera.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Vas a poner <code>"sideEffects": false</code> en el <code>package.json</code> de un paquete interno para mejorar el tree shaking. ¿Cuál es el riesgo real?</p>
+    <button class="opt">Que si algún módulo sí tiene efectos —un import de CSS, un parche de prototipo, el registro de un plugin— el bundler lo elimine y algo deje de funcionar en producción, sin ningún error</button>
+    <button class="opt">Ninguno: es una optimización puramente declarativa que el bundler verifica antes de aplicar</button>
+    <button class="opt">Que el build se vuelva más lento porque el bundler tiene que analizar cada módulo</button>
+    <div class="exp"><code>sideEffects: false</code> es una <strong>promesa tuya al bundler</strong>, no algo que el bundler pueda verificar: le estás diciendo "podés borrar cualquier módulo de este paquete que nadie importe explícitamente, sin cambiar el comportamiento". Si esa promesa es falsa, el bundler cumple su parte y se lleva puesto un <code>import "./estilos.css"</code>, un parche de prototipo o el registro de un plugin. El síntoma es horrible de depurar: aparece solo en producción, solo en una ruta, sin error en consola — algo simplemente perdió los estilos o un componente no quedó registrado. Por eso lo correcto casi siempre es la forma de lista (<code>"sideEffects": ["*.css", "./src/polyfills.js"]</code>), después de revisar módulo por módulo.</div>
+  </div>
+
+  <div class="score" id="scoreRS7"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS7');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS7').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS8.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs6-actions-formularios/lecture.html">← RS6: Actions y formularios</a>
+  <a href="../rs8-produccion/lecture.html">RS8: Producción y migración →</a>
+</nav>
+
+</div>
+</body>
+</html>

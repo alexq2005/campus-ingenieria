@@ -1,0 +1,1369 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS5 — Data fetching y caché a escala · React Senior</title>
+  <meta name="description" content="Server state vs client state, por qué useEffect + fetch es un anti-patrón, cómo funciona una caché de queries por dentro, staleTime vs gcTime, isLoading vs isFetching vs isPending, invalidación, optimistic updates con rollback, paginación por cursor, prefetching y convivencia con RSC.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS5</span>
+  <span class="badge">⏱ 55–155 min</span>
+  <span class="badge">🎯 Pre-req: RS4</span>
+  <span class="badge">🔄 Datos</span>
+</div>
+
+<article>
+
+<h1>RS5 — Data fetching y caché a escala</h1>
+
+<h2>RS5.0 Por qué este módulo</h2>
+
+<p>Hay una frase que separa a quien pelea con los datos de quien los tiene bajo control: <strong>el estado de servidor no es estado de tu aplicación</strong>. Es una <em>copia</em> de algo que vive en otro lado, que otro proceso puede modificar mientras vos mirás la pantalla, y sobre lo que no tenés autoridad.</p>
+
+<p>Casi todo el mundo lo trata igual que a un <code>useState</code>. Y ahí empieza todo: el usuario edita un perfil, vuelve a la lista y ve el nombre viejo. Dos pestañas muestran saldos distintos. Un dashboard tarda cuatro segundos porque hizo seis pedidos en fila cuando podía hacerlos juntos. Un botón de "me gusta" que se siente lento. Nada de eso es un bug de React: son consecuencias de haber modelado datos remotos como si fueran locales.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El estado de servidor tiene tres propiedades que el estado de cliente no tiene: <strong>(1)</strong> no sos el dueño —alguien más lo puede cambiar sin avisarte—, <strong>(2)</strong> tu copia empieza a envejecer en el instante en que llega, y <strong>(3)</strong> muchas partes de la UI quieren el mismo dato al mismo tiempo. Una librería de queries no es "fetch con azúcar": es una <strong>caché con identidad, deduplicación y política de frescura</strong>. Si no la usás, vas a escribir una peor.
+</div>
+
+<p>Este módulo no discute estilos de API —REST contra GraphQL contra tRPC, quién orquesta qué— porque esa conversación es sobre el <em>contrato</em> y vive en otro lado. Acá el tema es lo que pasa <strong>después</strong> de que la respuesta entra al navegador: dónde se guarda, cuánto vale, quién la mira, cuándo se vuelve a pedir y qué ve el usuario mientras tanto.</p>
+
+<p>Vamos a usar <strong>TanStack Query v5</strong> como referencia concreta, con <strong>React 19.2</strong>. Pero el objetivo no es que aprendas una API: es que entiendas el mecanismo, porque el mecanismo es el mismo en SWR, en RTK Query, en Apollo y en la caché que termines escribiendo vos si trabajás en una app con restricciones raras.</p>
+
+<div class="warn">
+  <strong>Advertencia de expectativas.</strong> Agregar una librería de queries no arregla una arquitectura de datos mala. Si tus claves de caché están mal diseñadas vas a invalidar de más o de menos; si copiás el resultado a un <code>useState</code> volvés al problema original con más pasos; y si ponés <code>staleTime: 0</code> en todo, cada foco de ventana dispara una tormenta de pedidos. La librería te da las herramientas — las decisiones siguen siendo tuyas.
+</div>
+
+<h2>RS5.1 Server state vs client state: dos cosas que no se parecen en nada</h2>
+
+<p>Antes de una línea de código, la distinción. La mayoría de los bugs de datos viejos nacen de aplicarle a la columna izquierda las reglas de la derecha.</p>
+
+<table>
+<thead><tr><th></th><th>Estado de servidor</th><th>Estado de cliente</th></tr></thead>
+<tbody>
+<tr><td><strong>Quién es el dueño</strong></td><td>Otro proceso, en otra máquina</td><td>Vos, este tab, esta sesión</td></tr>
+<tr><td><strong>Ejemplos</strong></td><td>Lista de pedidos, perfil, saldo, catálogo</td><td>Modal abierto, tab activo, texto sin enviar, tema oscuro</td></tr>
+<tr><td><strong>Cómo se modifica</strong></td><td>Asincrónicamente, y podés fallar</td><td>Sincrónicamente, nunca falla</td></tr>
+<tr><td><strong>Vida útil</strong></td><td>Envejece sola: alguien más la cambia</td><td>Vale hasta que vos la cambiés</td></tr>
+<tr><td><strong>Puede quedar vieja</strong></td><td><strong>Siempre</strong>, es la condición normal</td><td>Nunca (es la fuente de verdad)</td></tr>
+<tr><td><strong>Invalidación</strong></td><td>Problema central del diseño</td><td>No existe el concepto</td></tr>
+<tr><td><strong>Cuántos la miran</strong></td><td>N componentes, en N rutas, a la vez</td><td>Normalmente uno o su subárbol</td></tr>
+<tr><td><strong>Si desaparece</strong></td><td>Se vuelve a pedir</td><td>Se perdió y listo</td></tr>
+<tr><td><strong>Herramienta correcta</strong></td><td>Caché de queries</td><td><code>useState</code>, <code>useReducer</code>, contexto, store</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla operativa.</strong> Si el dato se obtiene con una petición de red, <strong>no lo pongas en un store de cliente</strong>. Ni en Redux, ni en Zustand, ni en un contexto, ni en un <code>useState</code>. En el momento en que lo copiás a estado propio creás una segunda fuente de verdad que nadie sincroniza, y ese es exactamente el bug que estás tratando de evitar.
+</div>
+
+<p>El error más frecuente de todos —y el más silencioso— es copiar el resultado a estado local para poder editarlo:</p>
+
+<pre><code class="lang-tsx">// ❌ El anti-patrón que parece razonable
+function PerfilEditable({ id }: { id: string }) {
+  const { data } = useQuery({ queryKey: ["usuario", id], queryFn: () =&gt; getUsuario(id) });
+  const [nombre, setNombre] = useState(data?.nombre ?? "");
+  // A partir de acá hay DOS verdades: la caché y `nombre`.
+  // Si la query refetchea en foco, `nombre` no se entera. Si el usuario
+  // editó, un refetch pisaría su trabajo. No hay respuesta buena:
+  // el problema es la copia, no la sincronización.
+}</code></pre>
+
+<pre><code class="lang-tsx">// ✅ El dato remoto es el valor inicial de un formulario, no su estado
+function PerfilEditable({ id }: { id: string }) {
+  const { data, isPending } = useQuery({
+    queryKey: ["usuario", id],
+    queryFn: () =&gt; getUsuario(id),
+    staleTime: Infinity, // mientras se edita, no quiero que cambie bajo los pies
+  });
+
+  if (isPending) return &lt;Skeleton /&gt;;
+
+  // `key` remonta el formulario si cambia el usuario: el estado local
+  // arranca limpio y la caché nunca compite con lo que el usuario escribe.
+  return &lt;FormularioPerfil key={data.id} inicial={data} /&gt;;
+}</code></pre>
+
+<div class="analogy">
+  <strong>La analogía útil.</strong> El estado de servidor es una <em>fotocopia</em> del original que está en otra oficina. Podés leerla, podés trabajar con ella, pero no podés tacharla y decir que el original cambió. Para cambiar el original mandás un pedido (una mutación) y después <strong>pedís una fotocopia nueva</strong>. Todo el diseño de una caché de queries sale de tomarse en serio esa metáfora.
+</div>
+
+<h2>RS5.2 Por qué <code>useEffect</code> + <code>fetch</code> es un anti-patrón</h2>
+
+<p>Este es el código que todos escribimos alguna vez. Tiene ocho problemas, y no es una exageración retórica: son ocho, contables.</p>
+
+<pre><code class="lang-tsx">// ❌ El clásico
+function Usuario({ id }: { id: string }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    setLoading(true);
+    fetch(`/api/usuarios/${id}`)
+      .then((r) =&gt; r.json())
+      .then(setData)
+      .catch(setError)
+      .finally(() =&gt; setLoading(false));
+  }, [id]);
+
+  if (loading) return &lt;Spinner /&gt;;
+  if (error) return &lt;Error /&gt;;
+  return &lt;h1&gt;{data.nombre}&lt;/h1&gt;;
+}</code></pre>
+
+<table>
+<thead><tr><th>#</th><th>Problema</th><th>Cuándo aparece</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>Race condition</strong>: respuestas fuera de orden</td><td>Cambia <code>id</code> rápido (búsqueda, tabs, paginación)</td></tr>
+<tr><td>2</td><td><strong>Doble fetch en StrictMode</strong></td><td>Siempre, en desarrollo</td></tr>
+<tr><td>3</td><td><strong>Sin caché</strong>: volvés a la ruta y pide todo de nuevo</td><td>En cada navegación</td></tr>
+<tr><td>4</td><td><strong>Sin deduplicación</strong>: 3 componentes → 3 pedidos idénticos</td><td>Avatar + header + sidebar del mismo usuario</td></tr>
+<tr><td>5</td><td><strong>Sin reintentos</strong> ante fallas transitorias</td><td>Red móvil, 503 momentáneo</td></tr>
+<tr><td>6</td><td><strong>Sin refetch en foco/reconexión</strong></td><td>Pestaña abierta 40 minutos, datos fósiles</td></tr>
+<tr><td>7</td><td><strong>Fuga de <code>setState</code></strong> tras desmontar</td><td>Navegación rápida</td></tr>
+<tr><td>8</td><td><strong>Sin estado compartido</strong>: cada copia envejece por su lado</td><td>La misma entidad en dos lugares</td></tr>
+</tbody>
+</table>
+
+<h3>La race condition, reproducible</h3>
+
+<p>Esta no es teórica y no es rara. Es la que hace que un buscador muestre resultados de una consulta anterior. Reproducila así:</p>
+
+<pre><code class="lang-tsx">// Endpoint de prueba: cuanto más corta la consulta, más tarda.
+// (Un backend real hace exactamente esto: "a" busca en todo el índice.)
+async function buscar(q: string) {
+  const demora = q.length === 1 ? 1500 : 100;
+  await new Promise((r) =&gt; setTimeout(r, demora));
+  return { q, resultados: [`resultado para "${q}"`] };
+}
+
+function Buscador() {
+  const [q, setQ] = useState("");
+  const [data, setData] = useState(null);
+
+  useEffect(() =&gt; {
+    if (!q) return;
+    buscar(q).then(setData); // ❌ sin protección
+  }, [q]);
+
+  return (
+    &lt;&gt;
+      &lt;input value={q} onChange={(e) =&gt; setQ(e.target.value)} /&gt;
+      &lt;pre&gt;{JSON.stringify(data)}&lt;/pre&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p>Escribí <code>"a"</code> y enseguida <code>"ab"</code>. Lo que ocurre, en orden real:</p>
+
+<pre><code class="lang-text">t=0ms     tecleás "a"    → arranca buscar("a"),  volverá en 1500ms
+t=120ms   tecleás "ab"   → arranca buscar("ab"), volverá en  220ms
+t=220ms   llega "ab"     → setData({q:"ab"})   ✅ pantalla correcta
+t=1500ms  llega "a"      → setData({q:"a"})    ❌ pisa lo nuevo con lo viejo
+
+Estado final: el input dice "ab", la pantalla muestra resultados de "a".</code></pre>
+
+<div class="danger">
+  <strong>Por qué esto es peor que un bug visual.</strong> No hay error en consola, no hay excepción, no hay nada en el monitoreo. En desarrollo, con <code>localhost</code> a 3 ms, es <em>invisible</em>. Aparece en producción, en un celular con red mala, de forma intermitente, y el reporte que te llega dice "a veces muestra cualquier cosa". Es la clase de bug que se cierra como "no reproducible" tres veces antes de que alguien entienda qué pasa.
+</div>
+
+<h3>Los dos arreglos, y por qué hacen falta los dos</h3>
+
+<pre><code class="lang-tsx">// Arreglo 1 — la bandera de ignorar. Corrige la UI.
+useEffect(() =&gt; {
+  if (!q) return;
+  let cancelado = false;
+
+  buscar(q).then((r) =&gt; {
+    if (!cancelado) setData(r); // la respuesta vieja llega y se descarta
+  });
+
+  return () =&gt; { cancelado = true; }; // cleanup al cambiar `q` o desmontar
+}, [q]);</code></pre>
+
+<p>Esto arregla lo que el usuario ve, pero la petición vieja igual viajó, igual consumió una de las seis conexiones que el navegador te da por dominio, e igual le costó CPU al backend. Para eso está la segunda mitad:</p>
+
+<pre><code class="lang-tsx">// Arreglo 2 — AbortController. Corrige la red.
+useEffect(() =&gt; {
+  if (!q) return;
+  const ctrl = new AbortController();
+
+  fetch(`/api/buscar?q=${encodeURIComponent(q)}`, { signal: ctrl.signal })
+    .then((r) =&gt; r.json())
+    .then(setData)
+    .catch((e) =&gt; {
+      if (e.name === "AbortError") return; // ⚠️ obligatorio: abortar RECHAZA
+      setError(e);
+    });
+
+  return () =&gt; ctrl.abort();
+}, [q]);</code></pre>
+
+<div class="mistake">
+  <strong>El error que sigue al arreglo.</strong> Al abortar, la promesa de <code>fetch</code> <em>se rechaza</em> con un <code>AbortError</code>. Si tu <code>.catch</code> no lo filtra, cada tecla que el usuario escribe pinta un cartel de error rojo por un instante. Y si además tenés un <code>.finally(() =&gt; setLoading(false))</code>, el aborto apaga el spinner de la petición que <em>sí</em> está en curso. Cancelar bien es más sutil de lo que parece.
+</div>
+
+<h3>El doble fetch en StrictMode no es el bug: es el detector</h3>
+
+<p>En desarrollo con <code>&lt;StrictMode&gt;</code>, React monta el componente, lo desmonta y lo vuelve a montar. Los efectos corren dos veces. Todo el mundo lo vive como una molestia y lo primero que busca en Google es cómo apagarlo.</p>
+
+<div class="rule">
+  <strong>📌 No lo apagues.</strong> Ese doble montaje es una <strong>prueba de resistencia</strong>. Está simulando algo que React ya hace en producción: desmontar y remontar preservando estado —al volver atrás en la navegación, al restaurar una vista suspendida—. Si tu efecto se rompe cuando corre dos veces, tu efecto está mal escrito. El fetch duplicado es el <em>síntoma</em> visible de que te falta el cleanup, no una imposición de la herramienta.
+</div>
+
+<p>Y acá está el punto que cierra la sección: con una caché de queries, el doble montaje <strong>no produce dos peticiones</strong>. No porque la librería detecte StrictMode, sino porque la deduplicación es una propiedad natural del diseño: dos observadores de la misma clave con una petición en vuelo comparten la misma promesa. El problema desaparece como efecto secundario de tener el mecanismo correcto.</p>
+
+<h2>RS5.3 Cómo funciona una caché de queries por dentro</h2>
+
+<p>Para no usar la librería como una caja negra, construyámosla. La versión mínima entra en unas setenta líneas y contiene las cuatro ideas que importan: <strong>identidad</strong>, <strong>almacén</strong>, <strong>deduplicación</strong> y <strong>observadores</strong>.</p>
+
+<h3>1. La <code>queryKey</code> es identidad, no una etiqueta</h3>
+
+<p>La clave no es un nombre bonito: es el <em>hash</em> con el que se indexa la entrada. Dos claves que hashean igual son <strong>el mismo dato</strong> para la caché, aunque tu intención fuera otra.</p>
+
+<pre><code class="lang-tsx">// Aproximación a lo que hace TanStack Query (packages/query-core/src/utils.ts)
+function hashKey(key: unknown): string {
+  return JSON.stringify(key, (_, val) =&gt;
+    esObjetoPlano(val)
+      ? Object.keys(val)                 // ⬅ las claves de objeto se ORDENAN
+          .sort()                        //    para que {a,b} y {b,a} hasheen igual
+          .reduce((acc, k) =&gt; { acc[k] = val[k]; return acc; }, {} as any)
+      : val
+  );
+}
+
+hashKey(["todos", { estado: "abierto", pagina: 1 }]);
+// '["todos",{"estado":"abierto","pagina":1}]'
+hashKey(["todos", { pagina: 1, estado: "abierto" }]);
+// '["todos",{"estado":"abierto","pagina":1}]'   ← idéntico, y está bien</code></pre>
+
+<p>El orden de las claves de un objeto no importa. El orden de los elementos del array <strong>sí</strong>, y el tipo también:</p>
+
+<pre><code class="lang-tsx">hashKey(["todo", 1]);    // '["todo",1]'
+hashKey(["todo", "1"]);  // '["todo","1"]'   ← OTRA entrada de caché
+
+// El bug clásico: el id viene de useParams() como string en una ruta
+// y como number del payload de una mutación. Dos entradas para la
+// misma fila de la base de datos, que se desincronizan sin ruido.</code></pre>
+
+<div class="tip">
+  <strong>Normalizá el tipo en la fábrica de claves, no en cada llamada.</strong> Si el <code>id</code> es un string en la URL y un número en la base, elegí uno y convertí siempre en el mismo lugar. Una fábrica de claves centralizada (RS5.6) hace esto imposible de olvidar.
+</div>
+
+<h3>2, 3 y 4: el almacén, la deduplicación y los observadores</h3>
+
+<pre><code class="lang-tsx">type Estado&lt;T&gt; = {
+  data?: T;
+  error?: unknown;
+  status: "pending" | "success" | "error";
+  fetching: boolean;
+  actualizadoEn: number;
+};
+
+class MiniQueryCache {
+  private entradas = new Map&lt;string, {
+    estado: Estado&lt;any&gt;;
+    promesa?: Promise&lt;any&gt;;              // ⬅ deduplicación
+    observadores: Set&lt;() =&gt; void&gt;;       // ⬅ suscriptores
+    temporizadorGc?: ReturnType&lt;typeof setTimeout&gt;;
+  }&gt;();
+
+  private obtener(hash: string) {
+    let e = this.entradas.get(hash);
+    if (!e) {
+      e = {
+        estado: { status: "pending", fetching: false, actualizadoEn: 0 },
+        observadores: new Set(),
+      };
+      this.entradas.set(hash, e);
+    }
+    return e;
+  }
+
+  // El corazón: si ya hay una petición en vuelo, devolvemos ESA promesa.
+  // Diez componentes montándose a la vez producen UNA petición.
+  fetch&lt;T&gt;(hash: string, fn: () =&gt; Promise&lt;T&gt;, staleTime: number): Promise&lt;T&gt; {
+    const e = this.obtener(hash);
+
+    if (e.promesa) return e.promesa;                          // dedupe
+    const fresco = Date.now() - e.estado.actualizadoEn &lt; staleTime;
+    if (e.estado.status === "success" &amp;&amp; fresco) {
+      return Promise.resolve(e.estado.data);                  // caché fresca
+    }
+
+    this.setEstado(hash, { fetching: true });
+    e.promesa = fn()
+      .then((data) =&gt; {
+        this.setEstado(hash, {
+          data, status: "success", fetching: false, actualizadoEn: Date.now(),
+        });
+        return data;
+      })
+      .catch((error) =&gt; {
+        this.setEstado(hash, { error, status: "error", fetching: false });
+        throw error;
+      })
+      .finally(() =&gt; { e.promesa = undefined; });
+
+    return e.promesa;
+  }
+
+  private setEstado(hash: string, parcial: Partial&lt;Estado&lt;any&gt;&gt;) {
+    const e = this.obtener(hash);
+    e.estado = { ...e.estado, ...parcial };   // objeto NUEVO: useSyncExternalStore lo detecta
+    e.observadores.forEach((notificar) =&gt; notificar());
+  }
+
+  leer(hash: string) { return this.obtener(hash).estado; }
+
+  suscribir(hash: string, notificar: () =&gt; void, gcTime: number) {
+    const e = this.obtener(hash);
+    clearTimeout(e.temporizadorGc);          // volvió a haber interesados
+    e.observadores.add(notificar);
+
+    return () =&gt; {
+      e.observadores.delete(notificar);
+      if (e.observadores.size === 0) {       // ⬅ nadie mira: arranca el reloj de GC
+        e.temporizadorGc = setTimeout(() =&gt; this.entradas.delete(hash), gcTime);
+      }
+    };
+  }
+}</code></pre>
+
+<p>Y el hook que lo consume, con <code>useSyncExternalStore</code> —la API que React expone justamente para leer de un store externo sin romper el renderizado concurrente que viste en RS2:</p>
+
+<pre><code class="lang-tsx">const cache = new MiniQueryCache();
+
+function useMiniQuery&lt;T&gt;(key: unknown[], fn: () =&gt; Promise&lt;T&gt;, opts = {
+  staleTime: 0, gcTime: 5 * 60_000,
+}) {
+  const hash = hashKey(key);
+
+  const estado = useSyncExternalStore(
+    (notificar) =&gt; cache.suscribir(hash, notificar, opts.gcTime),
+    () =&gt; cache.leer(hash),          // snapshot en cliente
+    () =&gt; cache.leer(hash),          // snapshot en servidor
+  );
+
+  useEffect(() =&gt; {
+    cache.fetch(hash, fn, opts.staleTime).catch(() =&gt; {});
+  }, [hash]);                        // ⬅ el hash, NO el array (que es nuevo en cada render)
+
+  return estado;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Lo que acabás de construir explica casi todo el comportamiento de la librería real.</strong> ¿Por qué StrictMode no duplica pedidos? Por <code>e.promesa</code>. ¿Por qué el dato aparece instantáneo al volver a una ruta? Porque la entrada sigue en el <code>Map</code>. ¿Por qué desaparece cinco minutos después? Por el temporizador de GC que arranca cuando <code>observadores.size === 0</code>. ¿Por qué tres componentes se actualizan juntos? Por el <code>Set</code> de observadores. Todo lo demás —reintentos, foco, ventanas de tiempo, paginación— son capas sobre estas cuatro piezas.
+</div>
+
+<h3>Lo que la versión real agrega y vos no querés escribir</h3>
+
+<table>
+<thead><tr><th>Pieza</th><th>Qué resuelve</th><th>Costo de hacerla a mano</th></tr></thead>
+<tbody>
+<tr><td><strong>Structural sharing</strong></td><td>Si la respuesta es igual, mantiene las <em>mismas referencias</em> de objeto</td><td>Alto: hay que comparar en profundidad y reconstruir preservando identidades</td></tr>
+<tr><td><strong>Batching de notificaciones</strong></td><td>50 observadores → un solo render</td><td>Medio, y fácil de hacer mal</td></tr>
+<tr><td><strong>Reintentos con backoff</strong></td><td>Fallas transitorias sin martillar el backend</td><td>Medio, más el jitter que casi nadie pone</td></tr>
+<tr><td><strong>Foco / reconexión / online</strong></td><td>Datos frescos al volver a la pestaña</td><td>Medio: hay tres eventos y varios casos borde</td></tr>
+<tr><td><strong>Deshidratación SSR</strong></td><td>Pasar la caché del servidor al cliente</td><td>Alto</td></tr>
+<tr><td><strong>Devtools</strong></td><td>Ver el estado real de cada entrada</td><td>Altísimo, y es lo que más vas a extrañar</td></tr>
+</tbody>
+</table>
+
+<p>El <em>structural sharing</em> merece un párrafo porque es invisible y salva renders. Si refetcheás una lista de 200 elementos y solo cambió uno, la librería devuelve un array nuevo pero con los <strong>199 objetos originales</strong> por referencia. Cualquier <code>memo</code> río abajo ve que sus props no cambiaron y no re-renderiza. Con un <code>JSON.parse(await r.text())</code> a mano, las 200 referencias son nuevas y se re-renderiza todo:</p>
+
+<pre><code class="lang-tsx">const a = { id: 1, items: [{ id: 10, txt: "x" }, { id: 11, txt: "y" }] };
+const b = { id: 1, items: [{ id: 10, txt: "x" }, { id: 11, txt: "z" }] }; // cambió uno
+
+const c = replaceEqualDeep(a, b);   // lo que hace la caché internamente
+c === a;                 // false — algo cambió
+c.items[0] === a.items[0]; // ✅ true  — este no cambió: misma referencia
+c.items[1] === b.items[1]; // ✅ true  — este sí, viene del nuevo</code></pre>
+
+<h2>RS5.4 <code>staleTime</code> vs <code>gcTime</code>: la confusión más común</h2>
+
+<p>Si hay una sola cosa que te llevás de este módulo, que sea esta. Son dos relojes distintos, que miden cosas distintas, y hasta que no los separás en la cabeza la caché se comporta como si tuviera voluntad propia.</p>
+
+<table>
+<thead><tr><th></th><th><code>staleTime</code></th><th><code>gcTime</code></th></tr></thead>
+<tbody>
+<tr><td><strong>Responde a</strong></td><td>¿El dato está <em>fresco</em>?</td><td>¿La entrada sigue <em>en memoria</em>?</td></tr>
+<tr><td><strong>Trata sobre</strong></td><td>Frescura / red</td><td>Memoria / basura</td></tr>
+<tr><td><strong>Reloj que corre</strong></td><td>Desde que llegó la respuesta</td><td>Desde que el <strong>último</strong> componente se desmontó</td></tr>
+<tr><td><strong>Default v5</strong></td><td><code>0</code> (viejo al instante)</td><td><code>5 * 60_000</code> (5 minutos)</td></tr>
+<tr><td><strong>Al vencer</strong></td><td>Se marca <em>stale</em>; refetch en el próximo disparador</td><td>La entrada se <strong>borra</strong> del <code>Map</code></td></tr>
+<tr><td><strong>Si es muy corto</strong></td><td>Tormenta de pedidos en cada foco</td><td>Spinner en cada vuelta a la ruta</td></tr>
+<tr><td><strong>Si es muy largo</strong></td><td>El usuario ve datos viejos</td><td>Memoria retenida sin sentido</td></tr>
+<tr><td><strong>Mientras hay observadores</strong></td><td>Sigue corriendo</td><td><strong>Ni empieza</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-text">Línea de tiempo · staleTime: 30s · gcTime: 5min
+
+t=0s     montás el componente → no hay entrada → FETCH
+t=0.2s   llega la data        → status: success, fresca ✅
+         ┌── ventana staleTime (30s) ──────────┐
+t=10s    cambiás de pestaña y volvés  → hay refetchOnWindowFocus,
+                                        pero está FRESCA → no pide nada
+t=30.2s  vence staleTime      → la entrada queda STALE (⚠ sigue mostrándose)
+t=35s    volvés a la pestaña  → foco + stale → REFETCH en segundo plano
+                                el usuario ve el dato viejo mientras tanto
+                                (stale-while-revalidate)
+t=40s    navegás a otra ruta  → observadores = 0 → ARRANCA el reloj de gcTime
+         ┌── ventana gcTime (5min) ────────────┐
+t=2min   volvés a la ruta     → la entrada SIGUE ahí → pinta INSTANTÁNEO
+                                (y refetchea atrás porque está stale)
+                                el reloj de gcTime se CANCELA
+t=2min   te vas otra vez      → el reloj de gcTime arranca DE CERO
+t=7min   nadie volvió         → la entrada se BORRA
+t=7min+  volvés               → no hay nada → spinner de carga inicial</code></pre>
+
+<div class="mistake">
+  <strong>El error de manual.</strong> "Quiero que los datos se refresquen cada 5 minutos" → alguien pone <code>gcTime: 5 * 60_000</code>. No hace nada de eso. <code>gcTime</code> no fuerza ningún refetch: solo decide cuándo se tira la entrada que <em>nadie está mirando</em>. Mientras el componente esté montado, <code>gcTime</code> es completamente irrelevante. Lo que buscabas era <code>staleTime</code>, o <code>refetchInterval</code> si querés que pida sola sin que nadie la toque.
+</div>
+
+<div class="warn">
+  <strong><code>gcTime</code> más chico que <code>staleTime</code> es casi siempre un error.</strong> Estás diciendo "considerá esto fresco por diez minutos, pero borralo de memoria a los treinta segundos". Resultado: cada vuelta a la ruta arranca de cero con spinner y una petición, exactamente lo que el <code>staleTime</code> largo intentaba evitar. Como piso, <code>gcTime &gt;= staleTime</code>.
+</div>
+
+<h3>Los cuatro disparadores de refetch, y qué los frena</h3>
+
+<pre><code class="lang-tsx">useQuery({
+  queryKey: ["pedidos"],
+  queryFn: getPedidos,
+  staleTime: 30_000,
+
+  refetchOnMount: true,        // al montar un observador nuevo
+  refetchOnWindowFocus: true,  // al volver a la pestaña
+  refetchOnReconnect: true,    // al recuperar conexión
+  refetchInterval: false,      // polling (este NO mira staleTime)
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 Los tres primeros son condicionales: solo disparan si la query está <em>stale</em>.</strong> Por eso <code>staleTime</code> es la única perilla que necesitás tocar el 90% de las veces: sube el <code>staleTime</code> y los tres se calman juntos. Apagar <code>refetchOnWindowFocus</code> porque "pide demasiado" es tratar el síntoma; el diagnóstico real es que dejaste el <code>staleTime</code> en <code>0</code>. La excepción es <code>refetchInterval</code>, que ignora la frescura y pide igual — es polling, no revalidación.
+</div>
+
+<h3>Cómo elegir un <code>staleTime</code> honesto</h3>
+
+<p>La pregunta correcta no es técnica: <strong>¿cuántos segundos de dato viejo tolera este usuario en esta pantalla?</strong> Contestala por dato, no por app.</p>
+
+<table>
+<thead><tr><th>Tipo de dato</th><th><code>staleTime</code></th><th>Razonamiento</th></tr></thead>
+<tbody>
+<tr><td>Configuración, países, categorías</td><td><code>Infinity</code></td><td>Cambia con un deploy. Invalidá a mano si hace falta.</td></tr>
+<tr><td>Perfil del usuario logueado</td><td>5–15 min</td><td>Lo cambia él mismo; su propia mutación invalida.</td></tr>
+<tr><td>Catálogo de productos</td><td>1–5 min</td><td>Ver un precio de hace dos minutos es aceptable.</td></tr>
+<tr><td>Lista de pedidos / bandeja</td><td>30–60 s</td><td>Cambia seguido, pero no es crítico al segundo.</td></tr>
+<tr><td>Stock, saldo, disponibilidad</td><td>0–10 s</td><td>Decidir con un número viejo cuesta plata.</td></tr>
+<tr><td>Notificaciones, presencia</td><td><code>0</code> + <code>refetchInterval</code> o SSE</td><td>El valor está en la inmediatez.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// Base sensata para toda la app, y excepciones donde el dato lo pida.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60_000,   // 1 min: elimina el 90% de los refetch inútiles
+      gcTime: 5 * 60_000,
+      retry: (fallos, error: any) =&gt;
+        error?.status &gt;= 500 &amp;&amp; fallos &lt; 3,   // no reintentes un 404
+    },
+  },
+});</code></pre>
+
+<h2>RS5.5 <code>isLoading</code> vs <code>isFetching</code> vs <code>isPending</code></h2>
+
+<p>Confundir estos tres produce el bug de UX más visible de todos: <strong>la pantalla que parpadea sola</strong>. El usuario vuelve a la pestaña y todo se transforma en esqueletos por 200 ms sin que él haya hecho nada.</p>
+
+<p>La clave es que en TanStack Query v5 hay <strong>dos dimensiones independientes</strong>, no una:</p>
+
+<table>
+<thead><tr><th></th><th><code>status</code></th><th><code>fetchStatus</code></th></tr></thead>
+<tbody>
+<tr><td><strong>Pregunta</strong></td><td>¿Tengo datos para mostrar?</td><td>¿Hay una petición en vuelo?</td></tr>
+<tr><td><strong>Valores</strong></td><td><code>pending</code> · <code>success</code> · <code>error</code></td><td><code>fetching</code> · <code>paused</code> · <code>idle</code></td></tr>
+<tr><td><strong>Atajo</strong></td><td><code>isPending</code></td><td><code>isFetching</code></td></tr>
+<tr><td><strong>Gobierna</strong></td><td>Qué componente renderizás</td><td>Un indicador sutil, nada más</td></tr>
+</tbody>
+</table>
+
+<p>Y las cuatro combinaciones posibles, que es donde se aclara todo:</p>
+
+<table>
+<thead><tr><th><code>status</code></th><th><code>fetchStatus</code></th><th>Situación real</th><th>Qué mostrar</th></tr></thead>
+<tbody>
+<tr><td><code>pending</code></td><td><code>fetching</code></td><td>Primera carga (<code>isLoading === true</code>)</td><td>Esqueleto</td></tr>
+<tr><td><code>pending</code></td><td><code>idle</code></td><td><code>enabled: false</code>: nunca arrancó</td><td>Estado vacío / "elegí un ítem"</td></tr>
+<tr><td><code>success</code></td><td><code>fetching</code></td><td>Refetch en segundo plano con datos viejos en pantalla</td><td><strong>Los datos</strong> + indicador chiquito</td></tr>
+<tr><td><code>success</code></td><td><code>idle</code></td><td>Todo tranquilo</td><td>Los datos</td></tr>
+<tr><td><code>pending</code></td><td><code>paused</code></td><td>Sin conexión, esperando red</td><td>Cartel de offline</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La definición exacta que hay que memorizar:</strong> <code>isLoading === isPending &amp;&amp; isFetching</code>. Es decir: <em>no tengo datos</em> <strong>y</strong> <em>los estoy pidiendo</em>. Eso es "primera carga", y es la única condición que justifica un esqueleto de pantalla completa. <code>isFetching</code> solo, por su cuenta, es cierto también durante cada refetch de fondo — y ahí ya tenés datos que mostrar.
+</div>
+
+<pre><code class="lang-tsx">// ❌ El spinner que parpadea
+function Pedidos() {
+  const { data, isFetching } = useQuery({ queryKey: ["pedidos"], queryFn: getPedidos });
+  if (isFetching) return &lt;Skeleton /&gt;;   // ⬅ cada foco de ventana borra la pantalla
+  return &lt;Tabla filas={data} /&gt;;
+}</code></pre>
+
+<pre><code class="lang-tsx">// ✅ Cada señal en su lugar
+function Pedidos() {
+  const { data, isPending, isError, isFetching, refetch } = useQuery({
+    queryKey: ["pedidos"],
+    queryFn: getPedidos,
+    staleTime: 30_000,
+  });
+
+  if (isPending) return &lt;Skeleton /&gt;;                     // no hay NADA que mostrar
+  if (isError)   return &lt;ErrorState onRetry={refetch} /&gt;;
+
+  return (
+    &lt;div&gt;
+      {/* hay datos: se muestran SIEMPRE, aunque estén revalidándose */}
+      &lt;Tabla filas={data} /&gt;
+      {isFetching &amp;&amp; &lt;BarraSutilArriba /&gt;}   {/* 2px, no bloquea, no salta */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>Para paginación y filtros, la señal correcta es otra:</strong> <code>isPlaceholderData</code>. Con <code>placeholderData: keepPreviousData</code> (RS5.8) la página anterior queda en pantalla mientras carga la nueva, y ese flag te dice "esto que ves es de antes". Bajarle la opacidad a la tabla comunica exactamente lo que pasa sin que la pantalla salte de altura.
+</div>
+
+<h3>En mutaciones, <code>isPending</code> significa otra cosa</h3>
+
+<pre><code class="lang-tsx">const { mutate, isPending } = useMutation({ mutationFn: crearPedido });
+
+&lt;button onClick={() =&gt; mutate(datos)} disabled={isPending}&gt;
+  {isPending ? "Creando…" : "Crear pedido"}
+&lt;/button&gt;</code></pre>
+
+<p>En una mutación no hay "tengo datos o no": hay "se está ejecutando o no". Por eso en v5 <code>useMutation</code> expone <code>isPending</code> y <strong>no</strong> <code>isLoading</code> — el cambio de nombre desde v4 fue justamente para que estas dos cosas dejaran de llamarse igual.</p>
+
+<h2>RS5.6 Invalidación: por clave, por prefijo, o a mano</h2>
+
+<p>Invalidar es decir "esto que tengo ya no sirve". El diseño de las claves es lo que hace que invalidar sea una línea o una pesadilla.</p>
+
+<h3>El prefijo es la característica que justifica los arrays</h3>
+
+<p>Las claves son arrays porque se comparan <strong>por prefijo</strong>, de izquierda a derecha. Eso te da jerarquía gratis:</p>
+
+<pre><code class="lang-tsx">// Entradas existentes en la caché:
+["pedidos"]
+["pedidos", "lista", { estado: "abierto" }]
+["pedidos", "lista", { estado: "cerrado" }]
+["pedidos", "detalle", 42]
+["usuarios", "detalle", 7]
+
+// Invalidar TODO lo relacionado con pedidos:
+queryClient.invalidateQueries({ queryKey: ["pedidos"] });
+//   ✅ alcanza a las cuatro primeras · ❌ no toca usuarios
+
+// Solo las listas, sin tocar los detalles ya cargados:
+queryClient.invalidateQueries({ queryKey: ["pedidos", "lista"] });
+
+// Solo esa entrada exacta:
+queryClient.invalidateQueries({ queryKey: ["pedidos", "detalle", 42], exact: true });
+
+// Lo que el prefijo no puede expresar → predicado:
+queryClient.invalidateQueries({
+  predicate: (q) =&gt; q.queryKey[0] === "pedidos" &amp;&amp; (q.queryKey[2] as any)?.estado === "abierto",
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 Ordená las claves de lo general a lo específico</strong>, como una ruta de archivos: <code>[entidad, tipoDeVista, parámetros]</code>. Si ponés el id primero (<code>[42, "pedido"]</code>) perdés la invalidación por prefijo para siempre y te quedan predicados por todos lados. Es una decisión de cinco segundos que se paga o se cobra durante toda la vida del proyecto.
+</div>
+
+<h3>La fábrica de claves</h3>
+
+<p>Escribir arrays a mano en cada archivo garantiza que algún día alguien ponga <code>["pedido"]</code> en singular y pase dos semanas buscando por qué la lista no se actualiza. La fábrica lo vuelve imposible:</p>
+
+<pre><code class="lang-tsx">export const claves = {
+  todo:     ["pedidos"] as const,
+  listas:   () =&gt; [...claves.todo, "lista"] as const,
+  lista:    (f: Filtros) =&gt; [...claves.listas(), f] as const,
+  detalles: () =&gt; [...claves.todo, "detalle"] as const,
+  detalle:  (id: string) =&gt; [...claves.detalles(), String(id)] as const, // ⬅ normaliza tipo
+};
+
+useQuery({ queryKey: claves.lista({ estado: "abierto" }), queryFn: ... });
+useQuery({ queryKey: claves.detalle(id), queryFn: ... });
+
+queryClient.invalidateQueries({ queryKey: claves.listas() }); // todas las listas
+queryClient.invalidateQueries({ queryKey: claves.todo });     // el módulo entero</code></pre>
+
+<h3>Invalidar o escribir la caché a mano</h3>
+
+<p>Después de una mutación tenés dos caminos. No son intercambiables.</p>
+
+<table>
+<thead><tr><th></th><th><code>invalidateQueries</code></th><th><code>setQueryData</code></th></tr></thead>
+<tbody>
+<tr><td><strong>Qué hace</strong></td><td>Marca stale y refetchea lo activo</td><td>Escribe el valor en la caché, sin red</td></tr>
+<tr><td><strong>Costo</strong></td><td>Una petición (o varias)</td><td>Cero</td></tr>
+<tr><td><strong>Riesgo</strong></td><td>Ninguno: el servidor manda</td><td>Tu copia puede no coincidir con la del servidor</td></tr>
+<tr><td><strong>Usalo cuando</strong></td><td>La mutación afecta cosas que no controlás (contadores, orden, agregados, permisos)</td><td>La respuesta trae la entidad <strong>completa</strong> y ya actualizada</td></tr>
+<tr><td><strong>Evitalo cuando</strong></td><td>La lista es enorme y solo cambió un campo</td><td>El servidor calcula campos derivados que no ves</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">const { mutate } = useMutation({
+  mutationFn: actualizarPedido,
+  onSuccess: (pedidoActualizado) =&gt; {
+    // 1. El detalle: la respuesta ES la entidad completa → escribimos, sin red.
+    queryClient.setQueryData(claves.detalle(pedidoActualizado.id), pedidoActualizado);
+
+    // 2. Las listas: pueden reordenarse, tener contadores, paginación,
+    //    filtros que este pedido ahora cumple o dejó de cumplir → invalidamos.
+    return queryClient.invalidateQueries({ queryKey: claves.listas() });
+    // ⬆ devolver la promesa mantiene `isPending` de la mutación en true
+    //   hasta que el refetch termine: el botón no se re-habilita antes de tiempo.
+  },
+});</code></pre>
+
+<div class="mistake">
+  <strong>Dos trampas de <code>setQueryData</code>.</strong> Primera: el actualizador puede recibir <code>undefined</code> —si la entrada fue recolectada o nunca existió—, así que si no lo contemplás vas a romper con un <code>TypeError</code> en producción y no en tu máquina. Segunda: tiene que ser <strong>inmutable</strong>. Mutar el objeto que te llega parece funcionar (la data cambia) pero como la referencia es la misma, ningún <code>memo</code> se entera y la pantalla no se actualiza. Es el bug "el dato está bien en las devtools pero la UI no cambia".
+</div>
+
+<pre><code class="lang-tsx">// ✅ Actualizador defensivo e inmutable
+queryClient.setQueryData&lt;Pedido[]&gt;(claves.listas(), (viejo) =&gt; {
+  if (!viejo) return viejo;                 // no inventes una lista que no existía
+  return viejo.map((p) =&gt; (p.id === id ? { ...p, estado: "cerrado" } : p));
+});</code></pre>
+
+<h2>RS5.7 Optimistic updates y el rollback correcto</h2>
+
+<p>Un "me gusta" que tarda 300 ms en aparecer se siente roto. La actualización optimista pinta el resultado <em>antes</em> de que el servidor conteste y lo revierte si falla. El patrón tiene cuatro pasos y ninguno es opcional:</p>
+
+<pre><code class="lang-tsx">const { mutate } = useMutation({
+  mutationFn: toggleFavorito,
+
+  // 1️⃣ Antes de salir a la red
+  onMutate: async (postId: string) =&gt; {
+    // (a) CANCELAR peticiones en vuelo de esa clave.
+    //     Si no, un GET que salió hace 200ms puede llegar DESPUÉS de tu
+    //     escritura optimista y pisarla con el valor viejo del servidor.
+    await queryClient.cancelQueries({ queryKey: claves.detalle(postId) });
+
+    // (b) SNAPSHOT: la única forma de poder volver atrás.
+    const previo = queryClient.getQueryData&lt;Post&gt;(claves.detalle(postId));
+
+    // (c) Escritura optimista.
+    queryClient.setQueryData&lt;Post&gt;(claves.detalle(postId), (p) =&gt;
+      p ? { ...p, favorito: !p.favorito, favs: p.favs + (p.favorito ? -1 : 1) } : p
+    );
+
+    // (d) Lo que devolvés acá llega como `context` a onError y onSettled.
+    return { previo };
+  },
+
+  // 2️⃣ Falló: restaurar exactamente lo que había
+  onError: (_err, postId, context) =&gt; {
+    if (context?.previo) {
+      queryClient.setQueryData(claves.detalle(postId), context.previo);
+    }
+  },
+
+  // 3️⃣ Pase lo que pase: que el servidor tenga la última palabra
+  onSettled: (_data, _err, postId) =&gt; {
+    return queryClient.invalidateQueries({ queryKey: claves.detalle(postId) });
+  },
+});</code></pre>
+
+<div class="danger">
+  <strong>Los tres errores que rompen el rollback.</strong>
+  <strong>(1) No cancelar</strong>: una respuesta en vuelo aterriza sobre tu escritura optimista y el corazoncito vuelve a apagarse solo, medio segundo después. <strong>(2) No snapshotear</strong>: en el <code>onError</code> se "revierte" recalculando el toggle al revés, lo cual es correcto solo si nada más tocó ese dato mientras tanto — y con dos clics rápidos deja de serlo. Guardá el objeto previo, no la operación inversa. <strong>(3) Invalidar solo en <code>onSuccess</code></strong>: si falló y no invalidás, la caché queda con el valor restaurado a mano y nunca se confronta con el servidor. Por eso el paso 3 va en <code>onSettled</code>.
+</div>
+
+<h3>La variante que evita el rollback entero</h3>
+
+<p>Si la mutación afecta a <strong>una sola pantalla</strong>, hay una alternativa mucho más barata: no tocar la caché y renderizar el estado optimista desde las variables de la mutación. Cuando la mutación termina, el estado desaparece solo y la caché ya trae la verdad.</p>
+
+<pre><code class="lang-tsx">function AgregarTarea() {
+  const { mutate, variables, isPending } = useMutation({
+    mutationFn: crearTarea,
+    onSettled: () =&gt; queryClient.invalidateQueries({ queryKey: claves.listas() }),
+  });
+  const { data: tareas } = useQuery({ queryKey: claves.listas(), queryFn: getTareas });
+
+  return (
+    &lt;ul&gt;
+      {tareas?.map((t) =&gt; &lt;li key={t.id}&gt;{t.titulo}&lt;/li&gt;)}
+      {/* la fila fantasma vive solo mientras dura la mutación */}
+      {isPending &amp;&amp; &lt;li style={{ opacity: 0.5 }}&gt;{variables.titulo}&lt;/li&gt;}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>Elegí por alcance.</strong> ¿El cambio tiene que verse en varias pantallas a la vez (el corazón en la lista, en el detalle y en el contador del header)? Escritura optimista en la caché. ¿Se ve en un solo lugar? Variables de la mutación: cero snapshots, cero rollback, cero posibilidad de dejar la caché en un estado inconsistente.
+</div>
+
+<div class="warn">
+  <strong>Cuándo NO ser optimista.</strong> Cuando revertir le miente al usuario sobre algo que importa: transferencias de dinero, confirmar un pedido, borrar definitivamente, publicar. Mostrar "listo" y después "en realidad no" es peor que 400 ms de spinner. La actualización optimista es para acciones <em>reversibles y de bajo impacto</em>, donde la probabilidad de fallo es baja y el costo de equivocarse es cosmético.
+</div>
+
+<h2>RS5.8 Paginación e infinite scroll</h2>
+
+<h3>Por qué el offset se rompe (y no es un caso raro)</h3>
+
+<p><code>?page=2&amp;per_page=20</code> asume que la lista no cambia entre pedidos. En cualquier lista ordenada por fecha con inserciones —un feed, una bandeja, un log— esa suposición es falsa cada pocos segundos:</p>
+
+<pre><code class="lang-text">Lista ordenada por fecha descendente. El usuario pide la página 1 (LIMIT 3 OFFSET 0):
+
+  [ E, D, C ]   ← ve estos tres
+    resto: B, A
+
+Mientras lee, se inserta F arriba. Ahora pide la página 2 (LIMIT 3 OFFSET 3):
+
+  servidor:  F, E, D, C, B, A
+  OFFSET 3 → [ C, B, A ]
+                ^
+                C YA lo había visto → aparece DUPLICADO
+
+Y si en vez de insertarse se hubiera borrado un elemento de arriba,
+el corrimiento va para el otro lado y un elemento se SALTEA sin que
+nadie lo note nunca — el usuario simplemente no lo ve.</code></pre>
+
+<table>
+<thead><tr><th></th><th>Offset (<code>page</code> / <code>skip</code>)</th><th>Cursor (<code>after</code> / <code>since</code>)</th></tr></thead>
+<tbody>
+<tr><td><strong>Con datos que cambian</strong></td><td>Duplica y saltea</td><td>Estable: el cursor es un punto fijo</td></tr>
+<tr><td><strong>Ir a la página 47</strong></td><td>Trivial</td><td>Imposible sin recorrer</td></tr>
+<tr><td><strong>Total de resultados</strong></td><td>Natural</td><td>Requiere un conteo aparte</td></tr>
+<tr><td><strong>Costo en la base</strong></td><td><code>OFFSET</code> grande es lento (descarta filas)</td><td><code>WHERE id &lt; cursor</code> usa el índice</td></tr>
+<tr><td><strong>Encaja con</strong></td><td>Tablas con numeritos de página</td><td>Scroll infinito, feeds, timelines</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Regla de decisión.</strong> ¿Scroll infinito sobre datos que cambian? <strong>Cursor</strong>, sin discusión. ¿Tabla de administración con "página 3 de 47", ordenada por algo estable y sin inserciones constantes? Offset está bien y te ahorra trabajo. El error es usar offset para un feed porque "es más fácil": el bug que produce es intermitente e irreproducible en desarrollo.
+</div>
+
+<h3>Paginación clásica sin que la pantalla salte</h3>
+
+<pre><code class="lang-tsx">import { keepPreviousData } from "@tanstack/react-query";
+
+function TablaPedidos() {
+  const [pagina, setPagina] = useState(1);
+
+  const { data, isPending, isPlaceholderData, isFetching } = useQuery({
+    queryKey: claves.lista({ pagina }),
+    queryFn: () =&gt; getPedidos({ pagina }),
+    placeholderData: keepPreviousData,  // ⬅ v5 (en v4 era keepPreviousData: true)
+    staleTime: 30_000,
+  });
+
+  if (isPending) return &lt;Skeleton /&gt;;   // solo la PRIMERA página de todas
+
+  return (
+    &lt;div style={{ opacity: isPlaceholderData ? 0.6 : 1 }}&gt;
+      &lt;Tabla filas={data.items} /&gt;
+      &lt;button
+        onClick={() =&gt; setPagina((p) =&gt; p + 1)}
+        disabled={isPlaceholderData || !data.hayMas}  // ⬅ evita saltar dos veces
+      &gt;
+        Siguiente {isFetching &amp;&amp; "…"}
+      &lt;/button&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p>Sin <code>keepPreviousData</code>, cada cambio de página devuelve la query a <code>pending</code>: la tabla desaparece, el layout colapsa, la página salta y vuelve. Con él, la página anterior queda visible hasta que llega la nueva. Es una línea y cambia por completo la sensación de la tabla.</p>
+
+<div class="mistake">
+  <strong>El deshabilitado que falta.</strong> Si no deshabilitás "Siguiente" mientras <code>isPlaceholderData</code> es cierto, dos clics rápidos saltan de la 1 a la 3 mostrando datos de la 1. La caché está perfecta; la UI mintió porque el botón permitía adelantarse a los datos.
+</div>
+
+<h3>Scroll infinito con cursores</h3>
+
+<pre><code class="lang-tsx">const {
+  data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending,
+} = useInfiniteQuery({
+  queryKey: ["feed"],
+  queryFn: ({ pageParam }) =&gt; getFeed({ cursor: pageParam, limite: 20 }),
+  initialPageParam: null as string | null,        // ⬅ obligatorio en v5
+  getNextPageParam: (ultima) =&gt; ultima.siguienteCursor ?? undefined,
+  //                              ⬆ undefined (NO null) = "no hay más"
+  maxPages: 5,          // ⬅ ver la advertencia de abajo
+  staleTime: 60_000,
+});
+
+// La data es { pages: Page[]; pageParams: unknown[] } — una sola entrada de caché.
+const items = data?.pages.flatMap((p) =&gt; p.items) ?? [];</code></pre>
+
+<div class="warn">
+  <strong>Una infinite query es UNA sola entrada de caché, no una por página.</strong> Cuando se invalida o refetchea, la librería vuelve a pedir <strong>todas las páginas cargadas, en secuencia</strong>, para mantener la coherencia de los cursores. Si el usuario scrolleó 40 páginas, un refocus de ventana dispara 40 peticiones encadenadas. Por eso existe <code>maxPages</code>: acota la ventana en memoria y descarta las de los extremos. Sin él, el scroll infinito es una bomba de tiempo que solo explota con usuarios que scrollean mucho — o sea, los que más te importan.
+</div>
+
+<div class="tip">
+  <strong><code>undefined</code> y <code>null</code> no son lo mismo acá.</strong> <code>getNextPageParam</code> tiene que devolver <code>undefined</code> para que <code>hasNextPage</code> pase a <code>false</code>. Si tu API devuelve <code>null</code> cuando se acabaron los resultados y lo pasás tal cual, <code>hasNextPage</code> sigue en <code>true</code> y el observador de scroll pide la misma página para siempre. Es un <code>?? undefined</code> de diferencia.
+</div>
+
+<h2>RS5.9 Prefetching y cómo matar el waterfall</h2>
+
+<p>Un <em>waterfall</em> es una cadena de esperas que podrían haber sido simultáneas. En una app con caché de queries hay tres variedades, y se arreglan distinto.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Cómo se ve</th><th>Arreglo</th></tr></thead>
+<tbody>
+<tr><td><strong>Por jerarquía</strong></td><td>El padre pide, renderiza, y recién ahí el hijo se monta y pide</td><td>Subir las queries a la ruta, o prefetch</td></tr>
+<tr><td><strong>Por code-splitting</strong></td><td>Descargar el chunk → montarlo → recién ahí pedir datos</td><td>Prefetch de datos en paralelo con el chunk</td></tr>
+<tr><td><strong>Por dependencia real</strong></td><td>Necesitás el id del paso 1 para el paso 2</td><td>No hay paralelismo posible: cambiá la API o aceptalo</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// ❌ Waterfall por jerarquía: 3 saltos en serie
+function Pagina({ id }) {
+  const { data: user } = useQuery({ queryKey: ["user", id], queryFn: ... });
+  if (!user) return &lt;Skeleton /&gt;;     // ⬅ el hijo ni existe hasta que esto resuelva
+  return &lt;Pedidos userId={user.id} /&gt;; // y recién acá arranca su fetch
+}
+
+// ✅ Ambas salen juntas: la segunda no necesitaba esperar a la primera
+function Pagina({ id }) {
+  const [user, pedidos] = useQueries({
+    queries: [
+      { queryKey: ["user", id],        queryFn: () =&gt; getUser(id) },
+      { queryKey: ["pedidos", "de", id], queryFn: () =&gt; getPedidosDe(id) },
+    ],
+  });
+  ...
+}</code></pre>
+
+<h3>Dependencias reales: <code>enabled</code></h3>
+
+<pre><code class="lang-tsx">const { data: user } = useQuery({ queryKey: ["user", email], queryFn: getUserPorEmail });
+
+const { data: proyectos } = useQuery({
+  queryKey: ["proyectos", user?.id],
+  queryFn: () =&gt; getProyectos(user!.id),
+  enabled: !!user?.id,     // ⬅ no arranca hasta tener el id
+});
+// Mientras `enabled` es false: status "pending", fetchStatus "idle".
+// Ojo: `isPending` es true pero NO hay nada cargando. Si mostrás un
+// spinner con isPending, gira sin que exista ninguna petición.</code></pre>
+
+<h3>Prefetch: pedir antes de que haga falta</h3>
+
+<pre><code class="lang-tsx">function FilaPedido({ pedido }: { pedido: Pedido }) {
+  const qc = useQueryClient();
+
+  // Al pasar el mouse, el usuario declara intención ~200-300ms antes de hacer clic.
+  // Ese es tiempo de red gratis.
+  const precargar = () =&gt; {
+    qc.prefetchQuery({
+      queryKey: claves.detalle(pedido.id),
+      queryFn: () =&gt; getPedido(pedido.id),
+      staleTime: 30_000,   // ⬅ sin esto, el prefetch se considera viejo al instante
+    });                    //    y el clic vuelve a pedir: precargaste al pedo
+  };
+
+  return &lt;tr onMouseEnter={precargar} onFocus={precargar}&gt;…&lt;/tr&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>El prefetch sin <code>staleTime</code> no sirve para nada.</strong> Con el default de <code>0</code>, el dato precargado nace viejo: al montar el detalle, <code>refetchOnMount</code> ve una query stale y dispara la petición igual. Ganaste cero milisegundos y gastaste una petición de más. El <code>staleTime</code> del prefetch tiene que cubrir la ventana entre el hover y el clic — con dos o tres segundos ya alcanza, pero tiene que estar.
+</div>
+
+<h3>La trampa de Suspense: hermanos que se suspenden en fila</h3>
+
+<pre><code class="lang-tsx">// ❌ Waterfall silencioso: A suspende, B NUNCA se monta, su fetch no arranca
+&lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+  &lt;WidgetA /&gt;   {/* useSuspenseQuery(["a"]) */}
+  &lt;WidgetB /&gt;   {/* useSuspenseQuery(["b"]) — espera a que A resuelva */}
+&lt;/Suspense&gt;
+
+// ✅ Opción 1: un solo hook que dispara todo junto
+const [a, b] = useSuspenseQueries({ queries: [{ queryKey: ["a"], ... },
+                                              { queryKey: ["b"], ... }] });
+
+// ✅ Opción 2: fronteras separadas — además cada widget aparece cuando está listo
+&lt;Suspense fallback={&lt;SkeletonA /&gt;}&gt;&lt;WidgetA /&gt;&lt;/Suspense&gt;
+&lt;Suspense fallback={&lt;SkeletonB /&gt;}&gt;&lt;WidgetB /&gt;&lt;/Suspense&gt;
+
+// ✅ Opción 3: prefetch en el padre antes de renderizar los hijos</code></pre>
+
+<div class="warn">
+  <strong>Esta es la cascada más difícil de ver</strong>, porque el código se lee como si fuera paralelo: dos hermanos, uno al lado del otro. Pero un componente que suspende <em>interrumpe el render de sus hermanos posteriores</em>: React nunca llega a ejecutar <code>WidgetB</code>, así que su query jamás se registra. La única forma de detectarla es mirando la pestaña Network y viendo dos barras escalonadas donde esperabas dos paralelas.
+</div>
+
+<h2>RS5.10 RSC y caché de cliente: cómo conviven</h2>
+
+<p>En RS4 viste que un Server Component puede leer datos directamente, sin ningún hook. La pregunta natural es: <strong>si el servidor ya trae los datos, ¿para qué quiero una caché en el cliente?</strong></p>
+
+<table>
+<thead><tr><th>Necesidad</th><th>RSC solo</th><th>Caché de cliente</th></tr></thead>
+<tbody>
+<tr><td>Primer render con datos, sin JS</td><td>✅ Es su especialidad</td><td>❌ Necesita hidratar y pedir</td></tr>
+<tr><td>Refetch en foco / reconexión</td><td>❌ No existe el concepto</td><td>✅</td></tr>
+<tr><td>Compartir un dato entre 5 componentes cliente</td><td>⚠️ Vía props, con prop drilling</td><td>✅ Por clave</td></tr>
+<tr><td>Paginación y scroll infinito con estado</td><td>⚠️ Round-trip al servidor por página</td><td>✅ Local e instantáneo</td></tr>
+<tr><td>Optimistic updates</td><td>⚠️ <code>useOptimistic</code> por formulario</td><td>✅ Global, sobre toda la caché</td></tr>
+<tr><td>Polling / tiempo real</td><td>❌</td><td>✅ <code>refetchInterval</code></td></tr>
+<tr><td>Bundle</td><td>✅ Cero</td><td>❌ ~13 KB comprimido</td></tr>
+</tbody>
+</table>
+
+<h3>El patrón que combina las dos: prefetch en el servidor, hidratar en el cliente</h3>
+
+<pre><code class="lang-tsx">// app/pedidos/page.tsx — Server Component
+import { dehydrate, HydrationBoundary, QueryClient } from "@tanstack/react-query";
+
+export default async function Page() {
+  const qc = new QueryClient();
+
+  // Se pide en el servidor: sin cascada, sin spinner, sin salto de red extra.
+  await qc.prefetchQuery({
+    queryKey: ["pedidos", "lista"],
+    queryFn: () =&gt; db.pedidos.findMany(),   // acceso directo, no pasa por HTTP
+  });
+
+  return (
+    &lt;HydrationBoundary state={dehydrate(qc)}&gt;
+      &lt;ListaPedidos /&gt;   {/* Client Component */}
+    &lt;/HydrationBoundary&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">"use client";
+
+export function ListaPedidos() {
+  // Misma clave → la caché ya viene poblada desde el HTML.
+  // No hay petición al montar: el dato está antes del primer píxel.
+  const { data } = useQuery({
+    queryKey: ["pedidos", "lista"],
+    queryFn: getPedidos,        // se usará solo en refetches posteriores
+  });
+  return &lt;Tabla filas={data} /&gt;;
+}</code></pre>
+
+<div class="danger">
+  <strong>El bug que arruina este patrón: <code>staleTime: 0</code>.</strong> Con el default, el dato deshidratado llega marcado como viejo y <code>refetchOnMount</code> dispara una petición inmediata al hidratar. Resultado: hiciste todo el trabajo de prefetch en el servidor y el navegador pide lo mismo de nuevo, medio segundo después. Se ve como una petición fantasma en Network que nadie explica. Poné un <code>staleTime</code> de al menos <strong>algunos segundos</strong> en los defaults del <code>QueryClient</code> del servidor y del cliente — es el arreglo de una línea más rentable de toda la integración.
+</div>
+
+<div class="warn">
+  <strong>Y en el servidor, un <code>QueryClient</code> por request.</strong> Si creás el <code>QueryClient</code> como módulo de nivel superior, todos los usuarios comparten la misma caché en el proceso de Node: el pedido de uno puede terminar renderizado en el HTML de otro. Es una fuga de datos entre usuarios, no un problema de performance. En el servidor se instancia adentro del componente o con <code>cache()</code> de React 19; en el cliente, una sola vez con <code>useState(() =&gt; new QueryClient())</code>.
+</div>
+
+<h3>Cuándo ya no necesitás la librería</h3>
+
+<p>Con RSC estable, hay una franja real de aplicaciones donde agregarla es sumar peso y conceptos sin ganar nada:</p>
+
+<ul>
+  <li>Los datos <strong>se leen en el servidor</strong> y se muestran; el cliente no los pide nunca.</li>
+  <li>Las escrituras van por <strong>Server Actions</strong> y la revalidación la hace <code>revalidatePath</code> / <code>revalidateTag</code>.</li>
+  <li>No hay polling, ni scroll infinito con estado, ni datos compartidos entre componentes cliente lejanos.</li>
+  <li>Lo optimista, cuando hace falta, se resuelve con <code>useOptimistic</code> dentro del formulario que lo necesita.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 El síntoma de que sí la necesitás:</strong> aparece el primer <code>router.refresh()</code> puesto para "que se vea el cambio", el primer <code>useEffect</code> con <code>fetch</code> en un Client Component, o el primer dato que dos componentes cliente distintos piden por separado. Ahí ya estás escribiendo una caché de queries — peor, y sin devtools.
+</div>
+
+<h2>RS5.11 Errores, reintentos y el error boundary de datos</h2>
+
+<h3>Reintentar lo que tiene sentido reintentar</h3>
+
+<pre><code class="lang-tsx">// Default de la librería: 3 reintentos, backoff exponencial hasta 30s.
+// Razonable para GETs; peligroso si lo dejás igual para todo.
+{
+  retry: (fallos, error: any) =&gt; {
+    if (error?.status &gt;= 400 &amp;&amp; error?.status &lt; 500) return false;
+    // 4xx: el pedido está mal. Reintentar 30 veces no lo va a arreglar.
+    // Excepción típica: 408 y 429, que sí se reintentan (con Retry-After).
+    return fallos &lt; 3;
+  },
+  retryDelay: (intento) =&gt;
+    Math.min(1000 * 2 ** intento, 30_000) + Math.random() * 300,
+    //                                      ⬆ jitter, no es opcional
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Por qué el jitter importa.</strong> Si el backend se cae 30 segundos, mil clientes fallan casi al mismo tiempo. Sin jitter, los mil reintentan a los 1000 ms, después a los 2000, después a los 4000 — sincronizados, en oleadas. El servicio que estaba por recuperarse recibe mil peticiones simultáneas y se vuelve a caer. Es el <em>thundering herd</em>, y se previene con una línea de ruido aleatorio.
+</div>
+
+<div class="danger">
+  <strong>Las mutaciones NO se reintentan por default, y está bien.</strong> Reintentar un POST puede crear dos pedidos, cobrar dos veces o mandar dos mails. Si necesitás reintentar una escritura, el requisito previo es que sea <strong>idempotente</strong>: el cliente genera una clave única por intento, el servidor la guarda y, si ve la misma clave dos veces, devuelve el resultado original en vez de ejecutar de nuevo. Sin eso del lado del servidor, <code>retry</code> en una mutación es una decisión de negocio disfrazada de configuración.
+</div>
+
+<h3>El error boundary de datos</h3>
+
+<p>Manejar <code>isError</code> en cada componente termina en veinte copias del mismo bloque. Con <code>throwOnError</code>, el error viaja al boundary más cercano y se maneja una vez:</p>
+
+<pre><code class="lang-tsx">import { QueryErrorResetBoundary } from "@tanstack/react-query";
+import { ErrorBoundary } from "react-error-boundary";
+
+&lt;QueryErrorResetBoundary&gt;
+  {({ reset }) =&gt; (
+    &lt;ErrorBoundary
+      onReset={reset}                 // ⬅ limpia el estado de error de las queries
+      fallbackRender={({ resetErrorBoundary }) =&gt; (
+        &lt;div&gt;
+          &lt;p&gt;No pudimos cargar esta sección.&lt;/p&gt;
+          &lt;button onClick={resetErrorBoundary}&gt;Reintentar&lt;/button&gt;
+        &lt;/div&gt;
+      )}
+    &gt;
+      &lt;Panel /&gt;
+    &lt;/ErrorBoundary&gt;
+  )}
+&lt;/QueryErrorResetBoundary&gt;</code></pre>
+
+<pre><code class="lang-tsx">// Y en la query: elegí QUÉ errores merecen tumbar el subárbol.
+useQuery({
+  queryKey: claves.detalle(id),
+  queryFn: getPedido,
+  throwOnError: (error: any) =&gt; error.status &gt;= 500,
+  // 500 → boundary (algo se rompió, no es culpa del usuario)
+  // 404 → lo maneja el componente con un "no encontrado" propio
+});</code></pre>
+
+<div class="mistake">
+  <strong>Sin <code>onReset={reset}</code>, el botón "Reintentar" no reintenta nada.</strong> El boundary vuelve a renderizar, la query sigue en estado de error en la caché, y el componente se vuelve a caer al instante. El <code>QueryErrorResetBoundary</code> existe exactamente para cerrar ese circuito: limpiar el error del lado de la caché al mismo tiempo que el boundary se resetea.
+</div>
+
+<h3>Errores globales sin acoplar componentes</h3>
+
+<pre><code class="lang-tsx">const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) =&gt; {
+      // Solo avisamos si el usuario YA estaba viendo datos: un fallo en la
+      // carga inicial lo cuenta la UI; un fallo en un refetch de fondo es
+      // invisible y ahí sí conviene un toast.
+      if (query.state.data !== undefined) {
+        toast.error(`No se pudo actualizar: ${(error as Error).message}`);
+      }
+      reportarAObservabilidad(error, { clave: query.queryKey });
+    },
+  }),
+});</code></pre>
+
+<h3>Offline: el estado que casi nadie contempla</h3>
+
+<pre><code class="lang-tsx">const { fetchStatus, data } = useQuery({ queryKey: ["x"], queryFn: getX });
+
+// fetchStatus === "paused" → hay una petición esperando que vuelva la red.
+// No falló: está en pausa. Cuando el navegador vuelve a estar online,
+// arranca sola. Mostrar "Error de red" acá es mentirle al usuario.
+if (fetchStatus === "paused" &amp;&amp; !data) return &lt;SinConexion /&gt;;</code></pre>
+
+<h2>RS5.12 Cuándo NO usar una librería de queries</h2>
+
+<table>
+<thead><tr><th>Situación</th><th>Qué usar</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>El dato no viene de la red (localStorage, cálculo, IndexedDB sincrónica)</td><td><code>useState</code> / <code>useSyncExternalStore</code></td><td>No hay nada que cachear ni revalidar</td></tr>
+<tr><td>App de 3 pantallas, un fetch por pantalla, sin datos compartidos</td><td><code>use()</code> + Suspense, o un fetch en la ruta</td><td>13 KB y un modelo mental nuevo por cero beneficio</td></tr>
+<tr><td>RSC puro: leés en el servidor, escribís con Server Actions</td><td>RSC + <code>revalidateTag</code></td><td>La caché ya está, del otro lado (RS4)</td></tr>
+<tr><td>Todo el estado es local y efímero (juego, editor, canvas)</td><td>Estado de cliente</td><td>No hay estado de servidor que administrar</td></tr>
+<tr><td>WebSocket que empuja todo el estado</td><td>Store de cliente alimentado por el socket</td><td>El servidor ya te avisa: no hay nada que revalidar</td></tr>
+<tr><td>Necesitás normalización relacional profunda</td><td>RTK Query, Apollo, Relay</td><td>TanStack Query cachea por clave, no normaliza entidades</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Ese último renglón es una limitación real que conviene entender antes de elegir. TanStack Query guarda <strong>documentos por clave</strong>: si el pedido 42 aparece dentro de <code>["pedidos","lista"]</code> y también en <code>["pedidos","detalle",42]</code>, son dos copias independientes y actualizar una no toca la otra. Normalizar (una tabla de entidades por id, y referencias) es lo que hacen Apollo y RTK Query, y trae su propio costo: configuración de <code>normalizer</code>, políticas de merge, y bugs de identidad cuando el servidor no manda ids consistentes. Para el 90% de las apps, invalidar por prefijo es más simple y más predecible que normalizar.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el dashboard de seis spinners</h2>
+
+<p>Un dashboard de operaciones: seis widgets, seis spinners que aparecen en fila como una escalera, y una queja recurrente del equipo de soporte de que "tarda una eternidad". Vamos a arreglarlo midiendo, no adivinando.</p>
+
+<h3>Paso 1 — Lo que hay</h3>
+
+<pre><code class="lang-tsx">// dashboard.tsx — cada widget se arregla solo. Suena desacoplado. Es un waterfall.
+function Dashboard() {
+  const [user, setUser] = useState(null);
+  useEffect(() =&gt; { fetch("/api/me").then(r =&gt; r.json()).then(setUser); }, []);
+
+  if (!user) return &lt;Spinner /&gt;;              // ⬅ nada más existe hasta que esto vuelva
+  return (
+    &lt;Grid&gt;
+      &lt;WidgetVentas   orgId={user.orgId} /&gt;
+      &lt;WidgetPedidos  orgId={user.orgId} /&gt;
+      &lt;WidgetStock    orgId={user.orgId} /&gt;
+      &lt;WidgetTopProd  orgId={user.orgId} /&gt;
+      &lt;WidgetEquipo   orgId={user.orgId} /&gt;
+      &lt;WidgetAlertas  orgId={user.orgId} /&gt;
+    &lt;/Grid&gt;
+  );
+}
+
+function WidgetVentas({ orgId }) {
+  const [data, setData] = useState(null);
+  useEffect(() =&gt; {
+    fetch(`/api/ventas?org=${orgId}`).then(r =&gt; r.json()).then(setData);
+  }, [orgId]);
+  if (!data) return &lt;Spinner /&gt;;              // ⬅ ×6, uno por widget
+  return &lt;Card&gt;{data.total}&lt;/Card&gt;;
+}
+
+// WidgetEquipo hace fetch("/api/me") otra vez para mostrar el avatar del dueño.
+// WidgetAlertas también, para saber el rol. Nadie lo notó nunca.</code></pre>
+
+<h3>Paso 2 — Medir antes de opinar</h3>
+
+<p>Pestaña Network, throttling "Fast 4G", recarga dura. Lo que aparece:</p>
+
+<pre><code class="lang-text">0ms      ├─ /api/me ─────────────┤ 180ms
+180ms                            ├─ /api/ventas ────┤ 320ms
+180ms                            ├─ /api/pedidos ───────────┤ 450ms
+180ms                            ├─ /api/stock ─────────┤ 390ms
+180ms                            ├─ /api/top ───────────────────┤ 620ms
+180ms                            ├─ /api/me (dup) ──┤ 300ms
+180ms                            ├─ /api/equipo ────────┤ 400ms
+180ms                            ├─ /api/me (dup) ──┤ 295ms
+180ms                            ├─ /api/alertas ───────────┤ 470ms
+
+Dashboard completo: ~800ms   ·   Peticiones: 9 (3 son /api/me)
+Volver desde otra ruta:      ~800ms otra vez, idéntico. No hay caché.</code></pre>
+
+<h3>Paso 3 — Diagnóstico: son tres problemas, no uno</h3>
+
+<table>
+<thead><tr><th>#</th><th>Problema</th><th>Evidencia</th><th>Costo</th></tr></thead>
+<tbody>
+<tr><td>A</td><td><strong>Cascada artificial</strong>: los seis widgets esperan a <code>/api/me</code></td><td>Nada arranca antes de los 180 ms</td><td>+180 ms a todo</td></tr>
+<tr><td>B</td><td><strong>Peticiones duplicadas</strong>: <code>/api/me</code> tres veces</td><td>3 filas idénticas en Network</td><td>2 peticiones y carga en el backend</td></tr>
+<tr><td>C</td><td><strong>Sin caché entre navegaciones</strong></td><td>Volver repite las 9</td><td>800 ms en cada vuelta</td></tr>
+</tbody>
+</table>
+
+<div class="step">
+  <strong>Antes de tocar código, la pregunta clave:</strong> ¿el <code>orgId</code> es realmente necesario para pedir los widgets? Miramos la API: los endpoints aceptan <code>?org=</code>, pero el backend <strong>ya deriva la organización de la sesión</strong> si no se le manda. El parámetro era decorativo. La dependencia de <code>/api/me</code> nunca existió: la inventó el frontend. Este es el hallazgo que más tiempo ahorra, y no se encuentra en el código de React sino leyendo el contrato del backend.
+</div>
+
+<h3>Paso 4 — Diseñar las claves antes de escribir hooks</h3>
+
+<pre><code class="lang-tsx">// La jerarquía tiene que reflejar cómo se INVALIDA, no cómo se muestra.
+export const k = {
+  sesion:  ["sesion"] as const,
+
+  panel:   ["panel"] as const,                                   // raíz del dashboard
+  ventas:  (rango: Rango) =&gt; [...k.panel, "ventas", rango] as const,
+  pedidos: () =&gt; [...k.panel, "pedidos"] as const,
+  stock:   () =&gt; [...k.panel, "stock"] as const,
+  top:     (rango: Rango) =&gt; [...k.panel, "top", rango] as const,
+  equipo:  () =&gt; [...k.panel, "equipo"] as const,
+  alertas: () =&gt; [...k.panel, "alertas"] as const,
+};
+
+// Con esto:
+//   invalidateQueries({ queryKey: k.panel })   → refresca el dashboard entero
+//   invalidateQueries({ queryKey: [...k.panel, "ventas"] }) → solo ventas, todos los rangos
+//   `sesion` queda AFUERA de `panel` a propósito: refrescar el panel no
+//   tiene por qué volver a pedir quién sos.</code></pre>
+
+<div class="mistake">
+  <strong>El diseño que descartamos.</strong> La primera versión fue <code>["panel", orgId, "ventas"]</code>, metiendo el <code>orgId</code> en el prefijo. Se ve prolijo, pero como el <code>orgId</code> sale de la sesión y no cambia durante la vida de la página, solo agrega una dependencia que obliga a esperar <code>/api/me</code> para poder <em>construir la clave</em>. La cascada volvía por la ventana. Si un parámetro nunca cambia en una sesión, no pertenece a la clave: pertenece al cliente HTTP.
+</div>
+
+<h3>Paso 5 — Paralelizar</h3>
+
+<pre><code class="lang-tsx">function Dashboard() {
+  const [rango, setRango] = useState&lt;Rango&gt;("7d");
+
+  // Las siete salen JUNTAS. La sesión ya no bloquea a nadie.
+  const resultados = useQueries({
+    queries: [
+      { queryKey: k.sesion,       queryFn: getSesion,  staleTime: Infinity },
+      { queryKey: k.ventas(rango),queryFn: () =&gt; getVentas(rango), staleTime: 5 * 60_000 },
+      { queryKey: k.pedidos(),    queryFn: getPedidos, staleTime: 30_000 },
+      { queryKey: k.stock(),      queryFn: getStock,   staleTime: 10_000 },
+      { queryKey: k.top(rango),   queryFn: () =&gt; getTop(rango), staleTime: 15 * 60_000 },
+      { queryKey: k.equipo(),     queryFn: getEquipo,  staleTime: 10 * 60_000 },
+      { queryKey: k.alertas(),    queryFn: getAlertas, staleTime: 0, refetchInterval: 30_000 },
+    ],
+  });
+
+  // Cada widget se pinta cuando SU dato llega: no hay un spinner global.
+  return (
+    &lt;Grid&gt;
+      {resultados.slice(1).map((r, i) =&gt;
+        r.isPending ? &lt;CardSkeleton key={i} /&gt; : &lt;Card key={i} {...r.data} /&gt;
+      )}
+    &lt;/Grid&gt;
+  );
+}</code></pre>
+
+<p>Los widgets internos ya no piden nada: leen de la caché por clave. Y <code>/api/me</code> se pide <strong>una sola vez</strong> aunque tres componentes lo consulten, porque la deduplicación de RS5.3 lo resuelve sin que nadie coordine nada.</p>
+
+<h3>Paso 6 — Un <code>staleTime</code> pensado, dato por dato</h3>
+
+<p>Acá está el trabajo intelectual real del ejercicio. No es una constante para toda la app: es una conversación con el negocio, widget por widget.</p>
+
+<table>
+<thead><tr><th>Widget</th><th><code>staleTime</code></th><th>La pregunta que lo define</th></tr></thead>
+<tbody>
+<tr><td>Sesión</td><td><code>Infinity</code></td><td>No cambia mientras la página esté abierta. Se invalida al hacer logout.</td></tr>
+<tr><td>Ventas (rango)</td><td>5 min</td><td>Un acumulado de 7 días no se mueve en 5 minutos.</td></tr>
+<tr><td>Pedidos</td><td>30 s</td><td>Operaciones lo mira seguido; medio minuto de retraso es tolerable.</td></tr>
+<tr><td>Stock</td><td>10 s</td><td>Prometerle a un cliente algo que ya no hay cuesta plata.</td></tr>
+<tr><td>Top productos</td><td>15 min</td><td>Un ranking histórico. Nadie decide nada con la variación de un minuto.</td></tr>
+<tr><td>Equipo</td><td>10 min</td><td>Alta y baja de personal es un evento semanal, no por minuto.</td></tr>
+<tr><td>Alertas</td><td><code>0</code> + <code>refetchInterval: 30s</code></td><td>Es lo único que justifica pedir sin que nadie lo pida.</td></tr>
+</tbody>
+</table>
+
+<h3>Paso 7 — Medir de nuevo, y ser honesto con los números</h3>
+
+<table>
+<thead><tr><th>Cambio</th><th>Carga inicial</th><th>Peticiones</th><th>Volver a la ruta</th><th>Veredicto</th></tr></thead>
+<tbody>
+<tr><td>Punto de partida</td><td>800 ms</td><td>9</td><td>800 ms</td><td>—</td></tr>
+<tr><td><strong>1.</strong> Romper la cascada de <code>/api/me</code></td><td><strong>620 ms</strong></td><td>9</td><td>620 ms</td><td>🟢 −180 ms, el más barato</td></tr>
+<tr><td><strong>2.</strong> Deduplicación (misma clave)</td><td>620 ms</td><td><strong>7</strong></td><td>620 ms</td><td>🟢 −22% de carga al backend</td></tr>
+<tr><td><strong>3.</strong> <code>staleTime</code> por widget</td><td>620 ms</td><td>7</td><td><strong>~0 ms</strong> (0–1 peticiones)</td><td>🔥 el cambio grande</td></tr>
+<tr><td><strong>4.</strong> Prefetch en RSC + hidratar</td><td><strong>310 ms</strong></td><td>7</td><td>~0 ms</td><td>🟢 −50% en la primera visita</td></tr>
+<tr><td><strong>5.</strong> <code>gcTime</code> de 5 a 30 min</td><td>310 ms</td><td>7</td><td>~0 ms</td><td>⚪ <strong>ni se movió</strong></td></tr>
+<tr><td><strong>6.</strong> <code>select</code> memoizado en 3 widgets</td><td>310 ms</td><td>7</td><td>~0 ms</td><td>⚪ <strong>ruido de medición</strong></td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Lo que enseñan los dos renglones blancos.</strong> El cambio <strong>5</strong> no movió nada porque la sesión típica vuelve al dashboard en menos de dos minutos: la entrada nunca llegaba a expirar con <code>gcTime</code> de 5 minutos. Subirlo a 30 solo retiene memoria por si acaso. El cambio <strong>6</strong> tampoco, porque los widgets renderizan cuatro números y un ícono: no había nada que optimizar, y el <em>structural sharing</em> ya evitaba los re-renders que <code>select</code> hubiera evitado. Los dos parecían optimizaciones sensatas en una revisión de código. <strong>Los dos habrían entrado al repositorio sin que nadie los cuestionara, si no se hubieran medido.</strong>
+</div>
+
+<div class="tip">
+  <strong>Y el que sí mueve la aguja es el menos glamoroso.</strong> El 90% de la ganancia percibida salió de <strong>pensar cuánto vale cada dato</strong> (cambio 3) — cero líneas de arquitectura, siete números elegidos con criterio. La cascada (cambio 1) se arregló <em>leyendo la documentación del backend</em>, no refactorizando React. Escribí eso en el resumen del PR: la próxima persona que optimice este dashboard tiene que saber dónde estaba la plata.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu lista de pedidos se refetchea cada vez que el usuario vuelve a la pestaña, y el equipo pide "apagar eso". ¿Qué hacés?</summary>
+<p>Apagar <code>refetchOnWindowFocus</code> es tratar el síntoma. El refetch en foco solo se dispara si la query está <strong>stale</strong>, así que el diagnóstico real es que el <code>staleTime</code> está en su default de <code>0</code>: la data nace vieja en el instante en que llega. La pregunta correcta no es técnica sino de producto: <em>¿cuántos segundos de retraso tolera quien mira esta lista?</em> Si son treinta, <code>staleTime: 30_000</code> elimina el 95% de los refetch y conserva el comportamiento valioso —volvés después de almorzar y ves datos frescos—. Apagar el foco te deja con datos de hace dos horas y sin ninguna señal de que están viejos, que es peor que el problema original. La única razón legítima para apagarlo es que el endpoint sea carísimo <em>y</em> el dato casi inmutable, y en ese caso <code>staleTime: Infinity</code> lo expresa mejor: dice "esto no envejece", en vez de "no mires si envejeció".</p></details>
+
+<details><summary>Después de una mutación exitosa, ¿cuándo <code>setQueryData</code> y cuándo <code>invalidateQueries</code>?</summary>
+<p><code>setQueryData</code> cuando la respuesta del servidor <strong>es la entidad completa y final</strong>, y vos podés reproducir exactamente lo que la caché debería tener: ahorrás un round-trip y la UI se actualiza en el mismo frame. <code>invalidateQueries</code> cuando el efecto de la mutación excede lo que ves: la lista puede reordenarse, hay contadores y agregados, la fila puede entrar o salir de un filtro activo, el servidor calcula campos derivados (totales, estados, permisos) que tu escritura a mano no puede inventar. La combinación habitual es hacer las dos cosas: <code>setQueryData</code> sobre el detalle —que sí conocés— e <code>invalidateQueries</code> sobre las listas —que no—. Y devolvé la promesa de <code>invalidateQueries</code> desde <code>onSuccess</code>: así <code>isPending</code> de la mutación sigue en <code>true</code> hasta que el refetch termine, y el botón no se re-habilita mostrando todavía datos viejos. El criterio de fondo: escribí a mano solo lo que podés reconstruir con certeza; para todo lo demás, que hable el servidor.</p></details>
+
+<details><summary>Tu dashboard hace seis peticiones en cascada. ¿Alcanza con envolver todo en un <code>&lt;Suspense&gt;</code>?</summary>
+<p>No, y probablemente lo empeore. Suspense administra <em>qué se muestra mientras se espera</em>; no cambia <em>cuándo arrancan</em> las peticiones. Peor: si los seis widgets usan <code>useSuspenseQuery</code> como hermanos bajo una misma frontera, el primero suspende y React nunca llega a renderizar a los otros cinco, así que sus queries ni siquiera se registran — convertís seis peticiones paralelas en seis secuenciales. Y con una sola frontera, el usuario no ve <em>nada</em> hasta que el más lento termine: el tiempo hasta el primer contenido empeora aunque el total sea igual. Los arreglos van en este orden: <strong>(1)</strong> eliminar la dependencia falsa que causa la cascada —muchas veces el parámetro que "hacía falta" no hacía falta—, <strong>(2)</strong> disparar en paralelo con <code>useQueries</code> / <code>useSuspenseQueries</code> o prefetch en el padre, y <strong>(3)</strong> recién ahí usar Suspense, con una frontera por widget, para que cada uno aparezca cuando esté listo. Suspense es la presentación; el paralelismo es la arquitectura.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>estado de servidor no es estado de la app</strong>: es una copia que envejece sola y que no controlás. Copiarlo a <code>useState</code> o a un store crea una segunda fuente de verdad que nadie sincroniza.</li>
+  <li><code>useEffect</code> + <code>fetch</code> falla en ocho puntos. El más grave es la <strong>race condition</strong>: invisible en desarrollo, intermitente en producción, sin ningún error en consola. Se arregla con bandera de cancelación (la UI) <em>y</em> <code>AbortController</code> (la red).</li>
+  <li>El <strong>doble fetch de StrictMode no es el bug</strong>: es el detector de que falta el cleanup. Con una caché desaparece solo, por deduplicación.</li>
+  <li>Una caché de queries son cuatro piezas: <strong>hash de la clave, <code>Map</code>, promesa compartida y set de observadores</strong>. Todo el comportamiento "mágico" sale de ahí.</li>
+  <li><code>staleTime</code> es <strong>frescura</strong> (¿pido de nuevo?); <code>gcTime</code> es <strong>memoria</strong> (¿lo borro?). El reloj de <code>gcTime</code> ni siquiera arranca mientras haya un componente montado. <code>gcTime &lt; staleTime</code> es casi siempre un error.</li>
+  <li><code>isLoading === isPending &amp;&amp; isFetching</code>. Usá <code>isPending</code> para decidir el esqueleto e <code>isFetching</code> solo para un indicador sutil: confundirlos es la pantalla que parpadea sola.</li>
+  <li>Las claves se comparan <strong>por prefijo</strong>: ordenalas de lo general a lo específico y centralizalas en una fábrica. Ese diseño es lo que hace que invalidar sea una línea.</li>
+  <li>Lo optimista necesita <strong>cancelar, snapshotear, escribir y reconciliar en <code>onSettled</code></strong>. Y no va en operaciones irreversibles: mostrar "listo" y desdecirse es peor que esperar.</li>
+  <li><strong>Offset se rompe</strong> con datos que cambian —duplica y saltea—. Para feeds, cursores. Y acotá el scroll infinito con <code>maxPages</code>, porque una infinite query refetchea <em>todas</em> sus páginas.</li>
+  <li>Con RSC, hacé <code>prefetchQuery</code> en el servidor e hidratá — pero con <code>staleTime &gt; 0</code>, o el cliente vuelve a pedir todo al montar. Y un <code>QueryClient</code> por request: compartirlo filtra datos entre usuarios.</li>
+  <li>Si leés en el servidor, escribís con Server Actions y no hay polling ni datos compartidos entre componentes cliente, <strong>puede que no necesites la librería</strong>. El primer <code>router.refresh()</code> puesto "para que se vea" es la señal de que sí.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Reproducí la race condition de RS5.2 con un endpoint que demore inversamente al largo de la consulta. Filmá o capturá el estado final inconsistente. Después arreglala tres veces —bandera, <code>AbortController</code>, <code>useQuery</code>— y anotá cuántas líneas y cuántos casos borde tiene cada solución.</li>
+  <li>Implementá el <code>MiniQueryCache</code> de RS5.3 completo y usalo en dos componentes hermanos que pidan la misma clave. Verificá en Network que se hace <strong>una</strong> petición. Después agregale <code>staleTime</code> y comprobá que el segundo montaje no dispara nada.</li>
+  <li>Tomá una query real de tu app y armá una tabla con cuatro valores de <code>staleTime</code> (<code>0</code>, <code>30s</code>, <code>5min</code>, <code>Infinity</code>). Para cada uno, contá peticiones durante un minuto de uso normal y anotá el peor caso de antigüedad del dato. Decidí cuál usarías y escribí la justificación en una frase.</li>
+  <li>Encontrá en tu código un lugar donde uses <code>isFetching</code> para decidir un esqueleto. Cambialo a <code>isPending</code> y grabá un antes/después volviendo a la pestaña. Si no encontrás ninguno, buscá el caso opuesto: un refetch de fondo que el usuario no puede percibir en absoluto.</li>
+  <li>Diseñá la fábrica de claves de un módulo tuyo. Después escribí las cuatro invalidaciones que ese módulo necesita y verificá que <strong>ninguna</strong> requiera un <code>predicate</code>. Si alguna lo requiere, rediseñá la jerarquía hasta que no haga falta.</li>
+  <li>Implementá un toggle optimista completo. Después rompelo a propósito de las tres formas de RS5.7 —sin <code>cancelQueries</code>, revirtiendo la operación en vez de restaurar el snapshot, invalidando solo en <code>onSuccess</code>— y documentá qué se ve mal en cada caso. Necesitás latencia artificial de ~1s y un fallo forzado del servidor.</li>
+  <li>Convertí una lista paginada por offset a cursores. Antes de migrar, provocá el bug: cargá la página 1, insertá un registro desde otra pestaña, pedí la página 2 y mostrá el elemento duplicado. Después repetí el experimento con cursores.</li>
+  <li>Perfilá una ruta tuya con la pestaña Network en "Fast 4G" y dibujá el waterfall real. Identificá cuáles de las esperas son dependencias verdaderas y cuáles son artificiales. Aplicá los cambios y armá la tabla del Paso 7, incluyendo <strong>al menos un cambio que no haya mejorado nada</strong>.</li>
+</ol>
+
+<section class="quiz" id="quizRS5">
+  <style>
+    #quizRS5{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS5 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS5 .q{margin-bottom:1.5rem}
+    #quizRS5 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS5 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS5 .opt:hover{border-color:var(--accent)}
+    #quizRS5 .opt:disabled{cursor:default}
+    #quizRS5 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS5 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS5 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS5 .exp.show{display:block}
+    #quizRS5 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Querés que una lista se refresque cada 5 minutos. ¿Qué configurás?</p>
+    <button class="opt"><code>gcTime: 5 * 60_000</code></button>
+    <button class="opt"><code>staleTime: 5 * 60_000</code>, y dejás que los disparadores hagan el resto</button>
+    <button class="opt"><code>gcTime: 5 * 60_000</code> y <code>staleTime: 0</code>, para que no quede en memoria</button>
+    <div class="exp"><code>gcTime</code> no fuerza ningún refetch: solo decide cuándo se <strong>borra de memoria</strong> una entrada que ya no mira nadie, y su reloj ni siquiera arranca mientras haya un componente montado. Lo que buscás es <code>staleTime</code>: pasados los 5 minutos la query queda stale y el próximo disparador —montaje, foco de ventana, reconexión— la refresca. Si además querés que se refresque <em>sin</em> que nadie interactúe, eso es <code>refetchInterval</code>, que es la única opción que ignora la frescura.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu pantalla se llena de esqueletos cada vez que el usuario vuelve a la pestaña, aunque los datos ya estaban cargados. ¿Cuál es la causa?</p>
+    <button class="opt">El <code>gcTime</code> es demasiado corto y la caché se vació</button>
+    <button class="opt">Falta envolver el componente en un <code>&lt;Suspense&gt;</code></button>
+    <button class="opt">El render decide el esqueleto con <code>isFetching</code> en vez de <code>isPending</code></button>
+    <div class="exp"><code>isFetching</code> es cierto durante <strong>cualquier</strong> petición, incluidos los refetch de fondo en los que ya tenés datos perfectamente mostrables. <code>isPending</code> significa "no tengo datos", que es la única condición que justifica un esqueleto de pantalla completa. La regla exacta: <code>isLoading === isPending &amp;&amp; isFetching</code> — o sea, primera carga. Para el refetch de fondo va un indicador sutil que no cambie el layout; borrar la pantalla comunica un problema que no existe.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. En una actualización optimista, ¿por qué hay que llamar a <code>cancelQueries</code> en <code>onMutate</code>?</p>
+    <button class="opt">Porque una petición ya en vuelo puede resolver después de tu escritura optimista y pisarla con el valor viejo</button>
+    <button class="opt">Porque sin eso la mutación no se envía al servidor</button>
+    <button class="opt">Porque libera memoria antes de escribir en la caché</button>
+    <div class="exp">Es una carrera contra una petición que ya salió. Si un <code>GET</code> de esa clave estaba viajando cuando el usuario hizo clic, va a llegar unos milisegundos <em>después</em> de tu escritura optimista y va a sobrescribir la caché con el estado anterior del servidor — que todavía no conoce la mutación. El usuario ve el corazón encenderse y apagarse solo. <code>cancelQueries</code> descarta esas respuestas en vuelo para esa clave. Junto con el snapshot para el rollback y el <code>invalidateQueries</code> en <code>onSettled</code>, son los tres pasos que hacen que lo optimista sea confiable en vez de una fuente nueva de inconsistencias.</div>
+  </div>
+
+  <div class="score" id="scoreRS5"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS5');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS5').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS6.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs4-server-components/lecture.html">← RS4: Server Components</a>
+  <a href="../rs6-actions-formularios/lecture.html">RS6: Actions y formularios →</a>
+</nav>
+
+</div>
+</body>
+</html>

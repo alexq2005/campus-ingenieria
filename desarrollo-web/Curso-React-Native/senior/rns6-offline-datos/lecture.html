@@ -1,0 +1,1085 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS6 — Offline-first: datos, sincronización y conflictos · React Native Senior</title>
+  <meta name="description" content="El espectro offline, dónde guardar (AsyncStorage, MMKV, SQLite, WatermelonDB), cifrado en reposo, migraciones de esquema en dispositivos que no controlás, cola de operaciones idempotente, sincronización y resolución de conflictos.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS6</span>
+  <span class="badge">⏱ 55–130 min</span>
+  <span class="badge">🎯 Pre-req: RNS5</span>
+  <span class="badge">📴 Offline</span>
+</div>
+
+<article>
+
+<h1>RNS6 — Offline-first: datos, sincronización y conflictos</h1>
+
+<h2>RNS6.0 Por qué este módulo</h2>
+
+<p>En la web escribís código asumiendo que hay red. Es una suposición razonable: el navegador vive en una máquina que casi siempre está enchufada a algo. En móvil esa suposición es <strong>falsa por diseño</strong>. El dispositivo se mueve, entra al subte, sube en un ascensor, cruza un túnel, se queda sin datos a mitad de mes, se conecta al wifi del bar que pide login, y se va al campo donde no hay antena.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En móvil la red <strong>no es una excepción: es un estado intermitente normal</strong>. Una app que trata la desconexión como error de borde se rompe en el uso cotidiano. Y una app que trata la desconexión como algo que "se arregla con un caché" pierde datos en silencio. El trabajo senior no es "agregar soporte offline": es <em>elegir conscientemente</em> cuánto offline soporta tu producto, y pagar el costo de ese nivel entero, no la mitad.
+</div>
+
+<p>En el <a href="../../m07-datos-persistencia/lecture.html">M07 del curso base</a> viste <code>AsyncStorage</code> y un caché de lectura: mostrar lo último que se vio mientras se refresca de la red. Eso resuelve el 60% de los casos y está muy bien. Este módulo empieza justo donde ese patrón se rompe: <strong>cuando el usuario tiene que poder escribir sin conexión</strong>. Ahí aparecen la cola de operaciones, la idempotencia, el versionado, y el problema que nadie quiere mirar de frente: dos versiones distintas de la misma cosa, y alguien tiene que decidir cuál sobrevive.</p>
+
+<div class="rule">
+  <strong>📌 La frase que hay que grabarse.</strong> Leer offline es un problema de caché. <strong>Escribir offline es un problema de sistemas distribuidos.</strong> Son dos disciplinas distintas y cuestan órdenes de magnitud diferentes. Confundirlas es el origen de casi todos los desastres de sincronización.
+</div>
+
+<h2>RNS6.1 El espectro offline: cuánto necesitás de verdad</h2>
+
+<p>"Offline-first" se usa como si fuera un interruptor, y no lo es. Es una escala con cuatro escalones bien distintos, cada uno con un costo de construcción y de mantenimiento muy diferente. Antes de escribir una línea, ubicá tu app en la escala <em>a propósito</em>.</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Qué hace</th><th>Costo de construir</th><th>Costo de mantener</th><th>Cuándo se justifica</th></tr></thead>
+<tbody>
+<tr><td><strong>0 · Online-only</strong></td><td>Sin red, pantalla de error y reintentar</td><td>Casi cero</td><td>Casi cero</td><td>Panel de administración, checkout, apps de uso puntual con buena conectividad</td></tr>
+<tr><td><strong>1 · Caché de lectura</strong></td><td>Muestra lo último visto; escribir requiere red</td><td>Bajo (1–3 días)</td><td>Bajo: invalidación de caché</td><td>La mayoría de las apps de consumo: feeds, catálogos, contenido</td></tr>
+<tr><td><strong>2 · Escritura optimista con cola</strong></td><td>Deja escribir offline; encola y reintenta</td><td>Medio (1–3 semanas)</td><td>Medio: idempotencia, reintentos, errores permanentes</td><td>Mensajería, likes, formularios de campo, checklists</td></tr>
+<tr><td><strong>3 · Offline-first completo</strong></td><td>La base local es la fuente de verdad; sync bidireccional con resolución de conflictos</td><td>Alto (1–3 meses + backend)</td><td>Alto: migraciones, conflictos, soporte</td><td>Notas, relevamientos de campo, salud, logística, herramientas de trabajo real</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ La mayoría de las apps NO necesitan el nivel 3.</strong> Decilo en voz alta antes de arrancar. El nivel 3 no es "el nivel 2 pero mejor": es otro producto. Te obliga a diseñar el <em>backend</em> distinto (versionado, tombstones, cursores de sync), a mantener migraciones de esquema en dispositivos que no controlás, y a construir UI para conflictos que en el 99% de los usos no aparecen — y en el 1% restante deciden si el usuario confía en tu app o la borra. Si el caso de uso real es "a veces el ascensor", el nivel 1 o 2 es la respuesta correcta y madura.
+</div>
+
+<p>El error más caro no es elegir un nivel bajo. Es <strong>elegir el nivel 3 sin darse cuenta</strong>: alguien agrega "guardar aunque no haya internet" a una app de nivel 1, sin cola, sin versiones, sin ids de cliente. Funciona en la demo. Seis meses después, los usuarios reportan notas que desaparecen y no hay forma de reconstruir qué pasó porque nunca hubo un registro de las operaciones.</p>
+
+<div class="mistake">
+  <strong>El síntoma clásico del nivel 3 accidental:</strong> tickets de soporte que dicen "se me borró lo que había escrito" y que no podés reproducir. No podés reproducirlos porque el bug depende del orden de dos escrituras en dos dispositivos, y tu sistema no guardó ese orden en ningún lado. <strong>Si no podés reconstruir la historia, no tenés un bug: tenés un diseño.</strong>
+</div>
+
+<h2>RNS6.2 Dónde guardar: las cuatro familias de almacenamiento</h2>
+
+<p>Elegir el almacén no es una cuestión de gusto. Se decide por dos variables: <strong>el volumen</strong> de datos y <strong>la forma</strong> en que los vas a consultar. Si vas a filtrar, ordenar y unir, necesitás consultas. Si vas a leer una preferencia en el arranque, necesitás velocidad y nada más.</p>
+
+<table>
+<thead><tr><th>Opción</th><th>Modelo</th><th>API</th><th>Velocidad típica</th><th>Límite práctico</th><th>Consultas</th><th>Cuándo</th></tr></thead>
+<tbody>
+<tr><td><strong>AsyncStorage</strong></td><td>Clave → string</td><td>Asíncrona</td><td>Lenta (serializa JSON, cruza el puente en la arquitectura vieja)</td><td>~6 MB por defecto en Android</td><td>❌ Ninguna</td><td>Preferencias, flags, un token de sesión no sensible</td></tr>
+<tr><td><strong>MMKV</strong></td><td>Clave → valor tipado</td><td><strong>Síncrona</strong> (JSI)</td><td>~30× más rápida que AsyncStorage</td><td>Decenas de MB, pero está pensado para valores chicos</td><td>❌ Ninguna</td><td>Reemplazo directo de AsyncStorage; estado que se lee en el primer render</td></tr>
+<tr><td><strong>SQLite</strong></td><td>Relacional</td><td>Sync o async según la lib</td><td>Muy rápida con índices</td><td>Cientos de MB sin drama</td><td>✅ SQL completo</td><td>La opción por defecto para datos "de verdad": listas, historiales, entidades relacionadas</td></tr>
+<tr><td><strong>WatermelonDB</strong></td><td>ORM reactivo sobre SQLite</td><td>Observables</td><td>Rápida, con carga perezosa</td><td>Decenas de miles de registros</td><td>✅ Query builder</td><td>Cuando querés que la UI se actualice sola y ya venís pensando en sync</td></tr>
+<tr><td><strong>Realm / documentales</strong></td><td>Objetos</td><td>Sync con observables</td><td>Muy rápida</td><td>Grande</td><td>✅ Propio</td><td>⚠️ Verificá el estado del producto antes de casarte: el sync gestionado de Realm fue discontinuado por su proveedor</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Riesgo de proveedor, no técnico.</strong> Realm era la respuesta cómoda a "quiero sync gestionado" hasta que MongoDB anunció el fin de Atlas Device Sync. La base local sigue existiendo, pero el servicio de sincronización administrado dejó de ser una apuesta segura. La lección no es "Realm malo": es que <strong>en offline-first, el componente que más te ata es el motor de sincronización</strong>, no la base de datos. Elegí sabiendo qué pasa si ese proveedor desaparece.
+</div>
+
+<p>Las cuatro familias se instalan así. Fijate que tres de las cuatro traen código nativo: eso significa que no corren en Expo Go y necesitan una <em>development build</em> — un detalle que conviene resolver antes de elegir, no después.</p>
+
+<pre><code class="lang-bash"># Clave-valor rápido (JSI, síncrono)
+npx expo install react-native-mmkv
+
+# SQLite: la opción de Expo, o la de mayor rendimiento
+npx expo install expo-sqlite
+npm  install @op-engineering/op-sqlite
+
+# ORM reactivo con protocolo de sync
+npm install @nozbe/watermelondb
+
+# Secretos en Keychain / Keystore + conectividad
+npx expo install expo-secure-store @react-native-community/netinfo
+
+# Todo lo anterior lleva codigo nativo -&gt; hace falta build propia
+npx expo run:ios      # o: eas build --profile development</code></pre>
+
+<h3>AsyncStorage: por qué sigue existiendo y por qué no alcanza</h3>
+
+<p>Es la API que aprendiste en M07 y está bien para lo que fue diseñada. El problema empieza cuando se usa como base de datos:</p>
+
+<pre><code class="lang-tsx">import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// 🔴 El antipatrón más común de offline en RN
+async function guardarNotas(notas: Nota[]) {
+  await AsyncStorage.setItem('notas', JSON.stringify(notas));
+}
+
+async function agregarNota(nueva: Nota) {
+  const crudo = await AsyncStorage.getItem('notas');
+  const notas = crudo ? JSON.parse(crudo) : [];
+  notas.push(nueva);
+  await AsyncStorage.setItem('notas', JSON.stringify(notas));  // reescribe TODO
+}</code></pre>
+
+<p>Ese código tiene tres defectos que no se ven con 20 notas y son fatales con 2.000:</p>
+
+<div class="step"><strong>1. Reescribe todo el dataset por cada cambio.</strong> Agregar una nota de 200 bytes serializa y escribe el megabyte entero. El costo crece con el total, no con el cambio.</div>
+
+<div class="step"><strong>2. No hay atomicidad.</strong> Si dos partes de la app hacen ese <em>read-modify-write</em> al mismo tiempo, una pisa a la otra. No hay transacción, no hay bloqueo, no hay error: simplemente falta una nota.</div>
+
+<div class="step"><strong>3. Hay un límite duro.</strong> En Android, AsyncStorage se apoya en SQLite con un tope por defecto de ~6 MB. Cuando lo cruzás, el <code>setItem</code> falla — y si no estás mirando ese error, la app sigue como si nada con datos viejos.</div>
+
+<h3>MMKV: la mejora de una línea</h3>
+
+<p>MMKV es clave-valor igual que AsyncStorage, pero está construido sobre <strong>JSI</strong> (el mecanismo que viste en <a href="../rns1-nueva-arquitectura/lecture.html">RNS1</a>): el código JS llama a C++ directamente, sin puente y sin serializar a JSON. Eso lo vuelve <em>síncrono</em>, que es la característica que más cambia el código:</p>
+
+<pre><code class="lang-tsx">import { MMKV } from 'react-native-mmkv';
+
+export const almacen = new MMKV({
+  id: 'app-notas',
+  encryptionKey: undefined,   // ver RNS6.3: la clave NO se hardcodea acá
+});
+
+// Síncrono: se puede leer durante el primer render, sin useEffect ni spinner
+const temaGuardado = almacen.getString('tema') ?? 'sistema';
+
+export function usarTema() {
+  const [tema, setTema] = useState(temaGuardado);   // ya tiene el valor real
+  const cambiar = (nuevo: string) =&gt; {
+    almacen.set('tema', nuevo);   // sin await
+    setTema(nuevo);
+  };
+  return { tema, cambiar };
+}</code></pre>
+
+<div class="tip">
+  Ese detalle —poder leer en el primer render— elimina toda una categoría de bugs visuales: el <em>flash</em> de tema claro antes de aplicar el oscuro, el idioma que parpadea, la pantalla de login que aparece medio segundo aunque haya sesión. Con AsyncStorage necesitás un estado "cargando" para eso. Con MMKV, no existe el problema.
+</div>
+
+<p>Lo que MMKV <strong>no</strong> resuelve: sigue siendo clave-valor. No podés preguntar "las notas del último mes con etiqueta trabajo ordenadas por fecha". Para eso hace falta SQL.</p>
+
+<h3>SQLite: la opción por defecto para datos reales</h3>
+
+<pre><code class="lang-tsx">import { open } from '@op-engineering/op-sqlite';
+
+const db = open({ name: 'notas.db' });
+
+db.execute(`
+  CREATE TABLE IF NOT EXISTS notas (
+    id            TEXT PRIMARY KEY,
+    titulo        TEXT NOT NULL,
+    cuerpo        TEXT NOT NULL DEFAULT '',
+    etiqueta      TEXT,
+    version       INTEGER NOT NULL DEFAULT 0,
+    actualizado   INTEGER NOT NULL,
+    borrado       INTEGER NOT NULL DEFAULT 0
+  );
+`);
+db.execute(`CREATE INDEX IF NOT EXISTS idx_notas_etiqueta ON notas(etiqueta, actualizado DESC);`);
+
+// Una consulta real, resuelta por el motor y no por JavaScript
+const { rows } = db.execute(
+  `SELECT id, titulo, actualizado FROM notas
+   WHERE borrado = 0 AND etiqueta = ?
+   ORDER BY actualizado DESC LIMIT 50`,
+  ['trabajo'],
+);</code></pre>
+
+<div class="rule">
+  <strong>📌 La diferencia que importa no es "SQL vs JSON": es dónde corre el filtro.</strong> Con AsyncStorage tenés que traer <em>todo</em> a memoria, parsear el JSON completo y filtrar en JS — en el hilo que también dibuja la pantalla. Con SQLite, el motor usa un índice, toca las páginas necesarias y te devuelve 50 filas. Con 10.000 registros la diferencia es entre una lista instantánea y una app que se congela dos segundos al abrir.
+</div>
+
+<h3>WatermelonDB: SQLite con reactividad y sync incorporado</h3>
+
+<p>WatermelonDB pone una capa reactiva encima de SQLite: los componentes se suscriben a consultas y se vuelven a renderizar solos cuando esos datos cambian. Además —y esto es lo que lo vuelve relevante en este módulo— trae un <strong>protocolo de sincronización</strong> ya diseñado con <code>pullChanges</code> / <code>pushChanges</code>, que es exactamente el par que vamos a construir a mano en RNS6.6.</p>
+
+<pre><code class="lang-tsx">import { synchronize } from '@nozbe/watermelondb/sync';
+
+await synchronize({
+  database,
+  pullChanges: async ({ lastPulledAt }) =&gt; {
+    const r = await fetch(`${API}/sync?desde=${lastPulledAt ?? 0}`);
+    const { changes, timestamp } = await r.json();
+    return { changes, timestamp };     // created / updated / deleted por tabla
+  },
+  pushChanges: async ({ changes, lastPulledAt }) =&gt; {
+    await fetch(`${API}/sync`, {
+      method: 'POST',
+      body: JSON.stringify({ changes, lastPulledAt }),
+    });
+  },
+});</code></pre>
+
+<div class="info">
+  Adoptar una librería de sync te ahorra el <em>mecanismo</em> (cursores, lotes, tombstones), pero <strong>no te ahorra las decisiones</strong>: seguís teniendo que definir qué pasa cuando dos dispositivos cambiaron el mismo campo. Por eso este módulo enseña primero el problema y después las herramientas. Si no entendés el conflicto, ninguna librería lo va a resolver bien por vos: va a elegir un default, y ese default va a ser "el último gana".
+</div>
+
+<h2>RNS6.3 Cifrado en reposo y qué NO guardar en el dispositivo</h2>
+
+<p>Todo lo que guardás localmente vive en un aparato que se pierde, se roba, se presta y a veces está rooteado. El sistema operativo ayuda —iOS cifra el sandbox con Data Protection si hay código de acceso, Android usa cifrado basado en archivos— pero esas garantías se caen con un dispositivo comprometido, con un backup a la nube mal configurado, o con un usuario que no puso PIN.</p>
+
+<div class="danger">
+  <strong>⚠️ Lo primero es no guardar.</strong> El dato más seguro es el que no está en el teléfono. Antes de preguntarte cómo cifrar algo, preguntate si el flujo necesita que ese algo exista offline. Números completos de tarjeta, documentos de identidad, historia clínica que solo se consulta con red, tokens de larga duración sin rotación: <strong>si no lo necesitás offline, no lo persistas</strong>.
+</div>
+
+<p>Para lo que sí tiene que quedarse, hay dos niveles y no son intercambiables:</p>
+
+<table>
+<thead><tr><th>Qué</th><th>Dónde va</th><th>API en RN</th><th>Respaldo del SO</th></tr></thead>
+<tbody>
+<tr><td>Secretos chicos: tokens, claves de cifrado, refresh tokens</td><td><strong>Keychain (iOS) / Keystore (Android)</strong></td><td><code>expo-secure-store</code>, <code>react-native-keychain</code></td><td>Hardware seguro (Secure Enclave / TEE); puede exigir biometría</td></tr>
+<tr><td>Datos de la app: la base local completa</td><td>Base cifrada con una clave que vive en Keychain/Keystore</td><td>MMKV con <code>encryptionKey</code>, SQLite con SQLCipher</td><td>Cifrado a nivel archivo; la clave nunca toca el disco en claro</td></tr>
+<tr><td>Datos públicos o derivables</td><td>Sin cifrar está bien</td><td>Lo que uses</td><td>El cifrado del sistema de archivos</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">import * as SecureStore from 'expo-secure-store';
+import { MMKV } from 'react-native-mmkv';
+import * as Crypto from 'expo-crypto';
+
+const CLAVE_DB = 'clave-cifrado-notas';
+
+// La clave se genera UNA vez en el dispositivo y vive en Keychain/Keystore.
+// Nunca se hardcodea, nunca viaja al server, nunca se guarda en AsyncStorage.
+async function obtenerClave(): Promise&lt;string&gt; {
+  let clave = await SecureStore.getItemAsync(CLAVE_DB);
+  if (!clave) {
+    const bytes = await Crypto.getRandomBytesAsync(32);
+    clave = Array.from(bytes, (b) =&gt; b.toString(16).padStart(2, '0')).join('');
+    await SecureStore.setItemAsync(CLAVE_DB, clave, {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+  }
+  return clave;
+}
+
+export async function abrirAlmacenCifrado() {
+  return new MMKV({ id: 'notas-privadas', encryptionKey: await obtenerClave() });
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error que anula todo el cifrado:</strong> generar la clave en el código (<code>encryptionKey: 'mi-clave-secreta-123'</code>) o guardarla junto a los datos. Una clave que está en el bundle JavaScript la extrae cualquiera con un descompilador en cinco minutos — y tu bundle viaja en cada instalación y en cada actualización OTA (<a href="../rns7-build-ota/lecture.html">RNS7</a>). <strong>Cifrar con una clave pública es teatro, no seguridad.</strong>
+</div>
+
+<p>El otro detalle que se pasa por alto son los <strong>backups automáticos</strong>. Por defecto, iOS puede subir el contenedor de la app a iCloud y Android puede respaldarla en Google Drive. Si tu base local tiene datos sensibles, esa copia sale del dispositivo y del modelo de amenazas que pensaste. Se excluye explícitamente: <code>android:allowBackup="false"</code> (o reglas de <code>dataExtractionRules</code>) y, en iOS, marcando el archivo con <code>NSURLIsExcludedFromBackupKey</code> o guardándolo en un directorio que no se respalda.</p>
+
+<div class="info">
+  <strong>📚 Profundizá.</strong> Qué significa "cifrado en reposo", por qué una clave derivada de una contraseña no es lo mismo que una clave aleatoria, y por qué el hardware seguro importa: <a href="../../../../sistemas/Curso-Ciberseguridad/m01-criptografia/lecture.html">Curso de Ciberseguridad — M01: Criptografía</a>. Este módulo asume esos conceptos y se concentra en dónde ponerlos en una app RN.
+</div>
+
+<h2>RNS6.4 Migraciones de esquema en un dispositivo que no controlás</h2>
+
+<p>En el servidor, una migración es un procedimiento con red de contención: la corrés en <em>staging</em>, tenés backup, y si sale mal restaurás y revertís el deploy. En un teléfono no tenés nada de eso.</p>
+
+<div class="rule">
+  <strong>📌 Por qué una migración fallida en móvil es peor que en el servidor.</strong> <strong>(1)</strong> No podés hacer rollback del dispositivo: la app 2.0 ya se instaló y la base ya se transformó. <strong>(2)</strong> No tenés backup de los datos del usuario — a menos que el servidor tenga todo, y si lo tuviera no necesitarías offline-first. <strong>(3)</strong> Las versiones conviven durante meses: siempre hay gente en 1.8, en 1.9 y en 2.0 al mismo tiempo, y a veces la misma persona en dos dispositivos. <strong>(4)</strong> Si la app crashea al arrancar por una migración rota, el usuario no puede ni abrirla para que le mandes el fix.
+</div>
+
+<p>El mecanismo básico en SQLite es <code>PRAGMA user_version</code>: un entero que la base guarda por vos y que usás como número de esquema.</p>
+
+<pre><code class="lang-sql">-- Leer la versión actual del esquema en el dispositivo
+PRAGMA user_version;
+
+-- Migración 1 -&gt; 2: SOLO agregar. Nada destructivo.
+ALTER TABLE notas ADD COLUMN etiqueta TEXT;
+CREATE INDEX IF NOT EXISTS idx_notas_etiqueta ON notas(etiqueta, actualizado DESC);
+PRAGMA user_version = 2;</code></pre>
+
+<pre><code class="lang-tsx">type Migracion = { version: number; sql: string[] };
+
+const MIGRACIONES: Migracion[] = [
+  { version: 1, sql: [`CREATE TABLE notas (id TEXT PRIMARY KEY, titulo TEXT NOT NULL,
+                       cuerpo TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
+                       actualizado INTEGER NOT NULL, borrado INTEGER NOT NULL DEFAULT 0)`] },
+  { version: 2, sql: [`ALTER TABLE notas ADD COLUMN etiqueta TEXT`] },
+  { version: 3, sql: [`CREATE TABLE outbox (id TEXT PRIMARY KEY, entidad TEXT NOT NULL,
+                       entidad_id TEXT NOT NULL, op TEXT NOT NULL, payload TEXT NOT NULL,
+                       base_version INTEGER, creado INTEGER NOT NULL,
+                       intentos INTEGER NOT NULL DEFAULT 0, proximo_intento INTEGER NOT NULL DEFAULT 0,
+                       estado TEXT NOT NULL DEFAULT 'pendiente')`] },
+];
+
+const ESQUEMA_ESPERADO = MIGRACIONES[MIGRACIONES.length - 1].version;
+
+export function migrar(db: DB) {
+  const actual = Number(db.execute('PRAGMA user_version').rows[0].user_version);
+
+  // 🔴 El caso que nadie prevé: app VIEJA abriendo datos NUEVOS
+  if (actual &gt; ESQUEMA_ESPERADO) {
+    throw new EsquemaDelFuturo(actual, ESQUEMA_ESPERADO);
+  }
+
+  for (const m of MIGRACIONES.filter((m) =&gt; m.version &gt; actual)) {
+    db.transaction(() =&gt; {                 // una transacción POR migración
+      for (const sentencia of m.sql) db.execute(sentencia);
+      db.execute(`PRAGMA user_version = ${m.version}`);
+    });
+  }
+}</code></pre>
+
+<h3>La app vieja que abre datos nuevos</h3>
+
+<p>Este escenario parece imposible hasta que lo ves. Ocurre en tres situaciones muy reales: un <strong>rollback de una actualización OTA</strong> (RNS7) que devuelve el bundle JS a una versión anterior sobre una base ya migrada; un usuario que restaura un backup de un teléfono nuevo en uno viejo; o dos dispositivos de la misma persona con versiones distintas compartiendo datos sincronizados.</p>
+
+<div class="danger">
+  <strong>⚠️ Nunca sigas adelante con un esquema del futuro.</strong> Una app que no conoce la columna <code>etiqueta</code> va a hacer <code>SELECT *</code>, va a ignorarla, y en el próximo <code>UPDATE</code> la va a dejar en <code>NULL</code> o va a reescribir la fila sin ese dato. Es pérdida silenciosa de información. La respuesta correcta es <strong>detenerse y pedir actualizar</strong>: una pantalla que dice "estos datos fueron creados por una versión más nueva de la app, actualizá para seguir", con el botón a la tienda. Es feo, y es infinitamente mejor que corromper.
+</div>
+
+<h3>Las cuatro reglas de las migraciones móviles</h3>
+
+<div class="step"><strong>1. Solo hacia adelante y solo aditivas.</strong> Agregar columnas y tablas es seguro. <code>DROP COLUMN</code> y renombrar no lo son: si tenés que retirar un campo, dejalo muerto una o dos versiones y limpialo cuando el 99% de los usuarios ya migró.</div>
+
+<div class="step"><strong>2. Cada migración en su propia transacción.</strong> Si la 4 falla, la 3 tiene que quedar aplicada y persistida. Meter todas en una transacción gigante convierte cualquier error en "volver a la versión 1 con 200 MB de datos a medio transformar".</div>
+
+<div class="step"><strong>3. Probá el camino largo, no solo el último salto.</strong> El bug clásico está en el usuario que venía de la versión 1.2 y salta a la 3.0 sin pasar por las intermedias. Tu test de migraciones tiene que arrancar de una base creada por cada versión publicada, no de una base nueva.</div>
+
+<div class="step"><strong>4. Definí el plan B <em>antes</em>, no durante el incidente.</strong> Si la migración falla, ¿podés borrar la base local y re-sincronizar desde el servidor? Solo si el servidor tiene absolutamente todo. Si hay datos que únicamente existen en el dispositivo, no hay plan B — y eso hay que saberlo el día del diseño, no el día del crash.</div>
+
+<h2>RNS6.5 La cola de operaciones: el corazón de la escritura offline</h2>
+
+<p>Cuando el usuario escribe sin conexión, la escritura tiene que ir a algún lado. Ese lado es una <strong>cola persistente de operaciones</strong> —el patrón <em>outbox</em>— que vive en la misma base local, se escribe en la misma transacción que el dato, y se drena cuando hay red.</p>
+
+<pre><code class="lang-sql">CREATE TABLE outbox (
+  id              TEXT PRIMARY KEY,   -- UUID: ESTE es el id de idempotencia
+  entidad         TEXT NOT NULL,      -- 'nota'
+  entidad_id      TEXT NOT NULL,      -- id de la nota (generado en el cliente)
+  op              TEXT NOT NULL,      -- 'crear' | 'actualizar' | 'borrar'
+  payload         TEXT NOT NULL,      -- JSON del cambio
+  payload_version INTEGER NOT NULL,   -- formato del payload, ver más abajo
+  base_version    INTEGER,            -- versión sobre la que se editó (conflictos)
+  creado          INTEGER NOT NULL,
+  intentos        INTEGER NOT NULL DEFAULT 0,
+  proximo_intento INTEGER NOT NULL DEFAULT 0,
+  estado          TEXT NOT NULL DEFAULT 'pendiente',  -- pendiente|enviando|fallo|muerta
+  ultimo_error    TEXT
+);
+CREATE INDEX idx_outbox_listas ON outbox(estado, proximo_intento);</code></pre>
+
+<p>La regla que hace que esto funcione es que <strong>el dato y su operación se escriben juntos, en una sola transacción</strong>. Si guardás la nota y después encolás en dos pasos separados, un cierre de la app entre ambos deja una nota que nunca se va a sincronizar — o una operación para una nota que no existe.</p>
+
+<pre><code class="lang-tsx">import { v7 as uuidv7 } from 'uuid';
+
+export function editarNota(db: DB, id: string, cambios: Partial&lt;Nota&gt;) {
+  db.transaction(() =&gt; {
+    const nota = leerNota(db, id);
+
+    db.execute(
+      `UPDATE notas SET titulo = ?, cuerpo = ?, actualizado = ? WHERE id = ?`,
+      [cambios.titulo ?? nota.titulo, cambios.cuerpo ?? nota.cuerpo, Date.now(), id],
+    );
+
+    db.execute(
+      `INSERT INTO outbox (id, entidad, entidad_id, op, payload, payload_version,
+                           base_version, creado, proximo_intento)
+       VALUES (?, 'nota', ?, 'actualizar', ?, 1, ?, ?, 0)`,
+      [uuidv7(), id, JSON.stringify(cambios), nota.version, Date.now()],
+    );
+  });   // ✅ atómico: o quedan las dos cosas, o ninguna
+}</code></pre>
+
+<h3>Idempotencia: la propiedad no negociable</h3>
+
+<div class="concept">
+  <strong>💡 La misma operación se va a enviar dos veces. Garantizado.</strong> No es una posibilidad remota: es lo que pasa cada vez que el servidor procesa el pedido y la respuesta se pierde en el camino. Desde el cliente, "timeout" y "el servidor no lo recibió" son indistinguibles. Si reintentás —y tenés que reintentar— la operación se aplica dos veces. <strong>Una operación idempotente es aquella que aplicada N veces deja el mismo resultado que aplicada una vez.</strong>
+</div>
+
+<p>La forma estándar de conseguirlo es un identificador de operación generado por el cliente, que el servidor guarda y usa para deduplicar:</p>
+
+<pre><code class="lang-tsx">async function enviarOperacion(op: OperacionOutbox) {
+  const r = await fetch(`${API}/notas/${op.entidad_id}`, {
+    method: op.op === 'crear' ? 'POST' : op.op === 'borrar' ? 'DELETE' : 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': op.id,              // ← el UUID de la fila del outbox
+      'If-Match': String(op.base_version),   // ← control de concurrencia (RNS6.6)
+    },
+    body: op.op === 'borrar' ? undefined : op.payload,
+  });
+  return r;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 El contrato del servidor.</strong> Al recibir una <code>Idempotency-Key</code> que ya procesó, el servidor <strong>no vuelve a aplicar el cambio</strong>: devuelve la respuesta que dio la primera vez. Esto es trabajo de backend, y es la mitad del sistema. Si el backend no lo implementa, ninguna cantidad de cuidado en el cliente evita los duplicados: vas a ver la misma nota tres veces y no vas a poder culpar a React Native.
+</div>
+
+<h3>Orden, reintentos y errores permanentes</h3>
+
+<p>Tres decisiones que definen si tu cola es sólida o una fuente de bugs:</p>
+
+<div class="step"><strong>Orden.</strong> Las operaciones sobre <em>la misma entidad</em> tienen que ir en orden estricto (crear antes que editar, editar antes que borrar). Enviar toda la cola en paralelo es la forma más rápida de que el servidor reciba un "editar la nota X" antes de haberla creado. La regla práctica: paralelizá entre entidades distintas, serializá dentro de cada entidad.</div>
+
+<div class="step"><strong>Reintentos con backoff exponencial y <em>jitter</em>.</strong> Sin backoff, mil dispositivos que recuperan señal al mismo tiempo martillan tu API a la vez. El jitter (una fracción aleatoria) es lo que evita que todos reintenten sincronizados en el mismo segundo.</div>
+
+<div class="step"><strong>Retriable vs permanente.</strong> Un 500 o un fallo de red se reintentan. Un 400 (payload inválido), un 403 (sin permiso) o un 422 <strong>nunca</strong> se van a arreglar solos: reintentarlos para siempre es un bucle infinito que gasta batería y datos. Van a un estado <em>muerta</em>, con su error guardado, y se le muestran al usuario.</div>
+
+<pre><code class="lang-tsx">const MAX_INTENTOS = 8;
+
+function esRetriable(status: number | null) {
+  if (status === null) return true;             // error de red: sí
+  if (status === 408 || status === 429) return true;
+  return status &gt;= 500;                          // 5xx: sí. 4xx: no.
+}
+
+function proximoIntento(intentos: number) {
+  const base = Math.min(1000 * 2 ** intentos, 5 * 60_000);   // techo de 5 min
+  const jitter = Math.random() * base * 0.3;                 // ±30% de dispersión
+  return Date.now() + base + jitter;
+}
+
+export async function drenarOutbox(db: DB) {
+  const pendientes = db.execute(
+    `SELECT * FROM outbox
+     WHERE estado IN ('pendiente','fallo') AND proximo_intento &lt;= ?
+     ORDER BY creado ASC`,
+    [Date.now()],
+  ).rows;
+
+  // Serializado por entidad, paralelo entre entidades distintas
+  for (const grupo of agruparPor(pendientes, (o) =&gt; o.entidad_id)) {
+    for (const op of grupo) {
+      let status: number | null = null;
+      try {
+        const r = await enviarOperacion(op);
+        status = r.status;
+        if (r.ok) { confirmar(db, op, await r.json()); continue; }
+        if (r.status === 409) { registrarConflicto(db, op, await r.json()); continue; }
+      } catch { /* red caída: status queda en null */ }
+
+      const intentos = op.intentos + 1;
+      const muerta = !esRetriable(status) || intentos &gt;= MAX_INTENTOS;
+      db.execute(
+        `UPDATE outbox SET intentos = ?, estado = ?, proximo_intento = ?, ultimo_error = ?
+         WHERE id = ?`,
+        [intentos, muerta ? 'muerta' : 'fallo', proximoIntento(intentos),
+         String(status ?? 'red'), op.id],
+      );
+      if (muerta) break;   // no sigas con la misma entidad: el orden ya se rompió
+    }
+  }
+}</code></pre>
+
+<div class="warn">
+  <strong>Ese <code>break</code> vale oro.</strong> Si la operación "crear nota X" murió, mandar el "editar nota X" que venía detrás es garantía de error y de datos inconsistentes. Cuando una operación de una entidad falla de forma permanente, <strong>toda la cola de esa entidad queda bloqueada</strong> hasta que alguien —el usuario o vos— resuelva el problema. Es incómodo y es correcto.
+</div>
+
+<h2>RNS6.6 Sincronización: pull, push y el modelo de consistencia</h2>
+
+<p>Un ciclo de sync tiene dos mitades. El <strong>push</strong> ya lo construimos: es drenar el outbox. El <strong>pull</strong> es traer lo que cambió en el servidor desde la última vez, y su pieza central es el <em>cursor</em>.</p>
+
+<pre><code class="lang-tsx">export async function sincronizar(db: DB) {
+  await drenarOutbox(db);            // 1. push primero: mandá lo tuyo
+
+  const cursor = leerCursor(db);      // 2. pull: pedí lo que cambió después del cursor
+  let siguiente: string | null = cursor;
+
+  do {
+    const r = await fetch(`${API}/sync?cursor=${siguiente ?? ''}&amp;limite=500`);
+    const { cambios, proximoCursor, hayMas } = await r.json();
+
+    db.transaction(() =&gt; {
+      for (const c of cambios) {
+        if (c.borrado) {
+          db.execute(`DELETE FROM notas WHERE id = ? AND version &lt;= ?`, [c.id, c.version]);
+        } else {
+          db.execute(
+            `INSERT INTO notas (id, titulo, cuerpo, etiqueta, version, actualizado, borrado)
+             VALUES (?,?,?,?,?,?,0)
+             ON CONFLICT(id) DO UPDATE SET
+               titulo=excluded.titulo, cuerpo=excluded.cuerpo, etiqueta=excluded.etiqueta,
+               version=excluded.version, actualizado=excluded.actualizado
+             WHERE notas.version &lt; excluded.version`,   // nunca pises algo más nuevo
+            [c.id, c.titulo, c.cuerpo, c.etiqueta, c.version, c.actualizado],
+          );
+        }
+      }
+      guardarCursor(db, proximoCursor);   // cursor y datos: misma transacción
+    });
+
+    siguiente = hayMas ? proximoCursor : null;
+  } while (siguiente);
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Tres reglas del pull que se aprenden a los golpes.</strong> <strong>(1)</strong> El cursor lo emite <em>el servidor</em>, nunca lo calcula el cliente con su propio reloj. <strong>(2)</strong> El cursor se guarda en la <em>misma transacción</em> que los datos que trajo; si no, un cierre a destiempo deja el cursor adelantado y esos cambios no llegan nunca. <strong>(3)</strong> Los borrados necesitan <em>tombstones</em>: si el servidor simplemente deja de mandar una fila, el cliente no tiene forma de distinguir "se borró" de "no cambió".
+</div>
+
+<h3>Última escritura gana vs. versionado</h3>
+
+<table>
+<thead><tr><th>Modelo</th><th>Cómo detecta el conflicto</th><th>Qué necesita el backend</th><th>Qué pasa cuando hay conflicto</th><th>Riesgo</th></tr></thead>
+<tbody>
+<tr><td><strong>LWW por reloj del cliente</strong></td><td>No lo detecta</td><td>Nada: un <code>UPDATE</code> pelado</td><td>Gana el último en llegar (o el de reloj más adelantado)</td><td>🔴 Alto: pérdida silenciosa, y el reloj del cliente es manipulable</td></tr>
+<tr><td><strong>LWW por reloj del servidor</strong></td><td>No lo detecta</td><td><code>updated_at</code> del servidor</td><td>Gana el último en llegar</td><td>🟠 Medio: no hay pérdida por reloj falso, pero sí pérdida silenciosa</td></tr>
+<tr><td><strong>Versión / ETag</strong></td><td>✅ <code>base_version ≠ version_actual</code></td><td>Contador por fila + rechazo con 409</td><td>El servidor rechaza y el cliente decide</td><td>🟢 Bajo: el conflicto se vuelve visible</td></tr>
+<tr><td><strong>Vector de versiones</strong></td><td>✅ Y además sabe <em>quién</em> divergió</td><td>Un contador por dispositivo</td><td>Permite merges más finos</td><td>🟢 Bajo, pero complejidad alta</td></tr>
+</tbody>
+</table>
+
+<p>El salto de calidad está en la tercera fila y es sorprendentemente barato: un entero por fila y un <code>WHERE</code> en el servidor.</p>
+
+<pre><code class="lang-sql">-- Servidor: la escritura condicional que convierte una pérdida silenciosa
+-- en un conflicto explícito.
+UPDATE notas
+   SET titulo = $1, cuerpo = $2, version = version + 1, actualizado = now()
+ WHERE id = $3
+   AND version = $4;          -- $4 = base_version que mandó el cliente
+
+-- 0 filas afectadas -&gt; alguien más escribió primero -&gt; responder 409 Conflict
+-- con la versión y el contenido actuales del servidor.</code></pre>
+
+<div class="concept">
+  <strong>💡 Detectar no es resolver.</strong> El versionado te dice <em>que</em> hay conflicto; no te dice qué hacer. Esa es la parte difícil, y es la siguiente sección. Pero notá el cambio de naturaleza del problema: pasaste de "perdí datos y no sé por qué" a "tengo dos versiones y tengo que decidir". El segundo es un problema de producto que se puede resolver. El primero es un agujero.
+</div>
+
+<h2>RNS6.7 Resolución de conflictos: la parte difícil</h2>
+
+<p>Hay exactamente cinco estrategias serias. No son alternativas de gusto: cada una encaja con una forma distinta de dato, y la mayoría de las apps usan más de una a la vez.</p>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Cómo funciona</th><th>¿Pierde datos?</th><th>Complejidad</th><th>Cuándo usarla</th></tr></thead>
+<tbody>
+<tr><td><strong>LWW</strong> (última gana)</td><td>Se queda la escritura más reciente y se descarta la otra</td><td>🔴 Sí, entera y en silencio</td><td>Trivial</td><td>Datos de bajo valor y reemplazables: preferencias, "leído", posición de scroll</td></tr>
+<tr><td><strong>Merge por campo</strong></td><td>Compara campo a campo; solo hay conflicto si el <em>mismo</em> campo cambió en ambos lados</td><td>🟠 Solo en el campo realmente disputado</td><td>Media</td><td>Entidades con campos independientes: perfil, configuración, formularios largos</td></tr>
+<tr><td><strong>Append-only</strong></td><td>No existe el update: todo es un evento nuevo. El estado se deriva</td><td>🟢 No: no hay nada que pisar</td><td>Media (el modelo cambia)</td><td>Chat, mediciones, bitácoras, historial de acciones</td></tr>
+<tr><td><strong>CRDT</strong></td><td>Estructuras que convergen matemáticamente sin coordinación (Yjs, Automerge)</td><td>🟢 No: converge en el mismo resultado en todos los nodos</td><td>Alta</td><td>Edición colaborativa real, texto compartido, listas concurrentes</td></tr>
+<tr><td><strong>Preguntar al usuario</strong></td><td>Se muestran las dos versiones y decide una persona</td><td>🟢 No, si guardás la perdedora</td><td>Baja en lógica, media en UI</td><td>Contenido irreemplazable y conflictos poco frecuentes</td></tr>
+</tbody>
+</table>
+
+<h3>Merge por campo: el punto dulce</h3>
+
+<pre><code class="lang-tsx">type Campo = keyof Nota;
+
+function fusionarPorCampo(base: Nota, local: Nota, remoto: Nota) {
+  const resultado: Nota = { ...remoto };
+  const enDisputa: Campo[] = [];
+
+  for (const campo of ['titulo', 'cuerpo', 'etiqueta'] as Campo[]) {
+    const cambioLocal  = local[campo]  !== base[campo];
+    const cambioRemoto = remoto[campo] !== base[campo];
+
+    if (cambioLocal &amp;&amp; !cambioRemoto) resultado[campo] = local[campo];   // solo yo
+    else if (!cambioLocal &amp;&amp; cambioRemoto) { /* solo el otro: ya está en remoto */ }
+    else if (cambioLocal &amp;&amp; cambioRemoto &amp;&amp; local[campo] !== remoto[campo]) {
+      enDisputa.push(campo);   // los dos, y distinto -&gt; conflicto REAL
+    }
+  }
+  return { resultado, enDisputa };
+}</code></pre>
+
+<div class="tip">
+  Fijate lo que hace esta función: convierte "conflicto en la nota" en "conflicto en el campo <code>cuerpo</code>". En la práctica, la enorme mayoría de los conflictos son falsos —una persona cambió la etiqueta y otra el título— y el merge por campo los resuelve solo. Solo llegás a molestar al usuario cuando dos personas escribieron sobre la <em>misma</em> cosa. Esa reducción de ruido es la diferencia entre una UI de conflictos usable y una que el usuario aprende a ignorar.
+</div>
+
+<h3>CRDT: qué son y cuándo valen la pena</h3>
+
+<p>Un <strong>CRDT</strong> (tipo de dato replicado sin conflictos) es una estructura diseñada para que las operaciones concurrentes se puedan aplicar en cualquier orden y siempre den el mismo resultado. Un contador CRDT no guarda "el valor": guarda "+1 del dispositivo A, +1 del dispositivo B", y sumar es conmutativo, así que ambos llegan a 2 sin ponerse de acuerdo. Para texto, la idea se extiende dando a cada carácter una identidad, de modo que insertar en la posición 5 desde dos lados produce un documento que contiene ambas inserciones.</p>
+
+<div class="warn">
+  <strong>Los CRDT no eliminan el conflicto: eliminan la <em>divergencia</em>.</strong> Garantizan que todos los dispositivos terminen con el mismo documento — no que ese documento sea el que el usuario quería. Si dos personas reescriben el mismo párrafo, el CRDT produce una fusión determinista de ambas versiones, que puede ser una oración sin sentido. Es exactamente lo correcto para escritura colaborativa en vivo (donde ves lo que el otro tipea) y a menudo incorrecto para edición asincrónica de a uno.
+</div>
+
+<p>El costo real: cambia el formato de almacenamiento (guardás la estructura CRDT, no el string), cambia el protocolo (mandás actualizaciones binarias, no el documento), agrega metadatos que crecen con la historia de edición, y hace que todo el debugging sea más difícil. <strong>Es la respuesta correcta a un problema específico, y una complejidad enorme para todos los demás.</strong></p>
+
+<h3>Preguntarle al usuario: la opción honesta</h3>
+
+<div class="rule">
+  <strong>📌 No es una derrota del diseño: es una decisión de producto.</strong> Cuando dos versiones de algo valioso entran en conflicto, la persona que escribió ese contenido es la única que sabe cuál importa. Ninguna heurística tuya lo sabe. Preguntar tiene dos condiciones: <strong>(1)</strong> que el conflicto sea infrecuente —si preguntás todos los días, el usuario va a apretar cualquier botón—, y <strong>(2)</strong> que <em>nunca</em> destruyas la versión perdedora: se guarda como copia, con su fecha y su origen. Un conflicto bien manejado se puede deshacer; uno mal manejado, no.
+</div>
+
+<h2>RNS6.8 Detección de conectividad: "tiene wifi" no es "hay internet"</h2>
+
+<p>La pregunta que hace todo el mundo es <code>isConnected</code>, y responde algo que casi nunca es lo que necesitás: que exista una interfaz de red activa. Eso es verdad cuando el teléfono está enganchado al wifi del hotel que todavía no dejaste pasar por el portal de login, cuando la señal es de una barra y el paquete no llega, o cuando tu backend está caído.</p>
+
+<pre><code class="lang-tsx">import NetInfo from '@react-native-community/netinfo';
+
+NetInfo.addEventListener((estado) =&gt; {
+  estado.isConnected;           // hay una interfaz activa (wifi/celular)
+  estado.isInternetReachable;   // el sistema pudo salir de verdad — puede ser null
+  estado.type;                  // 'wifi' | 'cellular' | 'none' | 'unknown'
+  estado.details;               // en cellular: '4g' | '3g' | ... ; isConnectionExpensive
+});</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El portal cautivo es el enemigo clásico.</strong> Wifi de aeropuerto, hotel, bar o subte: hay conexión, hay IP, hay DNS, y <em>todas</em> tus peticiones vuelven con un 200 y el HTML de la pantalla de login. Tu <code>fetch</code> no falla: te devuelve una página web donde esperabas JSON. Si tu código hace <code>await r.json()</code> sin verificar nada, explota con un error de parseo que no se parece en nada a "no hay internet", y el usuario recibe un mensaje incomprensible.
+</div>
+
+<p>La verificación honesta se hace contra <strong>tu</strong> backend, con un endpoint barato y una respuesta que puedas validar:</p>
+
+<pre><code class="lang-tsx">const SONDEO_MS = 4000;
+
+export async function hayInternetDeVerdad(): Promise&lt;boolean&gt; {
+  const estado = await NetInfo.fetch();
+  if (!estado.isConnected) return false;   // descarte rápido, sin gastar red
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() =&gt; ctrl.abort(), SONDEO_MS);
+  try {
+    const r = await fetch(`${API}/salud`, {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      signal: ctrl.signal,
+    });
+    if (!r.ok) return false;
+    const tipo = r.headers.get('content-type') ?? '';
+    if (!tipo.includes('application/json')) return false;   // ← portal cautivo
+    const cuerpo = await r.json();
+    return cuerpo?.ok === true;                             // ← firma propia
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La verdad definitiva es el request que hacés.</strong> Ningún flag de conectividad es autoritativo: entre que lo leés y que hacés la llamada, el estado puede cambiar. Usá los flags para <em>explicar</em> ("parece que estás sin conexión") y para <em>decidir cuándo intentar</em> (no drenar la cola si <code>isConnected</code> es false, para ahorrar batería). Pero nunca uses el flag para <em>bloquear</em> una acción del usuario: si él quiere reintentar, dejalo. El resultado real del <code>fetch</code> es el único dato confiable.
+</div>
+
+<h2>RNS6.9 UI de estado offline: cómo no mentirle al usuario</h2>
+
+<p>La UI optimista —mostrar el cambio al instante y sincronizar después— es lo que hace que una app offline se sienta rápida. También es la forma más elegante de mentir. El pecado no es ser optimista: es <strong>ser optimista y después no contar cuando salió mal</strong>.</p>
+
+<div class="mistake">
+  <strong>El patrón que rompe la confianza:</strong> el usuario escribe una nota en el subte, ve el toast verde de <em>"Guardado ✓"</em>, cierra la app tranquilo. Tres días después la nota no está en su computadora. En algún momento la sincronización falló con un 422 y el error se tragó en un <code>catch</code> vacío. El usuario no perdió una nota: perdió la confianza en que tu app guarde algo. Eso no se recupera con un fix.
+</div>
+
+<p>La solución no es dejar de ser optimista, es <strong>tener estados y mostrarlos</strong>. Cuatro estados por ítem alcanzan:</p>
+
+<table>
+<thead><tr><th>Estado</th><th>Qué significa</th><th>Qué mostrar</th><th>Qué NO decir</th></tr></thead>
+<tbody>
+<tr><td><code>sincronizado</code></td><td>El servidor lo tiene y lo confirmó</td><td>Nada, o un ✓ discreto</td><td>—</td></tr>
+<tr><td><code>pendiente</code></td><td>Está en la cola, esperando red</td><td>"Guardado en este dispositivo" + 🕓</td><td><strong>Nunca</strong> "Guardado" a secas</td></tr>
+<tr><td><code>enviando</code></td><td>La petición está en vuelo</td><td>Indicador sutil de actividad</td><td>—</td></tr>
+<tr><td><code>fallo</code></td><td>Falló y no se resuelve solo</td><td>⚠️ visible + motivo + botón para reintentar o ver</td><td>Nada. Que no se pueda ignorar</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">function EstadoSync({ estado }: { estado: EstadoItem }) {
+  if (estado === 'sincronizado') return null;
+
+  const texto = {
+    pendiente: 'Guardado en este dispositivo · se enviará al recuperar la conexión',
+    enviando:  'Sincronizando…',
+    fallo:     'No se pudo sincronizar',
+  }[estado];
+
+  return (
+    &lt;View style={[estilos.fila, estado === 'fallo' &amp;&amp; estilos.filaError]}&gt;
+      &lt;Text style={estilos.texto} accessibilityLiveRegion="polite"&gt;{texto}&lt;/Text&gt;
+      {estado === 'fallo' &amp;&amp; (
+        &lt;Pressable onPress={verDetalleDelError} accessibilityRole="button"&gt;
+          &lt;Text style={estilos.accion}&gt;Ver&lt;/Text&gt;
+        &lt;/Pressable&gt;
+      )}
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <strong>La frase importa más que el ícono.</strong> "Guardado en este dispositivo" es honesto, es corto, y le enseña al usuario el modelo mental correcto: existe una copia local y existe una remota. La gente entiende perfectamente esa idea —la usa con las fotos del celular todos los días— siempre que se la digas. El problema nunca fue que el usuario no entienda: es que no le contamos.
+</div>
+
+<div class="warn">
+  <strong>Y nunca hagas un rollback visual silencioso.</strong> Si el servidor rechazó el cambio y tu UI vuelve al valor anterior sin decir nada, para el usuario eso es la app "borrándole" lo que escribió. Si tenés que revertir, mostralo con una explicación y ofrecé el contenido perdido: <em>"Este cambio fue rechazado por el servidor. Copiá tu texto antes de descartarlo."</em>
+</div>
+
+<h2>RNS6.10 Background sync: lo que el sistema te deja hacer, y lo que no</h2>
+
+<p>La pregunta inevitable es "¿puedo sincronizar con la app cerrada?". La respuesta corta es: <strong>a veces, sin garantías de cuándo, y menos de lo que esperás en iOS</strong>. Ambos sistemas priorizan la batería del usuario por encima de tus necesidades, y hacen bien.</p>
+
+<table>
+<thead><tr><th>Plataforma</th><th>Mecanismo</th><th>Tiempo disponible</th><th>Garantía</th><th>Qué lo bloquea</th></tr></thead>
+<tbody>
+<tr><td><strong>iOS</strong></td><td><code>BGAppRefreshTask</code></td><td>~30 s</td><td>❌ Ninguna: el sistema decide según tu uso histórico</td><td>Actualización en 2° plano apagada, Modo de bajo consumo, app poco usada</td></tr>
+<tr><td><strong>iOS</strong></td><td><code>BGProcessingTask</code></td><td>Minutos</td><td>❌ Oportunista</td><td>Suele exigir el equipo cargando y en wifi; típicamente de noche</td></tr>
+<tr><td><strong>iOS</strong></td><td>Push silencioso</td><td>Segundos</td><td>❌ Limitado por el sistema, se puede descartar</td><td>Bajo consumo; entrega no garantizada por diseño</td></tr>
+<tr><td><strong>Android</strong></td><td><code>WorkManager</code></td><td>~10 min por tarea</td><td>🟡 Ejecución <em>eventual</em> garantizada, con restricciones</td><td>Doze, App Standby Buckets, y OEMs que matan procesos</td></tr>
+<tr><td><strong>Android</strong></td><td>Servicio en primer plano</td><td>Sin límite práctico</td><td>✅ Sí, mientras corre</td><td>Exige notificación permanente y justificación en la tienda</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">import * as BackgroundTask from 'expo-background-task';
+import * as TaskManager from 'expo-task-manager';
+
+const TAREA_SYNC = 'sync-notas';
+
+TaskManager.defineTask(TAREA_SYNC, async () =&gt; {
+  try {
+    await sincronizar(db);                        // el mismo ciclo del foreground
+    return BackgroundTask.BackgroundTaskResult.Success;
+  } catch {
+    return BackgroundTask.BackgroundTaskResult.Failed;
+  }
+});
+
+export async function registrarSyncEnSegundoPlano() {
+  await BackgroundTask.registerTaskAsync(TAREA_SYNC, {
+    minimumInterval: 15,     // MINUTOS, y es una sugerencia, no una promesa
+  });
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El background sync es un bonus, nunca un contrato.</strong> En iOS, un usuario que abre tu app una vez por semana puede no recibir <em>ninguna</em> ejecución en segundo plano. En Android, varios fabricantes (con sus "optimizaciones de batería") matan procesos de forma agresiva y no respetan del todo el contrato de WorkManager. Si tu producto depende de que la sincronización ocurra con la app cerrada, <strong>tenés un requisito que la plataforma no te puede garantizar</strong>, y el diseño tiene que asumirlo.
+</div>
+
+<div class="rule">
+  <strong>📌 El sync que sí podés garantizar es el del primer plano.</strong> Sincronizá al abrir la app, al volver de segundo plano (<code>AppState</code> pasando a <code>active</code>), al recuperar la conexión, y con un <em>pull to refresh</em> explícito. Esos cuatro momentos cubren el 95% del valor. El background es la frutilla: si corre, el usuario abre la app y ya está todo al día; si no corre, se sincroniza en dos segundos al abrir y nadie se entera.
+</div>
+
+<h2>RNS6.11 Errores clásicos que se pagan caro</h2>
+
+<h3>Confiar en el reloj del dispositivo</h3>
+
+<div class="mistake">
+  El reloj del teléfono lo controla el usuario. Puede estar mal por zona horaria, puede estar desincronizado, y puede estar adelantado a propósito (es un truco conocido para saltear temporizadores en juegos). Si tu resolución de conflictos es "gana el timestamp más alto" y ese timestamp lo genera el cliente, <strong>un dispositivo con el reloj adelantado gana todos los conflictos para siempre</strong> y borra el trabajo de los demás sin que nadie entienda por qué.
+</div>
+
+<pre><code class="lang-tsx">// 🔴 Mal: el orden depende del reloj de cada dispositivo
+const nota = { ...datos, actualizado: Date.now() };
+
+// 🟢 Mejor: el reloj local sirve para la UI; el orden lo define el servidor
+const nota = {
+  ...datos,
+  actualizado_local: Date.now(),   // solo para mostrar "hace 5 minutos"
+  base_version: versionConocida,   // ESTO es lo que ordena y detecta conflictos
+};
+
+// 🟢 Y si necesitás tiempo real, medí el desfase contra el servidor
+let desfaseMs = 0;
+async function calibrarReloj() {
+  const t0 = Date.now();
+  const r = await fetch(`${API}/hora`);
+  const t1 = Date.now();
+  const servidor = Number(r.headers.get('x-server-time'));
+  desfaseMs = servidor - (t0 + (t1 - t0) / 2);   // corrige la mitad del viaje
+}
+export const ahora = () =&gt; Date.now() + desfaseMs;</code></pre>
+
+<h3>Necesitar el id del servidor antes de tenerlo</h3>
+
+<p>El usuario crea una nota offline y le agrega tres adjuntos. Los adjuntos necesitan referenciar la nota. Pero la nota todavía no existe en el servidor, así que no tiene id. El diseño se rompe entero.</p>
+
+<div class="rule">
+  <strong>📌 La regla: los ids los genera el cliente, siempre.</strong> UUID v4 si no te importa el orden, o <strong>UUID v7</strong> si querés que además ordenen por tiempo de creación (v7 lleva el timestamp en los bits altos, lo que mantiene los índices de la base ordenados y evita la fragmentación que produce v4). El servidor acepta el id que le manda el cliente; a lo sumo guarda su propio id interno en paralelo. Un sistema offline-first donde el servidor asigna los ids <strong>no es offline-first</strong>: es online con un caché.
+</div>
+
+<h3>Colas que crecen sin límite</h3>
+
+<pre><code class="lang-tsx">const TOPE_OUTBOX = 5_000;
+
+export function encolar(db: DB, op: NuevaOperacion) {
+  // 1. Compactar: dos ediciones seguidas del mismo campo de la misma entidad
+  //    que todavía no salieron se colapsan en una sola.
+  if (op.op === 'actualizar') {
+    const previa = db.execute(
+      `SELECT id, payload FROM outbox
+       WHERE entidad_id = ? AND op = 'actualizar' AND estado = 'pendiente'
+       ORDER BY creado DESC LIMIT 1`,
+      [op.entidad_id],
+    ).rows[0];
+    if (previa) {
+      const fusionado = { ...JSON.parse(previa.payload), ...JSON.parse(op.payload) };
+      db.execute(`UPDATE outbox SET payload = ?, creado = ? WHERE id = ?`,
+                 [JSON.stringify(fusionado), Date.now(), previa.id]);
+      return;
+    }
+  }
+
+  // 2. Tope duro: mejor avisar que degradarse en silencio
+  const { total } = db.execute(`SELECT COUNT(*) AS total FROM outbox`).rows[0];
+  if (total &gt;= TOPE_OUTBOX) throw new ColaLlena(total);
+
+  db.execute(`INSERT INTO outbox (...) VALUES (...)`, [/* ... */]);
+}</code></pre>
+
+<div class="warn">
+  <strong>El escenario que rompe apps reales:</strong> un técnico de campo trabaja tres semanas sin señal. Vuelve con 40.000 operaciones encoladas. Al abrir la app, el drenado intenta mandarlas todas, el dispositivo se queda sin memoria, o el servidor lo bloquea por rate limit y los reintentos con backoff hacen que la sincronización tarde horas. Sin compactación ni tope, ese usuario está atrapado. <strong>La compactación no es una micro-optimización: es lo que hace que la cola sea acotada.</strong>
+</div>
+
+<h3>No versionar el formato del payload</h3>
+
+<div class="mistake">
+  La cola es persistente: sobrevive a la actualización de la app. Eso significa que la versión 2.0 puede encontrarse con operaciones encoladas por la 1.8, con un JSON de otra forma. Si tu código asume el formato actual, va a fallar al deserializar operaciones viejas y el usuario va a perder todo lo que había escrito antes de actualizar. Por eso el <code>payload_version</code> del esquema de RNS6.5: sin él, cada actualización de la app es una ruleta.
+</div>
+
+<h2>🧑‍🎓 Worked Example — la app de notas que pierde datos</h2>
+
+<blockquote>Una app de notas guarda offline y sincroniza al reconectar. Un usuario escribe en el teléfono (en el subte) y en la tablet (en casa sin wifi) sobre la misma nota. Al reconectar los dos, uno de los dos textos desaparece. No hay error, no hay aviso, no hay forma de recuperarlo. Soporte recibe tres tickets por semana y ninguno se puede reproducir.</blockquote>
+
+<p><strong>Paso 1 — Nombrar el bug antes de arreglarlo.</strong> Se mira el backend y aparece en una línea:</p>
+
+<pre><code class="lang-sql">-- El endpoint PUT /notas/:id, tal como está hoy
+UPDATE notas SET titulo = $1, cuerpo = $2, actualizado = now() WHERE id = $3;</code></pre>
+
+<p>No hay condición sobre la versión. El último <code>PUT</code> que llega pisa lo anterior. No es un bug de React Native ni de la cola: es <strong>ausencia de control de concurrencia</strong>. El cliente hace exactamente lo que el servidor le permite hacer.</p>
+
+<p><strong>Paso 2 — Ubicar el producto en el espectro.</strong> Las notas se crean offline, son texto escrito por una persona y no existen en ningún otro lado. Son irreemplazables. Eso pone la app en el <strong>nivel 3</strong> de la tabla de RNS6.1, con todo lo que implica. La decisión se documenta: no es "agreguemos versiones", es "asumimos el costo de offline-first completo".</p>
+
+<p><strong>Paso 3 — Ids en el cliente.</strong> Se pasa a <strong>UUID v7</strong> generado en el dispositivo al crear la nota. Desaparecen los ids temporales, el reemplazo posterior, y las referencias rotas de los adjuntos.</p>
+
+<pre><code class="lang-tsx">import { v7 as uuidv7 } from 'uuid';
+
+export function crearNota(db: DB, titulo: string) {
+  const id = uuidv7();          // el id definitivo, decidido offline
+  const nota: Nota = { id, titulo, cuerpo: '', version: 0, actualizado: Date.now() };
+  db.transaction(() =&gt; {
+    insertarNota(db, nota);
+    encolar(db, { entidad: 'nota', entidad_id: id, op: 'crear',
+                  payload: JSON.stringify(nota), base_version: null });
+  });
+  return nota;
+}</code></pre>
+
+<p><strong>Paso 4 — El servidor detecta el conflicto en vez de tragárselo.</strong></p>
+
+<pre><code class="lang-sql">UPDATE notas
+   SET titulo = $1, cuerpo = $2, version = version + 1, actualizado = now()
+ WHERE id = $3 AND version = $4
+RETURNING version;
+
+-- Si no devuelve filas: 409 Conflict, con el estado actual del servidor
+--   { "version": 7, "titulo": "...", "cuerpo": "...", "actualizado": "..." }</code></pre>
+
+<p><strong>Paso 5 — El cliente registra el conflicto sin destruir nada.</strong> Este es el paso que separa una app que se puede auditar de una que no:</p>
+
+<pre><code class="lang-tsx">async function confirmarOConflicto(db: DB, op: OperacionOutbox) {
+  const r = await enviarOperacion(op);
+
+  if (r.ok) {
+    const { version } = await r.json();
+    db.transaction(() =&gt; {
+      db.execute(`UPDATE notas SET version = ?, estado_sync = 'sincronizado' WHERE id = ?`,
+                 [version, op.entidad_id]);
+      db.execute(`DELETE FROM outbox WHERE id = ?`, [op.id]);
+    });
+    return;
+  }
+
+  if (r.status === 409) {
+    const remoto = await r.json();
+    const local  = leerNota(db, op.entidad_id);
+    const base   = leerSnapshot(db, op.entidad_id, op.base_version);
+
+    const { resultado, enDisputa } = fusionarPorCampo(base, local, remoto);
+
+    db.transaction(() =&gt; {
+      if (enDisputa.length === 0) {
+        // Cambiaron campos distintos: se fusiona solo y se reintenta con la
+        // versión nueva. El usuario no se entera de nada, y está bien.
+        aplicarNota(db, { ...resultado, version: remoto.version });
+        db.execute(`UPDATE outbox SET base_version = ?, payload = ?, estado = 'pendiente'
+                    WHERE id = ?`,
+                   [remoto.version, JSON.stringify(resultado), op.id]);
+      } else {
+        // Conflicto real: NO se elige en silencio. Se guardan las dos y se avisa.
+        db.execute(
+          `INSERT INTO conflictos (id, nota_id, campos, version_local, version_remota,
+                                   cuerpo_local, cuerpo_remoto, detectado)
+           VALUES (?,?,?,?,?,?,?,?)`,
+          [uuidv7(), op.entidad_id, enDisputa.join(','), local.version, remoto.version,
+           local.cuerpo, remoto.cuerpo, Date.now()],
+        );
+        db.execute(`UPDATE notas SET estado_sync = 'conflicto' WHERE id = ?`, [op.entidad_id]);
+        db.execute(`UPDATE outbox SET estado = 'muerta' WHERE id = ?`, [op.id]);
+      }
+    });
+  }
+}</code></pre>
+
+<p><strong>Paso 6 — La UI muestra el conflicto en vez de resolverlo por su cuenta.</strong></p>
+
+<pre><code class="lang-tsx">function PantallaConflicto({ conflicto }: { conflicto: Conflicto }) {
+  return (
+    &lt;ScrollView&gt;
+      &lt;Text style={t.titulo}&gt;Esta nota se editó en dos lugares&lt;/Text&gt;
+      &lt;Text style={t.ayuda}&gt;
+        Elegí cuál conservar. La otra versión se guarda como copia:
+        no vas a perder nada.
+      &lt;/Text&gt;
+
+      &lt;Version
+        etiqueta="En este dispositivo"
+        fecha={conflicto.detectado}
+        texto={conflicto.cuerpo_local}
+        onElegir={() =&gt; resolver(conflicto, 'local')}
+      /&gt;
+      &lt;Version
+        etiqueta="Desde otro dispositivo"
+        fecha={conflicto.actualizado_remoto}
+        texto={conflicto.cuerpo_remoto}
+        onElegir={() =&gt; resolver(conflicto, 'remoto')}
+      /&gt;
+
+      &lt;Pressable onPress={() =&gt; resolver(conflicto, 'ambas')}&gt;
+        &lt;Text style={t.secundario}&gt;Conservar las dos como notas separadas&lt;/Text&gt;
+      &lt;/Pressable&gt;
+    &lt;/ScrollView&gt;
+  );
+}</code></pre>
+
+<p><strong>Paso 7 — Qué se descartó y por qué.</strong> Esta tabla es la parte del trabajo que sobrevive: dentro de un año, alguien va a proponer "usemos CRDT" y esta tabla explica por qué no se hizo.</p>
+
+<table>
+<thead><tr><th>Estrategia</th><th>Por qué se descartó</th></tr></thead>
+<tbody>
+<tr><td>LWW con timestamp del cliente</td><td>El reloj del dispositivo es manipulable y suele estar desfasado. Un teléfono adelantado ganaría todos los conflictos. Y sigue perdiendo texto en silencio, que es el bug original</td></tr>
+<tr><td>LWW con timestamp del servidor</td><td>Elimina el problema del reloj pero <strong>no el problema real</strong>: el servidor no tiene forma de saber cuál de los dos textos vale más. Arregla la mitad equivocada</td></tr>
+<tr><td>Bloqueo pesimista (tomar un lock de la nota)</td><td>Requiere estar online para tomar el bloqueo. Contradice el objetivo del producto: escribir sin conexión</td></tr>
+<tr><td>Merge automático de texto (diff a 3 vías)</td><td>Funciona razonablemente en código, donde las líneas son unidades semánticas. En prosa produce párrafos frankenstein que el usuario no escribió, y encima sin avisarle</td></tr>
+<tr><td>CRDT con Yjs o Automerge</td><td>Es la solución correcta para <em>edición colaborativa en vivo</em>. Acá no hay colaboración: es una persona con dos dispositivos y conflictos ocasionales. Cambiar el formato de almacenamiento, el protocolo y todo el debugging por un caso del 0,3% no se justifica. Queda anotado como el camino si el producto agrega colaboración</td></tr>
+<tr><td><strong>✅ Elegido:</strong> versión optimista + merge por campo + conflicto explícito</td><td>Detecta el 100% de los conflictos, resuelve solo los falsos (campos distintos), pregunta únicamente en los reales, y <strong>nunca destruye una versión</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 8 — Verificar con un test, no con confianza.</strong> El bug original no se podía reproducir porque el sistema no guardaba la historia. Ahora sí:</p>
+
+<pre><code class="lang-tsx">test('dos dispositivos editando el mismo campo generan conflicto, no pérdida', async () =&gt; {
+  const nota = await servidor.crear({ titulo: 'Reunión', cuerpo: 'borrador' });
+
+  const tel = clienteFalso(); const tab = clienteFalso();
+  await tel.pull(); await tab.pull();                 // ambos en version = 1
+
+  tel.editar(nota.id, { cuerpo: 'texto del teléfono' });
+  tab.editar(nota.id, { cuerpo: 'texto de la tablet' });
+
+  await tel.sincronizar();                            // gana: version pasa a 2
+  await tab.sincronizar();                            // recibe 409
+
+  expect(tab.conflictos()).toHaveLength(1);
+  expect(tab.conflictos()[0].cuerpo_local).toBe('texto de la tablet');
+  expect(tab.conflictos()[0].cuerpo_remoto).toBe('texto del teléfono');
+  expect(await servidor.leer(nota.id)).toMatchObject({ cuerpo: 'texto del teléfono' });
+});
+
+test('campos distintos se fusionan sin molestar al usuario', async () =&gt; {
+  /* tel cambia el título, tab cambia el cuerpo -&gt; 0 conflictos, ambos aplicados */
+});</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "usá versiones".</strong> Es que la pérdida silenciosa de datos <strong>casi nunca es un bug del cliente</strong>: es un contrato faltante entre el cliente y el servidor. Y que la diferencia entre un sistema offline profesional y uno amateur no está en el almacenamiento elegido, sino en <strong>si el sistema puede decir qué pasó</strong>. Versiones, cola persistente, tabla de conflictos y tests: cuatro piezas que convierten "se me borró" en un caso reproducible.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué "la última escritura gana" es una decisión peligrosa aunque el timestamp lo genere el servidor?</summary>
+<p>Porque mueve el problema sin resolverlo. Usar el reloj del servidor elimina un riesgo real —el reloj del dispositivo es manipulable y suele estar desfasado— pero no toca el problema de fondo: <strong>el servidor no tiene ninguna información para decidir cuál de los dos contenidos es el que el usuario quiere conservar</strong>. Descarta uno por el orden de llegada de los paquetes, que es un criterio arbitrario, y lo hace sin dejar rastro. LWW es una elección correcta cuando el dato es reemplazable y de bajo valor (una preferencia, un "leído", la posición de scroll): perder una versión de eso no le cuesta nada a nadie. Sobre contenido que una persona escribió, LWW es pérdida de datos con otro nombre. El criterio práctico: preguntate si podrías explicarle a un usuario, sin vergüenza, por qué su texto no está.</p></details>
+
+<details><summary>Tu app usa el nivel 2 del espectro (escritura optimista con cola). ¿Qué tres cosas tenés que tener sí o sí, y qué pasa si falta alguna?</summary>
+<p><strong>(1) Ids generados en el cliente.</strong> Sin ellos, no podés referenciar una entidad que todavía no existe en el servidor, y todo lo que dependa de esa entidad —adjuntos, relaciones, ediciones posteriores— se rompe o necesita un remapeo frágil. <strong>(2) Idempotencia con una clave de operación que el servidor deduplique.</strong> Sin ella, cada timeout de red produce un duplicado, porque desde el cliente "no llegó" y "llegó pero se perdió la respuesta" son el mismo evento. <strong>(3) Distinción entre errores retriables y permanentes.</strong> Sin ella, un 422 se reintenta para siempre (bucle infinito que gasta batería y datos) o se descarta en silencio (pérdida de datos), y las dos salidas son malas. Falta cualquiera de las tres y no tenés nivel 2: tenés nivel 1 con una capa de optimismo que miente.</p></details>
+
+<details><summary>¿Por qué una migración de esquema fallida en móvil es peor que en el servidor, y cómo se mitiga?</summary>
+<p>Por cuatro razones acumuladas. <strong>No hay rollback</strong>: la app nueva ya se instaló y la base ya se transformó; no podés "volver el deploy". <strong>No hay backup</strong> de los datos del usuario, a menos que el servidor tenga todo — y si lo tuviera, no necesitarías offline-first. <strong>Las versiones conviven meses</strong>: siempre hay gente en varias versiones al mismo tiempo, y a veces la misma persona en dos dispositivos distintos. Y <strong>si la app crashea al arrancar</strong>, el usuario no puede ni abrirla para recibir el arreglo; la única salida es desinstalar, que borra sus datos. Se mitiga con migraciones solo aditivas y hacia adelante, una transacción por migración (para que las anteriores queden firmes), tests que arrancan desde una base creada por <em>cada</em> versión publicada y no solo desde una nueva, un plan B definido de antemano (¿se puede borrar y re-sincronizar? solo si el servidor tiene absolutamente todo), y una verificación explícita del caso "esquema del futuro": si <code>user_version</code> es mayor que la que la app conoce, hay que <strong>detenerse y pedir actualizar</strong>, nunca seguir leyendo datos que no entendés.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>El espectro tiene cuatro niveles</strong> (online-only, caché de lectura, escritura con cola, offline-first completo) y cada uno cuesta un orden de magnitud más que el anterior. Elegí uno a propósito. <strong>La mayoría de las apps no necesita el nivel 3</strong>, y el error caro es llegar a él sin darse cuenta.</li>
+  <li><strong>Leer offline es caché; escribir offline es un sistema distribuido.</strong> Esa frontera es donde aparecen la cola, la idempotencia, el versionado y los conflictos.</li>
+  <li><strong>El almacén se elige por volumen y forma de consulta:</strong> AsyncStorage para preferencias, <strong>MMKV</strong> (síncrono, sobre JSI) como su reemplazo rápido, <strong>SQLite</strong> como opción por defecto para datos reales, y WatermelonDB cuando querés reactividad y sync incorporado. El componente que más te ata no es la base: es el motor de sincronización.</li>
+  <li><strong>Cifrado:</strong> primero no guardes lo que no necesitás offline. Los secretos van a <strong>Keychain/Keystore</strong>; la base se cifra con una clave generada en el dispositivo que vive ahí — nunca en el código. Excluí la base de los backups automáticos a la nube.</li>
+  <li><strong>Migraciones:</strong> solo aditivas y hacia adelante, una transacción por migración, tests desde cada versión publicada, y <strong>detenerse ante un esquema del futuro</strong> en vez de corromper datos que no entendés.</li>
+  <li><strong>La cola de operaciones</strong> se escribe en la misma transacción que el dato. Necesita orden por entidad, backoff exponencial con jitter, distinción entre errores retriables y permanentes, compactación y un tope duro.</li>
+  <li><strong>La idempotencia no es opcional:</strong> la misma operación se va a enviar dos veces, siempre. Una clave de operación generada por el cliente y deduplicada por el servidor es la mitad del sistema, y vive en el backend.</li>
+  <li><strong>Versionado &gt; LWW.</strong> Un entero por fila y un <code>WHERE version = ?</code> convierten la pérdida silenciosa en un 409 explícito. Detectar no es resolver, pero sin detectar no hay nada que resolver.</li>
+  <li><strong>Cinco estrategias de conflicto:</strong> LWW, merge por campo, append-only, CRDT y preguntar al usuario. El merge por campo resuelve solo la mayoría de los conflictos falsos; preguntar es honesto si es infrecuente y <strong>nunca destruís la versión perdedora</strong>.</li>
+  <li><strong>"Tiene wifi" ≠ "hay internet".</strong> El portal cautivo devuelve 200 con HTML. Verificá contra tu propio endpoint validando el content-type y una firma propia. Y recordá que el único dato autoritativo es el resultado del request.</li>
+  <li><strong>La UI optimista sin estados es una mentira.</strong> "Guardado en este dispositivo" en vez de "Guardado"; los fallos se muestran y no se pueden ignorar; nunca hagas un rollback visual silencioso.</li>
+  <li><strong>El background sync es un bonus, no un contrato:</strong> iOS no garantiza nada y Android lo garantiza "eventualmente" con OEMs que lo rompen. Sincronizá al abrir, al volver del segundo plano, al recuperar conexión y con pull-to-refresh: eso es el 95% del valor.</li>
+  <li><strong>Los tres errores clásicos:</strong> confiar en el reloj del dispositivo, necesitar ids del servidor antes de tenerlos (usá UUID v7 en el cliente), y colas que crecen sin límite.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li><strong>Ubicá tu app en el espectro.</strong> Tomá una app que hayas hecho (o una que uses todos los días) y determiná en qué nivel de la tabla de RNS6.1 está <em>realmente</em>, no en cuál dice estar. Después escribí un párrafo: si tuvieras que subirla un nivel, ¿qué tres cosas habría que construir y qué habría que cambiar en el backend?</li>
+  <li><strong>Medí la diferencia real de almacenamiento.</strong> Escribí 5.000 registros usando (a) AsyncStorage con el patrón read-modify-write, (b) MMKV, y (c) SQLite con un índice. Cronometrá la escritura completa y después una consulta filtrada. Armá una tabla con <em>tus</em> números en un dispositivo real, no en el emulador — y explicá por qué las diferencias son las que son.</li>
+  <li><strong>Implementá la cola con idempotencia.</strong> Construí la tabla <code>outbox</code> de RNS6.5 y su drenado. Simulá un servidor que responde correctamente pero pierde la respuesta el 30% de las veces. Comprobá que <em>sin</em> clave de idempotencia aparecen duplicados, y que <em>con</em> ella no. Guardá los dos resultados.</li>
+  <li><strong>Rompé una migración a propósito.</strong> Creá una base con la versión 1 del esquema, escribí la migración a la 2 con un error de sintaxis a mitad de camino, y verificá qué queda en <code>user_version</code> y en la base. Después arreglalo con una transacción por migración y comprobá la diferencia. Escribí el test que atrapa el caso "esquema del futuro".</li>
+  <li><strong>Cazá el portal cautivo.</strong> Conectate a un wifi con login (un bar, un aeropuerto, o montá uno en tu red) y registrá qué devuelven <code>isConnected</code>, <code>isInternetReachable</code> y un <code>fetch</code> a tu API. Implementá <code>hayInternetDeVerdad()</code> y demostrá con evidencia que distingue los tres casos: sin red, portal cautivo, y conexión real.</li>
+  <li><strong>Resolvé un conflicto de las cinco maneras.</strong> Tomá una entidad con cuatro campos y escribí las cinco estrategias de RNS6.7 sobre el mismo conflicto. Para cada una, documentá qué datos se pierden y qué ve el usuario. Después elegí una y justificá la elección en tres oraciones — como si fuera un ADR que va a leer alguien dentro de un año.</li>
+  <li><strong>Diseñá la UI de una cola atascada.</strong> Simulá 500 operaciones pendientes, 12 fallidas de forma permanente y 1 conflicto. Diseñá (y construí) las pantallas: el indicador global, el estado por ítem, la lista de fallos con su motivo, y la pantalla de resolución. Regla dura: <strong>ninguna pantalla puede decir algo que no sea literalmente cierto</strong>, y el usuario tiene que poder llegar al contenido de cualquier versión perdedora.</li>
+</ol>
+
+<section class="quiz" id="quizRNS6">
+  <style>
+    #quizRNS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS6 .q{margin-bottom:1.5rem}
+    #quizRNS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS6 .opt:hover{border-color:var(--accent)}
+    #quizRNS6 .opt:disabled{cursor:default}
+    #quizRNS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS6 .exp.show{display:block}
+    #quizRNS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu app encola escrituras offline y las reenvía al recuperar la conexión. Los usuarios reportan mensajes duplicados. ¿Cuál es la causa más probable?</p>
+    <button class="opt">La cola está enviando las operaciones en paralelo en vez de en orden</button>
+    <button class="opt">Falta idempotencia: el servidor procesó el pedido, se perdió la respuesta y el cliente reintentó</button>
+    <button class="opt">AsyncStorage llegó a su límite de 6 MB y está corrompiendo la cola</button>
+    <div class="exp">Es el escenario canónico: desde el cliente, "el servidor no lo recibió" y "lo recibió pero se perdió la respuesta" son indistinguibles — en los dos casos ves un timeout. Como tenés que reintentar, la operación se aplica dos veces. La solución es una <code>Idempotency-Key</code> generada por el cliente (el UUID de la fila del outbox) que el servidor guarda y usa para deduplicar, devolviendo la respuesta original en lugar de volver a aplicar el cambio. Ojo: <strong>es trabajo de backend</strong>; ningún cuidado del lado del cliente lo compensa.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Estás diseñando la resolución de conflictos de una app de notas personales. Los conflictos son poco frecuentes pero el texto es irreemplazable. ¿Cuál es la mejor estrategia?</p>
+    <button class="opt">LWW con el timestamp del servidor: es simple y el reloj del servidor es confiable</button>
+    <button class="opt">CRDT con Yjs: garantiza que nunca se pierda nada y todos los dispositivos convergen</button>
+    <button class="opt">Merge por campo para los conflictos falsos, y preguntar al usuario cuando el mismo campo cambió en ambos lados, guardando siempre la versión perdedora</button>
+    <div class="exp">El merge por campo resuelve solo la mayoría de los casos —una persona cambió el título y otra el cuerpo no es un conflicto real— y reserva la pregunta para cuando dos textos compiten de verdad, que es cuando el usuario es el único que puede decidir. LWW por reloj del servidor arregla el problema equivocado: elimina el riesgo del reloj manipulable pero sigue descartando texto en silencio. Y los CRDT son la respuesta correcta a la <em>edición colaborativa en vivo</em>: acá cambiarías el formato de almacenamiento, el protocolo y todo el debugging por un caso del 0,3%, y encima el resultado del merge automático en prosa puede ser un párrafo que nadie escribió.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Tu app depende de sincronizar en segundo plano para que los datos estén frescos cuando el usuario la abre. ¿Qué expectativa es realista?</p>
+    <button class="opt">Ninguna garantía: iOS puede no ejecutar la tarea nunca y Android solo promete ejecución eventual con restricciones; el sync confiable es el del primer plano</button>
+    <button class="opt">Con <code>minimumInterval: 15</code> se ejecuta cada 15 minutos en ambas plataformas</button>
+    <button class="opt">Con un push silencioso se garantiza la ejecución en iOS, que es lo que compensa la limitación de BGAppRefreshTask</button>
+    <div class="exp">En iOS, <code>BGAppRefreshTask</code> es oportunista: el sistema decide según tu uso histórico, el Modo de bajo consumo y la preferencia de actualización en segundo plano — un usuario que abre la app una vez por semana puede no recibir ninguna ejecución. Los push silenciosos también están limitados y se pueden descartar por diseño. En Android, WorkManager garantiza ejecución <em>eventual</em>, pero Doze, los App Standby Buckets y varios fabricantes con "optimizaciones de batería" agresivas la rompen. <code>minimumInterval</code> es una sugerencia, no un contrato. Lo que sí controlás: sincronizar al abrir, al volver del segundo plano, al recuperar conexión y con pull-to-refresh — eso cubre el 95% del valor.</div>
+  </div>
+
+  <div class="score" id="scoreRNS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns5-navegacion-arquitectura/lecture.html">← RNS5: Navegación y arquitectura</a>
+  <a href="../rns7-build-ota/lecture.html">RNS7: Build, distribución y OTA →</a>
+</nav>
+
+</div>
+</body>
+</html>

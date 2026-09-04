@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS8 — Producción: arquitectura y migración · React Senior</title>
+  <meta name="description" content="Estructura por features y colocation, fronteras entre módulos con lint, design system y abstracción prematura, TypeScript en el borde, error boundaries con contexto útil, feature flags, migración incremental a RSC con orden y métricas, cuándo NO migrar y cómo priorizar deuda técnica.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS8</span>
+  <span class="badge">⏱ 50–125 min</span>
+  <span class="badge">🎯 Pre-req: RS1–RS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>RS8 — Producción: arquitectura y migración</h1>
+
+<h2>RS8.0 Por qué este módulo</h2>
+
+<p>Imaginate una app React de cinco años. Doscientos componentes. Pasaron cuarenta personas por el repo, de las cuales quedan tres. Los síntomas son siempre los mismos y los vas a reconocer apenas los leas:</p>
+
+<ul>
+  <li>Cambiás el <code>padding</code> de un botón y se rompe el checkout, en otra parte de la app, tres días después.</li>
+  <li>Hay una función <code>formatearFecha</code> en <code>utils/</code> y nadie sabe si se usa. Tampoco nadie la borra.</li>
+  <li>El bundle creció 400 KB en el último año. Nadie puede decir de qué.</li>
+  <li>Un error en producción dice <code>Cannot read properties of undefined (reading 'nombre')</code> y nada más. Ni qué usuario, ni qué estaba haciendo, ni en qué pantalla.</li>
+  <li>Para tocar una sola pantalla abrís seis carpetas distintas.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Ninguno de esos problemas es <em>de React</em>. React no tiene opinión sobre cómo organizás una app: te da componentes y estado, y el resto lo decidís vos. Esa libertad es un regalo en el mes uno y una factura en el año tres. Este módulo es sobre <strong>las decisiones que React no toma por vos</strong>, y sobre la única migración grande que vale la pena hacer hoy: la incremental a RSC.
+</div>
+
+<p>Una aclaración de alcance antes de arrancar. El <a href="../../../../track-senior/modulo-01-patterns-arquitectura/lecture.html">Track Senior de Frontend</a> ya cubre patrones y arquitectura en general, <a href="../../../../track-senior/modulo-03-testing-strategy/lecture.html">estrategia de testing</a>, <a href="../../../../track-senior/modulo-05-observability-devops/lecture.html">observabilidad</a>, <a href="../../../../track-senior/modulo-06-microfrontends-monorepos/lecture.html">microfrontends y monorepos</a>, <a href="../../../../track-senior/modulo-07-api-patterns/lecture.html">patrones de API</a> y <a href="../../../../track-senior/modulo-08-liderazgo-tecnico/lecture.html">liderazgo técnico</a>. Acá no repetimos nada de eso: donde el tema se toca, te mando al módulo que corresponde. Lo de este módulo es <strong>lo que es específicamente de React</strong> — cómo se ordena un árbol de componentes que creció, dónde van los error boundaries de verdad, y cómo se pasa una app vieja al modelo de servidor sin apagar la fábrica.</p>
+
+<p>El contexto de versiones, a septiembre de 2026: <strong>React 19.2</strong> estable, <strong>RSC y Server Functions estables</strong>, y el número que circula por todos lados —migrar de <code>pages/</code> a <code>app/</code> da <strong>alrededor de 40% menos de JavaScript</strong>— es real, pero es un promedio de migraciones bien hechas, no una garantía que te regala el framework. En RS8.8 vas a ver exactamente de dónde sale y cómo se te escapa.</p>
+
+<h2>RS8.1 Estructura: por features, no por tipo de archivo</h2>
+
+<p>Todo proyecto React arranca igual, porque es lo que muestran los tutoriales:</p>
+
+<pre><code class="lang-bash">src/
+├── components/      # 187 archivos, orden alfabético
+├── hooks/           # 41 archivos
+├── utils/           # 63 archivos, incluye "helpers.ts"
+├── services/        # 22 archivos
+├── types/           # types.ts de 900 líneas
+└── pages/</code></pre>
+
+<p>Esto funciona hasta los ~30 archivos y después se degrada de una forma muy particular: <strong>agrupa por lo que las cosas <em>son</em> en vez de por lo que hacen</strong>. En <code>components/</code>, ordenado alfabéticamente, <code>Button.tsx</code> queda al lado de <code>CheckoutSummary.tsx</code>. Uno lo usa toda la app, el otro lo usa una sola pantalla, y el sistema de carpetas no te dice cuál es cuál. Para trabajar en "checkout" tenés que abrir seis carpetas y buscar por prefijo.</p>
+
+<p>La alternativa es agrupar por <strong>feature</strong>: la unidad no es "componente", es "una parte del producto que un usuario puede nombrar".</p>
+
+<pre><code class="lang-bash">src/
+├── app/                        # rutas, layouts, providers, wiring
+│   ├── (marketing)/
+│   └── checkout/page.tsx
+├── features/
+│   ├── carrito/
+│   │   ├── components/         # SOLO del carrito
+│   │   │   ├── LineaCarrito.tsx
+│   │   │   └── ResumenTotales.tsx
+│   │   ├── hooks/use-carrito.ts
+│   │   ├── api/carrito.server.ts
+│   │   ├── model/tipos.ts
+│   │   ├── model/calcular-total.ts
+│   │   ├── model/calcular-total.test.ts
+│   │   └── index.ts            # 👈 API pública de la feature
+│   ├── checkout/
+│   ├── catalogo/
+│   └── cuenta/
+└── shared/
+    ├── ui/                     # design system: Button, Dialog, Field
+    ├── lib/                    # fetch client, formatos, fechas
+    └── config/</code></pre>
+
+<div class="rule">
+  <strong>📌 Colocation.</strong> Un archivo vive <strong>lo más cerca posible de donde se usa</strong>. El test al lado del código que testea. El tipo al lado de la función que lo devuelve. El sub-componente que solo usa <code>ResumenTotales</code> vive adentro de <code>carrito/</code>, no en un <code>components/</code> global. Si borrás la carpeta <code>features/carrito/</code>, se tiene que ir <em>todo</em> el carrito con ella, sin dejar huérfanos regados por el repo.
+</div>
+
+<h3>El límite: cuándo algo se vuelve compartido</h3>
+
+<p>Acá está la decisión que la gente resuelve mal, y siempre para el mismo lado: promover a <code>shared/</code> demasiado temprano. La regla que funciona es aburrida y numérica:</p>
+
+<table>
+<thead><tr><th>Usos reales</th><th>Dónde vive</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td><strong>1</strong> (una feature)</td><td>Adentro de esa feature</td><td>Todavía no sabés cuál es la forma general. Lo que ves es un caso, no un patrón.</td></tr>
+<tr><td><strong>2</strong> (dos features)</td><td>Duplicalo. En serio.</td><td>Dos usos te muestran dos formas. Copiar y esperar cuesta menos que abstraer mal.</td></tr>
+<tr><td><strong>3+</strong></td><td><code>shared/</code>, pero <em>rediseñado</em></td><td>Con tres usos ya ves qué varía y qué no. Recién ahí la abstracción tiene información.</td></tr>
+</tbody>
+</table>
+
+<p>Y "promover" no es mover el archivo de carpeta. Es <strong>rediseñarlo</strong>: sacarle todo lo que sabía de la feature original, hacer explícitas las props que antes tomaba de un contexto cercano, y ponerle un nombre que no mencione a ningún dominio en particular. Un <code>ResumenTotalesCarrito</code> no se convierte en compartido cambiándolo de lugar; se convierte en un <code>&lt;ListaDeMontos&gt;</code> genérico, o no se convierte.</p>
+
+<div class="mistake">
+  <strong>El error más caro de esta sección:</strong> "lo pongo en <code>shared/</code> por las dudas, total después lo usa alguien". Nunca lo usa nadie, y ahora es un archivo que <em>todo el repo puede importar</em>, así que nadie lo puede cambiar sin miedo ni borrar sin auditar. Un archivo mal ubicado en una feature lo arregla una persona en diez minutos; un archivo mal ubicado en <code>shared/</code> es un contrato con cuarenta consumidores potenciales.
+</div>
+
+<div class="tip">
+  <strong>Migrar una estructura vieja sin frenar el producto:</strong> no reorganices todo de una. Creá <code>features/</code> vacío, y la próxima vez que toques una pantalla, mové <em>esa</em> feature completa. En seis meses la mitad del repo migró sola, cada movimiento viajó en un PR que alguien iba a revisar igual, y nunca tuviste un PR de 300 archivos movidos que nadie puede revisar de verdad.
+</div>
+
+<h2>RS8.2 Fronteras: qué puede importar qué</h2>
+
+<p>La estructura de carpetas sola no hace nada. Si <code>features/checkout/</code> puede hacer <code>import { useCarrito } from "../carrito/hooks/use-carrito"</code>, las carpetas son decoración: el grafo de dependencias real sigue siendo un plato de fideos, solo que ahora con nombres más lindos.</p>
+
+<p>Las reglas mínimas de un proyecto grande son cuatro:</p>
+
+<div class="rule">
+  <strong>📌 Las cuatro reglas de frontera.</strong><br>
+  <strong>1.</strong> Una feature <strong>no importa de otra feature</strong>. Nunca, ni siquiera "solo un tipito".<br>
+  <strong>2.</strong> Una feature <strong>sí</strong> importa de <code>shared/</code>.<br>
+  <strong>3.</strong> <code>shared/</code> <strong>jamás</strong> importa de una feature. Si necesita algo de una feature, no era compartido.<br>
+  <strong>4.</strong> <code>app/</code> (rutas, layouts, providers) es el <strong>único lugar</strong> que puede combinar features. Ahí es donde el carrito y el checkout se conocen.
+</div>
+
+<p>Cuando dos features realmente necesitan hablarse, hay exactamente tres salidas legítimas, y todas pasan por arriba: la ruta en <code>app/</code> compone las dos y les pasa props; se comparte el <em>dato</em> vía el cache del servidor o del data layer (RS5), no vía import; o lo que compartían era genérico y se va a <code>shared/</code>. La cuarta salida —"le importo esta funcioncita y listo"— es la que te deja con un grafo del que no podés sacar nada sin romper todo.</p>
+
+<h3>La API pública de una feature</h3>
+
+<p>Cada feature expone un <code>index.ts</code> chico. Eso es su superficie. Todo lo demás es privado por convención y, en un minuto, por lint.</p>
+
+<pre><code class="lang-tsx">// features/carrito/index.ts — la superficie completa del carrito
+export { CarritoProvider } from "./components/CarritoProvider";
+export { ResumenTotales } from "./components/ResumenTotales";
+export { useCarrito } from "./hooks/use-carrito";
+export type { LineaCarrito, TotalesCarrito } from "./model/tipos";
+
+// NO se exporta: calcular-total.ts, LineaCarrito.tsx, carrito.server.ts.
+// Eso es maquinaria interna y tiene que poder cambiar sin avisarle a nadie.</code></pre>
+
+<div class="warn">
+  <strong>Ojo con el choque contra RS4.</strong> Un barril está bien acá porque es la puerta de una feature, no un cajón de sastre. Pero <strong>no mezcles cliente y servidor en el mismo <code>index.ts</code></strong>: si ese archivo exporta un componente con <code>"use client"</code> y también un helper de servidor, cualquiera que importe el helper se arrastra el bundle de cliente. Separá en <code>index.ts</code> e <code>index.server.ts</code> cuando la feature tenga las dos mitades.
+</div>
+
+<h3>Hacerlo cumplir con lint, no con buena voluntad</h3>
+
+<p>Una regla de arquitectura que vive en un documento de Notion es una sugerencia. Una que falla el CI es una regla. <code>eslint-plugin-import</code> trae <code>import/no-restricted-paths</code>, que expresa exactamente el modelo de zonas de arriba:</p>
+
+<pre><code class="lang-jsx">// eslint.config.js  (flat config, ESLint 9)
+import importPlugin from "eslint-plugin-import";
+
+export default [
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    plugins: { import: importPlugin },
+    rules: {
+      "import/no-restricted-paths": ["error", {
+        basePath: "./src",
+        zones: [
+          // 1. Ninguna feature entra en otra feature...
+          {
+            target: "./features/!(carrito)/**",
+            from: "./features/carrito/**",
+            // ...salvo por su puerta de entrada
+            except: ["./features/carrito/index.ts"],
+            message: "Las features no se importan entre sí. Componé en app/ o subí lo común a shared/.",
+          },
+          // (una zona equivalente por cada feature; se genera con un script)
+
+          // 2. shared/ nunca sabe de features
+          {
+            target: "./shared/**",
+            from: "./features/**",
+            message: "shared/ no puede depender de una feature. Si la necesita, no era compartido.",
+          },
+          // 3. features/ no conoce el router ni los layouts
+          {
+            target: "./features/**",
+            from: "./app/**",
+            message: "Una feature no importa de app/. La dependencia va al revés.",
+          },
+        ],
+      }],
+    },
+  },
+];</code></pre>
+
+<p>Con eso puesto, el error que ve la persona que rompe la regla es concreto y explica el porqué:</p>
+
+<pre><code class="lang-bash">src/features/checkout/components/PasoPago.tsx
+  4:1  error  Unexpected path "../../carrito/hooks/use-carrito" imported in restricted zone.
+              Las features no se importan entre sí. Componé en app/ o subí lo común a shared/.
+              import/no-restricted-paths
+
+✖ 1 problem (1 error, 0 warnings)</code></pre>
+
+<div class="info">
+  Alternativas equivalentes según el gusto del equipo: <strong><code>eslint-plugin-boundaries</code></strong> (declarás "tipos de elemento" y una matriz de qué tipo puede hablar con cuál — más legible cuando tenés muchas capas), o <strong><code>dependency-cruiser</code></strong>, que además de validar te dibuja el grafo. En monorepos, la frontera también se puede expresar con paquetes y <code>package.json</code>: ver el <a href="../../../../track-senior/modulo-06-microfrontends-monorepos/lecture.html">módulo 06 del Track Senior</a>.
+</div>
+
+<div class="step">
+  <strong>Cómo se adopta en un repo que ya está roto.</strong> Si prendés las reglas en <code>error</code> el día uno, el CI queda rojo con 700 violaciones y en dos días alguien las apaga. La secuencia que funciona: <strong>(1)</strong> prender en <code>"warn"</code> y contar; <strong>(2)</strong> congelar el número en un archivo de baseline; <strong>(3)</strong> hacer fallar el CI solo si el número <em>sube</em> ("ratchet"); <strong>(4)</strong> bajar el baseline cada vez que alguien toca esa zona por otro motivo. La deuda se paga donde ya estabas trabajando, no en un sprint especial.
+</div>
+
+<h2>RS8.3 El árbol de dependencias de una feature</h2>
+
+<p>Las reglas de lint atrapan el acoplamiento <em>por import</em>. El problema es que el acoplamiento más caro es el que no aparece en ningún import. Antes de pelearlo, hay que verlo:</p>
+
+<pre><code class="lang-bash"># Ciclos: lo primero que hay que mirar en un repo viejo
+npx madge --circular --extensions ts,tsx src/
+
+# El grafo de una feature: de qué depende y quién depende de ella
+npx depcruise src/features/carrito --include-only "^src" --output-type dot | dot -Tsvg &gt; carrito.svg
+
+# Métrica cruda pero útil: cuántos archivos importan de cada feature
+npx depcruise src --output-type json \
+  | jq -r '.modules[].dependencies[].resolved' \
+  | grep -o 'src/features/[^/]*' | sort | uniq -c | sort -rn</code></pre>
+
+<p>Lo que buscás en esa salida son dos números por feature. El <strong>fan-out</strong> (de cuántas cosas depende) te dice qué tan difícil es entenderla; el <strong>fan-in</strong> (cuántas cosas dependen de ella) te dice qué tan difícil es cambiarla. Una feature con fan-in alto dejó de ser una feature: es infraestructura, y probablemente tenga que partirse.</p>
+
+<h3>Las tres formas de acoplamiento invisible</h3>
+
+<table>
+<thead><tr><th>Forma</th><th>Cómo se ve</th><th>Cómo la detectás</th></tr></thead>
+<tbody>
+<tr><td><strong>Estado global compartido</strong></td><td>Dos features escriben el mismo slice del store. No hay import entre ellas, pero un cambio en una rompe la otra.</td><td>Grepear escrituras por slice. Si dos features hacen <code>set</code> del mismo campo, están acopladas aunque el linter no diga nada.</td></tr>
+<tr><td><strong>Tipos que arrastran</strong></td><td>Un <code>types.ts</code> global donde <code>Usuario</code> tiene 40 campos porque cada feature le agregó los suyos. Cambiar uno recompila y rompe medio repo.</td><td>Contar consumidores por tipo. Un tipo con 20+ consumidores es un contrato de facto: versionalo o partilo por feature.</td></tr>
+<tr><td><strong>Imports con efecto</strong></td><td>Un módulo que al importarse registra un interceptor, parchea <code>fetch</code>, o llena un registro global. El orden de imports cambia el comportamiento.</td><td><code>"sideEffects": false</code> en el <code>package.json</code> y ver qué se rompe. Lo que se rompe tenía efectos escondidos.</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  <strong>El test de la carpeta borrada.</strong> La prueba más honesta de si una feature está bien delimitada: borrala y corré <code>tsc --noEmit</code>. Si los errores que salen están todos en <code>app/</code> —el lugar que la compone— la frontera está bien. Si aparecen errores adentro de otras features o de <code>shared/</code>, encontraste exactamente dónde está el acoplamiento, con nombre de archivo y línea. Hacelo en una rama descartable, obviamente.
+</div>
+
+<h2>RS8.4 Design system y componentes compartidos</h2>
+
+<p>Un design system no arranca siendo un proyecto: arranca siendo tres botones parecidos. La pregunta no es "¿hacemos un design system?" sino "¿este componente ya se ganó el derecho a ser compartido?".</p>
+
+<h3>El costo de la abstracción prematura</h3>
+
+<p>Así se ve un componente compartido que se extrajo con un solo caso de uso y después absorbió los demás a fuerza de props:</p>
+
+<pre><code class="lang-tsx">// ❌ shared/ui/Button.tsx — 14 props, y ninguna se puede sacar
+type BotonProps = {
+  variante: "primario" | "secundario" | "fantasma" | "peligro" | "linkDeCheckout";
+  tamano: "sm" | "md" | "lg" | "xl" | "compactoDeTabla";
+  icono?: ReactNode;
+  iconoAlFinal?: boolean;
+  cargando?: boolean;
+  textoDeCarga?: string;          // agregado en el PR del checkout
+  anchoCompleto?: boolean;
+  sinPaddingEnMobile?: boolean;   // agregado para una pantalla, una sola vez
+  comoLink?: boolean;
+  href?: string;                  // solo válido si comoLink
+  target?: string;                // solo válido si comoLink
+  confirmar?: boolean;            // ¿un botón que confirma? esto es un Dialog
+  mensajeConfirmacion?: string;
+  trackearComo?: string;          // analytics adentro del botón
+};</code></pre>
+
+<div class="mistake">
+  Ese componente tiene tres olores clásicos, y los tres apuntan a lo mismo. <strong>(a)</strong> Props que solo son válidas si otra prop tiene cierto valor (<code>href</code> depende de <code>comoLink</code>) — eso son <em>dos componentes</em> disfrazados de uno. <strong>(b)</strong> Una variante con nombre de feature (<code>linkDeCheckout</code>) — ese caso nunca fue general. <strong>(c)</strong> Responsabilidades ajenas adentro (confirmación, analytics). El resultado práctico: nadie puede cambiar el botón sin revisar toda la app, y cada pantalla nueva le agrega la prop 15.
+</div>
+
+<p>La versión que envejece bien hace lo contrario: el compartido es <strong>chico y aburrido</strong>, y la especialización vive en la feature.</p>
+
+<pre><code class="lang-tsx">// ✅ shared/ui/Button.tsx — hace una cosa
+type ButtonProps = ComponentPropsWithoutRef&lt;"button"&gt; &amp; {
+  variante?: "primario" | "secundario" | "fantasma";
+  tamano?: "sm" | "md" | "lg";
+};
+
+export function Button({ variante = "primario", tamano = "md", ...props }: ButtonProps) {
+  return &lt;button className={estilos(variante, tamano)} {...props} /&gt;;
+}
+
+// ✅ features/checkout/components/BotonPagar.tsx — la especialización vive acá
+export function BotonPagar({ monto, onPagar }: { monto: number; onPagar: () =&gt; void }) {
+  const [enviando, setEnviando] = useState(false);
+  return (
+    &lt;Button
+      variante="primario"
+      tamano="lg"
+      disabled={enviando}
+      onClick={async () =&gt; { setEnviando(true); await onPagar(); }}
+    &gt;
+      {enviando ? "Procesando…" : `Pagar ${formatearMonto(monto)}`}
+    &lt;/Button&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Un componente compartido tiene que ser aburrido.</strong> Si adentro hay un <code>if</code> que menciona el nombre de una feature, un dominio, o una pantalla, no es compartido: es un componente de esa feature viviendo en el barrio equivocado. La prueba rápida: ¿podrías publicarlo en npm y que le sirva a otra empresa? Si no, no va en <code>shared/ui</code>.
+</div>
+
+<table>
+<thead><tr><th>Señales de extraer</th><th>Señales de NO extraer (todavía)</th></tr></thead>
+<tbody>
+<tr><td>3+ usos reales, en features distintas</td><td>1 o 2 usos, o los 3 en la misma feature</td></tr>
+<tr><td>Las diferencias entre usos son de <em>estilo</em>, no de lógica</td><td>Cada uso tiene reglas de negocio distintas</td></tr>
+<tr><td>Hay una decisión de diseño que querés unificar (foco, contraste, accesibilidad)</td><td>Solo se parecen visualmente por casualidad</td></tr>
+<tr><td>El bug de accesibilidad hay que arreglarlo en 3 lugares</td><td>Sospechás que en un mes uno de los tres va a divergir</td></tr>
+</tbody>
+</table>
+
+<h3>Versionado y cambios rompientes</h3>
+
+<p>Mientras el design system vive en el mismo repo, "versionar" es simplemente que el PR que cambia el componente arregla también a sus consumidores, y el CI lo prueba. Es lo más barato y por lejos lo que más conviene mientras haya un solo producto.</p>
+
+<p>Cuando hay dos o más productos que consumen el sistema, aparece la necesidad real de versionar. La secuencia estándar, sin drama:</p>
+
+<pre><code class="lang-bash"># Cambio rompiente en @acme/ui, con Changesets
+npx changeset            # elegís "major", escribís QUÉ rompe y cómo se migra
+npx changeset version    # bumpea versiones y arma el CHANGELOG
+npx changeset publish
+
+# Y del lado de los consumidores, un codemod en vez de un ticket
+npx jscodeshift -t ./codemods/button-v3.ts src/ --extensions=tsx</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de deprecación.</strong> Un cambio rompiente en un componente compartido sale con tres cosas o no sale: <strong>(1)</strong> la vieja API sigue funcionando marcada con <code>@deprecated</code> y una fecha; <strong>(2)</strong> un codemod que hace el 90% de la migración; <strong>(3)</strong> una entrada de changelog que dice qué rompe y por qué valió la pena. Sin las tres, lo que estás haciendo no es evolucionar el sistema: le estás pasando tu trabajo a los equipos que lo usan.
+</div>
+
+<h2>RS8.5 TypeScript a nivel de app: tipar el borde</h2>
+
+<p>Casi todo el valor de TypeScript en una app React se decide en un puñado de archivos: los que reciben datos de afuera. Adentro, la inferencia hace su trabajo sola. En el borde, si mentís, mentís para todo el árbol.</p>
+
+<p>La base no negociable:</p>
+
+<pre><code class="lang-bash"># tsconfig.json — lo mínimo en un proyecto grande
+{
+  "compilerOptions": {
+    "strict": true,                          // el paquete completo, no de a una
+    "noUncheckedIndexedAccess": true,        // arr[0] es T | undefined, que es la verdad
+    "exactOptionalPropertyTypes": true,      // { x?: string } no acepta { x: undefined }
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true             // imports de tipo explícitos: mejor tree-shaking
+  }
+}</code></pre>
+
+<div class="info">
+  <code>noUncheckedIndexedAccess</code> es el que más ruido hace al prenderlo y el que más bugs reales encuentra: todo <code>lista[i]</code> y todo <code>mapa[clave]</code> pasan a ser posiblemente <code>undefined</code>, que es exactamente lo que son en runtime. La mayoría de los <code>Cannot read properties of undefined</code> de producción vive ahí.
+</div>
+
+<h3>Por qué un <code>any</code> en el borde contamina hacia adentro</h3>
+
+<p>Este es el patrón que aparece en el 90% de los repos, y es una mentira con formato de tipo:</p>
+
+<pre><code class="lang-tsx">// ❌ La aserción es una promesa que nadie verifica
+async function traerUsuario(id: string): Promise&lt;Usuario&gt; {
+  const res = await fetch(`/api/usuarios/${id}`);
+  return res.json() as Promise&lt;Usuario&gt;;   // "confiá en mí"
+}</code></pre>
+
+<p><code>res.json()</code> devuelve <code>Promise&lt;any&gt;</code>. El <code>as</code> no valida nada: le dice al compilador que deje de mirar. Y ahí empieza la contaminación, que es silenciosa por diseño:</p>
+
+<pre><code class="lang-tsx">const usuario = await traerUsuario(id);       // TS cree: Usuario
+
+usuario.perfil.avatar;                         // ✅ compila. En runtime: 💥 si perfil es null
+usuario.creadoEl.getFullYear();                // ✅ compila. En runtime: 💥 creadoEl es un string
+usuario.plna;                                  // ❌ este sí lo agarra (typo de propiedad)
+
+// Y lo peor: lo que se deriva hereda la mentira
+const nombres = usuarios.map((u) =&gt; u.perfil.nombre);  // string[] según TS
+const primero = nombres[0].toUpperCase();               // "string", pero puede ser undefined</code></pre>
+
+<div class="danger">
+  <strong>Por qué es peor que no tener tipos.</strong> Sin tipos, escribís defensivo: chequeás, ponés <code>?.</code>, dudás. Con un tipo falso, el editor te autocompleta con confianza, el reviewer ve verde, y el error aparece seis pantallas más adentro, en un componente que nunca tocó la red. <strong>El costo del <code>any</code> del borde no lo paga el borde: lo paga el que está lejos.</strong>
+</div>
+
+<p>La versión honesta valida en runtime y <em>deriva</em> el tipo de la validación, en vez de al revés:</p>
+
+<pre><code class="lang-tsx">import { z } from "zod";
+
+const UsuarioSchema = z.object({
+  id: z.string(),
+  nombre: z.string(),
+  creadoEl: z.coerce.date(),                    // el string ISO se vuelve Date acá
+  perfil: z.object({ avatar: z.string().url().nullable() }).nullable(),
+});
+
+// El tipo sale del schema: imposible que se desincronicen
+export type Usuario = z.infer&lt;typeof UsuarioSchema&gt;;
+
+export async function traerUsuario(id: string): Promise&lt;Usuario&gt; {
+  const res = await fetch(`/api/usuarios/${id}`);
+  if (!res.ok) throw new ErrorDeApi(res.status, `GET /usuarios/${id}`);
+
+  const parsed = UsuarioSchema.safeParse(await res.json());
+  if (!parsed.success) {
+    // Falló el CONTRATO, no el usuario. Esto va a observabilidad, no a un toast.
+    reportarContratoRoto("GET /usuarios/:id", parsed.error);
+    throw new ErrorDeContrato("La API devolvió algo que no esperábamos");
+  }
+  return parsed.data;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla del borde.</strong> <code>any</code> y <code>as</code> se permiten <strong>solo dentro del archivo que valida</strong>, y siempre acompañados del parseo que los angosta en la línea siguiente. Nunca cruzan hacia una feature. Tres bordes hay en una app React: respuestas HTTP, <code>localStorage</code>/<code>sessionStorage</code>, y los parámetros de URL (<code>searchParams</code> es <code>string | undefined</code>, siempre). Los tres se parsean.
+</div>
+
+<div class="tip">
+  Si la API tiene OpenAPI o GraphQL, no escribas los schemas a mano: generalos (<code>openapi-typescript</code>, <code>graphql-codegen</code>) y dejá el parseo de runtime solo donde el contrato es débil. El diseño del contrato en sí está en el <a href="../../../../track-senior/modulo-07-api-patterns/lecture.html">módulo 07 del Track Senior</a>. Y con Server Components (RS4), el borde se corre al servidor: mucho mejor lugar para fallar, porque el usuario nunca ve un árbol roto.
+</div>
+
+<h2>RS8.6 Errores en producción</h2>
+
+<p>Un error de render en React no es un error común: <strong>desmonta el árbol</strong>. Si no hay un boundary arriba, el usuario se queda con una pantalla blanca y ninguna pista. Por eso la pregunta importante no es "¿tengo error boundaries?" sino "¿dónde exactamente?".</p>
+
+<h3>Dónde van de verdad</h3>
+
+<p>Las dos respuestas fáciles son las dos malas. <strong>Uno solo en la raíz</strong> convierte cualquier error en pantalla blanca completa: técnicamente capturaste, en la práctica perdiste al usuario. <strong>Uno por componente</strong> llena la pantalla de cajitas rotas y de ruido en el monitoreo, y esconde errores que deberían escalar.</p>
+
+<p>El criterio es <strong>por unidad de valor</strong>: envolvé lo que puede fallar sin arruinar el resto de lo que la persona vino a hacer.</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Qué envuelve</th><th>Qué muestra el usuario</th></tr></thead>
+<tbody>
+<tr><td><strong>Raíz</strong></td><td>Toda la app (red de seguridad)</td><td>Página de error con botón de recargar y el ID del incidente. Debería activarse casi nunca.</td></tr>
+<tr><td><strong>Ruta</strong> (<code>error.tsx</code>)</td><td>Cada página</td><td>El chrome de la app sigue: nav, sesión, links. Solo el contenido se reemplaza, con un "reintentar".</td></tr>
+<tr><td><strong>Widget</strong></td><td>Cada bloque independiente: gráfico, feed de recomendados, mapa, widget de terceros</td><td>Un placeholder discreto en el lugar del widget. El resto de la página funciona.</td></tr>
+<tr><td><strong>Formulario en curso</strong></td><td>Pasos de checkout, editores, wizards</td><td>Lo que sea, <strong>menos perder lo que la persona escribió</strong>. Esto manda sobre todo lo demás.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// app/checkout/error.tsx — boundary de ruta (App Router)
+"use client";
+
+export default function ErrorDeCheckout({
+  error, reset,
+}: { error: Error &amp; { digest?: string }; reset: () =&gt; void }) {
+  useEffect(() =&gt; {
+    reportar(error, { ruta: "/checkout", digest: error.digest });
+  }, [error]);
+
+  return (
+    &lt;div role="alert"&gt;
+      &lt;h2&gt;No pudimos cargar el checkout&lt;/h2&gt;
+      &lt;p&gt;Tu carrito está guardado. Podés reintentar sin perder nada.&lt;/p&gt;
+      &lt;Button onClick={reset}&gt;Reintentar&lt;/Button&gt;
+      &lt;a href="/carrito"&gt;Volver al carrito&lt;/a&gt;
+      {error.digest &amp;&amp; &lt;p&gt;&lt;small&gt;Referencia: {error.digest}&lt;/small&gt;&lt;/p&gt;}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Qué mostrarle al usuario.</strong> "Algo salió mal" es la peor pantalla de error posible: no dice qué pasó, no dice si perdió algo, y no ofrece nada que hacer. Un buen fallback responde tres cosas en este orden: <strong>(1)</strong> ¿perdí mi trabajo? (la más urgente y la que nadie contesta), <strong>(2)</strong> ¿qué puedo hacer ahora? (reintentar, volver, seguir sin eso), <strong>(3)</strong> ¿cómo pido ayuda? (una referencia corta que el soporte pueda buscar).
+</div>
+
+<h3>Capturar con contexto útil</h3>
+
+<p>Un stack trace en una app minificada te dice <em>dónde</em> explotó. Casi nunca te dice <em>por qué</em>, y el "por qué" es lo único que te deja arreglarlo. La diferencia entre un error que se arregla en veinte minutos y uno que queda tres semanas en el backlog es la información que le adjuntaste cuando lo capturaste.</p>
+
+<pre><code class="lang-tsx">// shared/lib/reportar.ts
+type Contexto = {
+  ruta: string;
+  feature: string;
+  ultimaAccion?: string;       // 👈 lo que estaba HACIENDO
+  requestId?: string;          // 👈 cose el error con el log del backend
+};
+
+export function reportar(error: unknown, ctx: Partial&lt;Contexto&gt; = {}) {
+  monitoreo.captureException(error, {
+    tags: {
+      feature: ctx.feature ?? "desconocida",
+      release: process.env.NEXT_PUBLIC_BUILD_SHA,     // qué versión exacta
+    },
+    contexts: {
+      app: {
+        ruta: ctx.ruta ?? location.pathname,
+        ultimaAccion: ctx.ultimaAccion ?? migas.ultima(),
+        flagsActivos: flags.activos(),                 // 👈 ¿es de un rollout?
+        requestId: ctx.requestId,
+        conexion: (navigator as any).connection?.effectiveType,
+        montoEnCarrito: sanear(estadoDeCarrito()),     // datos, nunca PII
+      },
+    },
+  });
+}</code></pre>
+
+<pre><code class="lang-tsx">// React 19: handlers globales al crear la raíz (apps con createRoot)
+const root = createRoot(document.getElementById("root")!, {
+  // El que NINGÚN boundary agarró: esto es un incidente
+  onUncaughtError(error, errorInfo) {
+    reportar(error, { ultimaAccion: "sin-boundary" });
+    console.error(errorInfo.componentStack);
+  },
+  // El que un boundary sí agarró: se degradó bien, pero igual hay que verlo
+  onCaughtError(error, errorInfo) {
+    reportar(error, { ultimaAccion: "capturado-por-boundary" });
+  },
+});</code></pre>
+
+<div class="warn">
+  <strong>Dos cosas que se olvidan siempre.</strong> <strong>(1)</strong> Sin <strong>source maps</strong> subidos al servicio de monitoreo, tu stack dice <code>a.min.js:1:48210</code> y no sirve para nada — subilos en el build y no los publiques al navegador. <strong>(2)</strong> Los boundaries de React <strong>no</strong> capturan errores en handlers de eventos, en <code>setTimeout</code>, ni en promesas sin <code>catch</code>. Para eso van <code>window.onerror</code> y <code>onunhandledrejection</code>. La mitad de los "no aparece nada en el monitoreo" es esto.
+</div>
+
+<div class="info">
+  El lado de plataforma —alertas, SLOs, presupuesto de error, correlación con deploys— está en el <a href="../../../../track-senior/modulo-05-observability-devops/lecture.html">módulo 05 del Track Senior</a>. Lo que acá importa es que <strong>el contexto se junta en el cliente, en el momento del error, y no hay forma de recuperarlo después</strong>. Si no lo adjuntaste ahí, se perdió.
+</div>
+
+<h2>RS8.7 Feature flags y despliegue progresivo</h2>
+
+<p>Un flag desacopla <em>deployar</em> de <em>lanzar</em>. Eso es todo, y es enorme: podés mergear a main código a medio terminar, salir con él apagado, y prenderlo para el 1% de la gente un martes a la mañana con alguien mirando las métricas.</p>
+
+<table>
+<thead><tr><th>Tipo</th><th>Para qué</th><th>Vida esperada</th><th>Quién lo apaga</th></tr></thead>
+<tbody>
+<tr><td><strong>Release</strong></td><td>Sacar código sin lanzar la funcionalidad</td><td>Días o semanas</td><td>El equipo, al terminar el rollout (y borra el flag)</td></tr>
+<tr><td><strong>Experimento</strong></td><td>A/B con métrica de decisión</td><td>El experimento</td><td>Se apaga solo al concluir</td></tr>
+<tr><td><strong>Kill-switch</strong></td><td>Apagar algo caro o frágil en un incidente</td><td>Permanente</td><td>Guardia / on-call, sin deploy</td></tr>
+<tr><td><strong>Permiso</strong></td><td>Plan, rol, entitlement</td><td>Permanente</td><td>Nadie: es lógica de producto, no un flag técnico</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">// En Server Components el flag se evalúa arriba y baja como dato
+export default async function PaginaProducto({ params }: Props) {
+  const nuevaFicha = await flags.evaluar("ficha-v2", { usuarioId: await sesionId() });
+  return nuevaFicha ? &lt;FichaV2 slug={params.slug} /&gt; : &lt;FichaV1 slug={params.slug} /&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>La trampa del flag y el bundle.</strong> Ese <code>if</code> resuelve <em>qué se renderiza</em>, no <em>qué se descarga</em>: si las dos ramas están importadas estáticamente y son componentes de cliente, el usuario baja las dos. Cuando la rama nueva es pesada (un editor, un mapa, una librería de charts), va con <code>next/dynamic</code> o <code>lazy</code> para que solo la baje quien la tiene prendida. Un rollout al 1% que le suma 200 KB al 100% de la gente es un rollout que empeoró la app.
+</div>
+
+<h3>Despliegue progresivo</h3>
+
+<div class="step">
+  <strong>La escalera, con puerta en cada escalón.</strong> <strong>1%</strong> (interno + early adopters) → mirar errores 24 h → <strong>5%</strong> → mirar Web Vitals y conversión 24 h → <strong>25%</strong> → 48 h → <strong>50%</strong> → <strong>100%</strong> → <strong>borrar el flag</strong>. La regla que hace que sirva: <em>antes</em> de subir, escribís cuál es el número que te haría bajar. "Si la tasa de error de la ruta sube más de 0.3 puntos o el INP p75 sube más de 50 ms, volvemos a 0". Escrito antes, no discutido después con el gráfico en pantalla.
+</div>
+
+<p>Y el costo, que es real: <strong>cada flag es un <code>if</code> para siempre y una rama de código que nadie testea</strong>. Con 30 flags tenés 2³⁰ combinaciones teóricas y ninguna cubierta.</p>
+
+<pre><code class="lang-bash"># Flags que ya no deberían existir: los que están al 100% hace más de 30 días
+npx tsx scripts/flags-vencidos.ts
+
+  ⚠  ficha-v2          100% desde hace  87 días  · dueño: @ana    · 14 usos en el código
+  ⚠  checkout-express   100% desde hace  62 días  · dueño: (nadie) · 3 usos
+  ⚠  nav-nueva            0% desde hace 210 días  · dueño: (nadie) · 22 usos  ← código muerto
+
+3 flags vencidos. El CI falla a los 90 días.</code></pre>
+
+<div class="rule">
+  <strong>📌 Un flag nace con dueño y con fecha de muerte.</strong> Se declaran en el mismo lugar donde se crea el flag, y el CI avisa cuando vencen. Sin esto, en un año tenés cuarenta flags, la mitad al 100%, un cuarto al 0% escondiendo código muerto, y nadie que se anime a borrar ninguno.
+</div>
+
+<h2>RS8.8 Migración incremental a RSC</h2>
+
+<p>Esta es la parte del módulo que más plata vale, y también donde más proyectos se estrellan. Vale la pena empezar por el fracaso.</p>
+
+<h3>Por qué "reescribimos todo" fracasa</h3>
+
+<p>La reescritura completa siempre suena razonable en la reunión: "el código viejo está podrido, con RSC arrancamos limpio, en cuatro meses lo tenemos". Después pasa esto, y pasa siempre igual:</p>
+
+<ul>
+  <li><strong>Mes 1.</strong> Velocidad increíble. La app nueva tiene 15 pantallas y es hermosa. Faltan 185.</li>
+  <li><strong>Mes 2.</strong> El negocio no se congeló: la app vieja sacó nueve features. Ahora hay que reimplementarlas en la nueva. La nueva empieza a correr atrás.</li>
+  <li><strong>Mes 3.</strong> Aparece el pantano: los casos borde de cinco años. El cupón que solo aplica los martes, el país con IVA distinto, el flujo del cliente que factura el 30%. Nada de eso está documentado, está en el código viejo.</li>
+  <li><strong>Mes 4–6.</strong> Dos codebases en paralelo, un solo equipo, el doble de bugs, cero features nuevas. La app nueva está al 70% desde hace ocho semanas.</li>
+  <li><strong>Mes 7.</strong> Se cancela. Queda un directorio <code>v2/</code> que nadie borra por respeto.</li>
+</ul>
+
+<div class="concept">
+  <strong>💡 Por qué esto no es mala suerte.</strong> Una reescritura te pide que <strong>pagues todo el costo antes de cobrar ningún beneficio</strong>, mientras competís contra un producto vivo que sigue avanzando. Una migración incremental invierte esa curva: cobrás en la primera semana (una ruta más rápida), pagás de a poco, y en cualquier momento podés parar y quedarte con lo que ganaste. Si migrás 12 páginas de marketing y decidís no seguir, esas 12 páginas siguen siendo más rápidas para siempre. El patrón tiene nombre: <em>strangler fig</em>. Rodeás lo viejo, le vas sacando rutas, y lo viejo se apaga solo cuando ya no queda nada adentro.
+</div>
+
+<h3>Convivir con la app vieja</h3>
+
+<p>Next.js soporta <code>pages/</code> y <code>app/</code> en el mismo proyecto, ruta por ruta. Esa es toda la infraestructura que necesitás para empezar mañana: no hay una migración "big bang" obligatoria.</p>
+
+<pre><code class="lang-bash">app/
+├── layout.tsx              # nuevo: shell del App Router
+├── (marketing)/page.tsx    # ✅ migrado
+├── blog/[slug]/page.tsx    # ✅ migrado
+└── productos/[id]/page.tsx # ✅ migrado
+
+pages/
+├── _app.tsx                # sigue vivo para todo lo de abajo
+├── checkout.tsx            # ⏳ todavía no
+├── cuenta/[...tab].tsx     # ⏳ todavía no
+└── dashboard.tsx           # ⏳ quizá nunca</code></pre>
+
+<p>Reglas de convivencia que conviene saber <em>antes</em> y no descubrir en producción:</p>
+
+<table>
+<thead><tr><th>Punto</th><th>Qué pasa</th><th>Qué hacer</th></tr></thead>
+<tbody>
+<tr><td><strong>Resolución de rutas</strong></td><td>Si la misma ruta existe en los dos, <code>app/</code> gana. En build te avisa del conflicto.</td><td>Migrá una ruta por PR y borrá la vieja en el mismo PR.</td></tr>
+<tr><td><strong>Navegación entre mundos</strong></td><td>Ir de <code>pages/</code> a <code>app/</code> (o al revés) es una <strong>carga completa</strong>, no una transición de cliente.</td><td>Migrá <em>grupos</em> de rutas que la gente recorre juntas, no rutas sueltas salteadas.</td></tr>
+<tr><td><strong>Layout y providers</strong></td><td><code>_app.tsx</code> no aplica a <code>app/</code>. Vas a tener el header dos veces, en dos archivos.</td><td>Extraé el shell a un componente compartido que los dos usen. Duplicar el shell es el bug visual más común de la etapa 1.</td></tr>
+<tr><td><strong>Contexto de React</strong></td><td>No se comparte entre los dos árboles. Un provider de <code>_app.tsx</code> no existe del otro lado.</td><td>Estado que tiene que sobrevivir el cruce va a cookie, URL o storage — no a un contexto.</td></tr>
+<tr><td><strong>Estilos</strong></td><td>CSS-in-JS de runtime necesita configuración especial en Server Components; algunas librerías directamente no van.</td><td>Chequeá tu librería de estilos <strong>antes</strong> de planificar. Si no soporta RSC, la migración empieza por cambiarla, y eso es otro proyecto.</td></tr>
+<tr><td><strong>Middleware</strong></td><td>Corre para los dos.</td><td>Es tu palanca de rollout: desde ahí redirigís tráfico entre viejo y nuevo (lo vemos abajo).</td></tr>
+</tbody>
+</table>
+
+<h3>Qué migrar primero: la tabla de orden</h3>
+
+<p>El criterio es uno solo y se calcula por página: <strong>cuánto contenido tiene y cuánta interacción necesita</strong>. Mucho contenido y poca interacción es el caso donde RSC gana por goleada; al revés, no gana nada y te complica.</p>
+
+<table>
+<thead><tr><th>Tipo de página</th><th>Contenido / interacción</th><th>Ganancia esperada</th><th>Riesgo</th><th>Etapa</th></tr></thead>
+<tbody>
+<tr><td>Landing, home, marketing</td><td>Altísimo</td><td>🟢 Alta (a veces &gt;60% de JS)</td><td>Bajo</td><td><strong>1</strong></td></tr>
+<tr><td>Blog, docs, ayuda, legales</td><td>Altísimo</td><td>🟢 Alta (se va el renderer de markdown entero)</td><td>Bajo</td><td><strong>1</strong></td></tr>
+<tr><td>Listados, catálogo, búsqueda</td><td>Alto</td><td>🟢 Alta</td><td>Medio (filtros y paginación)</td><td><strong>2</strong></td></tr>
+<tr><td>Detalle de producto / artículo</td><td>Alto</td><td>🟢 Alta</td><td>Medio (islas: galería, reseñas)</td><td><strong>2</strong></td></tr>
+<tr><td>Perfil y configuración (lectura)</td><td>Medio</td><td>🟡 Media</td><td>Medio (sesión y permisos)</td><td><strong>3</strong></td></tr>
+<tr><td>Formularios largos, checkout</td><td>Bajo</td><td>🟡 Media, con Server Actions</td><td>🔴 Alto (toca la plata)</td><td><strong>4</strong></td></tr>
+<tr><td>Dashboard con filtros en vivo</td><td>Bajo</td><td>🔴 Baja</td><td>Alto</td><td><strong>5</strong> o nunca</td></tr>
+<tr><td>Editor, canvas, tiempo real, mapa</td><td>Nulo</td><td>🔴 Negativa</td><td>Alto</td><td><strong>No migrar</strong></td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Fijate que el orden no es "de lo fácil a lo difícil" por casualidad: es <strong>de mayor relación beneficio/riesgo a menor</strong>. Empezar por marketing tiene un motivo extra que no es técnico: son las páginas donde el equipo aprende el modelo mental de RSC con el menor costo posible si se equivoca. Nadie pierde una venta porque el blog tardó 300 ms más un martes.
+</div>
+
+<h3>Qué se mide en cada etapa</h3>
+
+<p>Sin números antes y después, una migración es una opinión. Estas son las métricas que importan y en qué orden mirarlas:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>De dónde sale</th><th>Qué te dice</th></tr></thead>
+<tbody>
+<tr><td><strong>First Load JS por ruta</strong></td><td><code>next build</code></td><td>El número que la migración ataca directo. Es de laboratorio: es condición necesaria, no suficiente.</td></tr>
+<tr><td><strong>LCP p75</strong> (campo)</td><td>RUM / CrUX, por ruta</td><td>Si esto no mejora, el bundle no era tu cuello de botella.</td></tr>
+<tr><td><strong>INP p75</strong> (campo)</td><td>RUM</td><td>Menos JS suele mejorarlo. Si <em>empeoró</em>, quedaste con hidratación mal repartida.</td></tr>
+<tr><td><strong>TTFB p75</strong></td><td>RUM / logs del server</td><td>El costo nuevo: ahora hay un servidor renderizando. Es la métrica que más gente se olvida y la que más sorprende.</td></tr>
+<tr><td><strong>Tasa de error de la ruta</strong></td><td>Monitoreo</td><td>La puerta de seguridad. Ninguna mejora de velocidad compra un aumento de errores.</td></tr>
+<tr><td><strong>Conversión / métrica de negocio</strong></td><td>Analytics</td><td>La única que decide de verdad si el trabajo valió.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Foto del bundle por ruta, antes y después
+next build | tee bundle-antes.txt
+
+Route (app)                          Size     First Load JS
+┌ ○ /                                1.2 kB          89 kB
+├ ○ /blog/[slug]                     0.9 kB          87 kB
+└ ƒ /productos/[id]                  3.4 kB         112 kB
+
+Route (pages)
+├ ● /checkout                       48.7 kB         341 kB   ← todavía sin migrar
+└ ● /dashboard                      72.1 kB         418 kB</code></pre>
+
+<pre><code class="lang-jsx">// scripts/comparar-bundles.mjs — el diff que va pegado en el PR
+import { readFileSync } from "node:fs";
+
+const parsear = (archivo) =&gt;
+  Object.fromEntries(
+    readFileSync(archivo, "utf8")
+      .split("\n")
+      .map((l) =&gt; l.match(/^[├└┌]\s+[○●ƒλ]\s+(\S+)\s+[\d.]+\s*k?B\s+([\d.]+)\s*kB/))
+      .filter(Boolean)
+      .map((m) =&gt; [m[1], parseFloat(m[2])]),
+  );
+
+const antes = parsear("bundle-antes.txt");
+const despues = parsear("bundle-despues.txt");
+
+for (const [ruta, kbDespues] of Object.entries(despues)) {
+  const kbAntes = antes[ruta];
+  if (kbAntes == null) continue;
+  const delta = kbDespues - kbAntes;
+  const pct = ((delta / kbAntes) * 100).toFixed(1);
+  const señal = delta &lt; -5 ? "🟢" : delta &gt; 5 ? "🔴" : "⚪";
+  console.log(`${señal} ${ruta.padEnd(28)} ${kbAntes} → ${kbDespues} kB  (${pct}%)`);
+}</code></pre>
+
+<h3>El 40%: de dónde sale y cómo se te escapa</h3>
+
+<p>El famoso <strong>~40% menos de JavaScript</strong> al pasar de <code>pages/</code> a <code>app/</code> no es magia del compilador. Es una lista concreta de cosas que <em>dejan de viajar</em>:</p>
+
+<table>
+<thead><tr><th>Lo que antes iba al navegador</th><th>Dónde queda ahora</th><th>Peso típico</th></tr></thead>
+<tbody>
+<tr><td>Renderer de markdown / MDX</td><td>Servidor</td><td>60–120 KB</td></tr>
+<tr><td>Cliente del ORM o SDK del CMS</td><td>Servidor</td><td>40–90 KB</td></tr>
+<tr><td>Formateo de fechas con locales</td><td>Servidor (o <code>Intl</code> nativo)</td><td>20–70 KB</td></tr>
+<tr><td>Catálogos de i18n completos</td><td>Servidor, ya resuelto</td><td>30–200 KB</td></tr>
+<tr><td>Validación de schemas de la API</td><td>Servidor</td><td>15–40 KB</td></tr>
+<tr><td>Código de data fetching del cliente</td><td>Desaparece</td><td>10–30 KB</td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>Cómo se convierte ese 40% en 0%.</strong> Poniendo <code>"use client"</code> arriba de cada <code>page.tsx</code> "para que ande" durante la migración. Ahí migraste la sintaxis y ninguna de las propiedades: todo sigue en el cliente, sumaste un servidor que renderiza al pedo, y el TTFB empeoró. <strong>Si después de migrar una ruta el First Load JS bajó menos del 15%, no la migraste: la mudaste.</strong> Revisá dónde quedó el límite de cliente antes de seguir con la próxima.
+</div>
+
+<h3>Rollback: la parte que hace que todo esto sea seguro</h3>
+
+<p>Cada etapa tiene que poder deshacerse en minutos, sin deploy de emergencia y sin tocar datos. Con middleware, el rollback es una variable de entorno:</p>
+
+<pre><code class="lang-tsx">// middleware.ts — la palanca de tráfico entre lo viejo y lo nuevo
+import { NextResponse, type NextRequest } from "next/server";
+
+const RUTAS_MIGRADAS = ["/", "/blog", "/ayuda", "/legales"];
+
+export function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  const migrada = RUTAS_MIGRADAS.some((r) =&gt; pathname === r || pathname.startsWith(r + "/"));
+
+  // Un flag de entorno manda a TODO el tráfico de vuelta a pages/ sin deploy
+  if (migrada &amp;&amp; process.env.ROLLBACK_ETAPA_1 === "1") {
+    const url = req.nextUrl.clone();
+    url.pathname = "/legacy" + pathname;     // reescritura a la implementación vieja
+    return NextResponse.rewrite(url);
+  }
+  return NextResponse.next();
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Por qué una migración a RSC es tan reversible.</strong> Porque es <strong>de capa de presentación</strong>: no cambia el esquema de la base, no migra datos, no rompe compatibilidad con clientes viejos. Revertir es servir el árbol de antes. En el minuto en que una etapa <em>además</em> toca el modelo de datos, dejó de ser una migración a RSC y son dos proyectos que alguien juntó — separalos, porque el rollback de uno es una variable de entorno y el del otro es una migración inversa de base de datos a las tres de la mañana.
+</div>
+
+<h2>RS8.9 Cuándo NO migrar a RSC</h2>
+
+<p>Decir que no también es una decisión de arquitectura, y es más difícil de defender que decir que sí. Cuatro casos donde el "no" es la respuesta correcta:</p>
+
+<table>
+<thead><tr><th>Situación</th><th>Por qué RSC no ayuda</th><th>Qué hacer en su lugar</th></tr></thead>
+<tbody>
+<tr><td><strong>App muy interactiva</strong> (editor, canvas, DAW, mapa, terminal, diseño)</td><td>Casi todo el árbol es estado del cliente. El servidor renderiza un cascarón y después baja el mismo JS que antes. Encima pagás dos modelos mentales conviviendo.</td><td>Code-splitting agresivo por herramienta, virtualización, Web Workers, y las técnicas de RS7.</td></tr>
+<tr><td><strong>Sin servidor propio</strong> (S3+CDN, extensión, Electron, Capacitor, intranet sin Node)</td><td>RSC necesita algo que renderice: un servidor vivo o un build que prerenderice. Si tu deploy es subir archivos, no hay dónde.</td><td>SSG cubre el 80% del beneficio de contenido sin servidor. Prerenderizado en build, hidratación selectiva.</td></tr>
+<tr><td><strong>Equipo chico</strong> (1–4 personas)</td><td>El costo grande no es migrar: es <em>operar</em>. Ahora tenés un servidor con guardia, cold starts, caché de cuatro niveles y una superficie de seguridad nueva (RS4: cada Server Function es un endpoint público).</td><td>Quedate en SPA + CDN y gastá ese esfuerzo en el bundle y en las imágenes. Volvé a evaluar cuando haya alguien que pueda estar de guardia.</td></tr>
+<tr><td><strong>El bundle no es tu problema</strong></td><td>Si el LCP se te va en una imagen hero de 3 MB, en una API que tarda 2 s o en tres scripts de terceros, RSC no mueve la aguja. Vas a hacer un trimestre de trabajo para mejorar 4%.</td><td><strong>Medí primero.</strong> Waterfall real, no intuición. Arreglá lo que domina el gráfico.</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El test de una línea.</strong> Antes de arrancar cualquier migración, escribí esta frase completa: <em>"Migramos ___ porque medimos ___ y esperamos que pase a ___, y si en la etapa 1 no pasa, paramos."</em> Si no podés llenar los tres huecos con números que ya tenés, no estás listo para empezar — estás listo para medir.
+</div>
+
+<h2>RS8.10 Deuda técnica: priorizarla sin frenar el producto</h2>
+
+<p>"Deuda técnica" se usa para dos cosas distintas y ahí empieza el problema. Código feo que nadie toca <strong>no es deuda</strong>: es código feo, y no te cobra nada. Deuda es lo que <strong>te cobra interés</strong>, y el interés se mide.</p>
+
+<table>
+<thead><tr><th>Interés observable</th><th>Cómo lo medís</th></tr></thead>
+<tbody>
+<tr><td>Cada cambio en esa área tarda el triple</td><td>Días desde el primer commit hasta el merge, por carpeta</td></tr>
+<tr><td>Los bugs vuelven al mismo lugar</td><td>Bugs por área en los últimos 90 días</td></tr>
+<tr><td>Solo una persona puede tocarlo</td><td>Autores distintos por archivo (factor bus)</td></tr>
+<tr><td>Todo cambio ahí necesita QA manual</td><td>Cobertura de tests del área, y si hay tests que rompen "solos"</td></tr>
+<tr><td>El onboarding se traba siempre en lo mismo</td><td>Preguntá a los últimos dos que entraron. Van a decir lo mismo.</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-bash"># Dónde duele: archivos que cambian mucho Y tienen muchos fixes
+git log --since="6 months ago" --name-only --pretty=format:"%s" \
+  | awk '/^(fix|hotfix)/{f=1;next} /^$/{f=0} f' \
+  | sort | uniq -c | sort -rn | head -15
+
+     34 src/features/checkout/hooks/use-precios.ts     ← 34 fixes en 6 meses
+     28 src/shared/lib/fetch-client.ts
+     19 src/features/carrito/model/calcular-total.ts</code></pre>
+
+<div class="rule">
+  <strong>📌 Las tres reglas para que se pague de verdad.</strong><br>
+  <strong>1. Presupuesto fijo, permanente:</strong> 15–20% de la capacidad, todos los sprints. Un "sprint de limpieza" por trimestre no funciona — es lo primero que se cancela cuando aparece una fecha.<br>
+  <strong>2. Se paga donde ya estás trabajando:</strong> la feature que toca <code>use-precios.ts</code> viene precedida del refactor de <code>use-precios.ts</code>. Primero <code>refactor:</code>, después <code>feat:</code>, en commits separados, para poder revertir uno sin perder el otro.<br>
+  <strong>3. Deuda en código que no vas a tocar, no se paga.</strong> El módulo de reportes que nadie edita hace dos años puede ser horrible: no te cobra interés. Arreglarlo es vanidad, y es capacidad que le sacás a algo que sí duele.
+</div>
+
+<div class="tip">
+  Cómo se argumenta con quien decide: no lleves "el código está mal". Llevá "esta área nos costó 34 fixes en seis meses; el arreglo son cinco días; a este ritmo se paga en dos meses". Números y fecha de repago. Cómo se construye esa conversación —y cómo se sostiene en el tiempo— está en el <a href="../../../../track-senior/modulo-08-liderazgo-tecnico/lecture.html">módulo 08 del Track Senior</a>.
+</div>
+
+<h2>RS8.11 Worked Example: 200 componentes y 6 segundos</h2>
+
+<p>Una SPA de e-commerce con React Router, cinco años de vida, 200 componentes. Carga en <strong>6 segundos</strong> en 4G. El equipo quiere migrar a RSC. Vamos por partes, porque la primera etapa del plan no tiene nada que ver con RSC.</p>
+
+<h3>Etapa 0 — Medir (2 días, sin migrar nada)</h3>
+
+<pre><code class="lang-bash"># Estado inicial, medido, no estimado
+First Load JS (todas las rutas)   980 kB    ← una SPA: un solo bundle para todo
+LCP p75 (campo, 4G)                6.1 s
+INP p75                            240 ms
+TTFB p75                           180 ms    ← estático desde CDN, sano
+
+# ¿Y de qué está hecho ese bundle?
+npx source-map-explorer build/static/js/*.js
+
+  moment + locales completos        168 kB   ← y además hay date-fns Y dayjs
+  @mui/icons-material (todo)        142 kB   ← se usan 23 iconos
+  recharts                          118 kB   ← se usa en 2 rutas de 40
+  markdown-it + plugins              94 kB   ← solo en /ayuda
+  catálogo i18n (6 idiomas)          88 kB   ← el usuario usa uno
+  el código de la app               370 kB</code></pre>
+
+<div class="warn">
+  <strong>Acá está la parte incómoda del ejemplo:</strong> de esos 980 KB, <strong>610 KB son dependencias mal cargadas</strong>, no arquitectura. Nada de eso lo arregla RSC — lo arregla saber qué estás importando. Si el equipo hubiera arrancado migrando, habría hecho tres meses de trabajo para lograr lo que se logra en una semana con <code>source-map-explorer</code> y disciplina. <strong>Medí antes de migrar, siempre.</strong>
+</div>
+
+<h3>Etapa 1 — Lo barato primero (1 semana, cero RSC)</h3>
+
+<p>Una sola librería de fechas, iconos importados de a uno, <code>recharts</code> y <code>markdown-it</code> con <code>lazy</code>, catálogo de i18n por idioma bajo demanda, y code-splitting por ruta con <code>React.lazy</code>.</p>
+
+<pre><code class="lang-bash">First Load JS   980 → 415 kB   (-58%)
+LCP p75         6.1 → 3.4 s    (-44%)
+INP p75         240 → 210 ms
+TTFB p75        180 ms         (sin cambio)</code></pre>
+
+<p><strong>Criterio de éxito:</strong> LCP p75 &lt; 4 s. ✅ <strong>Rollback:</strong> revertir el PR; no hay estado ni infraestructura involucrada.</p>
+
+<div class="rule">
+  <strong>📌 La mitad de la ganancia no necesitaba RSC.</strong> Y esto es lo normal, no la excepción. Si el equipo hubiera empezado por la migración, se habría atribuido a RSC una mejora que era de higiene de dependencias — y habría sacado la conclusión equivocada sobre cuánto valió la migración de verdad.
+</div>
+
+<h3>Etapa 2 — Marketing y contenido (3 semanas, primer RSC)</h3>
+
+<p><strong>Qué entra:</strong> home, 8 landings, <code>/ayuda</code> (42 artículos en markdown), legales. Cero interacción más allá de links y un formulario de contacto. <strong>Qué se mide:</strong> First Load JS de esas rutas, LCP p75 de campo, y conversión del formulario de contacto.</p>
+
+<pre><code class="lang-bash">Rutas migradas (12 de 40)
+First Load JS   415 → 96 kB    (-77% en estas rutas)
+LCP p75         3.4 → 1.4 s
+TTFB p75        180 → 240 ms   ← ⚠ el costo nuevo: ahora hay servidor
+Errores         0.02% → 0.02%  (sin cambio)
+Conversión form 3.1% → 3.4%    (dentro del ruido, no se reclama la mejora)</code></pre>
+
+<p><strong>Criterio de éxito:</strong> LCP p75 &lt; 2 s en las rutas migradas, tasa de error sin aumento, conversión sin caída. ✅ <strong>Rollback:</strong> <code>ROLLBACK_ETAPA_1=1</code> en el entorno; el middleware reescribe a las rutas viejas, que siguen existiendo. Tiempo estimado: 3 minutos, sin deploy.</p>
+
+<div class="info">
+  El −77% acá es más alto que el 40% de referencia justamente porque son las páginas <em>más</em> favorables: se fue el renderer de markdown entero, el i18n resuelto en servidor y todo el data fetching de cliente. El promedio de la migración completa va a ser mucho más cerca del 40%, porque las etapas siguientes son cada vez menos favorables. <strong>No extrapoles la etapa 1.</strong>
+</div>
+
+<h3>Etapa 3 — Catálogo y detalle (5 semanas)</h3>
+
+<p><strong>Qué entra:</strong> listado con filtros, búsqueda, detalle de producto (~60 componentes). <strong>Qué queda como isla de cliente:</strong> galería de imágenes, selector de variante, botón de agregar al carrito, reseñas con paginación. <strong>Qué se mide:</strong> lo de siempre más INP (los filtros ahora hacen ida y vuelta al servidor) y la tasa de abandono del listado.</p>
+
+<pre><code class="lang-bash">First Load JS   415 → 148 kB   (-64% en estas rutas)
+LCP p75         3.4 → 1.9 s
+INP p75         210 → 260 ms   ← ⚠ filtros por servidor: se siente más lento al tipear
+TTFB p75        240 → 280 ms
+Abandono list.  41% → 41%</code></pre>
+
+<div class="mistake">
+  El INP subió 50 ms y esa es la señal más importante de toda la etapa: los filtros pasaron a ser una navegación de servidor y el usuario siente la latencia en cada tecla. El arreglo no es volver atrás — es <code>useDeferredValue</code> más una transición optimista en el input (RS2), para que la UI responda al toque y el resultado llegue cuando llegue. <strong>Una etapa puede pasar el criterio de bundle y fallar el de percepción.</strong> Por eso INP está en la lista.
+</div>
+
+<h3>Etapa 4 — Cuenta y configuración (3 semanas)</h3>
+
+<p>Vistas de lectura como Server Components, formularios con Server Actions. Riesgo medio: toca sesión y permisos, así que cada Server Function se audita con el checklist de RS4 (autenticar → validar → autorizar sobre el recurso → actuar). <strong>Criterio extra:</strong> intentos de acceso cruzado entre usuarios probados con <code>curl</code>, todos rechazados.</p>
+
+<h3>Etapa 5 — Checkout: se evalúa, no se asume</h3>
+
+<p>Ganancia estimada: media. Riesgo: alto, porque es donde entra la plata. La decisión del equipo fue <strong>esperar</strong> hasta tener dos etapas seguidas sin incidentes y hasta que los Server Actions estuvieran rodados en cuenta. Postergar una etapa <em>es</em> una decisión válida y va escrita en el plan, no se deja al olvido.</p>
+
+<h3>Dashboard y editor: no se migran</h3>
+
+<p>El dashboard con filtros en vivo y el editor de fichas del vendedor se quedan en el mundo cliente. Ahí RSC no aporta y le agrega latencia a cada interacción. Se optimizan con lo de RS7 (virtualización, memoización, transiciones) y listo. <strong>Terminar con rutas sin migrar no es una migración incompleta: es una migración con criterio.</strong></p>
+
+<h3>El plan en una tabla</h3>
+
+<table>
+<thead><tr><th>Etapa</th><th>Alcance</th><th>Métrica que decide</th><th>Puerta</th><th>Rollback</th></tr></thead>
+<tbody>
+<tr><td><strong>0</strong> Medir</td><td>2 días, nada de código</td><td>—</td><td>Saber de qué está hecho el bundle</td><td>—</td></tr>
+<tr><td><strong>1</strong> Higiene</td><td>Deps, code-split, i18n</td><td>LCP p75</td><td>&lt; 4 s</td><td>Revertir PR</td></tr>
+<tr><td><strong>2</strong> Contenido</td><td>12 rutas de marketing</td><td>LCP p75 + conversión</td><td>&lt; 2 s, conversión sin caída</td><td>Env var, 3 min</td></tr>
+<tr><td><strong>3</strong> Catálogo</td><td>~60 componentes</td><td>LCP + <strong>INP</strong> + abandono</td><td>INP p75 &lt; 300 ms</td><td>Env var, 3 min</td></tr>
+<tr><td><strong>4</strong> Cuenta</td><td>Lectura + Server Actions</td><td>Errores + auditoría de autorización</td><td>0 accesos cruzados</td><td>Env var, 3 min</td></tr>
+<tr><td><strong>5</strong> Checkout</td><td>Postergada</td><td>—</td><td>2 etapas sin incidentes primero</td><td>—</td></tr>
+<tr><td><strong>—</strong> Dashboard/editor</td><td>No migra</td><td>—</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El resultado, y la lectura honesta.</strong> De 6.1 s a ~1.9 s de LCP p75 en las rutas que importan, con el bundle general bajando de 980 KB a un rango de 96–148 KB según la ruta. Pero <strong>la mitad de esa mejora fue de la etapa 1, que no tocó RSC</strong>, y el TTFB empeoró 100 ms porque ahora hay un servidor que operar. Un reporte que dice "migramos a RSC y bajamos 80% el bundle" es verdad y es engañoso a la vez. Uno que separa qué ganó cada etapa es el que te deja tomar la próxima decisión bien.
+</div>
+
+<h2>RS8.12 Cierre del track: qué estudiar después</h2>
+
+<p>Terminaste el track. Lo que viste, en una línea cada uno: <strong>RS1</strong> el reconciliador y por qué React re-renderiza cuando re-renderiza; <strong>RS2</strong> concurrencia, prioridades y transiciones; <strong>RS3</strong> el compilador y qué memoización dejaste de escribir a mano; <strong>RS4</strong> Server Components, el payload y el límite cliente/servidor; <strong>RS5</strong> data fetching y las cuatro cachés; <strong>RS6</strong> arquitectura de estado; <strong>RS7</strong> performance medida; y <strong>RS8</strong> lo que pasa cuando todo eso tiene que vivir cinco años con gente que va y viene.</p>
+
+<p>Tres direcciones para seguir, en orden de rendimiento por hora invertida:</p>
+
+<ul>
+  <li><strong>Lo que este track deliberadamente no cubrió.</strong> El <a href="../../../../track-senior/index.html">Track Senior de Frontend</a> tiene lo que no es de React y hace falta igual: <a href="../../../../track-senior/modulo-02-state-machines/lecture.html">máquinas de estado</a>, <a href="../../../../track-senior/modulo-03-testing-strategy/lecture.html">estrategia de testing</a>, <a href="../../../../track-senior/modulo-04-seguridad-auth/lecture.html">seguridad y auth</a>, <a href="../../../../track-senior/modulo-05-observability-devops/lecture.html">observabilidad</a>, <a href="../../../../track-senior/modulo-06-microfrontends-monorepos/lecture.html">monorepos</a> y <a href="../../../../track-senior/modulo-08-liderazgo-tecnico/lecture.html">liderazgo técnico</a>.</li>
+  <li><strong>Las fuentes primarias.</strong> El blog de React y sus RFCs, las notas de versión de Next.js, la especificación del formato de payload RSC, y Web Vitals en la fuente. Todo lo que leas en un blog de terceros es una interpretación con seis meses de retraso.</li>
+  <li><strong>El código de React.</strong> El reconciliador de <code>react-reconciler</code> es legible si vas con una pregunta concreta ("¿qué hace exactamente <code>lanes</code>?"). Es la mejor forma de dejar de tenerle miedo a la caja negra.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 Y lo que ningún curso te puede dar.</strong> Mantener una app en producción durante seis meses. Ver un incidente a las tres de la mañana, revertir una etapa que empeoró las métricas, borrar un flag que dejaste vencido, encontrarte con tu propio código de hace un año y no entenderlo. Todo este track es vocabulario para esa experiencia; la experiencia no se puede leer.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Tu equipo quiere migrar a RSC porque la app tarda 6 segundos. ¿Cuál es el primer paso, y por qué no es migrar?</summary>
+<p><strong>Medir de qué están hechos esos 6 segundos.</strong> RSC ataca un problema específico —JavaScript que viaja al navegador sin necesidad— y si tu cuello de botella es otro, vas a hacer un trimestre de trabajo para una mejora marginal. En el ejemplo de RS8.11, de 980 KB de bundle, 610 KB eran dependencias mal cargadas: tres librerías de fechas, un pack de iconos entero por 23 iconos, y charts cargados en 40 rutas para usarse en 2. Eso se arregla en una semana con <code>source-map-explorer</code> y no requiere migrar nada. Recién cuando el bundle está limpio y el LCP <em>sigue</em> dominado por JavaScript, RSC es la herramienta correcta. Y hay un motivo adicional para ordenarlo así: si migrás primero, le vas a atribuir a RSC una mejora que era de higiene, y vas a decidir la etapa siguiente con un número inflado.</p></details>
+
+<details><summary>¿Por qué la regla "las features no se importan entre sí" necesita lint, si el equipo ya está de acuerdo?</summary>
+<p>Porque el acuerdo no sobrevive al contexto. Son las 6 de la tarde de un viernes, hay que sacar un fix, y hacer <code>import { calcularEnvio } from "../envios/model"</code> resuelve el problema en diez segundos mientras que hacerlo bien —subirlo a <code>shared/</code> o componer en <code>app/</code>— son cuarenta minutos y otro reviewer. Nadie es malicioso: la fricción decide. Después ese import queda, el siguiente es más fácil de justificar ("ya hay uno"), y en un año el grafo es un plato de fideos que ningún documento describe. <code>import/no-restricted-paths</code> convierte la decisión de "¿me conviene hacerlo bien?" en "no compila", que es una conversación mucho más corta. Y en un repo ya roto no se prende en <code>error</code> de golpe: se prende en <code>warn</code>, se congela el número de violaciones, y el CI falla solo si ese número sube.</p></details>
+
+<details><summary>Un <code>as Usuario</code> sobre un <code>res.json()</code> compila y funciona en el happy path. ¿Cuál es el daño real?</summary>
+<p>Que apagás al compilador exactamente donde más lo necesitás. <code>res.json()</code> es <code>any</code>: el <code>as</code> no valida nada, solo afirma. Desde esa línea hacia adentro, TypeScript infiere todo a partir de una mentira, y lo hace con total confianza — el editor te autocompleta <code>usuario.perfil.avatar</code> aunque <code>perfil</code> venga <code>null</code>, y <code>usuario.creadoEl.getFullYear()</code> aunque <code>creadoEl</code> sea un string ISO. El error no aparece en el borde: aparece seis componentes más adentro, en código que nunca tocó la red, y el stack te lleva ahí en vez de al contrato roto. Es peor que no tener tipos, porque sin tipos escribís defensivo y con un tipo falso escribís confiado. El arreglo es validar en runtime (zod, valibot) y <em>derivar</em> el tipo del schema con <code>z.infer</code>, para que no se puedan desincronizar; y cuando el parseo falla, tratarlo como lo que es —un contrato roto que va a observabilidad— y no como un error del usuario.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Organizá <strong>por feature, no por tipo de archivo</strong>. La unidad es algo que un usuario puede nombrar. Colocation: el archivo vive donde se usa, y si borrás la carpeta se tiene que ir todo con ella.</li>
+  <li>Promové a <code>shared/</code> con <strong>tres usos reales</strong>, no con uno. Con dos, duplicá. Y promover es <em>rediseñar</em>, no mover de carpeta.</li>
+  <li>Las fronteras se hacen cumplir con <strong>lint que falla el CI</strong> (<code>import/no-restricted-paths</code>), no con buena voluntad. En repos viejos: <code>warn</code>, baseline, y ratchet hacia abajo.</li>
+  <li>El acoplamiento caro es el <strong>invisible</strong>: estado global compartido, tipos que arrastran, imports con efectos. El test de la carpeta borrada te lo muestra con nombre y línea.</li>
+  <li>Un componente compartido tiene que ser <strong>aburrido</strong>. Props que dependen de otras props, variantes con nombre de feature y analytics adentro son las tres señales de abstracción prematura.</li>
+  <li><strong>Tipá el borde y derivá para adentro.</strong> <code>as Usuario</code> sobre un <code>res.json()</code> es una mentira que contamina todo el árbol y hace fallar lejos del origen. Validá en runtime y sacá el tipo del schema.</li>
+  <li>Error boundaries <strong>por unidad de valor</strong>: ruta y widget, no uno en la raíz ni uno por componente. Y el fallback responde "¿perdí mi trabajo?" antes que cualquier otra cosa.</li>
+  <li>Capturar el error <strong>con contexto</strong> (ruta, feature, última acción, flags activos, release, request id) es la diferencia entre veinte minutos y tres semanas. Ese contexto solo existe en el momento del error.</li>
+  <li>Un flag nace con <strong>dueño y fecha de muerte</strong>; el rollout sube por escalones con el número de rollback escrito <em>antes</em>. Y si la rama nueva es pesada, va con import dinámico o le sumás bundle al 100% para el 1%.</li>
+  <li>La migración a RSC es <strong>incremental o no es</strong>. Reescribir todo falla porque pagás todo el costo antes de cobrar nada, compitiendo contra un producto vivo.</li>
+  <li>Orden de migración: <strong>mucho contenido y poca interacción primero</strong> (marketing, docs), formularios después, editores y canvas nunca. El ~40% menos de JS es real y se evapora si ponés <code>"use client"</code> arriba de cada página.</li>
+  <li>Cada etapa tiene <strong>puerta de métrica y rollback en minutos</strong>. Es reversible porque es capa de presentación: en cuanto toque el esquema de datos, son dos proyectos distintos.</li>
+  <li>La deuda que se paga es la que <strong>cobra interés medible</strong>, con 15–20% de capacidad permanente, y pegada a la feature que ya toca esa área. Deuda en código que no vas a tocar no es deuda.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá tu proyecto React más grande y dibujá su estructura actual. Elegí <strong>una</strong> feature y migrala a la estructura por features de RS8.1, con su <code>index.ts</code> público. Anotá cuántos archivos tuviste que tocar que <em>no</em> eran de esa feature: ese número es tu acoplamiento real.</li>
+  <li>Configurá <code>import/no-restricted-paths</code> con las cuatro reglas de frontera y corré ESLint. Contá las violaciones y clasificalas en tres grupos: las que se arreglan moviendo a <code>shared/</code>, las que se arreglan componiendo en <code>app/</code>, y las que revelan que dos features en realidad eran una. Congelá el número como baseline.</li>
+  <li>Corré <code>madge --circular</code> y <code>depcruise</code> sobre tu repo. Si hay ciclos, elegí uno y explicá por escrito qué lo causó. Después hacé el test de la carpeta borrada en una rama descartable: borrá una feature, corré <code>tsc --noEmit</code>, y anotá dónde aparecieron los errores.</li>
+  <li>Buscá en tu código el componente compartido con más props. Contá cuántas solo son válidas si otra prop tiene cierto valor. Reescribilo como un primitivo aburrido más una especialización por feature, y anotá cuántas líneas quedaron en cada lado.</li>
+  <li>Encontrá todos los <code>as</code> y <code>any</code> que estén sobre respuestas de red (<code>grep -rn "as Promise&lt;\|res.json() as"</code>). Elegí el más usado, poné un schema de validación en runtime y derivá el tipo con <code>z.infer</code>. Después rompé la API a propósito (cambiá un campo en un mock) y verificá que el error ahora aparezca en el borde y no seis componentes adentro.</li>
+  <li>Provocá un error de render en una ruta de tu app y mirá qué llega al monitoreo. Después agregá el <code>reportar()</code> con contexto de RS8.6 y volvé a provocarlo. Compará los dos reportes y decidí, mirando solo el segundo, si podrías arreglar el bug sin abrir la app.</li>
+  <li>Elegí una app tuya y armá el plan de migración a RSC completo: la tabla de rutas clasificadas por contenido/interacción, la métrica que decide cada etapa con su número de puerta, y el mecanismo de rollback. Incluí explícitamente qué rutas <strong>no</strong> vas a migrar y por qué. Si concluís que no conviene migrar nada, ese también es un plan válido — escribí el argumento con números.</li>
+  <li>Corré el comando de <code>git log</code> de RS8.10 sobre tu repo y sacá el top 5 de archivos con más fixes. Para el primero, estimá el costo de arreglarlo y cuántos fixes por trimestre te ahorraría. Escribí las dos líneas que le llevarías a quien decide.</li>
+</ol>
+
+<section class="quiz" id="quizRS8">
+  <style>
+    #quizRS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS8 .q{margin-bottom:1.5rem}
+    #quizRS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS8 .opt:hover{border-color:var(--accent)}
+    #quizRS8 .opt:disabled{cursor:default}
+    #quizRS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS8 .exp.show{display:block}
+    #quizRS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Migraste una ruta de <code>pages/</code> a <code>app/</code> y el First Load JS bajó de 340 kB a 325 kB. ¿Qué pasó?</p>
+    <button class="opt">Es lo esperable: el 40% es un promedio y algunas rutas ganan poco</button>
+    <button class="opt">Probablemente pusiste <code>"use client"</code> muy arriba y todo sigue en el cliente</button>
+    <button class="opt">Falta activar el React Compiler para que la ganancia aparezca</button>
+    <div class="exp">Un 4% no es "una ruta poco favorable": es la firma de una migración que movió la sintaxis y no el límite cliente/servidor. Si <code>page.tsx</code> arranca con <code>"use client"</code>, todo el árbol vuelve a ser cliente, el bundle no cambia y encima sumaste un servidor renderizando de gusto — el TTFB empeora sin contrapartida. La regla práctica: <strong>menos del 15% de reducción en una ruta migrada significa revisar dónde quedó el límite antes de seguir con la siguiente</strong>. El compilador (RS3) optimiza re-renders, no mueve código al servidor: no tiene nada que ver acá.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu app es un editor colaborativo tipo canvas, la despliegan como archivos estáticos en un CDN y son 3 personas en el equipo. ¿Conviene migrar a RSC?</p>
+    <button class="opt">Sí: RSC siempre reduce el bundle y el editor también se beneficia</button>
+    <button class="opt">Sí, pero solo la pantalla de login y el listado de documentos</button>
+    <button class="opt">No: se juntan las tres condiciones donde RSC no aporta y sí cobra</button>
+    <div class="exp">Los tres factores apuntan al mismo lado. <strong>App muy interactiva</strong>: casi todo el árbol es estado de cliente, así que el servidor renderiza un cascarón y después baja el mismo JS. <strong>Sin servidor propio</strong>: RSC necesita algo que renderice; si tu deploy es subir archivos a un CDN, no hay dónde. <strong>Equipo chico</strong>: el costo grande no es migrar, es <em>operar</em> — guardia, cold starts, caché de varios niveles y una superficie de seguridad nueva. La opción de migrar solo login y listado suena prudente pero es la peor de las tres: pagás todo el costo de infraestructura y de doble modelo mental a cambio de dos pantallas, y encima cada cruce entre mundos es una carga completa de página.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Dos features necesitan la misma función de cálculo de envío. ¿Qué hacés?</p>
+    <button class="opt">Duplicarla: con dos usos todavía no sabés cuál es la forma general</button>
+    <button class="opt">Moverla a <code>shared/lib</code> ya mismo, para no repetir código</button>
+    <button class="opt">Que la segunda feature la importe de la primera, total es una sola función</button>
+    <div class="exp">Con dos usos ves dos casos, y una abstracción hecha sobre dos casos casi siempre termina siendo el componente de 14 props de RS8.4: cada feature nueva le agrega un parámetro y un <code>if</code>, hasta que nadie la puede cambiar. Duplicar cuesta unas líneas y te compra la información que necesitás; al tercer uso ya ves qué varía y qué no, y ahí la extracción tiene sentido — <strong>rediseñándola</strong>, no mudándola de carpeta. Importar de la otra feature es la peor: no ahorra nada respecto de duplicar y te ata las dos features para siempre, que es exactamente lo que <code>import/no-restricted-paths</code> existe para impedir.</div>
+  </div>
+
+  <div class="score" id="scoreRS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Terminaste el track React Senior.' : '  — repasá las que fallaste. Terminaste el track.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs7-performance/lecture.html">← RS7: Performance</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

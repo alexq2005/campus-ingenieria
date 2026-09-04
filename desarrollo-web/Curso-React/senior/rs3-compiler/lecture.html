@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS3 — React Compiler: el fin de la memoización manual · React Senior</title>
+  <meta name="description" content="Qué hace exactamente el React Compiler 1.0, cómo se ve su output, las Reglas de React como contrato, el linter que te dice qué quedó afuera, adopción incremental, qué NO arregla y qué hacer con los useMemo que ya tenés.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS3</span>
+  <span class="badge">⏱ 40–120 min</span>
+  <span class="badge">🎯 Pre-req: RS1</span>
+  <span class="badge">🤖 Compiler</span>
+</div>
+
+<article>
+
+<h1>RS3 — React Compiler: el fin de la memoización manual</h1>
+
+<h2>RS3.0 Por qué este módulo</h2>
+
+<p>Durante casi una década, "saber React avanzado" significó, en buena medida, saber <strong>dónde poner <code>useMemo</code>, <code>useCallback</code> y <code>memo</code></strong>. Era conocimiento real: había que entender identidad referencial, entender que un objeto literal creado en el render es un objeto nuevo cada vez, entender que pasar una función inline a un hijo memoizado anula el <code>memo</code>. Ese conocimiento separaba al que hacía que la app fuera fluida del que la dejaba trabada.</p>
+
+<p>También era, mirado con honestidad, <strong>trabajo mecánico</strong>. La decisión de memoizar casi nunca requería creatividad: requería aplicar reglas. Y las reglas que un humano aplica a mano las aplica mal, tarde y de a ratos: memoiza de más "por las dudas", se olvida de la dependencia que importa, deja un <code>useCallback</code> que envuelve una función que igual se recrea porque su closure cambió.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> El <strong>React Compiler</strong> convirtió ese trabajo mecánico en trabajo de la herramienta. No te vuelve innecesario: te cambia el trabajo. En vez de decidir <em>dónde memoizar</em>, tu trabajo pasa a ser <strong>garantizar que tu código cumpla las Reglas de React</strong> —que es lo único que el compilador necesita para optimizarte— y <strong>verificar que efectivamente lo hizo</strong>, porque cuando no puede, se saltea el componente <em>en silencio</em>.
+</div>
+
+<p>Y hay una razón de coyuntura para estudiarlo <em>ahora</em>. El compilador dejó de ser un experimento: llegó a <strong>1.0 el 7 de octubre de 2025</strong>, y sobre <strong>React 19.2</strong> —la versión estable actual— es una herramienta de producción. <strong>Meta ya lo usa en producción</strong> en features de Instagram, que es la validación a escala que a este tipo de herramientas siempre les falta. Los números que publica el equipo: entre <strong>25% y 40% menos re-renders innecesarios</strong>, sin ningún esfuerzo del desarrollador.</p>
+
+<div class="warn">
+  <strong>Ojo con esa cifra.</strong> "25–40% menos re-renders" no es "25–40% más rápido". Un re-render que no se ve, no se mide y no bloquea nada no cuesta nada perceptible. La ganancia real depende por completo de <em>cuáles</em> re-renders elimina en tu app. Por eso la mitad de este módulo es sobre <strong>medir</strong>, no sobre activar.
+</div>
+
+<h2>RS3.1 Qué hace exactamente: no es magia, es análisis estático</h2>
+
+<p>El React Compiler es un <strong>plugin de build</strong> —vive como plugin de Babel, y a través de él lo consumen Vite, Next.js, Remix, Expo, etc.— que corre <strong>antes</strong> de que tu código llegue al navegador. Toma cada función que reconoce como componente o como hook, la analiza, y <strong>reescribe su código</strong> agregando memoización automática.</p>
+
+<p>Lo que hace, paso a paso:</p>
+
+<div class="step"><strong>1. Identifica componentes y hooks.</strong> Por convención: funciones con nombre en PascalCase que devuelven JSX, y funciones cuyo nombre empieza con <code>use</code>. Si tu componente se llama <code>miWidget</code> en minúscula, para el compilador no es un componente y ni lo mira.</div>
+
+<div class="step"><strong>2. Construye una representación intermedia (HIR).</strong> Convierte el cuerpo de la función a una forma de bajo nivel con control de flujo explícito, similar a lo que hace un compilador de verdad. Sobre esa forma puede razonar.</div>
+
+<div class="step"><strong>3. Hace análisis de dependencias y de mutación.</strong> Determina, para cada valor que tu componente calcula, <strong>de qué otros valores depende</strong> y <strong>quién lo muta</strong>. Este es el corazón del asunto: si no puede probar que un valor no se muta después de crearse, no puede cachearlo.</div>
+
+<div class="step"><strong>4. Corta el cuerpo en "scopes reactivos".</strong> Agrupa las instrucciones en bloques que comparten dependencias, y le asigna a cada bloque un slot en una caché.</div>
+
+<div class="step"><strong>5. Emite el código memoizado.</strong> Reescribe la función para que, en cada render, compare las dependencias de cada bloque con las del render anterior y <strong>reutilice el resultado guardado</strong> si no cambiaron.</div>
+
+<div class="rule">
+  <strong>📌 La granularidad es más fina que la tuya.</strong> Vos memoizás <em>un valor</em> con <code>useMemo</code>. El compilador memoiza <strong>cada scope reactivo del componente por separado</strong>, incluyendo <strong>los elementos JSX que devolvés</strong>. Eso último es lo que un humano casi nunca hace a mano y es de donde sale buena parte de la ganancia: si el <code>&lt;Sidebar /&gt;</code> que devolvés no depende de nada que cambió, el compilador devuelve <em>el mismo objeto elemento</em> y React ni siquiera baja a reconciliar ese subárbol.
+</div>
+
+<p>Eso último conecta directo con RS1: React compara los elementos del árbol nuevo contra los del viejo. Si un elemento es <strong>referencialmente idéntico</strong> al del render anterior, React puede saltearse esa rama entera. Memoizar JSX es memoizar reconciliación, no solo cálculo.</p>
+
+<h2>RS3.2 Cómo se ve el output (esto es lo que hace que se entienda)</h2>
+
+<p>Nada explica el compilador tan bien como mirar lo que emite. Partimos de un componente absolutamente común, sin ninguna memoización:</p>
+
+<pre><code class="lang-jsx">function ListaDeTareas({ tareas, filtro, onToggle }) {
+  const visibles = tareas.filter((t) =&gt; t.estado === filtro);
+  const resumen = `${visibles.length} de ${tareas.length}`;
+
+  return (
+    &lt;section&gt;
+      &lt;Encabezado texto={resumen} /&gt;
+      &lt;ul&gt;
+        {visibles.map((t) =&gt; (
+          &lt;Tarea key={t.id} tarea={t} onToggle={onToggle} /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+<p>Sin compilador, cada render de este componente vuelve a filtrar el array, vuelve a construir el string, y vuelve a crear <strong>todos</strong> los elementos JSX —incluido <code>&lt;Encabezado /&gt;</code>, aunque <code>resumen</code> no haya cambiado.</p>
+
+<p>Con el compilador activado, el output es —simplificado y con nombres legibles— algo muy parecido a esto:</p>
+
+<pre><code class="lang-jsx">import { c as _c } from "react/compiler-runtime";
+
+function ListaDeTareas(props) {
+  const $ = _c(9);                 // 9 slots de caché para este componente
+  const { tareas, filtro, onToggle } = props;
+
+  // --- scope 1: visibles depende de (tareas, filtro) ---
+  let visibles;
+  if ($[0] !== tareas || $[1] !== filtro) {
+    visibles = tareas.filter((t) =&gt; t.estado === filtro);
+    $[0] = tareas;
+    $[1] = filtro;
+    $[2] = visibles;
+  } else {
+    visibles = $[2];
+  }
+
+  // --- scope 2: resumen depende de (visibles.length, tareas.length) ---
+  let resumen;
+  if ($[3] !== visibles || $[4] !== tareas) {
+    resumen = `${visibles.length} de ${tareas.length}`;
+    $[3] = visibles;
+    $[4] = tareas;
+    $[5] = resumen;
+  } else {
+    resumen = $[5];
+  }
+
+  // --- scope 3: el ELEMENTO &lt;Encabezado /&gt; depende solo de resumen ---
+  let encabezado;
+  if ($[6] !== resumen) {
+    encabezado = &lt;Encabezado texto={resumen} /&gt;;
+    $[6] = resumen;
+    $[7] = encabezado;
+  } else {
+    encabezado = $[7];
+  }
+
+  // ... y así con el resto del árbol
+  return $[8] !== encabezado ? ($[8] = encabezado, armarSeccion(...)) : /* cacheado */;
+}</code></pre>
+
+<div class="info">
+  El <code>$</code> es un array que vive en un hook interno del componente (por eso <code>_c(9)</code> reserva 9 posiciones). En el primer render todas las posiciones arrancan con un centinela —<code>Symbol.for("react.memo_cache_sentinel")</code>— que garantiza que ninguna comparación acierte y todo se calcule. En los siguientes, cada <code>if</code> es una comparación por identidad (<code>!==</code>), exactamente la misma semántica que las dependencias de <code>useMemo</code>.
+</div>
+
+<p>Tres observaciones que cambian cómo pensás el tema:</p>
+
+<div class="step"><strong>Es literalmente lo que vos escribirías a mano.</strong> No hay ninguna técnica exótica. Es <code>useMemo</code> aplicado sistemáticamente, con dependencias correctas, sobre <em>cada</em> valor intermedio. Un humano no escribe esto porque es ilegible; una herramienta sí, porque nadie lo lee.</div>
+
+<div class="step"><strong>Memoiza el JSX, no solo los datos.</strong> El <code>scope 3</code> del ejemplo no cachea un cálculo caro: cachea <em>un objeto elemento</em>. Ese es el caso que a mano casi nadie cubre y que, en árboles grandes, es el que más rinde.</div>
+
+<div class="step"><strong>El costo también es visible.</strong> Ese array de 9 slots existe por cada instancia montada del componente, y esas comparaciones se ejecutan en cada render. No es gratis. Volvemos sobre esto en RS3.9.</div>
+
+<p>Podés ver el output real de tu propio código sin adivinar. El <em>playground</em> oficial del compilador muestra el HIR y el JavaScript emitido lado a lado, y para un archivo local alcanza con pedirle a Babel que imprima el resultado:</p>
+
+<pre><code class="lang-bash">npx babel src/componentes/ListaDeTareas.jsx \
+  --plugins babel-plugin-react-compiler \
+  --presets @babel/preset-react</code></pre>
+
+<div class="tip">
+  Hacé esto <strong>una vez</strong>, con un componente tuyo real, antes de seguir leyendo el módulo. La diferencia entre "entiendo el concepto" y "vi el código que genera" es enorme, y no se recupera leyendo más prosa.
+</div>
+
+<h2>RS3.3 Las Reglas de React son el contrato</h2>
+
+<p>Todo el análisis de RS3.1 se apoya en una suposición: que tu componente es una <strong>función pura del estado y las props</strong>. Si lo es, el compilador puede probar cosas sobre él y optimizarlo. Si no lo es, cualquier caché que ponga puede cambiar el comportamiento del programa — y ahí el compilador hace lo correcto: <strong>no lo optimiza</strong>.</p>
+
+<p>Las reglas relevantes, y qué rompe cada una:</p>
+
+<table>
+<thead><tr><th>Regla</th><th>Qué significa en la práctica</th><th>Si la violás</th></tr></thead>
+<tbody>
+<tr><td><strong>Los componentes son puros</strong></td><td>Con las mismas props y estado, mismo output. Sin efectos secundarios durante el render.</td><td>El compilador no puede reordenar ni saltear el cálculo: se abstiene</td></tr>
+<tr><td><strong>No mutar props ni estado</strong></td><td>Tratar props, estado y todo lo que viene de un hook como <em>inmutable</em></td><td>Es la causa #1 de componentes salteados</td></tr>
+<tr><td><strong>No mutar valores después de usarlos en JSX</strong></td><td>Un objeto que ya pasaste a un hijo no se toca más</td><td>La caché devolvería el objeto ya mutado</td></tr>
+<tr><td><strong>Hooks en el tope, sin condicionales</strong></td><td>Mismo orden de hooks en todos los renders</td><td>Error de compilación, no solo skip</td></tr>
+<tr><td><strong>No leer ni escribir refs durante el render</strong></td><td><code>ref.current</code> solo en efectos y handlers</td><td>El render deja de ser puro</td></tr>
+<tr><td><strong>No llamar <code>setState</code> durante el render</strong></td><td>Salvo el patrón oficial de estado derivado</td><td>Render con efectos: no memoizable</td></tr>
+</tbody>
+</table>
+
+<p>El caso más frecuente, de lejos, es la mutación de props. Casi siempre entra por la puerta de atrás, disfrazada de conveniencia:</p>
+
+<pre><code class="lang-jsx">// ❌ Muta una prop. El compilador NO va a optimizar este componente.
+function TablaUsuarios({ usuarios, columnas }) {
+  // .sort() ordena EL ARRAY ORIGINAL, in place
+  usuarios.sort((a, b) =&gt; a.apellido.localeCompare(b.apellido));
+
+  // y esto muta el objeto que nos pasaron
+  columnas.forEach((col) =&gt; {
+    col.ancho = col.ancho ?? 120;
+  });
+
+  return &lt;Tabla filas={usuarios} cols={columnas} /&gt;;
+}</code></pre>
+
+<p>Esto probablemente "funcione" hoy. Nunca fue correcto: el padre le pasó un array y vos se lo reordenaste sin avisar, y le pusiste campos a sus objetos. Con Strict Mode y doble render en desarrollo ya podía dar sorpresas. Lo que cambia con el compilador es que ahora esa incorrección <strong>tiene un costo visible</strong>: el componente queda afuera de la optimización.</p>
+
+<pre><code class="lang-jsx">// ✅ Copiar antes de transformar. Ahora es puro y memoizable.
+function TablaUsuarios({ usuarios, columnas }) {
+  const ordenados = [...usuarios].sort((a, b) =&gt;
+    a.apellido.localeCompare(b.apellido)
+  );
+
+  const conAncho = columnas.map((col) =&gt; ({
+    ...col,
+    ancho: col.ancho ?? 120,
+  }));
+
+  return &lt;Tabla filas={ordenados} cols={conAncho} /&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>La trampa mental.</strong> "Pero copiar el array en cada render es más lento". Sin compilador, tal vez. Con compilador, ese <code>[...usuarios].sort(...)</code> queda dentro de un scope reactivo que depende de <code>usuarios</code>: si la prop no cambió, <strong>la copia no se vuelve a hacer</strong>. Escribir código puro es lo que <em>habilita</em> la optimización, no lo que la impide.
+</div>
+
+<p>El segundo caso frecuente es leer un ref durante el render, que suele aparecer como un intento de "acordarse" de algo entre renders:</p>
+
+<pre><code class="lang-jsx">// ❌ Lee y escribe ref.current en pleno render
+function Grafico({ datos }) {
+  const anterior = useRef(datos);
+  const crecio = datos.total &gt; anterior.current.total;   // lectura en render
+  anterior.current = datos;                              // escritura en render
+
+  return &lt;Barra valor={datos.total} subiendo={crecio} /&gt;;
+}</code></pre>
+
+<pre><code class="lang-jsx">// ✅ El "valor anterior" es estado derivado, y tiene un patrón oficial
+function Grafico({ datos }) {
+  const [anterior, setAnterior] = useState(datos);
+  const [crecio, setCrecio] = useState(false);
+
+  if (anterior !== datos) {           // patrón soportado: ajustar estado en render
+    setAnterior(datos);
+    setCrecio(datos.total &gt; anterior.total);
+  }
+
+  return &lt;Barra valor={datos.total} subiendo={crecio} /&gt;;
+}</code></pre>
+
+<div class="danger">
+  <strong>Lo importante del contrato: el incumplimiento es silencioso.</strong> Cuando el compilador detecta que no puede probar la pureza de un componente, <strong>lo deja tal cual y sigue de largo</strong>. No tira un error, no rompe el build, no aparece nada en la consola del navegador. Tu app funciona exactamente igual que antes — simplemente ese componente no recibió ninguna optimización. Por eso lo que viene ahora es la parte operativa del módulo.
+</div>
+
+<h2>RS3.4 El linter: la herramienta que te dice qué quedó afuera</h2>
+
+<p>Si el skip es silencioso, necesitás una fuente de verdad sobre qué se optimizó y qué no. Esa fuente es el <strong>linter del compilador</strong>, que desde <code>eslint-plugin-react-hooks</code> v6 viene <strong>integrado en el mismo plugin de siempre</strong>: ya no es un paquete aparte.</p>
+
+<pre><code class="lang-bash">npm install --save-dev eslint-plugin-react-hooks@latest
+npm install --save-dev babel-plugin-react-compiler@latest</code></pre>
+
+<p>La configuración en <em>flat config</em> es de dos líneas:</p>
+
+<pre><code class="lang-jsx">// eslint.config.js
+import reactHooks from "eslint-plugin-react-hooks";
+
+export default [
+  // Incluye las reglas clásicas de hooks MÁS los diagnósticos del compilador
+  reactHooks.configs.recommended,
+
+  {
+    rules: {
+      // Subir a error los que te importa que bloqueen el CI
+      "react-hooks/immutability": "error",
+      "react-hooks/purity": "error",
+      "react-hooks/set-state-in-render": "error",
+      "react-hooks/refs": "warn",
+      "react-hooks/preserve-manual-memoization": "warn",
+    },
+  },
+];</code></pre>
+
+<div class="info">
+  Los nombres exactos de las reglas dependen de la versión del plugin — verificalos con <code>npx eslint --print-config src/App.jsx</code>. El conjunto cubre, a grandes rasgos: pureza del render (<code>purity</code>), mutación de props y estado (<code>immutability</code>), <code>setState</code> en render, uso de refs, globals, componentes definidos dentro de otros componentes (<code>static-components</code>), y respeto de la memoización manual que ya escribiste (<code>preserve-manual-memoization</code>).
+</div>
+
+<p>Corriéndolo, la salida deja de ser una intuición y pasa a ser una lista:</p>
+
+<pre><code class="lang-bash">npx eslint src --format stylish
+
+# src/componentes/TablaUsuarios.jsx
+#   12:3  error  This mutates `usuarios`, a value received as a prop.
+#                Props are immutable  react-hooks/immutability
+#
+# src/componentes/Grafico.jsx
+#   8:19  warn   Ref values (`anterior.current`) may not be read during
+#                render  react-hooks/refs
+#
+# ✖ 2 problems (1 error, 1 warning)</code></pre>
+
+<p>Cada diagnóstico acá es, literalmente, <strong>un componente que no se está optimizando</strong> y por qué. Esa es la lista de trabajo del módulo: no "activar el compilador", sino <em>vaciar esa lista</em>.</p>
+
+<p>Además del linter, existe una herramienta de diagnóstico que te da el panorama de todo el proyecto antes de tocar nada:</p>
+
+<pre><code class="lang-bash">npx react-compiler-healthcheck@latest</code></pre>
+
+<pre><code class="lang-bash"># Salida típica
+Successfully compiled 184 out of 203 components.
+StrictMode usage not found.
+Found no usage of incompatible libraries.</code></pre>
+
+<div class="rule">
+  <strong>📌 Ese "184 de 203" es tu métrica de adopción.</strong> Anotalo antes de empezar y volvé a correrlo después de cada tanda de arreglos. Es el número que hace que "estamos migrando al compilador" deje de ser una sensación y pase a ser un porcentaje que sube. Los 19 que faltan son deuda técnica concreta, con archivo y línea.
+</div>
+
+<p>El healthcheck también avisa dos cosas que importan mucho: si <strong>no</strong> tenés <code>StrictMode</code> activo (sin él, muchas impurezas nunca se manifiestan en desarrollo) y si usás <strong>librerías incompatibles</strong> — típicamente librerías que dependen de que React re-renderice de más, o que mutan valores que les pasás.</p>
+
+<h2>RS3.5 Adopción incremental: por directorio y con escape hatch</h2>
+
+<p>Nadie activa el compilador en un monorepo de 2.000 componentes en un solo commit. La estrategia sensata tiene tres velocidades.</p>
+
+<h3>Velocidad 1 — Modo anotación: solo lo que marcás</h3>
+
+<p>El compilador puede arrancar en modo <em>opt-in</em>: no toca nada salvo las funciones que llevan la directiva <code>"use memo"</code>.</p>
+
+<pre><code class="lang-jsx">// vite.config.js
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        plugins: [
+          ["babel-plugin-react-compiler", { compilationMode: "annotation" }],
+        ],
+      },
+    }),
+  ],
+});</code></pre>
+
+<pre><code class="lang-jsx">function PanelDeMetricas({ series }) {
+  "use memo";           // ← solo este componente entra al compilador
+  const totales = series.map(agregar);
+  return &lt;Grilla datos={totales} /&gt;;
+}</code></pre>
+
+<h3>Velocidad 2 — Por directorio</h3>
+
+<p>Más útil en la práctica: activar el compilador para todo, pero acotando el alcance a las carpetas donde ya limpiaste el linter.</p>
+
+<pre><code class="lang-jsx">// vite.config.js — adopción por rutas
+const reactCompilerConfig = {
+  sources: (filename) =&gt; {
+    return (
+      filename.includes("/src/features/checkout/") ||
+      filename.includes("/src/componentes/ui/")
+    );
+  },
+};</code></pre>
+
+<p>En Next.js el interruptor es de más alto nivel y la configuración del plugin va por debajo:</p>
+
+<pre><code class="lang-jsx">// next.config.js  (Next.js 15.x — verificá el nombre del flag en tu versión)
+module.exports = {
+  experimental: {
+    reactCompiler: {
+      compilationMode: "annotation",   // o true, para todo el proyecto
+    },
+  },
+};</code></pre>
+
+<h3>Velocidad 3 — Todo activado, con <code>"use no memo"</code> como válvula</h3>
+
+<p>El estado final es el compilador aplicado a todo el proyecto. Para los componentes que todavía no se pueden arreglar, existe la directiva inversa:</p>
+
+<pre><code class="lang-jsx">function VisorLegacy({ config }) {
+  "use no memo";        // ← el compilador ignora este componente
+  // TODO(2026-Q4): depende de mutar config.filtros desde un plugin externo.
+  // Issue #4471. Sacar esta directiva cuando migremos el plugin.
+  config.filtros.push(filtroPorDefecto);
+  return &lt;Visor {...config} /&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong><code>"use no memo"</code> es una deuda, no una solución.</strong> Es la contraparte exacta de un <code>// eslint-disable-next-line</code>: legítima como medida temporal, tóxica como costumbre. Tratala igual — <strong>siempre</strong> con un comentario que diga por qué está y qué la va a sacar. Si tenés 40 en el repo y ninguna tiene fecha, no adoptaste el compilador: lo apagaste de a poco.
+</div>
+
+<h3>Compatibilidad de versiones</h3>
+
+<p>El compilador emite llamadas a <code>react/compiler-runtime</code>, que existe nativamente en React 19. Para proyectos en React 17 o 18 hay un runtime de compatibilidad que hay que instalar y declarar:</p>
+
+<pre><code class="lang-bash">npm install react-compiler-runtime@latest</code></pre>
+
+<pre><code class="lang-jsx">// Para React 17 / 18
+const reactCompilerConfig = {
+  target: "18",        // "17", "18" o "19"
+};</code></pre>
+
+<h2>RS3.6 Medir en vez de suponer</h2>
+
+<p>Activar el compilador y declarar "quedó más rápido" es exactamente el tipo de afirmación que un senior no hace sin datos. Hay tres instrumentos, y conviene usar los tres porque miden cosas distintas.</p>
+
+<h3>1. React DevTools: quién se optimizó</h3>
+
+<p>Con el compilador activo, los componentes optimizados aparecen en el árbol de DevTools con una insignia <strong>"Memo ✨"</strong>. Es la verificación visual más rápida que existe: abrís el panel, mirás el árbol, y los que no tienen la insignia son los que quedaron afuera. Cruzá esa lista con la salida del linter — deberían coincidir.</p>
+
+<h3>2. El Profiler: cuánto se renderiza y cuánto cuesta</h3>
+
+<p>El Profiler de React DevTools es la medición que importa. El procedimiento correcto es siempre el mismo, y el orden no es negociable:</p>
+
+<div class="step"><strong>1.</strong> Elegí <strong>una interacción concreta</strong> y repetible: "escribir 10 caracteres en el buscador", "tildar tres filas de la tabla". No "usar la app".</div>
+
+<div class="step"><strong>2.</strong> Grabá esa interacción <strong>con el compilador apagado</strong>. Anotá: cantidad de commits, duración del commit más lento, y qué componentes aparecen re-renderizando en el flamegraph.</div>
+
+<div class="step"><strong>3.</strong> Activá el compilador. Repetí <strong>exactamente</strong> la misma interacción. Anotá los mismos tres números.</div>
+
+<div class="step"><strong>4.</strong> Compará <em>commits</em> y <em>duración</em>, no sensaciones. Si los commits bajaron pero la duración no, ganaste poco: estabas renderizando de más, pero barato.</div>
+
+<div class="mistake">
+  <strong>Error clásico de medición:</strong> perfilar en build de desarrollo y sacar conclusiones de producción. El build de desarrollo tiene checks extra, y con <code>StrictMode</code> los componentes se renderizan <strong>dos veces a propósito</strong>. Los números absolutos no son comparables con producción. Para comparar A/B está bien (ambos lados tienen el mismo overhead), pero nunca reportes "el render tarda 34 ms" tomado en desarrollo.
+</div>
+
+<h3>3. <code>&lt;Profiler&gt;</code> programático: la medición que no depende de vos</h3>
+
+<p>Los números del panel se pierden cuando cerrás la pestaña. Para dejar la medición <em>escrita</em> —y poder detectar regresiones dentro de seis meses— React expone el componente <code>&lt;Profiler&gt;</code>:</p>
+
+<pre><code class="lang-jsx">import { Profiler } from "react";
+
+function registrar(id, fase, duracionReal, duracionBase) {
+  // fase: "mount" | "update" | "nested-update"
+  // duracionReal: lo que tardó ESTE commit
+  // duracionBase: lo que tardaría sin ninguna memoización
+  if (fase === "update" &amp;&amp; duracionReal &gt; 16) {
+    telemetria.track("render_lento", { id, duracionReal, duracionBase });
+  }
+}
+
+&lt;Profiler id="ListaDeTareas" onRender={registrar}&gt;
+  &lt;ListaDeTareas tareas={tareas} filtro={filtro} onToggle={toggle} /&gt;
+&lt;/Profiler&gt;</code></pre>
+
+<div class="tip">
+  La relación entre <code>duracionReal</code> y <code>duracionBase</code> es la métrica más honesta que tenés sobre la memoización: <strong><code>duracionBase</code> es el costo sin ninguna caché</strong>. Si después de activar el compilador <code>duracionReal</code> sigue casi igual a <code>duracionBase</code>, la memoización no está evitando trabajo — algo no se está optimizando, o el trabajo estaba en otro lado.
+</div>
+
+<p>Y para no depender de que alguien mire un dashboard, la medición se puede convertir en un test que falla solo:</p>
+
+<pre><code class="lang-tsx">import { render, screen, fireEvent } from "@testing-library/react";
+
+let renders = 0;
+function TareaEspiada(props: TareaProps) {
+  renders++;
+  return &lt;Tarea {...props} /&gt;;
+}
+
+test("cambiar el filtro no re-renderiza las tareas visibles", () =&gt; {
+  render(&lt;ListaDeTareas tareas={FIXTURE} Item={TareaEspiada} /&gt;);
+  renders = 0;
+
+  fireEvent.click(screen.getByRole("button", { name: /pendientes/i }));
+
+  // Antes del compilador este número era 40. Si vuelve a subir,
+  // alguien rompió la pureza de un componente del camino.
+  expect(renders).toBeLessThanOrEqual(12);
+});</code></pre>
+
+<h2>RS3.7 Qué NO hace el compilador</h2>
+
+<p>Esta sección existe porque la expectativa desmedida es la principal causa de decepción con la herramienta. El compilador resuelve <strong>una</strong> clase de problema: el trabajo repetido de un componente cuyo input no cambió. Todo lo demás sigue siendo tuyo.</p>
+
+<table>
+<thead><tr><th>Problema</th><th>¿Lo arregla el compilador?</th><th>Qué lo arregla</th></tr></thead>
+<tbody>
+<tr><td><strong>Fetch en cascada</strong> (hijo que pide datos recién cuando el padre terminó)</td><td>❌ No, ni de casualidad</td><td>Levantar el fetch, prefetch, Suspense con promesas iniciadas arriba (RS4/RS5)</td></tr>
+<tr><td><strong>Estado mal ubicado</strong> (un input controlado en la raíz del árbol)</td><td>⚠️ Mitiga el síntoma, no la causa</td><td>Bajar el estado, o colocation (RS6)</td></tr>
+<tr><td><strong>Lista de 10.000 filas en el DOM</strong></td><td>❌ No</td><td>Virtualización — el problema es el DOM, no el render de React</td></tr>
+<tr><td><strong>Bundle de 3 MB</strong></td><td>❌ No, lo agranda un poco</td><td>Code splitting, tree shaking, revisar dependencias</td></tr>
+<tr><td><strong>Un cálculo O(n²) sobre 50.000 items</strong></td><td>⚠️ Lo hace una sola vez en vez de en cada render</td><td>Cambiar el algoritmo, o sacarlo a un worker</td></tr>
+<tr><td><strong>Layout thrashing</strong> (leer <code>offsetHeight</code> en un loop)</td><td>❌ No, eso es del navegador</td><td>Batchear lecturas y escrituras del DOM</td></tr>
+<tr><td><strong>Context que dispara todo el árbol</strong></td><td>⚠️ Parcial: los consumidores puros pueden salteárselo</td><td>Partir el context, o selector-based state (RS6)</td></tr>
+<tr><td><strong>Re-render por props que cambian de verdad</strong></td><td>❌ No — y hace bien</td><td>Nada: si el input cambió, hay que renderizar</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El compilador no reemplaza a RS1.</strong> Sigue haciendo falta entender el reconciliador: por qué una <code>key</code> mal elegida remonta un subárbol entero, por qué mover un componente en el árbol destruye su estado, cuándo React puede reutilizar una instancia. El compilador optimiza <em>dentro</em> de las reglas del reconciliador; no las cambia. Si tu problema es que las keys son índices y la lista se reordena, el compilador no te va a salvar de nada.
+</div>
+
+<p>Y hay un caso donde el compilador es directamente irrelevante: cuando <strong>el input sí cambió</strong>. Si en cada tecla del buscador el array filtrado es distinto, ninguna caché puede reutilizar nada — el trabajo hay que hacerlo. Ahí la solución es de RS2: <code>useDeferredValue</code>, <code>startTransition</code>, marcar ese trabajo como interrumpible para que el input no se trabe. <strong>El compilador evita trabajo innecesario; la concurrencia prioriza el trabajo necesario.</strong> Son ejes distintos y se combinan.</p>
+
+<h2>RS3.8 ¿Hay que borrar los <code>useMemo</code> que ya tenés?</h2>
+
+<p>Es la pregunta que aparece siempre, y la respuesta honesta no es un sí ni un no. Empecemos por el hecho técnico que la mayoría ignora:</p>
+
+<div class="concept">
+  <strong>💡 El compilador NO elimina tu memoización manual: la respeta.</strong> Si escribiste un <code>useMemo</code>, el compilador lo trata como parte del contrato del código y se asegura de <strong>preservar esa garantía</strong>. Existe una regla del linter dedicada a eso (<code>preserve-manual-memoization</code>) que te avisa cuando tu memo manual está escrito de una forma que el compilador no puede preservar. Es decir: dejar los memos no rompe nada, y no genera doble memoización del mismo valor.
+</div>
+
+<p>Entonces la pregunta no es "¿es peligroso dejarlos?" sino "¿me conviene sacarlos?". Y ahí la respuesta depende de <strong>para qué estaba puesto cada uno</strong>:</p>
+
+<table>
+<thead><tr><th>Para qué estaba el memo</th><th>¿Borrarlo?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Evitar que un hijo con <code>memo</code> se re-renderice</td><td>✅ Sí</td><td>Es exactamente lo que el compilador hace, mejor y con más granularidad</td></tr>
+<tr><td>Estabilizar un objeto de props que se pasa hacia abajo</td><td>✅ Sí</td><td>Ídem: es memoización de identidad, el trabajo del compilador</td></tr>
+<tr><td><code>useCallback</code> de un handler pasado a un hijo</td><td>✅ Sí</td><td>Ídem</td></tr>
+<tr><td>Evitar un cálculo <strong>genuinamente caro</strong> (parsear, ordenar 50k, comprimir)</td><td>🟡 Podés, pero no ganás nada</td><td>El compilador lo cubre. Dejarlo documenta la intención: "esto es caro"</td></tr>
+<tr><td>Dar <strong>identidad referencial</strong> a una dependencia de <code>useEffect</code></td><td>❌ <strong>No</strong></td><td>Acá el memo es <em>corrección</em>, no performance. Sacarlo puede disparar el efecto de más</td></tr>
+<tr><td>Estabilizar el <code>value</code> de un <code>Context.Provider</code></td><td>❌ No, todavía no</td><td>Es semántica observable por todos los consumidores; verificalo antes de tocarlo</td></tr>
+<tr><td>Estabilizar algo que entra a una librería externa (deps de React Query, etc.)</td><td>❌ No</td><td>El contrato es con la librería, no con React. El compilador no lo conoce</td></tr>
+<tr><td><code>useMemo</code> que envuelve algo con efecto secundario</td><td>❌ No — arreglalo</td><td>Es un bug esperando: <code>useMemo</code> no garantiza ejecutarse una sola vez</td></tr>
+</tbody>
+</table>
+
+<p>La línea que separa las dos mitades de la tabla es una sola pregunta: <strong>¿este memo existe por velocidad o por corrección?</strong></p>
+
+<pre><code class="lang-jsx">// ✅ SE PUEDE BORRAR: existía solo para que &lt;Fila /&gt; no se re-renderizara.
+function Tabla({ filas, orden }) {
+  const ordenadas = useMemo(
+    () =&gt; [...filas].sort(comparadores[orden]),
+    [filas, orden]
+  );
+  const alClic = useCallback((id) =&gt; seleccionar(id), []);
+
+  return ordenadas.map((f) =&gt; &lt;Fila key={f.id} fila={f} onClick={alClic} /&gt;);
+}</code></pre>
+
+<pre><code class="lang-jsx">// ❌ NO BORRAR: acá el memo es CORRECCIÓN, no performance.
+function Buscador({ termino, filtros }) {
+  // Si `query` cambia de identidad, el efecto vuelve a pedir al servidor.
+  // Sin memo, cada render dispararía un fetch nuevo. Eso es un bug, no lentitud.
+  const query = useMemo(
+    () =&gt; ({ q: termino, ...filtros }),
+    [termino, filtros]
+  );
+
+  useEffect(() =&gt; {
+    const ctrl = new AbortController();
+    buscar(query, ctrl.signal).then(setResultados);
+    return () =&gt; ctrl.abort();
+  }, [query]);                    // ← la dependencia que el memo protege
+
+  return &lt;Resultados datos={resultados} /&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong>¿Y el compilador no memoiza <code>query</code> igual?</strong> En general sí, y muchas veces sacar el <code>useMemo</code> de ese ejemplo funciona perfecto. Pero <em>funciona perfecto</em> no es lo mismo que <em>está garantizado</em>: la memoización del compilador es una optimización, y una optimización puede cambiar entre versiones. <strong>Nunca apoyes la corrección de tu programa en una optimización.</strong> Si el efecto tiene que dispararse una sola vez, eso se escribe explícito.
+</div>
+
+<h3>La estrategia recomendada</h3>
+
+<div class="step"><strong>1. No hagas una limpieza masiva.</strong> Un PR de "saco 300 useMemo" es imposible de revisar y de bisectar si algo se rompe. Es el peor riesgo/beneficio disponible.</div>
+
+<div class="step"><strong>2. Borralos oportunísticamente.</strong> Cuando tocás un archivo por otra razón y ves un memo defensivo obvio, sacalo en ese mismo PR. Cero costo marginal.</div>
+
+<div class="step"><strong>3. Cuando dudes, dejalo.</strong> Un <code>useMemo</code> redundante cuesta unos bytes y una comparación. Un <code>useMemo</code> borrado que garantizaba una identidad cuesta un bug de producción raro de reproducir. La asimetría es enorme.</div>
+
+<div class="step"><strong>4. Documentá los que se quedan.</strong> Un comentario de una línea —<code>// identidad requerida por el efecto de abajo</code>— evita que el próximo lo borre en su limpieza.</div>
+
+<h2>RS3.9 El costo: build, bundle y cuándo empeora</h2>
+
+<p>Ninguna herramienta es gratis, y el senior es el que sabe qué está pagando.</p>
+
+<h3>Tiempo de build</h3>
+
+<p>El compilador agrega una pasada de análisis por archivo. En proyectos medianos el impacto suele ser modesto; en monorepos grandes es real y se nota en CI. Es medible en dos comandos:</p>
+
+<pre><code class="lang-bash"># Sin compilador
+time npm run build
+
+# Con compilador activado
+time npm run build
+
+# Y si querés saber quién se lleva el tiempo dentro del build:
+npx vite build --profile</code></pre>
+
+<div class="tip">
+  Si el build se vuelve el cuello de botella, acotá <code>sources</code> a los directorios donde la optimización rinde —las pantallas críticas, no los formularios de configuración que se abren dos veces por mes—. La ganancia de perf del compilador no está distribuida uniformemente por el código, así que el costo de build tampoco tiene por qué estarlo.
+</div>
+
+<h3>Tamaño del bundle</h3>
+
+<p>El código emitido es <strong>más grande</strong> que el que escribiste: cada scope reactivo agrega comparaciones y asignaciones. En la práctica el crecimiento reportado ronda un <strong>pequeño porcentaje</strong> del bundle de la app, y suele quedar bien compensado por la ganancia en runtime — pero si estás peleando por kilobytes en una landing, es un dato que tenés que medir vos:</p>
+
+<pre><code class="lang-bash">npx vite-bundle-visualizer
+# o, más simple, comparar el output crudo:
+ls -la dist/assets/*.js</code></pre>
+
+<h3>Memoria en runtime</h3>
+
+<p>Cada instancia montada de un componente compilado tiene su array <code>$</code>. En un componente con 12 slots montado 5.000 veces (una tabla virtualizada grande), eso son 60.000 referencias vivas más. Es raro que importe, pero deja de ser raro en listas enormes con componentes complejos.</p>
+
+<h3>Cuándo el compilador puede empeorar las cosas</h3>
+
+<div class="mistake">
+  <strong>Componentes triviales que se renderizan muchísimo.</strong> Si un componente devuelve <code>&lt;span&gt;{texto}&lt;/span&gt;</code> y se renderiza 10.000 veces, el costo de las comparaciones de caché puede superar al costo de simplemente ejecutarlo. La memoización nunca es gratis: siempre cambia <em>cálculo</em> por <em>comparación más memoria</em>. Cuando el cálculo es más barato que la comparación, perdés.
+</div>
+
+<div class="mistake">
+  <strong>Props que cambian de identidad en cada render igual.</strong> Si un componente recibe un objeto nuevo siempre —porque el padre no está compilado, o porque el dato viene de una librería que lo recrea— la caché <strong>nunca acierta</strong>. Pagás todas las comparaciones y no ahorrás ningún cálculo. Es el peor caso posible, y es la razón por la que <code>"use no memo"</code> existe.
+</div>
+
+<div class="mistake">
+  <strong>Fugas de memoria por retener valores grandes.</strong> Si un componente calcula un objeto de varios megabytes y el compilador lo cachea, ese objeto queda vivo mientras el componente esté montado, aunque ya no se use. Sin caché, el GC lo levantaba enseguida.
+</div>
+
+<p>Los tres casos tienen el mismo antídoto: <strong>medir el componente concreto</strong> con el Profiler y, si efectivamente empeoró, sacarlo con <code>"use no memo"</code> y dejar el comentario que explique por qué. Es una decisión perfectamente legítima, siempre que esté respaldada por un número.</p>
+
+<h2>RS3.10 Cuándo <code>memo</code> manual todavía tiene sentido</h2>
+
+<p>El compilador memoiza <em>dentro</em> de un componente y memoiza los elementos JSX que ese componente crea. Pero hay una frontera que no puede cruzar: <strong>lo que le llega desde afuera de su alcance</strong>.</p>
+
+<pre><code class="lang-jsx">// El padre NO está compilado (código de terceros, o carpeta excluida
+// de `sources`, o un render prop de una librería). Cada render crea
+// un objeto `config` nuevo, con identidad nueva.
+
+function VisorCaro({ config, datos }) {
+  // El compilador memoiza los cálculos internos... pero todos dependen
+  // de `config`, que cambia SIEMPRE. Ninguna caché acierta nunca.
+  const escala = calcularEscala(config, datos);
+  return &lt;Canvas escala={escala} /&gt;;
+}
+
+// ✅ memo con comparador propio: acá SÍ agrega algo que el compilador no puede
+export default memo(VisorCaro, (prev, next) =&gt;
+  prev.datos === next.datos &amp;&amp;
+  prev.config.zoom === next.config.zoom &amp;&amp;
+  prev.config.tema === next.config.tema
+);</code></pre>
+
+<p>Los casos donde <code>memo</code> manual sigue siendo la herramienta correcta:</p>
+
+<table>
+<thead><tr><th>Caso</th><th>Por qué el compilador no alcanza</th></tr></thead>
+<tbody>
+<tr><td>El padre no está compilado (librería, código legacy, carpeta excluida)</td><td>El compilador optimiza el componente, no a quien lo llama</td></tr>
+<tr><td>Necesitás una <strong>comparación semántica</strong>, no por identidad</td><td>El compilador siempre compara con <code>!==</code>; no sabe que dos objetos distintos son "iguales para vos"</td></tr>
+<tr><td>Un <strong>límite duro</strong> del árbol: un subárbol carísimo que querés aislar sí o sí</td><td>El <code>memo</code> es un contrato explícito y legible; la memoización del compilador es implícita</td></tr>
+<tr><td>El componente es la raíz de una isla de terceros (mapa, editor, canvas)</td><td>Querés control explícito sobre cuándo esa isla se toca</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 La regla de convivencia.</strong> Dejá que el compilador se ocupe de <strong>todo lo interno</strong> —cálculos, handlers, elementos JSX— y reservá <code>memo</code> manual para <strong>fronteras</strong>: el punto donde tu código compilado se toca con código que no controlás. Ahí <code>memo</code> deja de ser un parche de performance y pasa a ser documentación ejecutable de un límite arquitectónico.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "siete componentes, catorce memos y un Profiler"</h2>
+
+<blockquote>El panel de pedidos de un e-commerce está lento al escribir en el buscador. El equipo ya "optimizó": hay 14 <code>useMemo</code> y <code>useCallback</code> repartidos en 7 componentes. Nadie sabe cuáles hacen algo. La tarea: activar el compilador y determinar, con evidencia, qué mejoró.</blockquote>
+
+<p><strong>Paso 0 — Medir ANTES de tocar nada.</strong> Sin este paso el resto del ejercicio no vale nada, porque no vas a tener con qué comparar.</p>
+
+<pre><code class="lang-bash"># Baseline con el Profiler de React DevTools:
+# interacción = escribir "note" (4 teclas) en el buscador de pedidos
+#
+#   commits ............... 12
+#   commit más lento ...... 41 ms
+#   duración total ........ 210 ms
+#   componentes que re-renderizan por tecla ... 7 de 7</code></pre>
+
+<p><strong>Paso 1 — Diagnóstico del proyecto, antes de activar.</strong></p>
+
+<pre><code class="lang-bash">npx react-compiler-healthcheck@latest
+
+# Successfully compiled 5 out of 7 components.
+# StrictMode usage not found.
+# Found no usage of incompatible libraries.</code></pre>
+
+<p>5 de 7. Ya sabemos que dos componentes van a quedar afuera <strong>antes</strong> de activar nada. También sabemos algo peor: <strong>no hay StrictMode</strong>, así que las impurezas nunca se manifestaron en desarrollo. Eso se arregla primero, porque si no, el paso siguiente va a encontrar problemas que la app venía escondiendo.</p>
+
+<p><strong>Paso 2 — El linter dice cuáles y por qué.</strong></p>
+
+<pre><code class="lang-bash">npx eslint src/features/pedidos --format stylish
+
+# src/features/pedidos/TablaPedidos.jsx
+#   23:5  error  This mutates `pedidos`, a value received as a prop  react-hooks/immutability
+#
+# src/features/pedidos/ResumenEstado.jsx
+#   14:7  error  This mutates `resumen`, a value returned from a hook  react-hooks/immutability
+#
+# ✖ 2 problems (2 errors, 0 warnings)</code></pre>
+
+<p>Coincide con el healthcheck: los dos componentes que no compilan son los dos que mutan. Veamos el primero:</p>
+
+<pre><code class="lang-jsx">// ❌ TablaPedidos.jsx — el original
+function TablaPedidos({ pedidos, orden, onSeleccionar }) {
+  // Muta la prop: .sort() y .reverse() son in place
+  pedidos.sort((a, b) =&gt; a[orden.campo] &gt; b[orden.campo] ? 1 : -1);
+  if (orden.desc) pedidos.reverse();
+
+  // Y encima le agrega un campo calculado a cada objeto del padre
+  pedidos.forEach((p) =&gt; {
+    p.etiqueta = `${p.numero} · ${p.cliente}`;
+  });
+
+  const filas = useMemo(
+    () =&gt; pedidos.map((p) =&gt; &lt;Fila key={p.id} pedido={p} /&gt;),
+    [pedidos, orden]        // ← dependencia mentirosa: `pedidos` es la MISMA
+  );                        //    referencia siempre, porque se muta in place
+
+  const seleccionar = useCallback(
+    (id) =&gt; onSeleccionar(id),
+    [onSeleccionar]
+  );
+
+  return &lt;tbody onClick={seleccionar}&gt;{filas}&lt;/tbody&gt;;
+}</code></pre>
+
+<div class="danger">
+  <strong>El <code>useMemo</code> de este componente estaba roto desde el día uno.</strong> Como <code>pedidos</code> se ordena <em>in place</em>, la referencia del array nunca cambia — así que la dependencia <code>[pedidos, orden]</code> no detecta el reordenamiento y <code>filas</code> queda cacheada con el orden viejo. Nadie lo notó porque <code>orden</code> también está en las dependencias y cambia junto. Este es el patrón: <strong>el linter del compilador encuentra bugs latentes de correctitud, no solo oportunidades de optimización.</strong>
+</div>
+
+<pre><code class="lang-jsx">// ✅ TablaPedidos.jsx — puro, sin memos, listo para el compilador
+function TablaPedidos({ pedidos, orden, onSeleccionar }) {
+  const ordenados = [...pedidos]
+    .sort((a, b) =&gt; (a[orden.campo] &gt; b[orden.campo] ? 1 : -1))
+    .map((p) =&gt; ({ ...p, etiqueta: `${p.numero} · ${p.cliente}` }));
+
+  const finales = orden.desc ? ordenados.reverse() : ordenados;
+  //  ↑ .reverse() acá es seguro: `ordenados` es una copia nuestra
+
+  return (
+    &lt;tbody&gt;
+      {finales.map((p) =&gt; (
+        &lt;Fila key={p.id} pedido={p} onSeleccionar={onSeleccionar} /&gt;
+      ))}
+    &lt;/tbody&gt;
+  );
+}</code></pre>
+
+<p>Fijate lo que pasó: el componente quedó <strong>más corto y más claro</strong>, sin <code>useMemo</code> ni <code>useCallback</code>, y ahora sí es memoizable. El compilador va a cachear la copia, el sort, el map y los elementos <code>&lt;Fila /&gt;</code> — con dependencias correctas, cosa que el memo manual no tenía.</p>
+
+<p>El segundo caso, <code>ResumenEstado</code>, es la misma clase de bug con otro disfraz:</p>
+
+<pre><code class="lang-jsx">// ❌ Muta el objeto que devuelve un hook — igual de prohibido que mutar props
+function ResumenEstado({ pedidos }) {
+  const resumen = useResumenDePedidos(pedidos);
+  resumen.total = resumen.pendientes + resumen.enviados;   // ⛔
+  return &lt;Tarjetas datos={resumen} /&gt;;
+}
+
+// ✅ Derivar sin mutar
+function ResumenEstado({ pedidos }) {
+  const resumen = useResumenDePedidos(pedidos);
+  const total = resumen.pendientes + resumen.enviados;
+  return &lt;Tarjetas datos={resumen} total={total} /&gt;;
+}</code></pre>
+
+<p><strong>Paso 3 — Activar y verificar que efectivamente compila todo.</strong></p>
+
+<pre><code class="lang-bash">npx react-compiler-healthcheck@latest
+# Successfully compiled 7 out of 7 components.   ← la métrica de adopción
+
+npx eslint src/features/pedidos
+# ✔ 0 problems</code></pre>
+
+<p>Y la verificación visual: abrir React DevTools y confirmar que los 7 componentes tienen la insignia <strong>Memo ✨</strong>. Si el healthcheck dice 7/7 pero DevTools no muestra la insignia en alguno, el plugin no está corriendo sobre ese archivo — típicamente por un <code>sources</code> mal configurado.</p>
+
+<p><strong>Paso 4 — Medir DESPUÉS, con exactamente la misma interacción.</strong></p>
+
+<table>
+<thead><tr><th>Métrica (escribir "note", 4 teclas)</th><th>Antes</th><th>Después</th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Commits</td><td>12</td><td>8</td><td>−33%</td></tr>
+<tr><td>Commit más lento</td><td>41 ms</td><td>17 ms</td><td>−59%</td></tr>
+<tr><td>Duración total</td><td>210 ms</td><td>96 ms</td><td>−54%</td></tr>
+<tr><td>Componentes que re-renderizan por tecla</td><td>7 de 7</td><td>3 de 7</td><td>−57%</td></tr>
+<tr><td><code>useMemo</code> / <code>useCallback</code> en el código</td><td>14</td><td>3</td><td>−79%</td></tr>
+<tr><td>Bundle (gzip)</td><td>188 KB</td><td>191 KB</td><td>+1,6%</td></tr>
+<tr><td>Build (CI, frío)</td><td>52 s</td><td>61 s</td><td>+17%</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 5 — Leer la tabla con honestidad.</strong> Y acá está el hallazgo del ejercicio, que no es el que el equipo esperaba:</p>
+
+<div class="rule">
+  <strong>📌 De los 14 memos originales, 11 no hacían nada útil.</strong> Y no porque el compilador los haya reemplazado: <strong>ya no hacían nada antes</strong>. Siete tenían dependencias que cambiaban en cada render, así que la caché nunca acertaba. Dos memoizaban valores primitivos —comparar un string es más barato que cachearlo—. Uno estaba roto por la mutación in place. Solo tres cumplían una función real, y dos de esos tres son los que se quedaron porque garantizan identidad para efectos.
+</div>
+
+<p>La mejora medida no vino del compilador solo: vino de <strong>arreglar la pureza</strong>, que es lo que el compilador te obligó a hacer. Un componente que mutaba props no era memoizable ni a mano ni automáticamente; el <code>useMemo</code> que le habían puesto encima era decoración.</p>
+
+<p><strong>Paso 6 — Dejar la decisión escrita para que no se degrade sola.</strong> Los tres números que importan se convierten en un test que corre en CI:</p>
+
+<pre><code class="lang-tsx">// tests/pedidos.render.test.tsx
+import { render, screen, fireEvent } from "@testing-library/react";
+
+test("escribir en el buscador no re-renderiza toda la tabla", async () =&gt; {
+  const espia = jest.fn();
+  render(&lt;PanelPedidos onRenderFila={espia} pedidos={FIXTURE_200} /&gt;);
+  espia.mockClear();
+
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "n" } });
+
+  // Antes del compilador: 200 (todas las filas, por tecla).
+  // Si esto vuelve a subir, alguien rompió la pureza de un componente
+  // del camino y el compilador lo dejó de optimizar EN SILENCIO.
+  expect(espia).toHaveBeenCalledTimes(0);
+});</code></pre>
+
+<pre><code class="lang-bash"># Y en el CI, la métrica de adopción como gate:
+npx react-compiler-healthcheck@latest | tee healthcheck.txt
+grep -q "7 out of 7" healthcheck.txt || {
+  echo "❌ Bajó la cobertura del compilador. Corré: npx eslint src"
+  exit 1
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La lección del ejercicio no es "activá el compilador".</strong> Es que <strong>la memoización manual acumulada nunca fue auditada</strong>, y por eso la mayor parte no servía. El compilador no fue tanto un acelerador como un <em>auditor</em>: te obligó a mirar cada componente, encontró un bug real de correctitud, y dejó una métrica objetiva (7/7) donde antes había una sensación ("ya está optimizado"). Esa métrica, puesta en el CI, es lo que impide que el problema vuelva.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Activaste el compilador, el build pasa sin errores y la app funciona igual que antes. ¿Podés concluir que todo se está optimizando?</summary>
+<p>No, y es exactamente el error que este módulo intenta evitar. Cuando el compilador no puede probar que un componente cumple las Reglas de React, <strong>lo deja sin tocar y sigue de largo, sin emitir ningún error</strong>. Un build verde es compatible con que la mitad de tus componentes hayan quedado afuera. Las tres verificaciones que sí sirven: <code>npx react-compiler-healthcheck</code> te da el conteo "N de M compilados", el linter (<code>eslint-plugin-react-hooks</code> v6) te dice archivo y línea de cada motivo, y React DevTools te muestra la insignia <strong>Memo ✨</strong> componente por componente. Las tres deberían contar la misma historia; si no coinciden, lo más probable es que el plugin no esté corriendo sobre esos archivos.</p></details>
+
+<details><summary>Tenés un <code>useMemo</code> que estabiliza un objeto usado como dependencia de un <code>useEffect</code>. ¿Lo borrás?</summary>
+<p>No. Ese memo no está por performance: está por <strong>corrección</strong>. Si el objeto cambia de identidad en cada render, el efecto vuelve a ejecutarse en cada render — y si el efecto hace un fetch, abre un socket o dispara un evento de analytics, el resultado no es "un poco más lento": es un bug. En la práctica el compilador probablemente memoice ese objeto igual y todo siga funcionando, pero la memoización del compilador es <em>una optimización</em>, y las optimizaciones no son garantías semánticas: pueden cambiar entre versiones o desactivarse si alguien rompe la pureza del componente. La regla general es <strong>nunca apoyar la correctitud de un programa sobre una optimización</strong>. Dejalo, y dejale un comentario de una línea diciendo por qué está, para que el próximo no lo borre.</p></details>
+
+<details><summary>Un componente compilado se sigue renderizando en cada tecla del buscador. ¿Está fallando el compilador?</summary>
+<p>Casi seguro que no. Hay que separar dos cosas: el compilador evita el trabajo cuyo <strong>input no cambió</strong>. Si el componente depende del texto del buscador y ese texto cambia con cada tecla, el input <em>sí</em> cambió — hay que renderizar, y ninguna caché puede ni debe evitarlo. Las causas posibles a revisar, en orden: (1) el componente depende de un valor que cambia de verdad, y entonces el problema no es de memoización sino de <strong>prioridad</strong>, que se resuelve con <code>useDeferredValue</code> o <code>startTransition</code> (RS2); (2) recibe un objeto o función que el padre recrea porque el padre <em>no</em> está compilado — ahí <code>memo</code> manual en la frontera es la respuesta; (3) consume un Context cuyo <code>value</code> cambia de identidad en cada render del provider. El compilador y la concurrencia atacan ejes distintos: uno elimina trabajo innecesario, el otro prioriza el necesario.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>El <strong>React Compiler llegó a 1.0 el 7 de octubre de 2025</strong>. Sobre <strong>React 19.2</strong> es una herramienta de producción: <strong>Meta lo usa en features de Instagram</strong> y reporta entre <strong>25% y 40% menos re-renders innecesarios</strong> sin esfuerzo del desarrollador.</li>
+  <li>No es magia: es <strong>análisis estático en build time</strong>. Reescribe cada componente insertando una caché por scope reactivo — el equivalente a un <code>useMemo</code> por valor intermedio, con dependencias correctas, incluyendo <strong>los elementos JSX</strong>, que es donde más rinde.</li>
+  <li>Solo puede optimizar código que cumple las <strong>Reglas de React</strong>. Cuando no puede probarlas, <strong>se saltea el componente en silencio</strong>: sin error, sin warning, sin nada.</li>
+  <li>Por eso lo operativo del módulo es la <strong>verificación</strong>: <code>react-compiler-healthcheck</code> para la métrica "N de M", <code>eslint-plugin-react-hooks</code> v6 para el motivo con archivo y línea, y la insignia <strong>Memo ✨</strong> de DevTools para el chequeo visual.</li>
+  <li>La adopción es <strong>incremental</strong>: modo <code>annotation</code> con <code>"use memo"</code>, después por directorio con <code>sources</code>, y finalmente todo con <code>"use no memo"</code> como válvula temporal — siempre con comentario que explique por qué está.</li>
+  <li><strong>No arregla</strong> fetch en cascada, estado mal ubicado, listas sin virtualizar, bundles gordos ni algoritmos malos. Y no reemplaza entender el reconciliador (RS1).</li>
+  <li>Sobre los <code>useMemo</code> existentes: el compilador <strong>los respeta, no los borra</strong>. Sacá los que solo evitaban re-renders; <strong>conservá</strong> los que garantizan identidad referencial para un efecto, para un Context o para una librería externa. La pregunta es siempre: <em>¿este memo está por velocidad o por corrección?</em></li>
+  <li>El costo es real: build más lento, bundle levemente más grande, un array de caché por instancia montada. Puede <strong>empeorar</strong> componentes triviales renderizados muchísimo, o los que reciben props que cambian de identidad siempre.</li>
+  <li><code>memo</code> manual sigue teniendo lugar en las <strong>fronteras</strong>: donde tu código compilado toca código que no controlás, o donde necesitás comparación semántica en vez de por identidad.</li>
+  <li>La conclusión del Worked Example vale más que la herramienta: <strong>la mayor parte de la memoización manual acumulada no hacía nada</strong>. El compilador funciona tanto como acelerador como auditor.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Agarrá un componente tuyo de 30–60 líneas y pasalo por <code>npx babel archivo.jsx --plugins babel-plugin-react-compiler</code>. Contá cuántos slots de caché (<code>_c(n)</code>) reservó y explicá, scope por scope, de qué depende cada uno. Comparalo con la memoización manual que vos hubieras escrito.</li>
+  <li>Corré <code>npx react-compiler-healthcheck@latest</code> sobre un proyecto real y anotá el número "N de M". Después corré el linter y clasificá cada componente que quedó afuera según el motivo (mutación de props, ref en render, <code>setState</code> en render, otro). ¿Cuál es el motivo más frecuente en <em>tu</em> código?</li>
+  <li>Escribí a propósito un componente que mute una prop con <code>.sort()</code>. Verificá con DevTools que <strong>no</strong> tiene la insignia Memo ✨. Arreglalo copiando el array, y confirmá que ahora sí aparece. Medí ambas versiones con el Profiler.</li>
+  <li>Auditá los <code>useMemo</code> y <code>useCallback</code> de un archivo tuyo y clasificá cada uno en las categorías de la tabla de RS3.8. Justificá por escrito, en una línea, por qué cada uno se queda o se va. ¿Qué proporción resultó ser defensiva y no servía para nada?</li>
+  <li>Elegí una interacción concreta (escribir en un input, abrir un modal, ordenar una tabla) y armá la tabla antes/después completa del Worked Example: commits, commit más lento, duración total, tamaño de bundle y tiempo de build. Sacá una conclusión que incluya el <em>costo</em>, no solo la ganancia.</li>
+  <li>Construí un caso donde el compilador <strong>empeore</strong> la performance: un componente trivial renderizado decenas de miles de veces, o uno que recibe un objeto nuevo en cada render desde un padre no compilado. Demostralo con números del Profiler y arreglalo con <code>"use no memo"</code> o con <code>memo</code> y comparador propio.</li>
+  <li>Escribí un test de regresión que cuente renders (como el del Paso 6) y agregá al CI el <em>gate</em> del healthcheck. Después rompé la pureza de un componente a propósito y verificá que <strong>el CI falla</strong> — si no falla, tu red de seguridad no existe.</li>
+</ol>
+
+<section class="quiz" id="quizRS3">
+  <style>
+    #quizRS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS3 .q{margin-bottom:1.5rem}
+    #quizRS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS3 .opt:hover{border-color:var(--accent)}
+    #quizRS3 .opt:disabled{cursor:default}
+    #quizRS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS3 .exp.show{display:block}
+    #quizRS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Activaste el React Compiler, el build pasa limpio y no hay warnings en consola. ¿Qué podés afirmar sobre tus componentes?</p>
+    <button class="opt">Que todos están optimizados: si alguno fallara, el build habría roto</button>
+    <button class="opt">Que todos están optimizados salvo los que tengan <code>"use no memo"</code></button>
+    <button class="opt">Nada todavía: el compilador saltea en silencio lo que no puede probar, hay que verificarlo con el healthcheck, el linter y DevTools</button>
+    <div class="exp">El skip es silencioso <em>por diseño</em>: si el compilador no puede probar que un componente cumple las Reglas de React, lo deja intacto y sigue. No hay error ni warning, y la app funciona idéntica — simplemente sin optimizar. Las tres fuentes de verdad son <code>npx react-compiler-healthcheck</code> (te da "N de M compilados"), <code>eslint-plugin-react-hooks</code> v6 (te da archivo, línea y motivo) y la insignia <strong>Memo ✨</strong> en React DevTools. Un build verde no dice absolutamente nada sobre la cobertura.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Tenés un <code>useMemo</code> que estabiliza un objeto <code>query</code> usado como dependencia de un <code>useEffect</code> que hace un fetch. Con el compilador activo, ¿lo borrás?</p>
+    <button class="opt">No: ese memo existe por corrección, no por performance — sin él el efecto podría dispararse de más</button>
+    <button class="opt">Sí: el compilador memoiza todo, incluidas las dependencias de efectos</button>
+    <button class="opt">Sí, pero solo si el objeto tiene menos de cinco propiedades</button>
+    <div class="exp">La pregunta que decide siempre es: <em>¿este memo está por velocidad o por corrección?</em> Acá el memo garantiza la <strong>identidad referencial</strong> de la dependencia del efecto. Sin él, si el objeto cambia de identidad en cada render, el efecto vuelve a correr en cada render — y eso no es lentitud, es un fetch de más, un socket reabierto, un evento duplicado. En la práctica el compilador probablemente lo memoice igual, pero eso es <em>una optimización</em>, no una garantía semántica: puede cambiar entre versiones o desactivarse si alguien rompe la pureza del componente. Nunca apoyes la correctitud de un programa sobre una optimización.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Un componente compilado tiene un <code>.sort()</code> sobre una prop. ¿Cuál es la consecuencia más importante?</p>
+    <button class="opt">Que el sort se ejecuta dos veces por render y duplica el costo</button>
+    <button class="opt">Que muta una prop, así que el compilador no optimiza ese componente — y además cualquier <code>useMemo</code> con esa prop como dependencia ya estaba roto, porque la referencia del array nunca cambia</button>
+    <button class="opt">Ninguna: <code>.sort()</code> devuelve un array nuevo, no hay mutación</button>
+    <div class="exp">Dos problemas por el precio de uno. <code>.sort()</code> ordena <strong>in place</strong>: muta el array que te pasó el padre, lo que viola las Reglas de React y hace que el compilador saltee el componente entero. Y como la <em>referencia</em> del array no cambia al mutarlo, cualquier <code>useMemo</code> con <code>[pedidos]</code> en las dependencias nunca detecta el reordenamiento y devuelve el resultado viejo — un bug de correctitud que venía escondido desde antes del compilador. El arreglo es una línea (<code>[...pedidos].sort(...)</code>) y, contra la intuición, <strong>no</strong> es más lento: la copia queda dentro de un scope reactivo y solo se rehace cuando la prop cambia de verdad.</div>
+  </div>
+
+  <div class="score" id="scoreRS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs2-concurrent/lecture.html">← RS2: Concurrent React</a>
+  <a href="../rs4-server-components/lecture.html">RS4: Server Components →</a>
+</nav>
+
+</div>
+</body>
+</html>

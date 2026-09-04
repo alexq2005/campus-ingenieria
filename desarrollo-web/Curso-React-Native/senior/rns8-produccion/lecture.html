@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS8 — Producción: observabilidad y salud de la app · React Native Senior</title>
+  <meta name="description" content="Crash reporting con source maps y símbolos, errores que no son crashes, crash-free users, ANR, performance en campo por gama de dispositivo, privacidad en telemetría, feature flags, kill switch, rollout progresivo y respuesta a incidentes en móvil.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS8</span>
+  <span class="badge">⏱ 50–120 min</span>
+  <span class="badge">🎯 Pre-req: RNS1–RNS7</span>
+  <span class="badge">🚀 Producción</span>
+</div>
+
+<article>
+
+<h1>RNS8 — Producción: observabilidad y salud de la app</h1>
+
+<h2>RNS8.0 Por qué este módulo</h2>
+
+<p>En una app web, cuando algo se rompe, entrás al servidor. Tenés logs, tenés métricas, tenés la request completa, y si hace falta reproducís el bug con el mismo payload. Si no instrumentaste antes, instrumentás ahora y en cinco minutos ya estás viendo datos nuevos.</p>
+
+<p>En móvil <strong>nada de eso es cierto</strong>. Tu código corre en un teléfono que no es tuyo, en una versión de OS que no elegiste, en un dispositivo de un fabricante que le metió mano al framework, con una conexión que se cae en el ascensor. No tenés SSH. No tenés <code>tail -f</code>. No podés cambiar el código que ya está instalado sin pasar por una tienda o por un canal OTA que vos hayas construido de antemano.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> En móvil, la observabilidad no es algo que agregás cuando aparece el problema: es algo que <strong>se compila dentro del binario que publicaste</strong>. Si no instrumentaste antes de publicar, el bug que le pasa al 3% de tus usuarios es invisible para siempre — y ese 3% no va a escribirte un ticket, se va a desinstalar la app y a dejarte una estrella.
+</div>
+
+<p>Ese cambio de contexto tiene consecuencias muy concretas que vamos a recorrer una por una:</p>
+
+<ul>
+  <li>El <strong>ciclo de feedback</strong> pasa de segundos a días. Un fix necesita build, tienda, revisión y que el usuario acepte actualizar.</li>
+  <li>No existe el <strong>rollback</strong>. Podés detener la distribución de una versión, pero no podés desinstalarla de los teléfonos donde ya está.</li>
+  <li>La <strong>heterogeneidad</strong> es brutal: miles de combinaciones de modelo, RAM, versión de OS y capa del fabricante. Tu iPhone de desarrollo representa a nadie.</li>
+  <li>La <strong>telemetría cuesta</strong> — batería, datos móviles y, sobre todo, confianza del usuario. Mandar de más te puede costar la publicación en la tienda.</li>
+</ul>
+
+<p>La buena noticia es que hay un conjunto de prácticas bastante estabilizado para esto, y todas se apoyan en cosas que ya viste: el pipeline de build de RNS7, la arquitectura de módulos nativos de RNS4, el presupuesto de rendimiento de RNS2. Este módulo las cierra.</p>
+
+<h2>RNS8.1 Crash nativo vs error de JS: dos mundos que se reportan distinto</h2>
+
+<p>Una app de React Native tiene, como mínimo, tres capas donde algo puede explotar, y cada una produce un artefacto de error completamente distinto:</p>
+
+<table>
+  <thead>
+    <tr><th>Capa</th><th>Qué la rompe</th><th>Qué ve el usuario</th><th>Qué queda registrado</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>JS / Hermes</strong></td><td><code>undefined is not a function</code>, un <code>throw</code> sin catch, un render que tira</td><td>Pantalla roja en dev; en release, pantalla blanca o cierre según cómo esté configurado</td><td>Stack trace de JS, con nombres del bundle minificado</td></tr>
+    <tr><td><strong>Puente / módulos nativos</strong></td><td>Un tipo mal marshalado, un <code>null</code> que cruza, una excepción en el hilo nativo lanzada desde una llamada JS</td><td>Cierre inmediato, sin aviso</td><td>Excepción Java/Kotlin u ObjC/Swift, con parte del stack de JS perdido</td></tr>
+    <tr><td><strong>Nativo puro</strong></td><td><code>SIGSEGV</code> en una <code>.so</code>, un <code>EXC_BAD_ACCESS</code>, un OOM del sistema</td><td>Cierre inmediato, sin aviso</td><td>Crash del sistema operativo, con direcciones de memoria sin resolver</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Un crash nativo mata el proceso; un error de JS no necesariamente.</strong> Cuando el proceso muere, tu código JS ya no existe: no podés hacer <code>fetch</code> para reportarlo, no podés escribir en <code>AsyncStorage</code>, no podés mostrar una pantalla amable. Por eso el reporte de crashes nativos lo hace <strong>código nativo</strong> que instala manejadores de señal y persiste el reporte en disco, para enviarlo <strong>en el siguiente arranque</strong>. Es una diferencia arquitectónica, no un detalle de la herramienta.
+</div>
+
+<p>Eso explica una confusión muy común: "instalé el SDK de crash reporting pero mis errores de JS no aparecen". Son dos rutas distintas dentro del mismo SDK. La ruta nativa se instala en el arranque de la app (en <code>MainApplication</code> y en el <code>AppDelegate</code>); la ruta de JS se engancha al <code>ErrorUtils</code> global de React Native.</p>
+
+<pre><code class="lang-tsx">// src/observability/init.ts
+// Se importa PRIMERO en index.js, antes que App.
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+  // De qué build vino este evento. Sin esto, no podés atar
+  // un crash a un artefacto ni a un source map concreto.
+  release: `com.miapp@${APP_VERSION}+${BUILD_NUMBER}`,
+  dist: String(BUILD_NUMBER),
+  environment: __DEV__ ? 'development' : 'production',
+
+  // No mandes el 100% de las trazas de performance desde el día uno:
+  // es caro en cuota, en batería y en datos del usuario.
+  tracesSampleRate: 0.05,
+
+  // Los crashes SÍ van al 100%: son raros y son lo que más importa.
+  sampleRate: 1.0,
+});</code></pre>
+
+<p>Lo importante ahí no es el nombre del proveedor — la mecánica es la misma en Crashlytics, en Bugsnag o en cualquier otro. Lo importante es el par <code>release</code> + <code>dist</code>. Ese identificador es lo que va a permitir que el servidor encuentre <strong>el</strong> source map correcto entre los cientos que subiste a lo largo del año.</p>
+
+<h3>El handler global de JS</h3>
+
+<p>React Native expone un manejador global de excepciones no capturadas. En release, el comportamiento por defecto es cerrar la app; en desarrollo, mostrar la pantalla roja. Los SDK de crash reporting lo envuelven, pero conviene entender qué están haciendo:</p>
+
+<pre><code class="lang-tsx">// Lo que hace por dentro un SDK de errores en React Native.
+const anterior = ErrorUtils.getGlobalHandler();
+
+ErrorUtils.setGlobalHandler((error: Error, isFatal?: boolean) =&gt; {
+  reportar(error, { fatal: Boolean(isFatal), capa: 'js' });
+
+  // CRÍTICO: encadenar al handler previo. Si lo pisás sin llamarlo,
+  // rompés el reporte de cualquier otra herramienta y el
+  // comportamiento por defecto de RN.
+  anterior(error, isFatal);
+});</code></pre>
+
+<div class="mistake">
+  <strong>Error clásico:</strong> instalar el handler global <em>después</em> de montar la app. Los errores que ocurren durante el arranque —justo los peores, los que dejan al usuario sin poder usar nada— pasan antes de que tu handler exista y se pierden. Por eso la inicialización de observabilidad va en la <strong>primera línea</strong> de <code>index.js</code>, antes de importar <code>App</code>.
+</div>
+
+<h2>RNS8.2 Source maps y símbolos: sin esto, el stack trace es basura</h2>
+
+<p>Un build de release pasa el JS por Metro con minificación y después por Hermes, que lo convierte a bytecode. El resultado es que un stack trace de producción se ve así:</p>
+
+<pre><code class="lang-bash">Error: Cannot read property 'id' of undefined
+    at t (index.android.bundle:1:284915)
+    at n (index.android.bundle:1:291044)
+    at o (index.android.bundle:1:118273)</code></pre>
+
+<p>Eso no es un stack trace, es un número de teléfono. Para volver a nombres de archivo, línea y función reales necesitás <strong>source maps</strong>: el mapa que traduce <code>bundle:1:284915</code> a <code>src/screens/Perfil.tsx:47:12</code>. Y hay un equivalente en el lado nativo, con otro nombre: <strong>símbolos</strong>.</p>
+
+<table>
+  <thead>
+    <tr><th>Plataforma / capa</th><th>Artefacto</th><th>Qué traduce</th><th>Dónde se genera</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>JS (ambas)</td><td><code>index.*.bundle.map</code></td><td>Offset del bundle → archivo, línea, columna</td><td>Metro, en el paso de <code>bundle</code></td></tr>
+    <tr><td>JS con Hermes</td><td>Mapa compuesto (Metro + Hermes)</td><td>Offset del bytecode → fuente original</td><td><code>compose-source-maps.js</code> tras compilar</td></tr>
+    <tr><td>Android / Kotlin</td><td><code>mapping.txt</code> (R8/ProGuard)</td><td>Nombres ofuscados → clases y métodos reales</td><td>Gradle, en el build de release</td></tr>
+    <tr><td>Android / C++</td><td><code>native-debug-symbols.zip</code></td><td>Direcciones de <code>.so</code> → funciones y líneas</td><td>NDK, si pedís los símbolos sin strip</td></tr>
+    <tr><td>iOS</td><td><code>.dSYM</code></td><td>Direcciones de memoria → funciones y líneas</td><td>Xcode, con <code>DEBUG_INFORMATION_FORMAT</code></td></tr>
+  </tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ Los símbolos se generan durante el build y se destruyen con él.</strong> Si tu CI construye la app, sube el binario a la tienda y borra el workspace sin haber subido los <code>.dSYM</code> y los source maps, los crashes de esa versión son ilegibles <strong>para siempre</strong>. No hay forma de regenerarlos después sin reproducir el build bit a bit, y con timestamps, rutas absolutas y versiones de toolchain eso casi nunca sale igual.
+</div>
+
+<h3>Cómo se sube: es un paso del pipeline, no un ritual manual</h3>
+
+<p>La subida tiene que estar en el mismo job que produce el binario, y tiene que fallar el build si falla ella. Un paso "opcional" que se saltea en silencio es exactamente cómo se llega a una versión sin símbolos.</p>
+
+<pre><code class="lang-bash">#!/usr/bin/env bash
+set -euo pipefail   # que un fallo acá rompa el build entero
+
+VERSION="1.8.0"
+BUILD="482"
+RELEASE="com.miapp@${VERSION}+${BUILD}"
+
+# 1. Bundle de JS + source map (Android)
+npx react-native bundle \
+  --platform android \
+  --dev false \
+  --entry-file index.js \
+  --bundle-output build/index.android.bundle \
+  --sourcemap-output build/index.android.bundle.map
+
+# 2. Source maps de JS al backend de errores
+npx sentry-cli sourcemaps upload \
+  --release "$RELEASE" --dist "$BUILD" \
+  build/
+
+# 3. Símbolos nativos de iOS (los .dSYM del archive)
+npx sentry-cli debug-files upload \
+  --include-sources \
+  ios/build/Release-iphoneos/*.dSYM
+
+# 4. Mapping de R8 y símbolos nativos de Android
+npx sentry-cli upload-proguard \
+  android/app/build/outputs/mapping/release/mapping.txt
+npx sentry-cli debug-files upload \
+  android/app/build/intermediates/merged_native_libs/release/</code></pre>
+
+<p>En Android, además, hay que pedirle explícitamente a Gradle que <em>conserve</em> los símbolos nativos antes de que el bundle los descarte:</p>
+
+<pre><code class="lang-bash"># android/app/build.gradle
+android {
+  buildTypes {
+    release {
+      minifyEnabled true
+      // Sin esto, el AAB va sin símbolos y los crashes de C++
+      // llegan como direcciones crudas.
+      ndk { debugSymbolLevel 'FULL' }
+    }
+  }
+}</code></pre>
+
+<div class="tip">
+  <strong>Verificación empírica, no confianza.</strong> Antes de publicar, agregá un botón oculto (o un comando de debug) que lance un crash a propósito en el build de release firmado, instalalo desde el artefacto real, tocalo, y andá a mirar el panel. Si el stack trace tiene nombres de archivo tuyos, los símbolos están bien. Si tiene <code>bundle:1:284915</code>, todavía no publicaste nada: arreglá eso primero. Es literalmente un minuto de trabajo y es la diferencia entre poder depurar producción o no.
+</div>
+
+<pre><code class="lang-tsx">// src/debug/CrashTest.tsx — solo se monta si un flag remoto lo habilita.
+export function botonDeCrash() {
+  // Error de JS: debería llegar con stack de TypeScript.
+  throw new Error('CRASH_TEST_JS: verificando source maps');
+}
+
+export function botonDeCrashNativo() {
+  // Crash nativo real: debería llegar simbolizado.
+  Sentry.nativeCrash();
+}</code></pre>
+
+<h2>RNS8.3 Errores que no son crashes: el peligro de la pantalla en blanco</h2>
+
+<p>Los crashes son los errores <em>fáciles</em>: son ruidosos, el sistema operativo los registra, y llegan solos. Los peligrosos son los que no matan el proceso, porque no aparecen en ninguna métrica de crash y el usuario simplemente ve una app que no hace nada.</p>
+
+<h3>Error boundary: la red de contención de React</h3>
+
+<p>Cuando un componente tira una excepción durante el render, React desmonta todo el árbol. En web eso deja una página en blanco; en React Native deja una pantalla del color de fondo, sin nada. El <strong>error boundary</strong> es el único mecanismo de React para interceptar eso:</p>
+
+<pre><code class="lang-tsx">import React from 'react';
+import { View, Text, Pressable } from 'react-native';
+
+type Props = { children: React.ReactNode; area: string };
+type State = { error: Error | null };
+
+export class ErrorBoundary extends React.Component&lt;Props, State&gt; {
+  state: State = { error: null };
+
+  static getDerivedStateFromError(error: Error): State {
+    return { error };   // pinta la UI de fallback
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // Acá va el reporte, con contexto de QUÉ zona se cayó.
+    reportar(error, {
+      capa: 'render',
+      area: this.props.area,
+      componentStack: info.componentStack,
+    });
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+
+    return (
+      &lt;View style={{ flex: 1, justifyContent: 'center', padding: 24 }}&gt;
+        &lt;Text&gt;No pudimos mostrar esta sección.&lt;/Text&gt;
+        &lt;Pressable onPress={() =&gt; this.setState({ error: null })}&gt;
+          &lt;Text&gt;Reintentar&lt;/Text&gt;
+        &lt;/Pressable&gt;
+      &lt;/View&gt;
+    );
+  }
+}</code></pre>
+
+<div class="warn">
+  <strong>Un error boundary NO captura:</strong> errores dentro de <em>event handlers</em> (el <code>onPress</code>), código asincrónico (lo que pasa después de un <code>await</code>), errores lanzados en el propio boundary, ni nada fuera del ciclo de render de React. Es una red de contención para <strong>el render</strong>, no un <code>try/catch</code> universal. La mitad de los bugs que buscás no pasan por ahí.
+</div>
+
+<p>La granularidad importa. Un único boundary en la raíz convierte cualquier fallo en "la app entera murió". Boundaries por pantalla o por sección degradan mucho mejor: si se rompe el carrusel de recomendados, el usuario todavía puede comprar.</p>
+
+<pre><code class="lang-tsx">// Degradación por zonas, no todo o nada.
+&lt;Pantalla&gt;
+  &lt;ErrorBoundary area="header"&gt;&lt;Encabezado /&gt;&lt;/ErrorBoundary&gt;
+
+  {/* Si esto explota, el resto de la pantalla sigue viva */}
+  &lt;ErrorBoundary area="recomendados"&gt;&lt;Carrusel /&gt;&lt;/ErrorBoundary&gt;
+
+  &lt;ErrorBoundary area="checkout"&gt;&lt;BotonComprar /&gt;&lt;/ErrorBoundary&gt;
+&lt;/Pantalla&gt;</code></pre>
+
+<h3>Promesas rechazadas sin capturar</h3>
+
+<p>Este es el asesino silencioso número uno. Una promesa que se rechaza y nadie maneja no rompe nada visible: simplemente el estado nunca se actualiza, el spinner gira para siempre, y en el panel de crashes no hay absolutamente nada.</p>
+
+<pre><code class="lang-tsx">// El bug: si fetchPerfil rechaza, `cargando` queda en true
+// eternamente y no se entera nadie.
+useEffect(() =&gt; {
+  fetchPerfil(id).then(setPerfil);   // ← sin .catch
+}, [id]);
+
+// La versión sana: el error es un estado más de la pantalla,
+// y además se reporta.
+useEffect(() =&gt; {
+  let vivo = true;
+  fetchPerfil(id)
+    .then((p) =&gt; { if (vivo) setPerfil(p); })
+    .catch((e) =&gt; {
+      if (vivo) setError(e);
+      reportar(e, { capa: 'datos', operacion: 'fetchPerfil' });
+    })
+    .finally(() =&gt; { if (vivo) setCargando(false); });
+  return () =&gt; { vivo = false; };
+}, [id]);</code></pre>
+
+<p>Como red de seguridad global, conviene enganchar el rastreo de rechazos no manejados del runtime, para descubrir los que se te escapan:</p>
+
+<pre><code class="lang-tsx">// index.js, junto a la init de observabilidad.
+import { enable } from 'promise/setimmediate/rejection-tracking';
+
+if (!__DEV__) {
+  enable({
+    allRejections: true,
+    onUnhandled: (id, error) =&gt; {
+      reportar(error, { capa: 'promesa', fatal: false, id });
+    },
+    onHandled: () =&gt; {},   // se resolvió tarde: no es un bug real
+  });
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Definí una métrica para "pantalla que no cargó".</strong> El crash reporting no la va a detectar nunca. La forma práctica es instrumentar el ciclo de vida de cada pantalla de datos: emitís un evento cuando entra en estado de carga y otro cuando llega a contenido o a error. Si en tu panel el ratio <code>contenido / entradas</code> de una pantalla cae del 98% al 80%, tenés un incidente aunque el crash-free esté impecable.
+</div>
+
+<h2>RNS8.4 Métricas de salud: qué mirar y qué defender</h2>
+
+<p>Hay un puñado de métricas que definen si tu app está sana. Dos de ellas, además, las miran <strong>las tiendas</strong>, y afectan cuánto te muestran en las búsquedas y las recomendaciones. No son opcionales.</p>
+
+<table>
+  <thead>
+    <tr><th>Métrica</th><th>Qué mide</th><th>Dónde vive</th><th>Objetivo razonable</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Crash-free users</strong></td><td>% de usuarios únicos que no vieron ni un crash en el período</td><td>Crashlytics / Sentry / Play Console</td><td>≥ 99,5%; por debajo de 99% es incidente</td></tr>
+    <tr><td><strong>Crash-free sessions</strong></td><td>Lo mismo por sesión, no por usuario</td><td>Ídem</td><td>Siempre más alto que el anterior; útil para tendencia</td></tr>
+    <tr><td><strong>ANR rate</strong> (Android)</td><td>% de usuarios con "la app no responde": hilo principal bloqueado ~5 s</td><td>Play Console → Vitals</td><td>Bien por debajo del umbral que publica Play</td></tr>
+    <tr><td><strong>Hang rate</strong> (iOS)</td><td>Segundos de bloqueo de UI por hora de uso</td><td>Xcode Organizer / MetricKit</td><td>Lo más cerca de 0 posible; comparar contra el percentil de tu categoría</td></tr>
+    <tr><td><strong>Cold start</strong></td><td>Tiempo desde el toque al ícono hasta el primer frame útil</td><td>MetricKit, Vitals, o instrumentación propia</td><td>p90 &lt; 2 s en gama media</td></tr>
+    <tr><td><strong>Tamaño de descarga</strong></td><td>Lo que el usuario baja para instalar</td><td>Play Console / App Store Connect</td><td>Lo más chico posible; ver RNS8.12</td></tr>
+    <tr><td><strong>Éxito de pantalla</strong></td><td>% de entradas a una pantalla que terminan en contenido</td><td>Instrumentación propia</td><td>Definido por vos, con alerta sobre la caída</td></tr>
+  </tbody>
+</table>
+
+<div class="info">
+  Google Play publica <strong>umbrales de mal comportamiento</strong> para la tasa de crashes y de ANR percibidos por el usuario: si tu app los supera, Play puede degradar su visibilidad y hasta mostrar una advertencia en la ficha. Los valores concretos los ajusta Google cada tanto — al momento de escribir esto rondan el 1,1% para crashes y el 0,5% para ANR percibidos —, así que <strong>consultá el número vigente en tu Play Console</strong> en vez de memorizar el de un curso.
+</div>
+
+<h3>Crash-free users vs crash-free sessions: no son intercambiables</h3>
+
+<p>Es la confusión más común al leer un panel. Si un usuario abre la app 40 veces por día y crashea una sola vez, aportó 1 sesión mala de 40 (99,75% de sesiones sanas) pero cuenta como <strong>un usuario que crasheó</strong>. La métrica por usuario es siempre más dura y es la que representa mejor la experiencia real.</p>
+
+<pre><code class="lang-bash"># Traducir un porcentaje a personas: hacelo SIEMPRE.
+# El porcentaje anestesia; el número de personas, no.
+
+DAU=400000
+CRASH_FREE_ANTES=0.996
+CRASH_FREE_AHORA=0.971
+
+# usuarios afectados = DAU * (antes - ahora)
+python3 -c "print(f'{400000 * (0.996 - 0.971):,.0f} usuarios afectados por día')"
+# 10,000 usuarios afectados por día</code></pre>
+
+<div class="rule">
+  <strong>📌 Un punto porcentual de crash-free es mucha gente.</strong> "Bajamos de 99,6 a 97,1" suena a un cambio menor. Son <strong>diez mil personas por día</strong> cuya app se cierra sola. Convertí siempre los porcentajes en personas antes de decidir la urgencia de una respuesta, y ponelo en el canal del incidente. Cambia por completo la conversación.
+</div>
+
+<h3>ANR: el crash que no es un crash</h3>
+
+<p>En Android, si el hilo principal no responde durante unos cinco segundos, el sistema le ofrece al usuario cerrar la app. Para el usuario es idéntico a un crash; para tu panel de crashes, es invisible. Las causas típicas en React Native son exactamente las que viste en RNS2 y RNS4: trabajo pesado sincrónico en el hilo de UI, un módulo nativo que hace I/O bloqueante en la llamada, o un lock nativo contendido durante el arranque.</p>
+
+<pre><code class="lang-tsx">// Antipatrón que produce ANR en gama baja:
+// deserializar un JSON grande de forma sincrónica al montar.
+const datos = JSON.parse(await AsyncStorage.getItem('catalogo'));  // 4 MB
+
+// Alternativas, en orden de preferencia:
+// 1. No guardar 4 MB en un blob: usar SQLite / MMKV y leer por partes (RNS6).
+// 2. Mover el parseo fuera del hilo de JS y del hilo de UI (worklet, módulo nativo).
+// 3. Como mínimo, partirlo para no bloquear un solo tick largo.</code></pre>
+
+<h2>RNS8.5 Performance en campo: tu iPhone nuevo miente</h2>
+
+<p>La trampa más cara del desarrollo móvil: probás en tu dispositivo, va perfecto, publicás, y la app es injugable para una porción enorme de tus usuarios. Tu teléfono de desarrollo es, casi por definición, un dispositivo tope de gama, con la batería sana, sin térmica acumulada, en wifi, con la app recién instalada y la base de datos vacía.</p>
+
+<table>
+  <thead>
+    <tr><th>Lo que tenés en el escritorio</th><th>Lo que tiene una parte de tus usuarios</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SoC de última generación</td><td>Un chip de 4–6 años, con 3 GB de RAM</td></tr>
+    <tr><td>Almacenamiento rápido y con espacio libre</td><td>Almacenamiento casi lleno, con escrituras lentísimas</td></tr>
+    <tr><td>Wifi estable de 200 Mbps</td><td>Datos móviles intermitentes, 200 ms de latencia</td></tr>
+    <tr><td>Base de datos local vacía</td><td>Dos años de datos acumulados en la app</td></tr>
+    <tr><td>App recién abierta, sin presión de memoria</td><td>Quince apps en background, el sistema matando procesos</td></tr>
+    <tr><td>Sin throttling térmico</td><td>Teléfono caliente en el bolsillo, CPU limitada al 60%</td></tr>
+  </tbody>
+</table>
+
+<div class="danger">
+  <strong>⚠️ El promedio es la métrica que te miente más.</strong> Si el 90% de tus usuarios tiene un arranque de 1,2 s y el 10% uno de 9 s, el promedio da 1,98 s y parece bien. Ese 10% es justamente el que se va. <strong>Mirá percentiles: p75, p90, p95.</strong> Y miralos <em>segmentados</em>, porque un p95 global tampoco te dice en qué dispositivos está el problema.
+</div>
+
+<h3>Las dimensiones por las que hay que cortar</h3>
+
+<p>Un número de performance sin segmentación es casi inútil. Estas cuatro dimensiones explican la mayoría de los problemas:</p>
+
+<ol>
+  <li><strong>Gama de dispositivo</strong> — clasificá cada dispositivo en alta / media / baja usando RAM, cantidad de núcleos y año del modelo. Es la dimensión que más señal da.</li>
+  <li><strong>Versión de OS</strong> — un bug de un fabricante o de una versión puntual salta acá, y en ningún otro lado.</li>
+  <li><strong>Versión de tu app</strong> — sin esto no podés atribuir una regresión a una release.</li>
+  <li><strong>Tipo de red</strong> — separá wifi de datos móviles, o vas a culpar a tu código de la latencia de la operadora.</li>
+</ol>
+
+<pre><code class="lang-tsx">// src/observability/contexto.ts
+import DeviceInfo from 'react-native-device-info';
+
+export async function contextoDeDispositivo() {
+  const ramBytes = await DeviceInfo.getTotalMemory();
+  const ramGb = ramBytes / 1024 ** 3;
+
+  // Clasificación cruda pero suficiente: lo importante es que
+  // sea ESTABLE en el tiempo para poder comparar releases.
+  const gama = ramGb &gt;= 7 ? 'alta' : ramGb &gt;= 4 ? 'media' : 'baja';
+
+  return {
+    gama,
+    ram_gb: Math.round(ramGb),
+    os: `${DeviceInfo.getSystemName()} ${DeviceInfo.getSystemVersion()}`,
+    modelo: DeviceInfo.getModel(),      // "SM-A125F", no el nombre del dueño
+    fabricante: await DeviceInfo.getManufacturer(),
+    app_version: DeviceInfo.getVersion(),
+    build: DeviceInfo.getBuildNumber(),
+  };
+}</code></pre>
+
+<p>Con eso, medir el arranque deja de ser un dato suelto y pasa a ser una serie comparable entre versiones:</p>
+
+<pre><code class="lang-tsx">// src/observability/arranque.ts
+// t0 se toma lo más temprano posible: en index.js, línea 1.
+export const T0 = Date.now();
+
+export function marcarPrimerContenido(pantalla: string) {
+  const ms = Date.now() - T0;
+
+  metrica('app.cold_start_ms', ms, {
+    pantalla,
+    ...contextoCacheado,   // gama, os, app_version, red
+  });
+}
+
+// En la primera pantalla real, cuando ya hay datos para mostrar:
+useEffect(() =&gt; {
+  if (datos) marcarPrimerContenido('home');
+}, [datos]);</code></pre>
+
+<div class="tip">
+  <strong>Conseguite un teléfono malo.</strong> Un Android de gama baja con 3 GB de RAM, usado, cuesta muy poco y es la mejor inversión de calidad que podés hacer. Lo que en tu equipo tarda 300 ms, ahí tarda 2 s, y los problemas se vuelven obvios sin necesidad de instrumentar nada. Complementalo con el <em>throttling</em> de CPU del emulador para reproducir casos concretos, pero el hardware real no lo reemplaza nada.
+</div>
+
+<h2>RNS8.6 Analítica de producto vs observabilidad técnica</h2>
+
+<p>Son dos sistemas con propósitos, audiencias y ciclos de vida distintos. Meterlos en el mismo dashboard produce paneles que nadie mira y decisiones que nadie toma.</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Observabilidad técnica</th><th>Analítica de producto</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Pregunta que responde</strong></td><td>¿Está roto? ¿Desde cuándo? ¿Para quién?</td><td>¿Sirve? ¿Lo usan? ¿Convierte?</td></tr>
+    <tr><td><strong>Quién la mira</strong></td><td>Quien está de guardia, hoy</td><td>Producto, en la revisión semanal</td></tr>
+    <tr><td><strong>Latencia aceptable</strong></td><td>Minutos — hay que despertar a alguien</td><td>Horas o días</td></tr>
+    <tr><td><strong>Granularidad</strong></td><td>Evento individual, con stack trace</td><td>Agregado, por cohorte</td></tr>
+    <tr><td><strong>Retención típica</strong></td><td>Semanas</td><td>Meses o años</td></tr>
+    <tr><td><strong>Qué pasa si se cae</strong></td><td>Estás ciego en un incidente</td><td>La revisión del lunes se atrasa</td></tr>
+  </tbody>
+</table>
+
+<div class="mistake">
+  <strong>El antipatrón:</strong> mandar los eventos de producto al sistema de errores "porque ya está instalado", o poner alertas sobre métricas de producto. Terminás con alertas que suenan porque bajaron las ventas un domingo, la gente las silencia, y el día que suena una de verdad ya nadie la mira. La <strong>fatiga de alertas</strong> es la forma más común de perder observabilidad: no por falta de datos, sino por exceso de ruido.
+</div>
+
+<p>Una separación limpia y barata en el código es tener dos funciones con nombres distintos y reglas distintas:</p>
+
+<pre><code class="lang-tsx">// src/observability/api.ts
+
+/** Técnico: algo salió mal o algo tardó. Puede disparar alertas. */
+export function reportar(error: unknown, ctx?: Record&lt;string, unknown&gt;) { /* ... */ }
+export function metrica(nombre: string, valor: number, dims?: Dims) { /* ... */ }
+
+/** Producto: alguien hizo algo. NUNCA dispara alertas de guardia. */
+export function evento(nombre: string, props?: Record&lt;string, unknown&gt;) { /* ... */ }
+
+// Uso:
+evento('checkout_iniciado', { items: 3, metodo_pago: 'tarjeta' });
+metrica('checkout.latencia_ms', 840, { gama: 'baja' });
+reportar(err, { capa: 'datos', operacion: 'crearOrden' });</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de oro de las alertas:</strong> una alerta solo existe si tiene un <em>runbook</em> — es decir, si quien la recibe sabe qué hacer al recibirla. Si la respuesta honesta a "¿qué hago cuando suena esto?" es "la miro y sigo", no es una alerta: es un gráfico. Movela al dashboard.
+</div>
+
+<h2>RNS8.7 Privacidad y datos: qué NO mandar</h2>
+
+<p>Cada campo que agregás a la telemetría es un campo que estás sacando del teléfono de una persona y guardando en un servidor de terceros. Esto tiene tres capas de consecuencias: legales (GDPR y equivalentes), de tienda (te pueden rechazar la publicación) y de seguridad (lo que guardás es lo que te pueden robar).</p>
+
+<div class="danger">
+  <strong>⚠️ Nunca mandes en telemetría:</strong> contraseñas ni tokens, contenido escrito por el usuario (mensajes, notas, búsquedas), datos de salud o financieros, documentos de identidad, direcciones exactas o coordenadas precisas, la libreta de contactos, ni cuerpos completos de request o response. Nada de eso lo necesitás para depurar, y todo eso convierte tu panel de errores en una base de datos de información sensible con controles de acceso mucho más flojos que los de tu producción.
+</div>
+
+<p>La técnica práctica es <strong>scrubbing</strong>: un filtro que corre antes de enviar cualquier evento y borra o enmascara lo que no debería salir. Se implementa una sola vez, en el borde del sistema, y no depende de que cada quien se acuerde:</p>
+
+<pre><code class="lang-tsx">const CLAVES_PROHIBIDAS = /pass|token|secret|auth|dni|cuit|tarjeta|cvv|email|telefono/i;
+
+function limpiar(obj: Record&lt;string, unknown&gt;): Record&lt;string, unknown&gt; {
+  const salida: Record&lt;string, unknown&gt; = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (CLAVES_PROHIBIDAS.test(k)) { salida[k] = '[redactado]'; continue; }
+    if (typeof v === 'string' &amp;&amp; v.length &gt; 200) { salida[k] = '[texto largo omitido]'; continue; }
+    salida[k] = typeof v === 'object' &amp;&amp; v !== null
+      ? limpiar(v as Record&lt;string, unknown&gt;)
+      : v;
+  }
+  return salida;
+}
+
+Sentry.init({
+  // ...
+  beforeSend(evento) {
+    // 1. Nada de URLs con query string: ahí viajan tokens y filtros con datos.
+    if (evento.request?.url) evento.request.url = evento.request.url.split('?')[0];
+    // 2. Identificador propio, opaco y rotable. NUNCA el email.
+    if (evento.user) evento.user = { id: idAnonimoLocal() };
+    // 3. Scrub del contexto extra.
+    if (evento.extra) evento.extra = limpiar(evento.extra);
+    return evento;
+  },
+});</code></pre>
+
+<h3>Consentimiento y etiquetas de privacidad</h3>
+
+<p>Las dos tiendas te obligan a <strong>declarar</strong> qué datos recolectás y para qué. En App Store Connect son las etiquetas de privacidad de la ficha, más el archivo <code>PrivacyInfo.xcprivacy</code> (manifiesto de privacidad) que también deben aportar los SDK de terceros que uses. En Google Play es la sección de <em>Seguridad de los datos</em>. Declarar de menos es motivo de rechazo o de retiro; y como esas declaraciones aparecen en la ficha pública, un usuario puede compararlas con lo que tu app hace de verdad.</p>
+
+<pre><code class="lang-json">// ios/MiApp/PrivacyInfo.xcprivacy — esquema simplificado.
+// Lo que declarás acá tiene que coincidir con lo que realmente mandás.
+{
+  "NSPrivacyTracking": false,
+  "NSPrivacyCollectedDataTypes": [
+    {
+      "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeCrashData",
+      "NSPrivacyCollectedDataTypeLinkedToUser": false,
+      "NSPrivacyCollectedDataTypeUsedForTracking": false,
+      "NSPrivacyCollectedDataTypePurposes": [
+        "NSPrivacyCollectedDataTypePurposeAppFunctionality"
+      ]
+    }
+  ]
+}</code></pre>
+
+<div class="warn">
+  <strong>Los SDK de terceros recolectan por su cuenta.</strong> Un SDK de analítica, de publicidad o de mapas puede estar mandando identificadores y ubicación sin que vos hayas escrito una línea para eso — y aun así lo tenés que declarar vos, porque la ficha es tuya. Antes de agregar una dependencia que toque red, leé qué manda. Vale también como criterio de arquitectura: cuantos menos SDK de terceros, menos superficie de privacidad y de fallos que no controlás.
+</div>
+
+<p>Y del lado del código, el consentimiento tiene que poder apagar la telemetría de verdad, no solo esconder el switch:</p>
+
+<pre><code class="lang-tsx">// Arranque con telemetría de producto APAGADA por defecto.
+// Los crashes técnicos suelen encuadrar como "funcionamiento de la app",
+// pero verificá el criterio legal de tu jurisdicción antes de asumirlo.
+let consentimientoProducto = false;
+
+export function setConsentimiento(valor: boolean) {
+  consentimientoProducto = valor;
+  persistir('consent.producto', valor);
+  if (!valor) purgarColaLocal();   // y borrá lo que no llegaste a mandar
+}
+
+export function evento(nombre: string, props?: Props) {
+  if (!consentimientoProducto) return;   // no encolar, no guardar, no mandar
+  enviar(nombre, limpiar(props ?? {}));
+}</code></pre>
+
+<div class="info">
+  🔗 <strong>Conexión con seguridad.</strong> Todo esto tiene su contraparte en el lado de detección y respuesta: qué se loguea, cuánto se retiene, quién accede y cómo se responde cuando esos datos se filtran. Está desarrollado en <a href="../../../../sistemas/Curso-Ciberseguridad/m10-deteccion-respuesta/lecture.html">M10 — Detección y respuesta</a> del Curso de Ciberseguridad. La regla que se repite en los dos cursos es la misma: <strong>el dato que no recolectás es el único que no se te puede filtrar.</strong>
+</div>
+
+<h2>RNS8.8 Feature flags y kill switch: apagar sin publicar</h2>
+
+<p>En web, si una feature sale mal, hacés deploy de la versión anterior y en dos minutos terminó. En móvil no existe esa opción. Por eso el <strong>feature flag</strong> deja de ser una comodidad de proceso y pasa a ser infraestructura de seguridad: es la única forma de cambiar el comportamiento de una app ya instalada sin pasar por una tienda.</p>
+
+<div class="analogy">
+  <strong>La analogía.</strong> Publicar sin flags es soldar el interruptor de la luz en posición "encendido" antes de entregar la casa. Funciona perfecto hasta el día que hay un cortocircuito, y ahí la única opción es una obra. Con flags, tenés una llave térmica: bajás una palanca y el problema queda aislado mientras arreglás con calma.
+</div>
+
+<p>Hay dos usos que conviene no mezclar, aunque la implementación se parezca:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Feature flag</th><th>Kill switch</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Para qué</strong></td><td>Exponer una feature a un % de usuarios, hacer A/B, lanzar por etapas</td><td>Apagar algo que está rompiendo la app, ya</td></tr>
+    <tr><td><strong>Estado por defecto</strong></td><td>Apagado, se enciende gradualmente</td><td><strong>Encendido</strong>: si no se puede leer la config, la app sigue funcionando</td></tr>
+    <tr><td><strong>Quién lo toca</strong></td><td>Producto</td><td>Quien está de guardia, sin pedir permiso</td></tr>
+    <tr><td><strong>Vida útil</strong></td><td>Se borra cuando la feature está al 100%</td><td>Vive mientras viva el código riesgoso</td></tr>
+    <tr><td><strong>Latencia aceptable</strong></td><td>Horas</td><td>Minutos</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="lang-tsx">// src/flags/index.ts
+type Flags = {
+  escaner_documentos: boolean;
+  checkout_v2: boolean;
+  telemetria_traces_rate: number;
+};
+
+// Defaults compilados en el binario: lo que pasa si la red falla
+// o si el servicio de config está caído. Esto es lo que corre
+// en el PRIMER arranque, siempre.
+const DEFAULTS: Flags = {
+  escaner_documentos: true,     // kill switch: enciende por defecto
+  checkout_v2: false,           // feature flag: apagado por defecto
+  telemetria_traces_rate: 0.05,
+};
+
+let actuales: Flags = { ...DEFAULTS, ...leerCacheLocal() };
+
+export function flag&lt;K extends keyof Flags&gt;(k: K): Flags[K] {
+  return actuales[k];
+}
+
+export async function refrescarFlags() {
+  try {
+    const remotos = await fetchConfig({ timeout: 3000 });
+    actuales = { ...DEFAULTS, ...remotos };
+    guardarCacheLocal(remotos);   // para el próximo arranque offline
+  } catch (e) {
+    // Silencioso a propósito: la app tiene que funcionar sin config.
+    metrica('flags.fetch_error', 1);
+  }
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ La trampa del intervalo de caché.</strong> Casi todos los servicios de configuración remota cachean agresivamente por defecto — Firebase Remote Config, por ejemplo, usa un intervalo mínimo de fetch de <strong>12 horas</strong> si no lo cambiás. Con eso, tu "kill switch" tarda medio día en llegar y no sirve para nada en un incidente. Configurá un intervalo corto (minutos) para el <em>subconjunto</em> de flags de emergencia, o usá un canal con actualizaciones en tiempo real, y <strong>medí cuánto tarda de verdad</strong> antes de necesitarlo.
+</div>
+
+<p>Del lado del consumo, la regla es que el flag se lea lo más cerca posible del código riesgoso, y que el camino apagado sea un camino <em>probado</em>, no un hueco:</p>
+
+<pre><code class="lang-tsx">function MenuHerramientas() {
+  // Bien: si el flag está apagado, la entrada no existe y nada
+  // del subárbol riesgoso se monta ni se importa.
+  return (
+    &lt;&gt;
+      &lt;ItemPerfil /&gt;
+      {flag('escaner_documentos') &amp;&amp; &lt;ItemEscaner /&gt;}
+      &lt;ItemAyuda /&gt;
+    &lt;/&gt;
+  );
+}
+
+// Y en el punto de entrada por deep link, que se saltea el menú:
+function PantallaEscaner() {
+  if (!flag('escaner_documentos')) return &lt;NoDisponible /&gt;;
+  return &lt;Escaner /&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>El error que arruina el kill switch:</strong> proteger la pantalla pero no el <code>import</code> del módulo nativo que crashea al inicializarse, o dejar una ruta de entrada sin proteger (un deep link, una notificación push, un reintento en background). Un kill switch que no cubre <em>todas</em> las entradas al código roto no es un kill switch. Escribí la lista de entradas antes de implementarlo.
+</div>
+
+<p>Como los flags se distribuyen igual que el JS de un update OTA, en la práctica se complementan: el flag es el bisturí (rápido, reversible, granular) y el OTA es la cirugía (arregla el código, pero necesita un bundle nuevo). Todo el mecanismo de canales, runtime version y rollback de updates lo viste en <a href="../rns7-build-ota/lecture.html">RNS7</a>; acá lo que agregamos es <em>cuándo</em> usar cada uno.</p>
+
+<h2>RNS8.9 El ciclo de release sano</h2>
+
+<p>Publicar no es un evento, es un proceso con etapas y con criterios de avance explícitos. La versión mínima que funciona tiene cuatro:</p>
+
+<div class="step">
+  <strong>1. Canary interno.</strong> El build exacto que va a producción, distribuido al equipo y a un grupo de usuarios internos (TestFlight, canal interno de Play). Duración: 1–3 días.<br>
+  <em>Qué se mira:</em> que arranque en los dispositivos del equipo, que no haya crashes nuevos, que los source maps resuelvan bien, que la telemetría llegue. Es la última oportunidad barata de encontrar un problema de configuración de build.
+</div>
+
+<div class="step">
+  <strong>2. Rollout progresivo.</strong> 1% → 5% → 20% → 50% → 100%, con al menos 24 h en los primeros escalones. En Play se configura como <em>lanzamiento por fases</em>; en App Store, la <em>publicación gradual</em> reparte las actualizaciones automáticas a lo largo de siete días.<br>
+  <em>Qué se mira:</em> crash-free de <strong>la versión nueva</strong> comparado con el de la anterior en el mismo período, ANR, y las dos o tres métricas de negocio que no pueden bajar (checkout completado, login exitoso).
+</div>
+
+<div class="step">
+  <strong>3. Monitoreo activo.</strong> Ventana definida —típicamente las primeras 24–48 h de cada escalón— con alguien mirando de verdad, no "el dashboard está ahí".<br>
+  <em>Qué se mira:</em> issues <em>nuevos</em> ordenados por usuarios afectados. Un crash que ya existía en la versión anterior no bloquea el rollout; uno que apareció con esta versión, sí.
+</div>
+
+<div class="step">
+  <strong>4. Decisión explícita.</strong> Alguien dice "seguimos" o "paramos", con nombre y hora. Sin decisión explícita, el rollout avanza por inercia y nadie lo revisó.
+</div>
+
+<div class="warn">
+  <strong>La publicación gradual de App Store solo afecta las actualizaciones automáticas.</strong> El usuario que entra a la ficha y toca "Actualizar" recibe la versión nueva de inmediato, esté en la fase que esté. O sea que el "1%" no es un techo duro: es un piso. Nunca uses el rollout como si fuera un entorno de staging — lo que publicás está en manos de usuarios reales desde el minuto cero.
+</div>
+
+<p>Los criterios de avance conviene escribirlos como números, no como sensaciones, para poder decidir a las tres de la mañana sin discutir:</p>
+
+<pre><code class="lang-json">// release-gates.json — leído por el job que avanza el rollout.
+{
+  "ventana_minima_horas": 24,
+  "minimo_sesiones_por_escalon": 20000,
+  "bloquear_si": {
+    "crash_free_users_menor_a": 0.995,
+    "delta_crash_free_vs_version_previa_menor_a": -0.002,
+    "anr_rate_mayor_a": 0.004,
+    "checkout_exitoso_delta_menor_a": -0.01,
+    "issue_nuevo_con_usuarios_afectados_mayor_a": 500
+  },
+  "escalones": [1, 5, 20, 50, 100]
+}</code></pre>
+
+<div class="tip">
+  <strong>El mínimo de sesiones importa tanto como el porcentaje.</strong> Con 1% de rollout y 800 sesiones acumuladas, un crash-free de 99,2% puede ser ruido estadístico puro. Antes de tomar cualquier decisión, exigí volumen: si no llegaste al mínimo de sesiones, la respuesta correcta es <em>esperar</em>, no avanzar ni frenar.
+</div>
+
+<h2>RNS8.10 Responder a un incidente en móvil</h2>
+
+<p>Acá es donde móvil se diferencia de todo lo demás, y conviene tenerlo internalizado antes de que pase: <strong>no existe el rollback de lo que ya está instalado</strong>. Podés frenar la distribución, pero el binario que está en el teléfono de alguien se queda ahí hasta que esa persona actualice.</p>
+
+<table>
+  <thead>
+    <tr><th>Opción</th><th>A quién alcanza</th><th>Cuánto tarda en llegar</th><th>Qué puede arreglar</th><th>Costo / riesgo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Frenar el rollout</strong></td><td>Solo instalaciones y updates <em>futuros</em></td><td>Minutos en tomar efecto</td><td>Nada de lo ya instalado — solo detiene la sangría</td><td>Casi nulo. Es siempre el primer paso.</td></tr>
+    <tr><td><strong>Kill switch (config remota)</strong></td><td>Todos los usuarios de la versión afectada</td><td>Minutos a horas, según el intervalo de fetch</td><td>Desactivar la ruta rota, si estaba detrás de un flag</td><td>La feature desaparece para todos. Requiere haberlo previsto.</td></tr>
+    <tr><td><strong>Update OTA</strong></td><td>Los que tengan el runtime compatible</td><td>Próximo arranque, o el siguiente según la política</td><td>Cualquier bug que esté <strong>en el JS</strong></td><td>No toca código nativo. Puede romper más si se apura.</td></tr>
+    <tr><td><strong>Build nuevo a la tienda</strong></td><td>Los que actualicen</td><td>Horas de revisión + días de adopción</td><td>Todo, incluido lo nativo</td><td>Lento. La adopción nunca llega al 100%.</td></tr>
+    <tr><td><strong>Forzar actualización</strong></td><td>Todos, bloqueando la app</td><td>Al abrir, pero exige que el build ya esté publicado</td><td>Garantiza que nadie quede en la versión rota</td><td>Alto: bloquear la app enoja mucho y genera reseñas de una estrella.</td></tr>
+    <tr><td><strong>Rollback</strong></td><td>—</td><td>—</td><td><strong>No existe</strong></td><td>Ninguna tienda desinstala una versión de los dispositivos.</td></tr>
+  </tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El orden casi siempre es el mismo:</strong> (1) frenar el rollout — es gratis y no requiere análisis; (2) medir cuánta gente está afectada de verdad; (3) kill switch si el código roto está detrás de un flag; (4) OTA si el fix es de JS; (5) build a la tienda para el fix definitivo. Los pasos 1 y 3 se pueden hacer <em>mientras</em> todavía no sabés la causa raíz. No esperes a entender el bug para dejar de lastimar usuarios.
+</div>
+
+<p>Y un detalle que se olvida: si detenés el rollout de la 1.8.0, Play <strong>no</strong> vuelve a servir la 1.7.9 automáticamente en todos los casos, y en ninguna tienda podés "despublicar" hacia atrás de forma limpia. La salida estándar es publicar una <strong>1.8.1</strong> con el fix o con la feature revertida, porque el número de versión solo puede subir.</p>
+
+<h2>RNS8.11 Soporte de versiones viejas y forzar actualización</h2>
+
+<p>La cola de versiones es más larga de lo que uno cree: siempre hay gente con una app de hace un año, sea porque tiene las actualizaciones automáticas apagadas, porque no le entra en el almacenamiento, o porque su dispositivo ya no recibe la versión nueva. Eso te obliga a definir una política, porque el backend tiene que seguir respondiéndoles.</p>
+
+<pre><code class="lang-json">// Respuesta del endpoint de arranque: la app pregunta y el
+// servidor decide. Nunca al revés: la lógica de soporte no
+// puede vivir en el binario, porque el binario es lo viejo.
+{
+  "version_minima_soportada": "1.5.0",
+  "version_minima_recomendada": "1.8.1",
+  "version_actual": "1.9.0",
+  "mensaje_bloqueo": "Necesitás actualizar para seguir usando la app.",
+  "mensaje_sugerencia": "Hay una versión nueva con mejoras de rendimiento.",
+  "url_tienda": {
+    "ios": "https://apps.apple.com/app/id000000000",
+    "android": "https://play.google.com/store/apps/details?id=com.miapp"
+  }
+}</code></pre>
+
+<pre><code class="lang-tsx">// src/actualizacion/Gate.tsx
+type Nivel = 'ok' | 'sugerir' | 'bloquear';
+
+function nivelDeActualizacion(actual: string, cfg: Config): Nivel {
+  if (semverMenor(actual, cfg.version_minima_soportada)) return 'bloquear';
+  if (semverMenor(actual, cfg.version_minima_recomendada)) return 'sugerir';
+  return 'ok';
+}
+
+export function GateDeActualizacion({ children }: { children: React.ReactNode }) {
+  const cfg = useConfigDeArranque();
+  const nivel = cfg ? nivelDeActualizacion(APP_VERSION, cfg) : 'ok';
+
+  // Si la config no cargó (offline), NUNCA bloquear:
+  // dejar a alguien sin app por una falla de red es peor que el bug.
+  if (nivel === 'bloquear') return &lt;PantallaActualizarObligatorio cfg={cfg!} /&gt;;
+
+  return (
+    &lt;&gt;
+      {children}
+      {nivel === 'sugerir' &amp;&amp; &lt;BannerActualizar cfg={cfg!} descartable /&gt;}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 Tres niveles, no dos.</strong> La diferencia entre <em>sugerir</em> y <em>bloquear</em> es la que hace que la política sea tolerable. Sugerir es un banner descartable que aparece con moderación; bloquear es una pantalla sin salida. El bloqueo se reserva para dos casos: una versión que está activamente rota o insegura, o una que el backend ya no puede seguir soportando. Bloquear "para que todos usen lo último" es una decisión de producto perezosa que se paga en reseñas.
+</div>
+
+<p>Reglas prácticas para que forzar actualización no sea una tortura:</p>
+
+<ul>
+  <li><strong>Avisá antes de bloquear.</strong> Semanas de banner descartable, después el bloqueo. Nadie debería encontrarse el muro sin haberlo visto venir.</li>
+  <li><strong>Explicá por qué</strong>, en una línea concreta ("esta versión tiene un problema de seguridad"), no con un genérico.</li>
+  <li><strong>Llevá directo a la tienda</strong> con un botón. En Android podés usar la API de <em>in-app updates</em> para actualizar sin salir de la app; en iOS no hay equivalente y el botón abre la ficha.</li>
+  <li><strong>Nunca bloquees por falta de red.</strong> Si no pudiste consultar la política, asumí que está todo bien.</li>
+  <li><strong>Soportá el rango que declarás.</strong> Si tu política dice 1.5.0, los tests de contrato del backend tienen que cubrir 1.5.0. Si no, la política es una mentira que descubrís en un incidente.</li>
+</ul>
+
+<h2>RNS8.12 Tamaño de la app: la métrica de producto que parece técnica</h2>
+
+<p>El tamaño de descarga afecta directamente cuánta gente termina de instalar tu app. La gente en datos móviles, con almacenamiento lleno o con conexión lenta abandona la instalación a mitad de camino, y esa pérdida no aparece en ninguna métrica de tu app — porque nunca llegó a abrirla.</p>
+
+<div class="info">
+  Google publicó hace años un análisis que se sigue citando: por cada ~6 MB adicionales de tamaño de descarga, la tasa de conversión de instalación cae aproximadamente <strong>1%</strong>. El número exacto varía enormemente por mercado y categoría —pesa mucho más en países con conexiones caras—, pero la dirección es siempre la misma y el efecto es real.
+</div>
+
+<p>Además hay límites duros que conviene conocer antes de chocarlos: Play tiene un tope para el tamaño de descarga del bundle base (con <em>Play Asset Delivery</em> para lo que exceda), y iOS pide confirmación explícita al usuario cuando la descarga por datos móviles supera cierto umbral. Los dos valores los mueven las plataformas cada tanto, así que verificalos en la documentación vigente en vez de asumir el que aprendiste hace tres años.</p>
+
+<pre><code class="lang-bash"># Ver de qué está hecho tu APK/AAB. Casi siempre hay una sorpresa.
+npx react-native-bundle-visualizer            # el bundle de JS
+unzip -l app-release.apk | sort -k1 -n | tail -30   # los archivos más pesados
+
+# Tamaño de descarga real por configuración de dispositivo
+# (no el del AAB entero, que no lo baja nadie):
+bundletool build-apks --bundle=app-release.aab --output=app.apks
+bundletool get-size total --apks=app.apks --dimensions=SDK,ABI,SCREEN_DENSITY</code></pre>
+
+<p>Las palancas que más rinden, en orden de relación beneficio/esfuerzo:</p>
+
+<table>
+  <thead>
+    <tr><th>Palanca</th><th>Impacto típico</th><th>Costo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Publicar como <strong>AAB</strong> y no como APK universal</td><td>Alto: cada usuario baja solo su ABI y su densidad</td><td>Nulo, ya es lo estándar</td></tr>
+    <tr><td>Activar <strong>R8</strong> y el <em>shrinking</em> de recursos</td><td>Medio-alto</td><td>Bajo, pero exige reglas <code>keep</code> bien puestas</td></tr>
+    <tr><td>Auditar <strong>fuentes e íconos</strong> embebidos</td><td>Sorprendentemente alto</td><td>Bajo: casi siempre hay packs enteros por 4 íconos</td></tr>
+    <tr><td>Recomprimir <strong>imágenes</strong> (WebP / AVIF) y sacar las que no se usan</td><td>Medio-alto</td><td>Bajo</td></tr>
+    <tr><td>Sacar <strong>dependencias</strong> que aportan poco</td><td>Variable, a veces enorme</td><td>Medio: hay que reescribir código</td></tr>
+    <tr><td>Descargar <strong>assets bajo demanda</strong></td><td>Alto si tenés muchos recursos</td><td>Alto: complejidad de estado y de offline</td></tr>
+  </tbody>
+</table>
+
+<div class="mistake">
+  <strong>El error de medición:</strong> mirar el peso del <code>.aab</code> o del <code>.ipa</code> en tu disco y creer que es lo que baja el usuario. El AAB contiene <em>todas</em> las variantes; el usuario baja una. Medí siempre el <strong>tamaño de descarga</strong> que reporta la consola de la tienda o <code>bundletool get-size</code>, y trackealo por versión: una regresión de tamaño es tan reportable como una de rendimiento.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "el crash-free se cayó a 97,1%"</h2>
+
+<p>Miércoles, 10:40. La 1.8.0 salió ayer con el escáner de documentos y está en 20% de rollout. Suena la alerta de crash-free.</p>
+
+<h3>Paso 1 — Convertir el porcentaje en personas</h3>
+
+<pre><code class="lang-bash"># Lo primero, siempre: ¿de qué tamaño es esto?
+# DAU 400.000 · 20% del rollout tiene la 1.8.0
+
+# Crash-free global de la app
+#   antes: 99,6%   ahora: 97,1%   → delta -2,5 pp
+
+# Pero el rollout es del 20%, así que el daño está CONCENTRADO:
+python3 -c "
+dau=400000; rollout=0.20
+afectados = dau*(0.996-0.971)
+print(f'afectados/día: {afectados:,.0f}')
+print(f'sobre la base con 1.8.0: {afectados/(dau*rollout):.1%} de esos usuarios')"
+# afectados/día: 10,000
+# sobre la base con 1.8.0: 12.5% de esos usuarios</code></pre>
+
+<p>Ese segundo número es el que importa: <strong>uno de cada ocho</strong> usuarios que recibieron la 1.8.0 está crasheando. Si el rollout llega al 100%, el crash-free global se desploma por debajo del 88%. Esto no es un bug: es un incidente.</p>
+
+<h3>Paso 2 — Frenar el rollout antes de entender nada</h3>
+
+<p>Es gratis, es reversible y no requiere diagnóstico. Detener la distribución en Play y pausar la publicación gradual en App Store toma dos minutos y evita que el problema siga creciendo mientras investigás. <strong>No cambia nada para los que ya lo tienen</strong>, pero corta la entrada de nuevos afectados.</p>
+
+<h3>Paso 3 — Segmentar el crash</h3>
+
+<p>El panel muestra un único issue nuevo que concentra el 96% de los eventos. Se agrupa por las dimensiones que instrumentamos en RNS8.5:</p>
+
+<table>
+  <thead>
+    <tr><th>Dimensión</th><th>Distribución de los crashes</th><th>Distribución de la base instalada</th><th>Lectura</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Versión de app</td><td>1.8.0: 100%</td><td>1.8.0: 20%</td><td>Regresión introducida por esta release</td></tr>
+    <tr><td>Plataforma</td><td>Android: 100%</td><td>Android: 62%</td><td>iOS está limpio</td></tr>
+    <tr><td>Versión de OS</td><td>Android 12: 94%</td><td>Android 12: 21%</td><td>Fortísima concentración</td></tr>
+    <tr><td>Fabricante</td><td>Un solo fabricante: 91%</td><td>Ese fabricante: 34%</td><td>Es la capa del fabricante sobre Android 12</td></tr>
+    <tr><td>Pantalla</td><td><code>EscanerDocumentos</code>: 100%</td><td>—</td><td>La feature nueva</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="lang-bash"># El stack, ya simbolizado gracias a los símbolos que subimos en el build:
+Fatal signal 11 (SIGSEGV), code 1, fault addr 0x0 in tid 9182 (mqt_native_modules)
+
+  #00  pc 0x00000000000418ac  libdocscan.so (dsCreateSession+124)
+  #01  pc 0x0000000000029f40  libdocscan.so (dsInit+88)
+  #02  pc 0x00000000000133a0  libdocscan-jni.so (Java_com_miapp_DocScanModule_init+64)
+        at com.miapp.DocScanModule.init(DocScanModule.java:41)
+        at com.facebook.react.bridge.JavaMethodWrapper.invoke(...)</code></pre>
+
+<div class="rule">
+  <strong>📌 Fijate lo que acaba de pasar acá.</strong> Ese stack se lee porque en RNS8.2 subimos <code>native-debug-symbols</code> en el mismo job del build. Sin eso tendríamos seis líneas de direcciones hexadecimales y estaríamos adivinando qué feature es. <strong>El trabajo de observabilidad se hace antes del incidente; durante el incidente solo se cobra.</strong>
+</div>
+
+<h3>Paso 4 — Descartar el OTA</h3>
+
+<p>El crash está en <code>libdocscan.so</code>, una librería nativa que vino dentro del binario 1.8.0. Un update OTA reemplaza el bundle de JavaScript; <strong>no puede reemplazar código nativo</strong>. Así que el OTA <em>no puede arreglar el bug</em>.</p>
+
+<div class="warn">
+  Lo que un OTA <strong>sí</strong> podría hacer es enviar JS que deje de llamar al módulo — un kill switch entregado por el canal de updates. Pero es más lento y más riesgoso que el flag: requiere construir y publicar un bundle nuevo, pasar por el chequeo de compatibilidad de runtime, y solo se aplica en el próximo arranque. Si ya tenés el flag, usá el flag.
+</div>
+
+<h3>Paso 5 — Bajar el kill switch</h3>
+
+<p>La feature estaba detrás de <code>escaner_documentos</code>, un flag con default <code>true</code> en el binario y con intervalo de fetch corto (verificado: 5 minutos). Se pone en <code>false</code> — pero, importante, <strong>segmentado</strong>, para no apagarle la feature a los usuarios que no están afectados:</p>
+
+<pre><code class="lang-json">// Regla de configuración remota, evaluada en el servidor.
+{
+  "flag": "escaner_documentos",
+  "valor_por_defecto": true,
+  "reglas": [
+    {
+      "si": {
+        "app_version": "1.8.0",
+        "os": "android",
+        "os_version_mayor": 12,
+        "fabricante": "acme"
+      },
+      "entonces": false,
+      "motivo": "INC-241 · SIGSEGV en dsCreateSession"
+    }
+  ]
+}</code></pre>
+
+<p>A los 12 minutos, la curva de crashes nuevos se aplana. A los 40 minutos, con la mayoría de los clientes ya refrescados, el crash-free global vuelve a 99,5%.</p>
+
+<h3>Paso 6 — La decisión, con los tiempos reales sobre la mesa</h3>
+
+<table>
+  <thead>
+    <tr><th>Opción</th><th>¿Arregla este bug?</th><th>Tiempo hasta el usuario</th><th>Decisión</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Frenar rollout</td><td>No, pero detiene el crecimiento</td><td>~2 min</td><td>✅ Hecho primero, sin diagnóstico</td></tr>
+    <tr><td>Kill switch segmentado</td><td>Sí: el código roto deja de ejecutarse</td><td>~12 min (intervalo de fetch)</td><td>✅ Es la mitigación real</td></tr>
+    <tr><td>Update OTA</td><td>No: el bug es nativo</td><td>Próximo arranque</td><td>❌ Descartado</td></tr>
+    <tr><td>Forzar actualización</td><td>No hay versión arreglada todavía</td><td>—</td><td>❌ Prematuro</td></tr>
+    <tr><td>Build 1.8.1</td><td>Sí, definitivo</td><td>Horas de revisión + días de adopción</td><td>✅ En paralelo, sin apuro</td></tr>
+    <tr><td>Rollback a 1.7.9</td><td>—</td><td>—</td><td>❌ No existe en móvil</td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 El criterio para elegir.</strong> Preguntate dos cosas en este orden: <strong>(1) ¿el fix está en JS o en nativo?</strong> — si es nativo, el OTA queda descartado de entrada. <strong>(2) ¿el código roto está detrás de un flag?</strong> — si sí, el kill switch es siempre la vía más rápida y la más segura, porque no despliega código nuevo. El build a la tienda nunca es la mitigación: es la <em>reparación</em>, y va en paralelo, sin la presión de tener usuarios rompiéndose.
+</div>
+
+<h3>Paso 7 — El post-mortem, que es donde está el valor</h3>
+
+<p>La causa raíz fue que el SDK del escáner asume un códec de imagen que la capa de ese fabricante sobre Android 12 no expone, y no valida el <code>null</code> que devuelve. Pero las preguntas útiles del post-mortem no son sobre el SDK:</p>
+
+<ul>
+  <li><strong>¿Por qué no lo vimos en el canary?</strong> Porque el equipo tiene iPhones y Pixels. Acción: sumar dos dispositivos de ese fabricante al parque de pruebas, y priorizar el canary interno por cuota de mercado real de la base instalada, no por lo que hay en la oficina.</li>
+  <li><strong>¿Por qué el gate de 24 h a 1% no lo frenó?</strong> Porque el rollout saltó de 1% a 20% en 6 h por presión de lanzamiento. Acción: el avance de escalón lo ejecuta un job que verifica <code>release-gates.json</code>, no una persona apurada.</li>
+  <li><strong>¿Por qué tardamos 12 minutos y no 2?</strong> Por el intervalo de fetch. Acción: separar un canal de "flags de emergencia" con actualización en tiempo real, y medir su latencia una vez por trimestre con un simulacro.</li>
+  <li><strong>¿Qué habría pasado si esta feature no hubiera tenido flag?</strong> La única opción habría sido un build nuevo: días de exposición en vez de minutos. Acción: que toda integración de SDK de terceros nazca con flag y con default seguro, como requisito de revisión de código.</li>
+</ul>
+
+<h2>RNS8.13 Cierre del track: qué estudiar después</h2>
+
+<p>Con esto cerrás React Native Senior. Repasando el arco: en <a href="../rns1-nueva-arquitectura/lecture.html">RNS1</a> entendiste qué cambió con la nueva arquitectura y por qué; en <a href="../rns2-rendimiento/lecture.html">RNS2</a> aprendiste a medir antes de optimizar; en <a href="../rns3-animaciones-gestos/lecture.html">RNS3</a> a sacar el trabajo del hilo de JS; en <a href="../rns4-modulos-nativos/lecture.html">RNS4</a> a bajar a la plataforma cuando hace falta; en <a href="../rns5-navegacion-arquitectura/lecture.html">RNS5</a> a estructurar una app que crece; en <a href="../rns6-offline-datos/lecture.html">RNS6</a> a que funcione sin red; en <a href="../rns7-build-ota/lecture.html">RNS7</a> a construirla y distribuirla; y en este módulo, a saber qué le está pasando una vez que está afuera.</p>
+
+<p>El hilo conductor de los ocho módulos es uno solo: <strong>medir antes de afirmar</strong>. Es la misma disciplina en el perfilado de RNS2, en el presupuesto de tamaño de RNS7 y en el crash-free de acá.</p>
+
+<h3>Hacia dónde seguir</h3>
+
+<ul>
+  <li><strong>Plataforma nativa en serio.</strong> Swift/SwiftUI y Kotlin/Compose. Casi todos los techos que vas a encontrar en RN se destraban entendiendo la plataforma de abajo, y RNS4 fue apenas la puerta de entrada.</li>
+  <li><strong>Backend para móvil.</strong> Diseño de API pensado para clientes que no podés actualizar: versionado, compatibilidad hacia atrás, payloads chicos, sincronización. Es la contracara natural de RNS6.</li>
+  <li><strong>Testing en dispositivos reales.</strong> Detox o Maestro sobre una granja de dispositivos, integrado al pipeline de RNS7. Es lo que habría atrapado el bug del worked example.</li>
+  <li><strong>Seguridad de aplicaciones móviles.</strong> Almacenamiento seguro, <em>pinning</em>, protección de secretos en el binario, resistencia a ingeniería inversa. Empezá por el <a href="../../../../sistemas/Curso-Ciberseguridad/m10-deteccion-respuesta/lecture.html">M10 de Ciberseguridad</a> y seguí con el OWASP Mobile Top 10.</li>
+  <li><strong>Accesibilidad.</strong> Lectores de pantalla, tamaños de fuente dinámicos, contraste, orden de foco. Es donde más rápido se nota la diferencia entre una app hecha y una app terminada.</li>
+  <li><strong>Y lo más importante:</strong> mantené una app tuya en producción, con usuarios de verdad, durante un año. Ningún curso enseña lo que enseña tener que responder un incidente un domingo a la noche.</li>
+</ul>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Publicaste una versión y el panel de crashes está limpio, pero soporte reporta que "la app no anda". ¿Qué mirás?</summary>
+<p>Lo primero es asumir que el crash-free limpio es información real pero incompleta: lo que se está rompiendo <strong>no está matando el proceso</strong>. Los tres sospechosos son promesas rechazadas sin capturar (el spinner que gira para siempre), un error de render contenido por un boundary que muestra el fallback y nadie está contando, y ANR en Android — que el usuario vive como un crash pero no aparece en el panel de crashes, sino en Play Vitals. La métrica que hay que tener instrumentada para no depender de soporte es la de éxito de pantalla: qué porcentaje de las entradas a cada pantalla termina mostrando contenido. Si eso cae, tenés un incidente aunque el crash-free esté en 99,9%.</p></details>
+
+<details><summary>Un crash afecta al 8% de los usuarios de la última versión. ¿OTA, kill switch o build nuevo?</summary>
+<p>La respuesta depende de dos preguntas, en este orden. <strong>Primera: ¿el fix está en JS o en código nativo?</strong> Si el stack apunta a una <code>.so</code>, a una clase Java o a Objective-C que vino en el binario, el OTA queda descartado — un update OTA solo reemplaza el bundle de JavaScript. <strong>Segunda: ¿el código roto está detrás de un feature flag?</strong> Si sí, el kill switch es la vía más rápida y la más segura, porque no despliega código nuevo y llega en minutos. Y antes de todo eso, sea cual sea la respuesta: frenar el rollout, que es gratis, instantáneo y no requiere entender la causa. El build a la tienda es la reparación definitiva y va en paralelo, pero nunca es la mitigación: tarda horas de revisión más días de adopción.</p></details>
+
+<details><summary>¿Por qué el promedio de tiempo de arranque es una métrica peligrosa?</summary>
+<p>Porque promedia dos poblaciones que no tienen nada que ver. Si el 90% arranca en 1,2 s y el 10% en 9 s, el promedio da 1,98 s y parece razonable — pero ese 10% está teniendo una experiencia inaceptable y es el que desinstala. Hay que mirar percentiles (p75, p90, p95) y, sobre todo, <strong>segmentar</strong>: por gama de dispositivo, versión de OS, versión de app y tipo de red. Un p95 global tampoco alcanza, porque te dice que hay un problema pero no dónde. Y el fondo del asunto es que tu dispositivo de desarrollo —tope de gama, con espacio libre, en wifi y sin datos acumulados— no representa a ningún usuario real, así que la intuición del equipo sobre el rendimiento está sistemáticamente sesgada hacia el optimismo.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>En móvil no tenés acceso al entorno de ejecución: la observabilidad <strong>se compila dentro del binario</strong>. Lo que no instrumentaste antes de publicar, no lo vas a poder ver después.</li>
+  <li>Los crashes nativos matan el proceso y se reportan en el <strong>siguiente arranque</strong>; los errores de JS pasan por <code>ErrorUtils</code>. Son dos rutas distintas del mismo SDK, y las dos hay que verificar.</li>
+  <li>Sin <strong>source maps</strong> (JS) y <strong>símbolos</strong> (<code>.dSYM</code>, <code>mapping.txt</code>, símbolos del NDK), los stack traces son inútiles. Se suben en el mismo job del build o se pierden para siempre.</li>
+  <li>Los errores peligrosos no son crashes: promesas sin <code>catch</code>, boundaries que ocultan fallos y ANR. Definí una métrica de <strong>éxito de pantalla</strong> o vas a estar ciego.</li>
+  <li><strong>Crash-free users</strong> es la métrica a defender, y hay que traducirla a personas: 2,5 puntos sobre 400.000 DAU son diez mil usuarios por día.</li>
+  <li>En performance, el promedio miente y tu dispositivo también. <strong>Percentiles segmentados</strong> por gama, OS, versión y red.</li>
+  <li>Separá <strong>observabilidad técnica</strong> de <strong>analítica de producto</strong>: distinta audiencia, distinta urgencia, distintas alertas. Una alerta sin runbook es un gráfico.</li>
+  <li>En telemetría, <strong>el dato que no recolectás es el único que no se te puede filtrar</strong>. Scrubbing en el borde, consentimiento real, y las etiquetas de privacidad de la ficha alineadas con lo que la app hace de verdad.</li>
+  <li><strong>Feature flags y kill switch</strong> son infraestructura de seguridad en móvil: la única forma de cambiar el comportamiento de una app instalada sin pasar por la tienda. Default seguro y <strong>latencia medida</strong>, no supuesta.</li>
+  <li>Release sano: canary interno → rollout progresivo con gates numéricos → monitoreo activo → decisión explícita.</li>
+  <li><strong>No existe el rollback.</strong> Las opciones reales son frenar el rollout, kill switch, OTA (solo JS) y build nuevo, en ese orden y con esos costos.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Configurá crash reporting en una app tuya y verificá empíricamente los <strong>dos</strong> caminos: lanzá un error de JS y un crash nativo desde un build de <em>release firmado</em>, y confirmá que los dos stack traces llegan con nombres de archivo tuyos. Si aparece <code>bundle:1:284915</code>, arreglá la subida de source maps y repetí hasta que resuelva.</li>
+  <li>Agregá error boundaries por zonas a una pantalla con al menos tres secciones. Forzá un error en una sola y comprobá que el resto sigue usable. Después revisá el reporte: ¿te dice <em>qué</em> zona se cayó, o solo que "algo" falló?</li>
+  <li>Instrumentá el <strong>éxito de pantalla</strong> en tus tres pantallas de datos principales (entrada → contenido / error / abandono). Corré la app con el servidor apagado y verificá que el panel refleja la caída.</li>
+  <li>Medí el <em>cold start</em> con la técnica de RNS8.5 en dos dispositivos de gama distinta, con 20 muestras cada uno. Reportá p50, p90 y p95 por gama y explicá la diferencia entre el promedio global y el p90 de la gama baja.</li>
+  <li>Implementá un flag con default seguro y un kill switch, y <strong>medí cuánto tarda de verdad</strong> en llegar desde que lo cambiás hasta que la app instalada lo respeta. Si tarda más de 15 minutos, ajustá la configuración y volvé a medir.</li>
+  <li>Escribí el <code>release-gates.json</code> de tu app: umbrales, ventana mínima, sesiones mínimas y escalones. Justificá cada número — no copies los del módulo.</li>
+  <li>Auditá tu telemetría actual: listá cada campo que sale del dispositivo, marcá cuál es realmente necesario para depurar y eliminá el resto. Después compará esa lista con lo que declarás en la ficha de la tienda. ¿Coinciden?</li>
+  <li>Medí el tamaño de descarga real con <code>bundletool get-size</code> para tres configuraciones de dispositivo, identificá los cinco archivos más pesados del APK y proponé una reducción concreta con el ahorro estimado en MB.</li>
+</ol>
+
+<section class="quiz" id="quizRNS8">
+  <style>
+    #quizRNS8{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS8 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS8 .q{margin-bottom:1.5rem}
+    #quizRNS8 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS8 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS8 .opt:hover{border-color:var(--accent)}
+    #quizRNS8 .opt:disabled{cursor:default}
+    #quizRNS8 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS8 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS8 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS8 .exp.show{display:block}
+    #quizRNS8 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Un crash en producción llega con el stack <code>at t (index.android.bundle:1:284915)</code>. ¿Qué falta?</p>
+    <button class="opt">Habilitar Hermes en el build de release</button>
+    <button class="opt">Instalar el SDK de crash reporting también en el lado nativo</button>
+    <button class="opt">Subir los source maps de ese build, atados al mismo <code>release</code> y <code>dist</code></button>
+    <div class="exp">El stack llegó, así que el SDK está funcionando: lo que falta es el mapa que traduce el offset del bundle minificado a archivo, línea y columna. Y tiene que estar asociado al identificador exacto de <em>ese</em> build — si el <code>release</code>/<code>dist</code> no coincide, el servidor no encuentra el mapa correcto entre todos los que subiste. Lo peor es que los source maps se generan durante el build: si el CI ya borró el workspace sin subirlos, esos crashes son ilegibles para siempre.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. La versión nueva crashea al 8% de sus usuarios. El stack apunta a una librería <code>.so</code> que vino en el binario, y la feature está detrás de un flag. ¿Cuál es la mitigación más rápida?</p>
+    <button class="opt">Frenar el rollout y bajar el kill switch del flag</button>
+    <button class="opt">Publicar un update OTA con el fix</button>
+    <button class="opt">Hacer rollback a la versión anterior en la tienda</button>
+    <div class="exp">Frenar el rollout es gratis e instantáneo, y no requiere haber entendido la causa: corta la entrada de nuevos afectados. El kill switch llega a los que ya tienen la versión rota en minutos, sin desplegar código nuevo. El OTA está descartado porque el bug es <strong>nativo</strong>: un update OTA reemplaza el bundle de JavaScript, no una <code>.so</code>. Y el rollback simplemente no existe en móvil — ninguna tienda desinstala una versión de los dispositivos donde ya está; lo que se hace es publicar una versión superior con el fix.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. El crash-free está en 99,8% pero soporte reporta que muchos usuarios ven una pantalla vacía. ¿Qué explica mejor la contradicción?</p>
+    <button class="opt">El crash-free se calcula con retraso y todavía no reflejó el problema</button>
+    <button class="opt">Son errores que no matan el proceso —promesas rechazadas, ANR, boundaries— y por eso no aparecen en el panel de crashes</button>
+    <button class="opt">Los usuarios están en una versión vieja que ya no reporta métricas</button>
+    <div class="exp">El panel de crashes solo ve lo que mata el proceso. Una promesa rechazada sin <code>catch</code> deja el spinner girando eternamente sin generar ningún evento; un error boundary muestra su fallback y absorbe el fallo; y un ANR en Android bloquea la UI hasta que el usuario cierra la app, pero se registra en Play Vitals, no en el crash reporting. Por eso hace falta una métrica propia de <strong>éxito de pantalla</strong>: qué porcentaje de las entradas a cada pantalla termina en contenido. Es lo único que detecta la pantalla en blanco silenciosa.</div>
+  </div>
+
+  <div class="score" id="scoreRNS8"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS8');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS8').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Cerraste el track de React Native Senior.' : '  — repasá las que fallaste; este módulo es el que se cobra en producción.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns7-build-ota/lecture.html">← RNS7: Build, distribución y OTA</a>
+  <a href="../index.html">Volver al track →</a>
+</nav>
+
+</div>
+</body>
+</html>

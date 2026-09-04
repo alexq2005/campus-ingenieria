@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS2 — Concurrent React: transiciones, Suspense y streaming · React Senior</title>
+  <meta name="description" content="El modelo de prioridades de React 19.2: useTransition, useDeferredValue, Suspense a fondo, streaming SSR con reveals batcheados, hidratación, use(), useSyncExternalStore y qué se rompe cuando el render deja de ser una sola pasada.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS2</span>
+  <span class="badge">⏱ 45–135 min</span>
+  <span class="badge">🎯 Pre-req: RS1</span>
+  <span class="badge">⚡ Concurrencia</span>
+</div>
+
+<article>
+
+<h1>RS2 — Concurrent React: transiciones, Suspense y streaming</h1>
+
+<h2>RS2.0 Por qué este módulo: "concurrente" no significa multihilo</h2>
+
+<p>En RS1 viste que React construye un árbol de fibers y que el render está partido en dos fases: <strong>render</strong> (calcular qué cambió, sin tocar el DOM) y <strong>commit</strong> (aplicar los cambios). Ese diseño no existe por elegancia arquitectónica. Existe para habilitar exactamente una cosa: que la fase de render pueda <strong>pausarse a la mitad, tirarse a la basura y volver a empezar</strong>.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> React sigue corriendo en un solo hilo, el del navegador. "Concurrente" acá significa que React trocea el trabajo de render y le devuelve el control al browser cada pocos milisegundos, para que pueda pintar, responder a un click o procesar una tecla. La consecuencia profunda no es de rendimiento: es <strong>semántica</strong>. Tu función componente puede ejecutarse para un render que después se descarta. Todo lo que asumía "esto corre una vez y termina" deja de ser cierto.
+</div>
+
+<p>Mucha gente aprende Concurrent React como una lista de hooks nuevos: <code>useTransition</code>, <code>useDeferredValue</code>, <code>use</code>. Así aprendido, se convierte en cargo cult: se envuelve todo en <code>startTransition</code> "por las dudas" y la app queda peor. La forma útil de entenderlo es al revés: primero el modelo de ejecución, y los hooks después, como la API que te deja participar de ese modelo.</p>
+
+<div class="analogy">
+  <strong>La analogía que sí sirve.</strong> Un scheduler de sistema operativo con un solo núcleo. No hay paralelismo: hay <em>quantum</em>. React se toma ~5 ms de CPU, mira si el navegador tiene algo urgente (<code>shouldYield()</code>), y si lo hay, guarda el puntero al fiber donde iba y devuelve el control. Después retoma. Si mientras tanto llegó una actualización más urgente, <strong>abandona el trabajo hecho</strong> y arranca de nuevo desde arriba con el estado nuevo. Ese "abandona el trabajo hecho" es la fuente de todos los bugs sutiles de este módulo.
+</div>
+
+<p>Y hay un detalle que casi nadie tiene claro, que va a ser el hilo conductor del <em>worked example</em>:</p>
+
+<div class="rule">
+  <strong>📌 La fase de render se puede interrumpir. La fase de commit, no.</strong> Cuando React termina de calcular el árbol nuevo, aplica todas las mutaciones al DOM de corrido, sincrónicamente, sin ceder el control. Insertar 5.000 nodos es una tarea larga que ningún scheduler puede partir. Por eso las transiciones mejoran <em>la respuesta al input</em> y no arreglan <em>el frame en el que aparece la lista</em>.
+</div>
+
+<h2>RS2.1 El modelo de prioridades: urgente vs transición</h2>
+
+<p>Internamente React clasifica cada actualización en un <strong>lane</strong> (un bit dentro de un bitmask de 31 posiciones). No necesitás manejar lanes a mano, pero sí necesitás saber que existen cuatro grandes categorías, porque son las que explican por qué dos <code>setState</code> escritos uno al lado del otro se comportan distinto:</p>
+
+<table>
+<thead><tr><th>Prioridad</th><th>Qué la dispara</th><th>Comportamiento</th></tr></thead>
+<tbody>
+<tr><td><strong>Discreta / sincrónica</strong></td><td><code>click</code>, <code>keydown</code>, <code>input</code>, <code>submit</code></td><td>Se procesa antes del próximo paint. No se interrumpe.</td></tr>
+<tr><td><strong>Continua</strong></td><td><code>mousemove</code>, <code>scroll</code>, <code>drag</code></td><td>Urgente, pero se puede colapsar: si llegan diez, importa la última.</td></tr>
+<tr><td><strong>Default</strong></td><td><code>setState</code> desde un <code>useEffect</code>, una promesa, un timer</td><td>Se procesa apenas se pueda, interrumpible.</td></tr>
+<tr><td><strong>Transición</strong></td><td><code>startTransition</code>, <code>useDeferredValue</code></td><td>Explícitamente no urgente. Interrumpible y descartable.</td></tr>
+</tbody>
+</table>
+
+<p>El caso canónico donde esto importa es una única interacción que dispara <strong>dos</strong> actualizaciones con urgencias distintas. Tipear en un buscador es exactamente eso:</p>
+
+<pre><code class="lang-jsx">function Buscador() {
+  const [texto, setTexto] = useState("");      // (A) lo que ve el usuario en el input
+  const [query, setQuery] = useState("");      // (B) lo que filtra 5.000 resultados
+
+  function onChange(e) {
+    setTexto(e.target.value);                  // urgente: la letra tiene que aparecer YA
+    startTransition(() =&gt; setQuery(e.target.value)); // puede esperar: los resultados
+  }
+
+  return (
+    &lt;&gt;
+      &lt;input value={texto} onChange={onChange} /&gt;
+      &lt;Resultados query={query} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p>Sin la transición, ambas actualizaciones viajan en el mismo lane sincrónico: React tiene que terminar de renderizar los 5.000 resultados antes de poder pintar la letra. Con la transición, React hace un commit chiquito con la letra, pinta, y <em>después</em> arranca el render caro — que además puede abandonar en cuanto la persona toque otra tecla.</p>
+
+<div class="info">
+  <strong>Qué siente el usuario, concretamente.</strong> Sin transición: tipeás rápido y las letras aparecen a los tirones, en bloque, con 200–400 ms de retraso. Con transición: las letras aparecen instantáneas y los resultados llegan un poquito después, quizás con un estado de "actualizando". La cantidad total de trabajo de CPU no bajó — en general <strong>subió</strong>. Lo que cambió es <em>en qué orden</em> se hace y cuándo se pinta. Esta distinción entre <strong>latencia percibida</strong> y <strong>trabajo total</strong> es todo el módulo en una frase.
+</div>
+
+<h2>RS2.2 <code>useTransition</code> y <code>startTransition</code></h2>
+
+<p>Hay dos formas de marcar una actualización como transición y no son intercambiables:</p>
+
+<pre><code class="lang-jsx">import { startTransition, useTransition } from "react";
+
+// 1) La función suelta: marca la actualización, no te da estado pendiente.
+//    Sirve fuera de componentes (un store, un handler de router, un módulo).
+startTransition(() =&gt; setTab("perfil"));
+
+// 2) El hook: además te devuelve isPending para renderizar feedback.
+const [isPending, startTransition] = useTransition();</code></pre>
+
+<p>El hook es el que vas a usar el 90% del tiempo, porque el problema real de diferir algo es que el usuario no sabe si su acción se registró:</p>
+
+<pre><code class="lang-jsx">function Tabs() {
+  const [tab, setTab] = useState("inicio");
+  const [isPending, startTransition] = useTransition();
+
+  function seleccionar(siguiente) {
+    startTransition(() =&gt; setTab(siguiente));
+  }
+
+  return (
+    &lt;&gt;
+      &lt;nav&gt;
+        {["inicio", "posts", "config"].map((t) =&gt; (
+          &lt;button
+            key={t}
+            onClick={() =&gt; seleccionar(t)}
+            aria-current={t === tab ? "page" : undefined}
+          &gt;
+            {t}
+          &lt;/button&gt;
+        ))}
+      &lt;/nav&gt;
+
+      {/* La pestaña vieja sigue visible e interactiva mientras se prepara la nueva */}
+      &lt;div style={{ opacity: isPending ? 0.6 : 1, transition: "opacity .15s" }}&gt;
+        &lt;Panel tab={tab} /&gt;
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  Fijate en el detalle del <code>opacity</code>: la pestaña vieja <strong>no se reemplaza por un spinner</strong>. Ese es el punto de las transiciones. Un spinner destruye contexto (la persona pierde de vista dónde estaba) y provoca <em>layout shift</em>. Atenuar lo viejo mantiene el layout y comunica "estoy trabajando" sin borrar nada.
+</div>
+
+<h3>El error más común: meter el fetch en vez del cambio de estado</h3>
+
+<p>Este es el malentendido número uno. Alguien tiene una búsqueda lenta y escribe esto:</p>
+
+<pre><code class="lang-jsx">// ❌ Confusión de origen: la lentitud es de red, no de render
+function Buscador() {
+  const [isPending, startTransition] = useTransition();
+  const [datos, setDatos] = useState([]);
+
+  function buscar(q) {
+    startTransition(async () =&gt; {
+      const r = await fetch(`/api/buscar?q=${q}`);
+      setDatos(await r.json());
+    });
+  }
+  // "sigue lento" — obvio: startTransition no acelera la red
+}</code></pre>
+
+<div class="mistake">
+  <strong>Una transición no hace nada más rápido.</strong> No cachea, no cancela requests, no baja la latencia del servidor. Lo único que hace es decirle al scheduler de React <em>"esta actualización puede esperar y podés abandonarla"</em>. Si tu problema es que el endpoint tarda 800 ms, la transición te da un <code>isPending</code> lindo y cero milisegundos de mejora. El diagnóstico previo —¿es render caro o es red lenta?— no es opcional.
+</div>
+
+<p>Ahora bien, ese código <em>no está mal escrito</em>: en React 19 las transiciones asíncronas son oficialmente soportadas y se llaman <strong>Actions</strong>. La función que pasás puede ser <code>async</code>, y las actualizaciones que hagas <em>después</em> del <code>await</code> siguen marcadas como transición, con <code>isPending</code> en <code>true</code> durante todo el proceso. Esto en React 18 estaba roto: el estado se perdía cruzando el <code>await</code>.</p>
+
+<pre><code class="lang-jsx">// ✅ Action correcta (React 19+): isPending cubre red + render
+function GuardarPerfil({ id }) {
+  const [isPending, startTransition] = useTransition();
+  const [error, setError] = useState(null);
+
+  function onSubmit(formData) {
+    startTransition(async () =&gt; {
+      const res = await actualizarPerfil(id, formData);  // el await va ADENTRO
+      if (res.error) { setError(res.error); return; }     // este setState sigue en la transición
+      setError(null);
+    });
+  }
+
+  return (
+    &lt;form action={onSubmit}&gt;
+      &lt;input name="nombre" /&gt;
+      &lt;button disabled={isPending}&gt;{isPending ? "Guardando…" : "Guardar"}&lt;/button&gt;
+      {error &amp;&amp; &lt;p role="alert"&gt;{error}&lt;/p&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>El <code>await</code> tiene que estar adentro del callback.</strong> Si escribís <code>const r = await fetch(...); startTransition(() =&gt; setDatos(r))</code>, solo el <code>setState</code> queda en la transición: <code>isPending</code> nunca cubre la espera de red y tu botón no se deshabilita mientras el request viaja. Es la diferencia entre "la transición envuelve la operación" y "la transición envuelve el último paso".
+</div>
+
+<h3>El otro error: meter el input controlado adentro</h3>
+
+<pre><code class="lang-jsx">// ❌ El input se siente PEOR que antes
+function Mal() {
+  const [texto, setTexto] = useState("");
+  const [isPending, startTransition] = useTransition();
+
+  return (
+    &lt;input
+      value={texto}
+      onChange={(e) =&gt; startTransition(() =&gt; setTexto(e.target.value))}
+    /&gt;
+  );
+}</code></pre>
+
+<p>Un input controlado necesita que su <code>value</code> se actualice de forma urgente y garantizada. Al ponerlo en una transición, esa actualización pasa a ser interrumpible y descartable: si el usuario tipea rápido, React puede abandonar renders intermedios y el cursor salta, se comen letras o el valor "rebota". React incluso te lo advierte en la documentación como <em>pitfall</em> explícito.</p>
+
+<div class="rule">
+  <strong>📌 La regla de oro de las transiciones.</strong> Lo que la persona <em>acaba de escribir o tocar</em> va urgente. Lo que se <em>deriva</em> de eso y es caro va en la transición. Nunca al revés. Si te encontrás queriendo diferir el valor de un input, lo que necesitás es <code>useDeferredValue</code> sobre la parte cara, no <code>useTransition</code> sobre el input.
+</div>
+
+<h2>RS2.3 <code>useDeferredValue</code>: cuando no controlás el <code>setState</code></h2>
+
+<p><code>useDeferredValue</code> ataca el mismo problema desde el otro lado. En vez de marcar <em>la actualización</em> como no urgente, marca <em>un valor</em> como "puede ir atrasado":</p>
+
+<pre><code class="lang-jsx">function Buscador() {
+  const [texto, setTexto] = useState("");
+  const textoDiferido = useDeferredValue(texto);
+
+  return (
+    &lt;&gt;
+      &lt;input value={texto} onChange={(e) =&gt; setTexto(e.target.value)} /&gt;
+      &lt;Resultados query={textoDiferido} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p>Lo que pasa por dentro es un render doble: cuando <code>texto</code> cambia, React renderiza primero con <code>textoDiferido</code> <strong>viejo</strong> (rapidísimo, porque nada caro cambió) y commitea eso para que la letra aparezca. Después agenda en segundo plano un render con el valor nuevo, interrumpible. Si llega otra tecla antes de terminarlo, lo descarta y arranca de nuevo.</p>
+
+<div class="danger">
+  <strong>⚠️ El detalle que hace que funcione o que sea inútil: la memoización.</strong> Si <code>&lt;Resultados&gt;</code> no está envuelto en <code>memo</code>, el render "rápido" con el valor viejo <strong>también</strong> re-renderiza los 5.000 resultados. Resultado: hacés dos renders caros por tecla en vez de uno, y la app queda medible y notoriamente <em>peor</em>. <code>useDeferredValue</code> sin memoización es un anti-patrón, no una optimización.
+</div>
+
+<pre><code class="lang-jsx">// ✅ La forma correcta: el hijo caro salta el render cuando la prop no cambió
+const Resultados = memo(function Resultados({ query }) {
+  const items = useMemo(() =&gt; filtrar(TODOS, query), [query]);
+  return (
+    &lt;ul&gt;
+      {items.map((it) =&gt; &lt;li key={it.id}&gt;{it.nombre}&lt;/li&gt;)}
+    &lt;/ul&gt;
+  );
+});</code></pre>
+
+<div class="info">
+  Con el <strong>React Compiler</strong> (RS3) esta memoización deja de ser manual: el compilador la inserta por vos. Pero el <em>requisito</em> no desaparece — sigue siendo necesario que el subárbol caro pueda saltarse el render intermedio. Cambia quién escribe el <code>memo</code>, no la física del asunto.
+</div>
+
+<p>React 19 agregó un segundo argumento, <code>initialValue</code>, que resuelve el caso del primer render: en vez de renderizar de una con el valor real (caro) o con <code>undefined</code> (feo), arrancás con un valor liviano y React agenda el real en segundo plano.</p>
+
+<pre><code class="lang-jsx">function Listado({ query }) {
+  // Primer render: usa "" (barato). Después va al valor real en background.
+  const diferido = useDeferredValue(query, "");
+  const desactualizado = diferido !== query;
+
+  return (
+    &lt;div aria-busy={desactualizado}&gt;
+      {desactualizado &amp;&amp; &lt;span className="hint"&gt;actualizando…&lt;/span&gt;}
+      &lt;Resultados query={diferido} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  Ese <code>diferido !== query</code> es el equivalente casero de <code>isPending</code>. <code>useDeferredValue</code> no te devuelve un booleano, pero comparar el valor diferido contra el actual te dice exactamente lo mismo: hay un render en vuelo. Sumale <code>aria-busy</code> y el estado también existe para lectores de pantalla, no solo para los ojos.
+</div>
+
+<h3>La tabla comparativa</h3>
+
+<table>
+<thead><tr><th>Criterio</th><th><code>useTransition</code></th><th><code>useDeferredValue</code></th></tr></thead>
+<tbody>
+<tr><td>Qué marca</td><td>La <strong>actualización</strong> (el <code>setState</code>)</td><td>El <strong>valor</strong> que se propaga</td></tr>
+<tr><td>Necesitás</td><td>Ser dueño del <code>setState</code></td><td>Nada: sirve con props o valores externos</td></tr>
+<tr><td>Estado pendiente</td><td><code>isPending</code>, directo</td><td>Comparar <code>valor !== diferido</code></td></tr>
+<tr><td>Renders por cambio</td><td>Uno (el trabajo se agenda)</td><td>Dos (viejo urgente + nuevo en background)</td></tr>
+<tr><td>Exige memoización del hijo</td><td>Conveniente</td><td><strong>Obligatorio</strong>, si no empeora</td></tr>
+<tr><td>Soporta <code>async</code></td><td>Sí (Actions, React 19)</td><td>No aplica</td></tr>
+<tr><td>Caso típico</td><td>Cambiar de pestaña, navegar, enviar un form</td><td>Filtrar/derivar de un input, prop que baja de un padre</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El criterio de decisión, en una línea.</strong> ¿Podés tocar el <code>setState</code> que dispara el trabajo caro? Usá <code>useTransition</code>. ¿El valor te llega ya hecho —como prop, desde un contexto, desde una librería de estado— y no tenés dónde meter el <code>startTransition</code>? Usá <code>useDeferredValue</code>. Escribir librerías genéricas cae casi siempre del lado de <code>useDeferredValue</code>.
+</div>
+
+<h2>RS2.4 Suspense a fondo: qué suspende de verdad</h2>
+
+<p><code>&lt;Suspense&gt;</code> es un límite que dice "si algo acá abajo todavía no está listo, mostrá este fallback". La confusión clásica es creer que capta cualquier estado de carga. No: capta un mecanismo muy específico.</p>
+
+<pre><code class="lang-jsx">// ✅ Estas tres cosas SÍ suspenden
+const Panel = lazy(() =&gt; import("./Panel"));       // 1) código: React.lazy
+
+function Perfil({ promesaUsuario }) {
+  const usuario = use(promesaUsuario);              // 2) datos: use(promise)
+  return &lt;h1&gt;{usuario.nombre}&lt;/h1&gt;;
+}
+
+// 3) Server Components en streaming, y librerías integradas
+//    (useSuspenseQuery de TanStack Query, Relay, el router de tu framework)</code></pre>
+
+<pre><code class="lang-jsx">// ❌ Esto NO suspende. Jamás. El fallback nunca se muestra.
+function Perfil({ id }) {
+  const [usuario, setUsuario] = useState(null);
+  useEffect(() =&gt; {
+    fetch(`/api/u/${id}`).then((r) =&gt; r.json()).then(setUsuario);
+  }, [id]);
+
+  if (!usuario) return &lt;Spinner /&gt;;   // el loading lo manejás vos, a mano
+  return &lt;h1&gt;{usuario.nombre}&lt;/h1&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>Envolver un componente con <code>useEffect</code> + <code>useState</code> en un <code>&lt;Suspense&gt;</code> no hace nada.</strong> El componente renderiza inmediato devolviendo <code>null</code> o su propio spinner; nunca "lanza" nada que el límite pueda interceptar. Es un error frecuentísimo en migraciones: se agregan boundaries por todos lados y no cambia absolutamente nada, porque la capa de datos nunca se integró con Suspense.
+</div>
+
+<h3>La interacción clave: Suspense dentro de una transición</h3>
+
+<p>Acá es donde Suspense y las transiciones se cruzan, y es el comportamiento que más gente desconoce:</p>
+
+<pre><code class="lang-jsx">function App() {
+  const [pagina, setPagina] = useState("home");
+  const [isPending, startTransition] = useTransition();
+
+  return (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; startTransition(() =&gt; setPagina("perfil"))}&gt;
+        Ir al perfil
+      &lt;/button&gt;
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;Pagina nombre={pagina} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 El comportamiento.</strong> Si el cambio de página suspende y la actualización <strong>no</strong> está en una transición, React esconde el contenido actual y muestra el <code>&lt;Skeleton /&gt;</code>: la pantalla parpadea de contenido bueno a esqueleto y de vuelta. Si <strong>sí</strong> está en una transición, React <strong>mantiene la página vieja en pantalla</strong>, no muestra el fallback, y pone <code>isPending</code> en <code>true</code> hasta que la nueva esté lista. El fallback queda reservado para la primera carga, cuando todavía no hay nada bueno que preservar.
+</div>
+
+<p>Esto convierte a <code>startTransition</code> en la herramienta de navegación por defecto: es lo que hace que cambiar de ruta no sea un flash blanco. Todos los routers modernos de React envuelven las navegaciones en transiciones por esta razón.</p>
+
+<h3>Dónde poner los límites</h3>
+
+<p>El error de principiante es un boundary gigante:</p>
+
+<pre><code class="lang-jsx">// ❌ Un solo límite: si cualquier cosa tarda, TODA la pantalla es un esqueleto
+&lt;Suspense fallback={&lt;PantallaCompletaCargando /&gt;}&gt;
+  &lt;Header /&gt;
+  &lt;Sidebar /&gt;
+  &lt;Feed /&gt;         {/* el lento es este */}
+  &lt;Footer /&gt;
+&lt;/Suspense&gt;</code></pre>
+
+<pre><code class="lang-jsx">// ✅ Límites por unidad significativa: lo rápido se ve rápido
+&lt;&gt;
+  &lt;Header /&gt;                        {/* datos que ya están: sin boundary */}
+  &lt;div className="layout"&gt;
+    &lt;Suspense fallback={&lt;SidebarSkeleton /&gt;}&gt;
+      &lt;Sidebar /&gt;
+    &lt;/Suspense&gt;
+    &lt;Suspense fallback={&lt;FeedSkeleton filas={5} /&gt;}&gt;
+      &lt;Feed /&gt;
+    &lt;/Suspense&gt;
+  &lt;/div&gt;
+  &lt;Footer /&gt;
+&lt;/&gt;</code></pre>
+
+<p>Pero el extremo opuesto también es malo: un boundary por cada tarjeta produce el efecto <em>popcorn</em> — quince pedacitos que aparecen en momentos distintos, cada uno empujando el layout. La heurística es:</p>
+
+<div class="step"><strong>1. Un límite envuelve cosas que tiene sentido que aparezcan juntas.</strong> Si la persona no puede usar la mitad de un widget sin la otra mitad, van adentro del mismo límite.</div>
+
+<div class="step"><strong>2. El fallback tiene que ocupar el mismo espacio que el contenido real.</strong> Un skeleton con la altura correcta convierte una carga en algo invisible; un <code>&lt;p&gt;Cargando…&lt;/p&gt;</code> de 20 px que después se reemplaza por 600 px de contenido es CLS puro y te destroza Core Web Vitals.</div>
+
+<div class="step"><strong>3. Lo que está por encima del pliegue y no depende de datos, va fuera de todo límite.</strong> Eso es el <em>shell</em>, y en streaming es literalmente lo primero que se manda (RS2.5).</div>
+
+<pre><code class="lang-jsx">// El skeleton correcto: misma estructura, mismas dimensiones, sin texto que salte
+function FeedSkeleton({ filas = 5 }) {
+  return (
+    &lt;ul aria-hidden="true" className="skeleton"&gt;
+      {Array.from({ length: filas }, (_, i) =&gt; (
+        &lt;li key={i} style={{ height: 96, marginBottom: 12 }} /&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>Cuidado con las <code>key</code>.</strong> Cambiar la <code>key</code> de un <code>&lt;Suspense&gt;</code> lo resetea: se vuelve a montar y <strong>sí</strong> muestra el fallback, incluso dentro de una transición. Es útil a propósito (querés el esqueleto al cambiar de usuario) y es una fuente de parpadeos accidentales cuando la key incluye algo que cambia más seguido de lo que pensabas.
+</div>
+
+<h2>RS2.5 Streaming SSR y el batching de reveals de React 19.2</h2>
+
+<p>El SSR clásico era <code>renderToString</code>: bloqueante, todo o nada. El servidor esperaba a tener el HTML completo y recién ahí mandaba el primer byte. Una consulta lenta arruinaba el TTFB de toda la página. El streaming rompe esa atadura:</p>
+
+<pre><code class="lang-js">// Node.js
+import { renderToPipeableStream } from "react-dom/server";
+
+app.get("/*", (req, res) =&gt; {
+  const { pipe, abort } = renderToPipeableStream(&lt;App url={req.url} /&gt;, {
+    bootstrapScripts: ["/client.js"],
+
+    onShellReady() {
+      // El "shell" es todo lo que está FUERA de límites de Suspense.
+      // Apenas está listo, empezamos a mandar bytes: TTFB bajo y estable.
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html");
+      pipe(res);
+    },
+
+    onShellError(error) {
+      // Falló lo esencial: no hay página. Acá sí devolvés 500.
+      res.statusCode = 500;
+      res.send("&lt;h1&gt;Error&lt;/h1&gt;");
+    },
+
+    onAllReady() {
+      // Todo resuelto. Es el hook para crawlers o generación estática.
+    },
+
+    onError(error) {
+      // Falló algo DENTRO de un boundary: la página igual se sirve,
+      // ese pedazo se recupera en el cliente. Loguealo, no lo tragues.
+      logger.error(error);
+    },
+  });
+
+  setTimeout(abort, 10_000); // presupuesto de tiempo duro
+});</code></pre>
+
+<pre><code class="lang-js">// Runtimes con Web Streams (edge, Deno, Bun, Cloudflare Workers)
+import { renderToReadableStream } from "react-dom/server";
+
+const stream = await renderToReadableStream(&lt;App /&gt;, {
+  bootstrapScripts: ["/client.js"],
+  onError(error) { logger.error(error); },
+});
+
+// allReady permite decidir: streaming para humanos, HTML completo para bots
+if (esCrawler(request)) await stream.allReady;
+
+return new Response(stream, {
+  headers: { "content-type": "text/html" },
+});</code></pre>
+
+<p>El mecanismo de transporte es más ingenioso de lo que parece. Para cada boundary pendiente, el servidor manda primero el HTML del <em>fallback</em>. Cuando los datos llegan, manda el HTML real dentro de un <code>&lt;div hidden&gt;</code> al final del documento, más un <code>&lt;script&gt;</code> minúsculo que mueve esos nodos a su lugar y borra el fallback. No hace falta que el bundle de React haya cargado: funciona con HTML y unas líneas de JS inline.</p>
+
+<h3>La mejora de React 19.2: los reveals se batchean</h3>
+
+<div class="concept">
+  <strong>💡 El problema visual que resuelve.</strong> Hasta 19.1, durante el streaming cada boundary se revelaba <strong>apenas llegaba su HTML</strong>, uno por uno. Una página con ocho boundaries que resolvían en 300, 310, 340, 350, 380 ms producía cinco reflows separados en 80 ms: contenido saltando, texto corriéndose, el botón que ibas a tocar moviéndose de lugar. En el cliente esto no pasaba, porque React ya aplicaba un <em>throttle</em> a los reveals para agruparlos. El servidor y el cliente se comportaban distinto ante la misma página.
+</div>
+
+<p><strong>React 19.2</strong> alineó los dos: ahora los límites de Suspense <strong>batchean sus reveals durante el streaming</strong>, con la misma cadencia con la que lo hace el cliente. Los boundaries que terminan cerca en el tiempo se revelan juntos, en menos pasos y más grandes.</p>
+
+<table>
+<thead><tr><th>Aspecto</th><th>Antes (≤ 19.1)</th><th>React 19.2</th></tr></thead>
+<tbody>
+<tr><td>Cadencia de reveals</td><td>Uno por uno, apenas llega cada uno</td><td>Agrupados con throttle, como en el cliente</td></tr>
+<tr><td>Reflows percibidos</td><td>Uno por boundary</td><td>Uno por grupo</td></tr>
+<tr><td>Consistencia servidor/cliente</td><td>Distinta: la misma página se veía distinta según de dónde viniera</td><td>Igual en los dos caminos</td></tr>
+<tr><td>Trabajo total</td><td>—</td><td>Igual: es scheduling de reveals, no menos bytes</td></tr>
+</tbody>
+</table>
+
+<div class="tip">
+  Es la misma lección de <code>useDeferredValue</code> en otra capa: <strong>no se hizo menos trabajo, se ordenó mejor</strong>. Un contenido que aparece 40 ms más tarde pero sin arrastrar el layout se percibe más rápido que uno que aparece antes y hace saltar la página. Si venís de 19.0/19.1 y tu página tenía muchos boundaries chicos, actualizar te da esta mejora <strong>sin tocar una línea de código</strong>.
+</div>
+
+<h3>Hidratación selectiva</h3>
+
+<p>La otra mitad del streaming pasa en el cliente. <code>hydrateRoot</code> no espera a tener todo el HTML: hidrata el shell primero y después cada boundary a medida que su contenido llega. Y hay un detalle brillante:</p>
+
+<div class="rule">
+  <strong>📌 Si el usuario hace click en una parte que todavía no se hidrató, React prioriza hidratar esa parte primero</strong> y después reproduce el evento. La interacción no se pierde. Es la razón concreta por la que muchos boundaries bien puestos mejoran la interactividad real, no solo la métrica: la página se vuelve usable por pedazos, empezando por el pedazo que a la persona le importa.
+</div>
+
+<pre><code class="lang-jsx">import { hydrateRoot } from "react-dom/client";
+
+hydrateRoot(document.getElementById("root"), &lt;App /&gt;, {
+  // Se dispara cuando React se recupera de un error o de un mismatch.
+  // NO es fatal, pero es exactamente lo que querés en tu telemetría:
+  // un pico acá suele ser un bug de hidratación en producción.
+  onRecoverableError(error, errorInfo) {
+    telemetria.enviar("hydration-recoverable", {
+      mensaje: error.message,
+      componentStack: errorInfo.componentStack,
+    });
+  },
+});</code></pre>
+
+<div class="info">
+  React 19.2 sumó además <strong>pre-renderizado parcial</strong>: <code>prerender</code> genera el shell estático (cacheable en un CDN) y <code>resume</code> completa el resto en el request, retomando el stream desde donde quedó. Es la combinación de "estático rápido" con "datos frescos" sin duplicar el árbol. El detalle fino corresponde a RS4, cuando entren Server Components.
+</div>
+
+<h2>RS2.6 Hidratación: qué es, por qué es cara y cómo se depuran los mismatch</h2>
+
+<p>Hidratar no es "activar el HTML". React ejecuta <strong>todo el árbol de componentes igual que en un render normal</strong> —construye fibers, corre hooks, calcula el resultado— pero en vez de crear nodos DOM, va comparando contra los que ya existen y les adosa listeners y refs.</p>
+
+<div class="analogy">
+  Es como recibir una casa construida y tener que recorrerla habitación por habitación con los planos en la mano, verificando que cada pared esté donde dice el plano y conectando la electricidad. Recibir la casa hecha te ahorró la obra gruesa (crear el DOM, el primer layout, el primer paint), pero el recorrido completo lo hacés igual. Por eso el HTML aparece rápido y la página tarda un rato más en <em>responder</em>: ese hueco entre "se ve" y "funciona" es la hidratación, y es lo que mide el INP de la primera interacción.
+</div>
+
+<h3>Los mismatch y su origen real</h3>
+
+<p>Un mismatch es que el HTML que produjo el cliente no coincide con el que mandó el servidor. Casi siempre viene de una de estas cinco causas:</p>
+
+<table>
+<thead><tr><th>Causa</th><th>Ejemplo</th><th>Arreglo</th></tr></thead>
+<tbody>
+<tr><td>No determinismo</td><td><code>Date.now()</code>, <code>Math.random()</code>, <code>crypto.randomUUID()</code></td><td>Calcularlo en el servidor y pasarlo como prop, o en un efecto</td></tr>
+<tr><td>Ramas por entorno</td><td><code>typeof window !== "undefined" ? A : B</code></td><td>Renderizar B siempre y cambiar a A en <code>useEffect</code></td></tr>
+<tr><td>Locale / zona horaria</td><td><code>toLocaleDateString()</code> con TZ del server ≠ del cliente</td><td>Fijar <code>timeZone</code> y <code>locale</code> explícitos, o formatear en el cliente</td></tr>
+<tr><td>HTML inválido</td><td><code>&lt;div&gt;</code> dentro de <code>&lt;p&gt;</code>, <code>&lt;p&gt;</code> dentro de <code>&lt;p&gt;</code></td><td>Arreglar el anidamiento: el parser del browser lo reescribe y ya no coincide</td></tr>
+<tr><td>Extensiones del navegador</td><td>Traductores, gestores de contraseñas que inyectan nodos</td><td>Verificar en modo incógnito antes de buscar el bug en tu código</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">// ❌ Mismatch garantizado: el servidor y el cliente no comparten el reloj
+function Reloj() {
+  return &lt;time&gt;{new Date().toLocaleTimeString()}&lt;/time&gt;;
+}
+
+// ❌ Mismatch garantizado: el servidor no tiene window
+function Ancho() {
+  const esMobile = typeof window !== "undefined" &amp;&amp; window.innerWidth &lt; 768;
+  return esMobile ? &lt;Compacto /&gt; : &lt;Amplio /&gt;;
+}</code></pre>
+
+<pre><code class="lang-jsx">// ✅ Patrón "montado": el primer render coincide siempre, el ajuste va después
+function Ancho() {
+  const [esMobile, setEsMobile] = useState(false); // el server también ve false
+  useEffect(() =&gt; {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const actualizar = () =&gt; setEsMobile(mq.matches);
+    actualizar();
+    mq.addEventListener("change", actualizar);
+    return () =&gt; mq.removeEventListener("change", actualizar);
+  }, []);
+  return esMobile ? &lt;Compacto /&gt; : &lt;Amplio /&gt;;
+}
+
+// ✅ Cuando la diferencia es legítima y de UN nodo de texto:
+function Timestamp({ iso }) {
+  return &lt;time dateTime={iso} suppressHydrationWarning&gt;
+    {new Date(iso).toLocaleString()}
+  &lt;/time&gt;;
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ <code>suppressHydrationWarning</code> no arregla nada: silencia.</strong> Solo aplica a un nivel de profundidad y solo al contenido de texto de ese elemento. Usarlo para tapar un mismatch estructural esconde el síntoma y deja el árbol del cliente distinto del servidor, con listeners potencialmente en el nodo equivocado. Es válido para un timestamp; es una bomba de tiempo para todo lo demás.
+</div>
+
+<h3>Cómo se depuran de verdad</h3>
+
+<div class="step"><strong>1. Leé el diff.</strong> React 19 unificó los errores de hidratación en un único mensaje que muestra el árbol con <code>+</code> y <code>-</code> marcando qué renderizó el servidor y qué el cliente. Antes eran tres warnings crípticos; ahora el mensaje suele nombrar el componente exacto. Empezá siempre por ahí, no por adivinar.</div>
+
+<div class="step"><strong>2. Descartá extensiones.</strong> Ventana de incógnito sin extensiones. Si el mismatch desaparece, no era tu código y te ahorraste medio día. Este paso va segundo porque es el más barato.</div>
+
+<div class="step"><strong>3. Comparativa de HTML crudo.</strong> <code>curl</code> de la URL contra el <code>innerHTML</code> del cliente antes de hidratar. Un <code>diff</code> de texto plano encuentra el anidamiento inválido en segundos, que es la causa que más cuesta ver leyendo JSX.</div>
+
+<div class="step"><strong>4. Bisección por boundary.</strong> Si el diff no alcanza, comentá mitades del árbol. Con boundaries bien puestos la bisección es casi gratis: cada uno es una unidad aislable.</div>
+
+<div class="step"><strong>5. Dejalo instrumentado.</strong> <code>onRecoverableError</code> en telemetría. Los mismatch que solo aparecen con datos reales o zonas horarias específicas no se reproducen en tu máquina — se detectan con una métrica.</div>
+
+<pre><code class="lang-js">// Paso 3, concreto: qué mandó el servidor vs qué esperaba el cliente
+// curl -s https://mi-app.com/ruta &gt; server.html
+// Después, en la consola ANTES de que hidrate (breakpoint en bootstrap):
+copy(document.getElementById("root").innerHTML);
+// y compará con diff. El anidamiento inválido salta a la vista.</code></pre>
+
+<h2>RS2.7 <code>use()</code>: leer una promesa o un contexto durante el render</h2>
+
+<p><code>use</code> es la API que integra promesas con Suspense. Es la primera cosa en React que se parece a un hook pero no lo es: <strong>se puede llamar condicionalmente y dentro de loops</strong>, porque no guarda estado en el slot de hooks del fiber.</p>
+
+<pre><code class="lang-jsx">import { use, Suspense } from "react";
+
+function Perfil({ promesaUsuario }) {
+  const usuario = use(promesaUsuario);   // suspende hasta que resuelva
+  return &lt;h1&gt;{usuario.nombre}&lt;/h1&gt;;
+}
+
+function Pantalla({ promesaUsuario }) {
+  return (
+    &lt;ErrorBoundary fallback={&lt;p&gt;No se pudo cargar&lt;/p&gt;}&gt;
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;Perfil promesaUsuario={promesaUsuario} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-jsx">// use(context): legal condicionalmente. useContext no lo es.
+function Item({ destacado }) {
+  if (destacado) {
+    const tema = use(TemaContext);       // ✅ dentro de un if
+    return &lt;li className={tema.clase}&gt;…&lt;/li&gt;;
+  }
+  return &lt;li&gt;…&lt;/li&gt;;
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El anti-patrón que rompe todo: crear la promesa en el render.</strong> Un componente cliente que hace <code>use(fetch(url))</code> crea una promesa <em>nueva</em> en cada render. React suspende, la promesa resuelve, React re-renderiza, se crea otra promesa nueva, suspende de nuevo… loop infinito con requests infinitos. La promesa tiene que ser <strong>estable</strong>: creada en un Server Component y bajada como prop, guardada en un caché, o entregada por una librería que hace la deduplicación por vos.
+</div>
+
+<pre><code class="lang-jsx">// ❌ Loop infinito
+function Malo({ id }) {
+  const u = use(fetch(`/api/u/${id}`).then((r) =&gt; r.json()));
+  return &lt;h1&gt;{u.nombre}&lt;/h1&gt;;
+}
+
+// ✅ Caché a nivel módulo: misma clave, misma instancia de promesa
+const cache = new Map();
+function getUsuario(id) {
+  if (!cache.has(id)) {
+    cache.set(id, fetch(`/api/u/${id}`).then((r) =&gt; r.json()));
+  }
+  return cache.get(id);
+}
+
+function Bueno({ id }) {
+  const u = use(getUsuario(id));   // estable entre renders
+  return &lt;h1&gt;{u.nombre}&lt;/h1&gt;;
+}</code></pre>
+
+<h3><code>use()</code> vs <code>useEffect</code> + estado</h3>
+
+<table>
+<thead><tr><th></th><th><code>useEffect</code> + <code>useState</code></th><th><code>use(promesa)</code></th></tr></thead>
+<tbody>
+<tr><td>Cuándo arranca el pedido</td><td>Después del primer paint (cascada render → efecto → fetch)</td><td>Antes o durante el render; puede arrancar en el servidor</td></tr>
+<tr><td>Estado de carga</td><td>A mano: <code>loading</code>, <code>error</code>, <code>data</code></td><td><code>&lt;Suspense&gt;</code> y error boundary</td></tr>
+<tr><td>Race conditions</td><td>Tuyas: hace falta flag de cancelación o <code>AbortController</code></td><td>React se queda con el render vigente</td></tr>
+<tr><td>SSR</td><td>No corre en el servidor: el HTML sale vacío</td><td>Participa del streaming</td></tr>
+<tr><td>Interacción con transiciones</td><td>Ninguna: el spinner aparece igual</td><td>Dentro de una transición, mantiene el contenido viejo</td></tr>
+<tr><td>Riesgo</td><td>Cascadas de waterfalls entre componentes anidados</td><td>Promesas mal cacheadas → loops</td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>No podés envolver <code>use</code> en <code>try/catch</code>.</strong> El mecanismo de suspensión usa el mismo canal que los errores; interceptarlo rompe React y hay una regla de lint que te lo marca. El manejo de errores de un <code>use</code> va en un <strong>error boundary</strong>, o lo resolvés en la promesa misma con un <code>.catch()</code> que devuelva un valor de fallback.
+</div>
+
+<h2>RS2.8 <code>useSyncExternalStore</code>: el hook que existe por el tearing</h2>
+
+<p>Este hook casi nunca lo escribís en código de producto, y sin embargo es el que mejor explica <em>por qué</em> el render concurrente cambió las reglas.</p>
+
+<div class="concept">
+  <strong>💡 Qué es el tearing.</strong> Un render se puede interrumpir a la mitad. Supongamos que React renderizó diez componentes que leen <code>store.precio</code> y valía <code>100</code>. Cede el control al browser. Durante esa pausa llega un WebSocket y el precio pasa a <code>105</code>. React retoma y renderiza los diez restantes, que ahora leen <code>105</code>. Commitea. En pantalla quedan veinte componentes mostrando <strong>dos valores distintos del mismo dato</strong>, en el mismo frame. Eso es <em>tearing</em> — "desgarro" — y antes del render concurrente era imposible, porque el render era una sola pasada sincrónica.
+</div>
+
+<p><code>useState</code> y <code>useReducer</code> son inmunes: React guarda el valor en el fiber y todo el render ve la misma foto. El problema es exclusivo de las fuentes <strong>externas y mutables</strong>: un Redux/Zustand escrito a mano, un singleton, <code>navigator.onLine</code>, <code>window.matchMedia</code>, <code>document.cookie</code>.</p>
+
+<pre><code class="lang-tsx">import { useSyncExternalStore } from "react";
+
+type Oyente = () =&gt; void;
+
+function crearStore&lt;T&gt;(inicial: T) {
+  let estado = inicial;
+  const oyentes = new Set&lt;Oyente&gt;();
+
+  return {
+    // 1) subscribe: recibe un callback y devuelve la función de limpieza.
+    //    Tiene que ser ESTABLE entre renders (definida fuera del componente).
+    subscribe(fn: Oyente) {
+      oyentes.add(fn);
+      return () =&gt; { oyentes.delete(fn); };
+    },
+    // 2) getSnapshot: devuelve el valor actual. React lo llama muchas veces
+    //    y compara con Object.is. Tiene que ser referencialmente estable.
+    getSnapshot() {
+      return estado;
+    },
+    // 3) getServerSnapshot: el valor durante SSR e hidratación.
+    getServerSnapshot() {
+      return inicial;
+    },
+    set(siguiente: T) {
+      estado = siguiente;
+      oyentes.forEach((fn) =&gt; fn());
+    },
+  };
+}
+
+const storePrecio = crearStore(100);
+
+function Precio() {
+  const precio = useSyncExternalStore(
+    storePrecio.subscribe,
+    storePrecio.getSnapshot,
+    storePrecio.getServerSnapshot,
+  );
+  return &lt;span&gt;{precio}&lt;/span&gt;;
+}</code></pre>
+
+<p>Lo que hace React con esto: antes de commitear, vuelve a llamar a <code>getSnapshot</code> y verifica que el valor no haya cambiado durante el render. Si cambió, <strong>descarta el render y lo rehace sincrónicamente</strong> con el valor nuevo. Sacrifica la interrumpibilidad para garantizar consistencia. Ese es todo el truco: las suscripciones externas se degradan a render sincrónico a cambio de no mostrar datos desgarrados.</p>
+
+<div class="danger">
+  <strong>⚠️ El error universal: devolver un objeto nuevo desde <code>getSnapshot</code>.</strong> React compara snapshots con <code>Object.is</code>. Si devolvés un objeto o array construido en el momento, nunca son iguales, React cree que el store cambió en cada chequeo y entrás en un loop de renders infinito. El warning literal es <em>"The result of getSnapshot should be cached to avoid an infinite loop"</em>.
+</div>
+
+<pre><code class="lang-jsx">// ❌ Objeto nuevo en cada llamada → loop infinito
+useSyncExternalStore(subscribe, () =&gt; ({ a: store.a, b: store.b }));
+
+// ❌ Filtrado en cada llamada → array nuevo → loop infinito
+useSyncExternalStore(subscribe, () =&gt; store.items.filter((i) =&gt; i.activo));
+
+// ✅ Valor primitivo: comparable por identidad
+useSyncExternalStore(subscribe, () =&gt; store.a);
+
+// ✅ Referencia estable, cacheada dentro del store (recalculada solo al mutar)
+useSyncExternalStore(subscribe, () =&gt; store.itemsActivosMemo);</code></pre>
+
+<pre><code class="lang-jsx">// Caso real y legítimo en código de producto: una API del navegador
+const suscribirseAOnline = (cb) =&gt; {
+  window.addEventListener("online", cb);
+  window.addEventListener("offline", cb);
+  return () =&gt; {
+    window.removeEventListener("online", cb);
+    window.removeEventListener("offline", cb);
+  };
+};
+
+export function useEstaOnline() {
+  return useSyncExternalStore(
+    suscribirseAOnline,               // definida FUERA: referencia estable
+    () =&gt; navigator.onLine,           // primitivo
+    () =&gt; true,                       // en el servidor asumimos online
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Cuándo lo necesitás.</strong> Si escribís una librería de estado, un adaptador a una API del navegador, o cualquier cosa que exponga un hook para leer datos mutables de afuera de React: <strong>sí</strong>, es obligatorio. Si tu estado vive en <code>useState</code>, <code>useReducer</code> o context: <strong>no</strong>, y usarlo solo agrega ceremonia. Zustand, Redux Toolkit, Jotai y compañía ya lo usan por dentro — parte de por qué conviene usar una librería en vez de un singleton casero.
+</div>
+
+<h2>RS2.9 Qué se rompe en modo concurrente</h2>
+
+<p>Todo lo anterior tiene una contracara. Estas son las tres familias de bugs que aparecen cuando el render deja de ser una sola pasada.</p>
+
+<h3>1. Efectos que asumían correr una sola vez</h3>
+
+<pre><code class="lang-jsx">// ❌ Se rompe con doble montaje, con Activity, y con cualquier remount
+function Chat({ salaId }) {
+  useEffect(() =&gt; {
+    const conn = conectar(salaId);
+    conn.abrir();
+    // sin cleanup: cada montaje deja una conexión colgada
+  }, [salaId]);
+}
+
+// ✅ Simétrico: todo lo que abrís, lo cerrás
+function Chat({ salaId }) {
+  useEffect(() =&gt; {
+    const conn = conectar(salaId);
+    conn.abrir();
+    return () =&gt; conn.cerrar();
+  }, [salaId]);
+}</code></pre>
+
+<pre><code class="lang-jsx">// ❌ Race condition: una respuesta vieja pisa a una nueva
+useEffect(() =&gt; {
+  fetch(`/api/buscar?q=${q}`).then((r) =&gt; r.json()).then(setDatos);
+}, [q]);
+
+// ✅ Ignorar respuestas obsoletas + abortar el request
+useEffect(() =&gt; {
+  const ctrl = new AbortController();
+  let vigente = true;
+
+  fetch(`/api/buscar?q=${q}`, { signal: ctrl.signal })
+    .then((r) =&gt; r.json())
+    .then((d) =&gt; { if (vigente) setDatos(d); })
+    .catch((e) =&gt; { if (e.name !== "AbortError") setError(e); });
+
+  return () =&gt; { vigente = false; ctrl.abort(); };
+}, [q]);</code></pre>
+
+<div class="info">
+  React 19.2 sumó <code>useEffectEvent</code> para el caso hermano: leer el valor <em>más reciente</em> de una prop o estado dentro de un efecto <strong>sin</strong> ponerla en el array de dependencias. Es la solución oficial al patrón de la ref mutable que se usaba para no re-suscribirse cada vez que cambia un callback.
+</div>
+
+<h3>2. Refs mutadas durante el render</h3>
+
+<p>La regla de pureza no es un consejo de estilo: es un requisito del scheduler. Un render se puede ejecutar dos veces (StrictMode), abandonarse a la mitad (transición interrumpida) o descartarse entero. Un efecto secundario durante el render sobrevive a un render que nunca se commiteó.</p>
+
+<pre><code class="lang-jsx">// ❌ Contador que miente: cuenta renders abandonados y renders dobles
+function Malo() {
+  const veces = useRef(0);
+  veces.current++;                      // mutación durante el render
+  return &lt;p&gt;Renders: {veces.current}&lt;/p&gt;;
+}
+
+// ✅ Los efectos secundarios van al commit
+function Bueno() {
+  const veces = useRef(0);
+  useEffect(() =&gt; { veces.current++; });
+  return &lt;p&gt;Commits: {veces.current}&lt;/p&gt;;
+}</code></pre>
+
+<pre><code class="lang-jsx">// ❌ Mutar props/estado durante el render
+function Lista({ items }) {
+  items.sort((a, b) =&gt; a.n - b.n);      // muta el array del padre
+  return &lt;ul&gt;{items.map(/* … */)}&lt;/ul&gt;;
+}
+
+// ✅ Copia local; el input queda intacto
+function Lista({ items }) {
+  const ordenados = useMemo(() =&gt; [...items].sort((a, b) =&gt; a.n - b.n), [items]);
+  return &lt;ul&gt;{ordenados.map(/* … */)}&lt;/ul&gt;;
+}</code></pre>
+
+<div class="tip">
+  La única mutación de ref aceptada durante el render es la <strong>inicialización perezosa</strong>, y solo porque es idempotente: <code>if (ref.current === null) ref.current = crearAlgoCaro();</code>. Se puede correr veinte veces y el resultado observable es el mismo. Ese es el criterio real — no "¿es una ref?" sino <strong>"¿es idempotente y no observable desde afuera?"</strong>.
+</div>
+
+<h3>3. Suscripciones mal hechas</h3>
+
+<pre><code class="lang-jsx">// ❌ Lee una fuente mutable directo en el render: tearing asegurado
+function Ancho() {
+  return &lt;p&gt;{window.innerWidth}&lt;/p&gt;;   // además, rompe SSR
+}
+
+// ❌ Se suscribe en el render en vez de en un efecto
+function Malo({ store }) {
+  store.on("cambio", () =&gt; setEstado(store.valor));  // fuga: nunca se limpia
+}
+
+// ✅ useSyncExternalStore (RS2.8) o un efecto con cleanup</code></pre>
+
+<h3>StrictMode como detector</h3>
+
+<p><code>&lt;StrictMode&gt;</code> no cambia nada en producción. En desarrollo, provoca a propósito las condiciones que el modo concurrente puede provocar en producción:</p>
+
+<table>
+<thead><tr><th>Qué duplica en dev</th><th>Qué bug destapa</th></tr></thead>
+<tbody>
+<tr><td>El cuerpo del componente (doble render)</td><td>Efectos secundarios durante el render, mutación de props, contadores mentirosos</td></tr>
+<tr><td>Los inicializadores de <code>useState</code>/<code>useMemo</code>/<code>useReducer</code></td><td>Inicializadores impuros con efectos colaterales</td></tr>
+<tr><td>Las funciones actualizadoras (<code>setX(prev =&gt; …)</code>)</td><td>Actualizadores que no son funciones puras de <code>prev</code></td></tr>
+<tr><td>El ciclo de vida de los efectos (montar → limpiar → montar)</td><td>Cleanups faltantes: conexiones, listeners, timers, suscripciones</td></tr>
+<tr><td>Los callbacks de <code>ref</code> (adjuntar → soltar → adjuntar)</td><td>Callbacks de ref sin limpieza simétrica</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+createRoot(document.getElementById("root")).render(
+  &lt;StrictMode&gt;
+    &lt;App /&gt;
+  &lt;/StrictMode&gt;,
+);</code></pre>
+
+<div class="mistake">
+  <strong>El reflejo equivocado: sacar <code>StrictMode</code> porque "hace dos requests".</strong> Los dos requests son el <em>hallazgo</em>, no el problema: te está mostrando que tu efecto no tiene cleanup y que en producción vas a tener race conditions cuando el usuario tipee rápido. Apagar el detector no arregla el circuito. Si un componente se rompe con StrictMode, se va a romper con <code>&lt;Activity&gt;</code>, con navegación con back/forward, o con cualquier remount real.
+</div>
+
+<div class="info">
+  <strong>Un ejemplo de por qué esto ya no es hipotético.</strong> React 19.2 estabilizó <code>&lt;Activity&gt;</code>: <code>&lt;Activity mode="hidden"&gt;</code> desmonta los efectos de un subárbol pero <strong>conserva su estado</strong>, y lo pre-renderiza en baja prioridad. Cuando volvés a mostrarlo, los efectos se re-montan sobre estado preservado. Es exactamente el escenario que StrictMode viene simulando desde 2022 — con la diferencia de que ahora pasa en producción.
+</div>
+
+<pre><code class="lang-jsx">// Mantener una pestaña "viva" sin renderizarla ni correr sus efectos
+&lt;Activity mode={tab === "chat" ? "visible" : "hidden"}&gt;
+  &lt;Chat /&gt;   {/* el scroll y el borrador se conservan al volver */}
+&lt;/Activity&gt;</code></pre>
+
+<h2>RS2.10 Cuándo NO usar transiciones</h2>
+
+<div class="step"><strong>1. Cuando el trabajo es rápido.</strong> Si el render tarda 4 ms, envolverlo en <code>startTransition</code> agrega overhead de scheduling, una posible pasada extra y un estado pendiente que nunca se ve. Estás pagando complejidad por nada.</div>
+
+<div class="step"><strong>2. Cuando el cuello de botella es la red.</strong> Una transición no acelera un endpoint. Ahí lo que servís es caché, prefetch, paginación o un endpoint más rápido.</div>
+
+<div class="step"><strong>3. En inputs controlados y controles directos.</strong> Checkbox, toggle, abrir un menú, el <code>value</code> de un input: son feedback directo y tienen que ser inmediatos. Diferirlos rompe la sensación de causalidad.</div>
+
+<div class="step"><strong>4. Cuando el problema es la cantidad de nodos.</strong> Si el commit tiene que insertar miles de elementos, ninguna prioridad ayuda: el commit no se interrumpe. La respuesta es virtualizar o paginar.</div>
+
+<div class="step"><strong>5. En animaciones frame a frame.</strong> Lo que tiene que correr a 60 fps no va por el scheduler de React: va por CSS, Web Animations API o una librería de animación. Una transición justamente puede <em>retrasarlo</em>.</div>
+
+<div class="step"><strong>6. "Por las dudas", en todos lados.</strong> Si todo es baja prioridad, nada lo es. Además convertís cada interacción en potencialmente reversible y llenás la UI de estados pendientes que compiten entre sí.</div>
+
+<h2>🧑‍🎓 Worked Example — el buscador de 5.000 resultados</h2>
+
+<blockquote>Un panel interno tiene un buscador sobre 5.000 productos, todos ya en memoria (llegan en un solo request al montar). Al tipear, el input se traba: las letras aparecen a los saltos. El equipo propone "usar Concurrent React". Vamos a hacerlo bien: medir, cambiar una cosa, medir de nuevo, y decidir con los números.</blockquote>
+
+<h3>Paso 0 — El código como está</h3>
+
+<pre><code class="lang-jsx">function Buscador({ productos }) {           // productos.length === 5000
+  const [q, setQ] = useState("");
+  const visibles = productos.filter((p) =&gt;
+    p.nombre.toLowerCase().includes(q.toLowerCase()),
+  );
+
+  return (
+    &lt;&gt;
+      &lt;input value={q} onChange={(e) =&gt; setQ(e.target.value)} /&gt;
+      &lt;p&gt;{visibles.length} resultados&lt;/p&gt;
+      &lt;ul&gt;
+        {visibles.map((p) =&gt; (
+          &lt;Fila key={p.id} producto={p} /&gt;   {/* ~12 nodos DOM por fila */}
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h3>Paso 1 — Medir antes de tocar nada</h3>
+
+<pre><code class="lang-js">// (a) INP real, la métrica que importa. Va en la app, no en el devtools.
+import { onINP } from "web-vitals";
+onINP(({ value, attribution }) =&gt; {
+  console.log("INP", value, attribution.interactionTarget);
+});
+
+// (b) Costo de un keystroke concreto, para iterar rápido
+performance.mark("tecla-inicio");
+// … en un useEffect sin deps, que corre después de cada commit:
+useEffect(() =&gt; {
+  performance.mark("tecla-fin");
+  const m = performance.measure("tecla", "tecla-inicio", "tecla-fin");
+  console.log("commit-a-commit:", m.duration.toFixed(1), "ms");
+});</code></pre>
+
+<p>Además, dos herramientas visuales:</p>
+
+<ul>
+  <li><strong>React DevTools → Profiler</strong>, grabando mientras tipeás cinco letras. Te dice qué componente costó qué y cuántos commits hubo.</li>
+  <li><strong>Chrome DevTools → Performance</strong>, con las <strong>Performance Tracks</strong> que React 19.2 publica: las pistas <em>Scheduler ⚛</em> y <em>Components ⚛</em> muestran en qué prioridad corrió cada render y dónde React cedió el control. Es la forma de <em>ver</em> el modelo de este módulo en vez de imaginarlo.</li>
+</ul>
+
+<p>Los números en una laptop de gama media, con CPU throttling 4×:</p>
+
+<table>
+<thead><tr><th>Métrica</th><th>Base</th></tr></thead>
+<tbody>
+<tr><td>Render por tecla (filtro + 5.000 filas)</td><td><strong>310 ms</strong></td></tr>
+<tr><td>Commit (inserción/actualización de DOM)</td><td><strong>95 ms</strong></td></tr>
+<tr><td>Tarea larga más grande</td><td><strong>405 ms</strong></td></tr>
+<tr><td>INP p75</td><td><strong>480 ms</strong> 🔴</td></tr>
+<tr><td>Latencia hasta ver la letra</td><td><strong>~400 ms</strong></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+  <strong>Sin esta tabla, todo lo que sigue es opinión.</strong> El 60% de los "problemas de performance de React" que se atribuyen al render resultan ser una función <code>filtrar()</code> con complejidad cuadrática, un <code>JSON.parse</code> gigante en cada tecla, o un <code>console.log</code> de un array enorme. Medí primero, siempre.
+</div>
+
+<h3>Paso 2 — Aplicar <code>useDeferredValue</code></h3>
+
+<pre><code class="lang-jsx">const Filas = memo(function Filas({ q, productos }) {
+  const visibles = useMemo(
+    () =&gt; productos.filter((p) =&gt; p.nombre.toLowerCase().includes(q.toLowerCase())),
+    [productos, q],
+  );
+  return (
+    &lt;&gt;
+      &lt;p&gt;{visibles.length} resultados&lt;/p&gt;
+      &lt;ul&gt;{visibles.map((p) =&gt; &lt;Fila key={p.id} producto={p} /&gt;)}&lt;/ul&gt;
+    &lt;/&gt;
+  );
+});
+
+function Buscador({ productos }) {
+  const [q, setQ] = useState("");
+  const qDiferido = useDeferredValue(q);
+  const desactualizado = q !== qDiferido;
+
+  return (
+    &lt;&gt;
+      &lt;input value={q} onChange={(e) =&gt; setQ(e.target.value)} /&gt;
+      &lt;div style={{ opacity: desactualizado ? 0.55 : 1 }} aria-busy={desactualizado}&gt;
+        &lt;Filas q={qDiferido} productos={productos} /&gt;
+      &lt;/div&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Por qué <code>useDeferredValue</code> y no <code>useTransition</code> acá.</strong> Porque el valor que se difiere es el del <em>input controlado</em>. Con <code>useTransition</code> tendríamos que envolver el <code>setQ</code>, y ya vimos en RS2.2 que eso vuelve interrumpible al valor del input y lo empeora. Necesitamos que <code>q</code> se actualice urgente y que solo <em>lo derivado</em> se atrase. Eso es literalmente la definición de <code>useDeferredValue</code>.
+</div>
+
+<h3>Paso 3 — Medir de nuevo</h3>
+
+<table>
+<thead><tr><th>Métrica</th><th>Base</th><th>Con <code>useDeferredValue</code></th><th>Δ</th></tr></thead>
+<tbody>
+<tr><td>Latencia hasta ver la letra</td><td>~400 ms</td><td><strong>~8 ms</strong></td><td>🟢 −98%</td></tr>
+<tr><td>INP p75</td><td>480 ms</td><td><strong>45 ms</strong></td><td>🟢 en verde</td></tr>
+<tr><td>Render urgente (solo el input)</td><td>—</td><td>3 ms</td><td>nuevo</td></tr>
+<tr><td>Render de fondo (las filas)</td><td>310 ms</td><td>305 ms</td><td>≈ igual</td></tr>
+<tr><td>Commit (no interrumpible)</td><td>95 ms</td><td><strong>95 ms</strong></td><td>🔴 idéntico</td></tr>
+<tr><td><strong>CPU total por tecla</strong></td><td>405 ms</td><td><strong>~415 ms</strong></td><td>🔴 <strong>subió</strong></td></tr>
+<tr><td>Scroll durante la actualización</td><td>traba</td><td><strong>sigue trabando</strong></td><td>🔴 sin cambios</td></tr>
+</tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 Leé bien esa tabla, porque es la lección entera del módulo.</strong> El INP bajó de 480 ms a 45 ms: una mejora enorme, real y medible en Core Web Vitals. Y el trabajo total de CPU <strong>aumentó</strong> unos 10 ms, porque ahora hay un render urgente extra por tecla. No optimizamos: <strong>reordenamos</strong>. La percepción mejoró muchísimo; la máquina trabaja igual o un poquito más.
+</div>
+
+<h3>Paso 4 — Por qué el scroll sigue trabando</h3>
+
+<p>Acá es donde se separa entender el modelo de repetir la receta. El render de fondo son 305 ms, pero es <strong>interrumpible</strong>: React cede cada ~5 ms y el scroll fluye durante esa etapa. El problema es el commit: 95 ms de inserciones de DOM, layout y paint, <strong>sincrónicos y sin ceder el control</strong>. Ninguna prioridad de React puede partir eso. Es un long task de 95 ms cada vez que la lista se materializa, y el scroll se congela ahí.</p>
+
+<div class="rule">
+  <strong>📌 <code>useDeferredValue</code> compró percepción. Para bajar el trabajo hay que renderizar menos cosas.</strong> Ninguna cantidad de scheduling reduce el costo de meter 60.000 nodos DOM en la página. Lo que lo reduce es no meterlos.
+</div>
+
+<h3>Paso 5 — Virtualizar</h3>
+
+<pre><code class="lang-jsx">import { useVirtualizer } from "@tanstack/react-virtual";
+
+const Filas = memo(function Filas({ q, productos }) {
+  const visibles = useMemo(
+    () =&gt; productos.filter((p) =&gt; p.nombre.toLowerCase().includes(q.toLowerCase())),
+    [productos, q],
+  );
+
+  const contenedor = useRef(null);
+  const v = useVirtualizer({
+    count: visibles.length,
+    getScrollElement: () =&gt; contenedor.current,
+    estimateSize: () =&gt; 48,
+    overscan: 8,
+  });
+
+  return (
+    &lt;div ref={contenedor} style={{ height: 600, overflow: "auto" }}&gt;
+      {/* espaciador con la altura total: la barra de scroll no miente */}
+      &lt;div style={{ height: v.getTotalSize(), position: "relative" }}&gt;
+        {v.getVirtualItems().map((item) =&gt; (
+          &lt;div
+            key={visibles[item.index].id}
+            style={{
+              position: "absolute", top: 0, left: 0, width: "100%",
+              height: item.size, transform: `translateY(${item.start}px)`,
+            }}
+          &gt;
+            &lt;Fila producto={visibles[item.index]} /&gt;
+          &lt;/div&gt;
+        ))}
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+});</code></pre>
+
+<table>
+<thead><tr><th>Métrica</th><th>Base</th><th><code>useDeferredValue</code></th><th>+ virtualizado</th></tr></thead>
+<tbody>
+<tr><td>Filas montadas</td><td>5.000</td><td>5.000</td><td><strong>~21</strong></td></tr>
+<tr><td>Render por tecla</td><td>310 ms</td><td>305 ms</td><td><strong>7 ms</strong></td></tr>
+<tr><td>Commit</td><td>95 ms</td><td>95 ms</td><td><strong>3 ms</strong></td></tr>
+<tr><td>CPU total por tecla</td><td>405 ms</td><td>415 ms</td><td><strong>~11 ms</strong> 🟢</td></tr>
+<tr><td>INP p75</td><td>480 ms</td><td>45 ms</td><td><strong>28 ms</strong> 🟢</td></tr>
+<tr><td>Scroll</td><td>traba</td><td>traba</td><td><strong>fluido</strong> 🟢</td></tr>
+<tr><td>Memoria del árbol</td><td>alta</td><td>alta</td><td><strong>baja</strong> 🟢</td></tr>
+</tbody>
+</table>
+
+<h3>Paso 6 — Entonces, ¿el <code>useDeferredValue</code> sobra?</h3>
+
+<p>No, y este matiz es lo que hace al ejercicio interesante. Con virtualización el filtro sigue costando ~6 ms sobre 5.000 items. Con 200.000 items costaría 200 ms y el input volvería a trabarse, ahora sin culpa del DOM. Los dos arreglos atacan cosas distintas y se combinan:</p>
+
+<table>
+<thead><tr><th>Técnica</th><th>Qué reduce</th><th>Cuándo alcanza sola</th></tr></thead>
+<tbody>
+<tr><td><code>useDeferredValue</code></td><td>Latencia percibida del input</td><td>El render caro es inevitable y ocasional; el DOM resultante es chico</td></tr>
+<tr><td>Virtualización</td><td>Nodos DOM y tiempo de commit</td><td>Listas largas donde solo se ve una ventana</td></tr>
+<tr><td>Ambas</td><td>Las dos cosas</td><td>Listas largas con un cómputo caro por tecla</td></tr>
+<tr><td>Mover el cómputo (worker / servidor / índice)</td><td>El cómputo en sí</td><td>Cuando el filtro es realmente pesado: fuzzy search, miles de campos</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 El orden correcto de ataque.</strong> <strong>(1)</strong> Renderizá menos cosas (virtualizar, paginar). <strong>(2)</strong> Hacé menos trabajo (indexar, memoizar, mover a un worker). <strong>(3)</strong> Y recién ahí, reordená lo que queda con transiciones. Muchísima gente empieza por el 3 porque es el que suena moderno, mejora el INP en la demo, y deja intacto el problema de fondo.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Envolviste el <code>setState</code> de un input controlado en <code>startTransition</code> y el input quedó peor. ¿Por qué exactamente?</summary>
+<p>Porque un input controlado necesita que su <code>value</code> se actualice de forma urgente y garantizada, y una transición hace lo contrario: la marca como interrumpible y descartable. Si la persona tipea rápido, React puede abandonar renders intermedios, con lo que el <code>value</code> que muestra el DOM se atrasa respecto de lo que el usuario tecleó: el cursor salta, se comen letras, el texto rebota. La corrección no es sacar el diferimiento sino moverlo de lugar: <code>q</code> se actualiza urgente y lo derivado —el filtro, la lista— pasa por <code>useDeferredValue</code>. Regla general: lo que la persona acaba de escribir va urgente; lo que se deriva de eso, difiérelo.</p></details>
+
+<details><summary>Aplicaste <code>useDeferredValue</code>, el INP bajó 10×, y el scroll sigue trabando cuando aparece la lista. ¿Qué está pasando y qué hacés?</summary>
+<p>Estás viendo la frontera entre las dos fases. El render es interrumpible: React cede el control cada ~5 ms y por eso el input responde. El <strong>commit</strong> no lo es: aplicar miles de mutaciones al DOM, más el layout y el paint que provoca, es una tarea sincrónica que ningún scheduler puede partir. Ese long task de decenas de milisegundos es el que congela el scroll. Cambiar prioridades no lo toca, porque el trabajo sigue siendo el mismo. La solución es reducir el trabajo: virtualizar para montar solo las filas visibles, o paginar. <code>useDeferredValue</code> compra percepción; virtualizar compra trabajo, y no son sustitutos.</p></details>
+
+<details><summary>Tu librería de estado expone un hook que lee un objeto mutable. ¿Por qué no alcanza con <code>useState</code> + un <code>useEffect</code> que se suscribe, y qué te da <code>useSyncExternalStore</code>?</summary>
+<p>Porque el render se puede interrumpir. Con <code>useEffect</code>, los componentes leen el valor mutable en distintos momentos del render; si el store cambia durante una pausa, la mitad del árbol muestra el valor viejo y la otra mitad el nuevo, en el mismo frame: eso es <em>tearing</em>. Además el efecto corre después del paint, así que hay una ventana donde la UI ya se pintó con un valor desactualizado. <code>useSyncExternalStore</code> vuelve a llamar a <code>getSnapshot</code> antes de commitear y, si el valor cambió, descarta el render y lo rehace sincrónicamente: sacrifica interrumpibilidad para garantizar consistencia. También resuelve el SSR con <code>getServerSnapshot</code>. Condiciones: <code>subscribe</code> estable y <code>getSnapshot</code> devolviendo un valor cacheado —si devolvés un objeto nuevo cada vez, entrás en un loop infinito de renders.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Concurrente no es multihilo.</strong> Es un solo hilo con render troceado que cede al navegador cada ~5 ms, y que puede abandonar y rehacer trabajo. La consecuencia importante es semántica, no de rendimiento: tu componente puede correr para un render que se descarta.</li>
+  <li><strong>La fase de render se interrumpe; la de commit, no.</strong> Todo lo que se puede y no se puede arreglar con prioridades se deduce de esa frase.</li>
+  <li><strong><code>useTransition</code></strong> marca actualizaciones cuando sos dueño del <code>setState</code>, te da <code>isPending</code> y en React 19 soporta funciones <code>async</code> (Actions), siempre que el <code>await</code> esté adentro del callback. Nunca envuelvas el valor de un input controlado.</li>
+  <li><strong><code>useDeferredValue</code></strong> marca un valor cuando el <code>setState</code> no es tuyo. Exige memoizar el subárbol caro: sin eso hacés dos renders caros por cambio y empeorás todo.</li>
+  <li><strong>Suspense</strong> solo intercepta <code>lazy</code>, <code>use(promesa)</code>, RSC y librerías integradas — nunca <code>useEffect</code> + <code>useState</code>. Dentro de una transición no muestra el fallback: preserva el contenido viejo. Límites por unidad significativa, con fallbacks de la misma altura.</li>
+  <li><strong>Streaming SSR</strong>: manda el shell en <code>onShellReady</code>, el resto por el stream, y el cliente hidrata selectivamente priorizando lo que el usuario toca. <strong>React 19.2 batchea los reveals de los boundaries durante el streaming</strong>, con la misma cadencia del cliente: menos reflows, misma cantidad de bytes, y es gratis con solo actualizar.</li>
+  <li><strong>Hidratación</strong>: es un render completo sobre HTML existente, y es cara. Los mismatch vienen de no determinismo, ramas por entorno, locale/TZ, HTML inválido y extensiones. Se depuran leyendo el diff de React 19, descartando extensiones y comparando HTML crudo — no con <code>suppressHydrationWarning</code>.</li>
+  <li><strong><code>use()</code></strong> lee promesas y contextos durante el render, se puede llamar condicionalmente, y exige promesas estables: crearlas en el render es un loop infinito. Los errores van a un error boundary, no a un <code>try/catch</code>.</li>
+  <li><strong><code>useSyncExternalStore</code></strong> existe por el tearing. Lo necesitás si escribís librerías de estado o adaptás APIs del navegador; <code>getSnapshot</code> tiene que devolver valores cacheados.</li>
+  <li><strong>Lo que se rompe</strong>: efectos sin cleanup, refs mutadas en el render, suscripciones mal hechas. <strong>StrictMode</strong> es el detector, no la causa — y con <code>&lt;Activity&gt;</code> estable en 19.2 esos escenarios ya ocurren en producción.</li>
+  <li><strong>Orden de ataque</strong>: renderizar menos → trabajar menos → reordenar con prioridades. Empezar por el último es el error más común.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá una lista de 5.000 filas con un input de filtrado y reproducí las tres versiones del <em>worked example</em> (base, <code>useDeferredValue</code> + <code>memo</code>, virtualizada). Medí con React DevTools Profiler y con las Performance Tracks de Chrome, y armá <strong>tu</strong> tabla con tus números. Después sacá el <code>memo</code> de la versión diferida y anotá cuánto empeora: ese número es el argumento que vas a necesitar cuando alguien proponga "solo agregar <code>useDeferredValue</code>".</li>
+  <li>Escribí el mismo buscador con <code>useTransition</code> envolviendo el <code>setQ</code> del input controlado. Tipeá rápido veinte caracteres y describí con precisión qué se rompe (cursor, letras perdidas, rebote del valor). Después arreglalo moviendo el diferimiento al valor derivado.</li>
+  <li>Tomá una página con cuatro secciones de datos independientes y montala con streaming SSR (<code>renderToPipeableStream</code>). Probá tres configuraciones de boundaries: uno solo en la raíz, uno por sección, y uno por tarjeta. Grabá las tres en el panel Performance y compará cantidad de reflows y CLS. Justificá cuál elegirías y por qué.</li>
+  <li>Provocá a propósito los cinco tipos de mismatch de la tabla de RS2.6. Para cada uno: capturá el mensaje de error de React 19, identificá qué te dice el diff, y aplicá el arreglo correcto (no <code>suppressHydrationWarning</code>, salvo en el caso donde sí corresponde).</li>
+  <li>Implementá un store externo mínimo (un objeto con <code>subscribe</code>/<code>getSnapshot</code>/<code>set</code>) y consumilo de dos maneras: con <code>useEffect</code> + <code>useState</code>, y con <code>useSyncExternalStore</code>. Dispará actualizaciones desde un <code>setInterval</code> de 1 ms mientras renderizás 2.000 componentes que leen ese store, dentro de una transición. Buscá tearing en la versión con <code>useEffect</code> y documentá cómo lo detectaste.</li>
+  <li>Escribí un componente que use <code>use(promesa)</code>. Primero con la promesa creada en el render, para ver el loop infinito en la pestaña Network (cortalo rápido). Después con caché a nivel módulo. Agregale un error boundary y comprobá que un rechazo de la promesa cae ahí y no rompe la app.</li>
+  <li>Agarrá tres componentes de un proyecto real que ya tengas y auditalos con la lista de RS2.9: ¿algún efecto sin cleanup? ¿alguna ref mutada durante el render? ¿alguna lectura directa de <code>window</code>/<code>document</code>/store global en el cuerpo del componente? Arreglá lo que encuentres y verificá con <code>StrictMode</code> activado que ya no se rompe al doble montaje.</li>
+</ol>
+
+<section class="quiz" id="quizRS2">
+  <style>
+    #quizRS2{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS2 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS2 .q{margin-bottom:1.5rem}
+    #quizRS2 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS2 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS2 .opt:hover{border-color:var(--accent)}
+    #quizRS2 .opt:disabled{cursor:default}
+    #quizRS2 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS2 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS2 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS2 .exp.show{display:block}
+    #quizRS2 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tenés un input controlado que filtra una lista pesada. Envolvés el <code>setQuery</code> del input en <code>startTransition</code> y el input se siente <em>peor</em> que antes. ¿Cuál es la explicación?</p>
+    <button class="opt"><code>startTransition</code> solo funciona en Server Components, en el cliente no hace nada</button>
+    <button class="opt">El <code>value</code> del input quedó en una actualización interrumpible y descartable: la letra que tipeás puede atrasarse o perderse. Lo urgente es el input; lo que se difiere es la lista, con <code>useDeferredValue</code></button>
+    <button class="opt">Falta envolver la lista en un <code>&lt;Suspense&gt;</code> para que la transición tenga efecto</button>
+    <div class="exp">Un input controlado necesita que su <code>value</code> se actualice de forma urgente y garantizada. Una transición dice exactamente lo contrario: "esto puede esperar y lo podés abandonar". Con tecleo rápido, React descarta renders intermedios y el DOM se atrasa respecto de lo tecleado: cursor que salta, letras comidas, valor que rebota. La documentación de React lo marca como <em>pitfall</em> explícito. El arreglo es mover el diferimiento del input al valor derivado.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. ¿Por qué existe <code>useSyncExternalStore</code>?</p>
+    <button class="opt">Para reemplazar <code>useEffect</code> en las suscripciones y escribir menos código</button>
+    <button class="opt">Para poder hacer fetch de datos durante el render, como <code>use()</code></button>
+    <button class="opt">Para evitar el <em>tearing</em>: un render interrumpible puede leer una store mutable en dos momentos distintos y terminar mostrando valores inconsistentes del mismo dato en el mismo frame</button>
+    <div class="exp">Con render concurrente, React puede pausar a la mitad del árbol. Si una fuente externa mutable cambia durante esa pausa, los componentes renderizados antes y después ven valores distintos y la pantalla queda "desgarrada". <code>useState</code> es inmune porque React congela el valor por render; las fuentes externas no. <code>useSyncExternalStore</code> revalida <code>getSnapshot</code> antes del commit y, si cambió, rehace el render sincrónicamente: cambia interrumpibilidad por consistencia. Requisitos: <code>subscribe</code> estable y <code>getSnapshot</code> con valor cacheado, o entrás en un loop infinito.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Aplicaste <code>useDeferredValue</code> con <code>memo</code>: el INP bajó de 480 ms a 45 ms, pero el scroll <strong>sigue</strong> trabándose cuando la lista se actualiza. ¿Qué lo explica?</p>
+    <button class="opt">La fase de commit no es interrumpible: insertar miles de nodos en el DOM es una tarea larga que ningún scheduler puede partir. Lo que hay que bajar es la cantidad de nodos (virtualizar), no la prioridad</button>
+    <button class="opt">Falta agregar también <code>startTransition</code>: los dos hooks se necesitan juntos para que el diferimiento funcione</button>
+    <button class="opt"><code>useDeferredValue</code> solo tiene efecto en producción; en desarrollo React lo desactiva</button>
+    <div class="exp">React trocea y cede el control durante la fase de <strong>render</strong>, que es por qué el input responde al instante. El <strong>commit</strong> —mutaciones de DOM, layout y paint— es sincrónico y no cede: son decenas de milisegundos de tarea larga cada vez que la lista se materializa, y ahí se congela el scroll. Ninguna prioridad reduce ese trabajo porque el trabajo sigue siendo el mismo. Virtualizar baja de 5.000 filas a ~20 y el commit se desploma. Es la diferencia entre reordenar el trabajo y reducirlo.</div>
+  </div>
+
+  <div class="score" id="scoreRS2"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS2');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS2').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS3.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs1-reconciliador/lecture.html">← RS1: El reconciliador por dentro</a>
+  <a href="../rs3-compiler/lecture.html">RS3: React Compiler →</a>
+</nav>
+
+</div>
+</body>
+</html>

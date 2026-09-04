@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS1 — El reconciliador por dentro: fiber, render y commit · React Senior</title>
+  <meta name="description" content="Cómo funciona el reconciliador de React: la estructura de un fiber, los dos árboles, la fase de render y la fase de commit, qué dispara un re-render de verdad, keys, bailouts, batching automático y el orden de los efectos.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS1</span>
+  <span class="badge">⏱ 55–150 min</span>
+  <span class="badge">🎯 Pre-req: Curso de React M00–M14</span>
+  <span class="badge">🧠 Internals</span>
+</div>
+
+<article>
+
+<h1>RS1 — El reconciliador por dentro: fiber, render y commit</h1>
+
+<h2>RS1.0 Por qué este módulo</h2>
+
+<p>"React re-renderiza de más" es la frase que más se repite en las revisiones de código de cualquier equipo de React, y casi siempre está mal planteada. Un re-render no es un bug ni es caro por definición: llamar a una función que devuelve objetos es de las cosas más baratas que hace un navegador. Podés renderizar un componente cien veces por segundo y no pasar de un milisegundo.</p>
+
+<p>El problema es que <strong>"re-render" es un síntoma que la gente usa como si fuera un diagnóstico</strong>. Cuando alguien dice "esto re-renderiza de más" en realidad está describiendo alguna de estas cosas, que son distintas entre sí y se arreglan de maneras distintas: el navegador tarda 200 ms en responder a una tecla; un input pierde el foco solo; el texto que escribiste aparece en la fila equivocada; una animación se corta; un efecto se dispara dos veces. Todas esas son consecuencias observables de <em>cómo funciona el reconciliador</em>, y ninguna se resuelve espolvoreando <code>React.memo</code> hasta que el síntoma desaparece.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Casi todo lo raro que hace React se explica con tres hechos: <strong>(1)</strong> cuando escribís JSX no tocás el DOM, construís una <em>descripción</em>; <strong>(2)</strong> React compara esa descripción contra una estructura de datos propia —el árbol de <em>fibers</em>— que puede pausar, descartar y rehacer; <strong>(3)</strong> el DOM se toca en un único momento sincrónico al final, el <em>commit</em>. Render ≠ commit ≠ pintado del navegador. Entendé esos tres momentos y el resto se deduce.
+</div>
+
+<p>Este módulo no es una lista de trucos de optimización — eso es RS7. Es el mapa mental que te permite mirar un perfil de rendimiento y decir <em>qué</em> está pasando y <em>por qué</em>, en vez de probar cosas hasta que el número baje.</p>
+
+<div class="warn">
+  <strong>Nada de lo que sigue es API pública.</strong> Los nombres de los campos internos cambian entre versiones de React sin aviso ni changelog. Estamos parados en <strong>React 19.2</strong> (línea de parches 19.2.x). Lo que <em>no</em> cambia —hace ya casi una década— es el modelo: dos árboles, dos fases, un heurístico de identidad. Aprendé el modelo, no los nombres de las variables.
+</div>
+
+<h2>RS1.1 De VDOM a Fiber: el problema que había que resolver</h2>
+
+<p>Hasta React 15, el reconciliador era <strong>recursivo</strong>. Cuando llegaba una actualización, React llamaba a tu componente raíz, que devolvía elementos, que hacían que React llamara a los hijos, y así hasta abajo. Todo eso pasaba en una sola llamada de función, dentro del stack del motor de JavaScript.</p>
+
+<p>Esa arquitectura tiene una propiedad fatal: <strong>una vez que empezaste, no podés parar</strong>. El stack de JavaScript no se pausa. Si el árbol tenía cinco mil nodos y recorrerlo tardaba 300 ms, el hilo principal quedaba ocupado 300 ms: sin responder clicks, sin procesar teclas, sin pintar. A 60 fps tenés unos 16,7 ms por cuadro. Trescientos milisegundos son dieciocho cuadros perdidos, y eso el usuario lo ve como una app trabada.</p>
+
+<div class="analogy">
+  <strong>🔗 La analogía.</strong> La recursión es leer un libro sin poder poner un marcapáginas: si te interrumpen, o seguís hasta terminar o perdés el lugar. <strong>Fiber</strong> es reescribir la lectura como "estoy en la página 84, la próxima es la 85": el estado del recorrido está guardado en un objeto, no en el stack. Ahora sí podés cerrar el libro, atender el timbre y volver exactamente donde estabas. O tirar el marcapáginas y empezar de nuevo con otro libro, si mientras tanto cambió lo que había que leer.
+</div>
+
+<p>React 16 (2017) reimplementó el reconciliador con esa idea. El recorrido recursivo pasó a ser un <strong>bucle sobre una lista enlazada</strong>, y el "stack de llamadas" pasó a vivir en el heap, como datos:</p>
+
+<pre><code class="lang-js">// react-reconciler/src/ReactFiberWorkLoop.js — la idea, muy simplificada
+let workInProgress = null;   // el fiber que estamos procesando AHORA
+
+function workLoopConcurrent() {
+  while (workInProgress !== null &amp;&amp; !shouldYield()) {
+    workInProgress = performUnitOfWork(workInProgress);
+  }
+  // Si salimos por shouldYield(), NO terminamos el árbol.
+  // workInProgress queda apuntando al próximo nodo: devolvemos el control
+  // al navegador y retomamos en el siguiente hueco libre.
+}</code></pre>
+
+<p>Ese <code>while</code> es toda la revolución. <code>shouldYield()</code> pregunta si se acabó la porción de tiempo asignada —en la práctica, unos <strong>5 ms</strong>— y si se acabó, el bucle corta. React devuelve el control al navegador, que pinta, procesa el click pendiente y respira, y después React retoma el recorrido desde <code>workInProgress</code>.</p>
+
+<div class="info">
+  <strong>No todas las actualizaciones se trocean.</strong> Que la arquitectura <em>pueda</em> interrumpirse no significa que siempre lo haga. Una actualización urgente (escribir en un input, un click) se renderiza de un tirón, porque trocearla la haría llegar más tarde. El troceo se usa para trabajo de baja prioridad: transiciones, contenido diferido. Ese sistema de prioridades se llama <em>lanes</em> y es el tema completo de <strong>RS2</strong>. Para RS1 alcanza con una consecuencia: <strong>la fase de render puede descartarse y rehacerse</strong>.
+</div>
+
+<h2>RS1.2 Anatomía de un fiber</h2>
+
+<p>Un <strong>fiber</strong> es un objeto plano de JavaScript que representa <em>una unidad de trabajo</em>: un componente, un nodo del DOM, un fragmento, un límite de Suspense. Hay uno por cada cosa que React tiene que procesar. Sacando campos experimentales y de desarrollo, se parece bastante a esto:</p>
+
+<pre><code class="lang-tsx">// react-reconciler/src/ReactInternalTypes.js — recortado y comentado
+type Fiber = {
+  // ── IDENTIDAD: con esto React decide si te reutiliza o te destruye ──
+  tag: WorkTag,          // 0 = FunctionComponent, 1 = ClassComponent,
+                         // 3 = HostRoot, 5 = HostComponent (&lt;div&gt;), 6 = HostText…
+  key: null | string,    // la key que le pusiste en el JSX
+  elementType: any,      // el tipo tal cual lo escribiste (Foo, 'div', memo(Foo)…)
+  type: any,             // el tipo resuelto (lo que React realmente invoca)
+
+  // ── POSICIÓN: el árbol es una lista enlazada, no un array de hijos ──
+  return: Fiber | null,  // el padre (se llama "return" porque es a dónde volver)
+  child: Fiber | null,   // SOLO el primer hijo
+  sibling: Fiber | null, // el próximo hermano
+  index: number,         // posición entre hermanos
+
+  // ── ESTADO ──
+  stateNode: any,          // el nodo real del DOM, o la instancia de la clase
+  pendingProps: any,       // las props de ESTE render
+  memoizedProps: any,      // las props del render ANTERIOR (ya commiteadas)
+  memoizedState: any,      // clases: this.state · funciones: la lista de hooks
+  updateQueue: mixed,      // cola de setState pendientes
+  dependencies: Dependencies | null,  // contextos que este fiber consume
+
+  // ── TRABAJO PENDIENTE ──
+  flags: Flags,            // qué hay que hacerle en el commit: Placement,
+                           // Update, Deletion, Ref, Passive…
+  subtreeFlags: Flags,     // el OR de los flags de todo el subárbol
+  deletions: Array&lt;Fiber&gt; | null,
+  lanes: Lanes,            // prioridad del trabajo agendado EN este fiber
+  childLanes: Lanes,       // prioridad del trabajo agendado más ABAJO
+
+  // ── EL OTRO ÁRBOL ──
+  alternate: Fiber | null, // el mismo nodo, en el árbol opuesto
+};</code></pre>
+
+<p>Fijate en <code>child</code> y <code>sibling</code>: un fiber <strong>no tiene un array de hijos</strong>. Tiene un puntero al primer hijo, y ese hijo tiene un puntero al próximo hermano. Es una lista enlazada, porque una lista enlazada se recorre con un bucle y un puntero — que es exactamente lo que necesitás para poder pausar.</p>
+
+<pre><code class="lang-text">Lo que escribís en JSX:
+
+    &lt;App&gt;
+      &lt;Header /&gt;
+      &lt;Lista&gt;
+        &lt;Fila a /&gt;
+        &lt;Fila b /&gt;
+      &lt;/Lista&gt;
+    &lt;/App&gt;
+
+Lo que React guarda:
+
+                    App
+                     │ child
+                     ▼
+                  Header ──── sibling ────►  Lista
+                     │                          │ child
+              return │                          ▼
+                     └───────────►  App      Fila a ──sibling──► Fila b
+                                                 │                  │
+                                          return │           return │
+                                                 └──► Lista ◄───────┘
+
+Recorrido (profundidad primero): App → Header → Lista → Fila a → Fila b
+Cuando un nodo no tiene child, se va por sibling.
+Cuando no tiene sibling, sube por return y prueba el sibling del padre.
+Todo el recorrido cabe en una variable: workInProgress.</code></pre>
+
+<div class="rule">
+  <strong>📌 Un fiber es la unidad de trabajo y también la unidad de identidad.</strong> El estado local de tu componente no vive "en el componente": vive en <code>memoizedState</code> de <em>ese fiber</em>. Si React decide que el fiber de esta posición ya no corresponde al mismo componente, el fiber se descarta — y tu estado se va con él. Todo el resto del módulo es, en el fondo, la respuesta a "¿cuándo decide eso?".
+</div>
+
+<h3>Por qué los hooks no pueden ser condicionales</h3>
+
+<p>Acá hay un pago inmediato por saber internals. <code>memoizedState</code>, en un componente de función, es <strong>la cabeza de una lista enlazada de hooks</strong>. No hay nombres, no hay claves: solo orden.</p>
+
+<pre><code class="lang-js">// Lo que React guarda para: useState(0); useState(''); useEffect(fn, [x])
+fiber.memoizedState = {
+  memoizedState: 0,              // ← el useState(0)
+  queue: { /* … */ },
+  next: {
+    memoizedState: '',           // ← el useState('')
+    queue: { /* … */ },
+    next: {
+      memoizedState: { /* efecto: create, destroy, deps */ },
+      next: null,
+    },
+  },
+};</code></pre>
+
+<p>En cada render, React recorre esa lista <strong>en el mismo orden en que vos llamás a los hooks</strong>. El primer <code>useState</code> agarra el primer nodo, el segundo agarra el segundo. No hay ninguna otra forma de emparejarlos.</p>
+
+<pre><code class="lang-jsx">function Perfil({ usuario }) {
+  if (usuario) {
+    const [nombre, setNombre] = useState(usuario.nombre); // ⛔ a veces sí, a veces no
+  }
+  const [tema, setTema] = useState('oscuro');
+  // Si `usuario` es null, `useState('oscuro')` agarra el PRIMER nodo de la lista,
+  // que es el que guardaba el nombre. React te devuelve el string equivocado
+  // y, si hay efectos, se desincronizan las dependencias.
+}</code></pre>
+
+<div class="info">
+  Por eso la regla "los hooks se llaman siempre, en el mismo orden, en el nivel superior" no es una convención de estilo ni una manía del linter: es la única forma de que una lista enlazada sin claves se pueda emparejar entre renders. Y por eso el error que te tira React es <em>"Rendered fewer hooks than expected"</em>: literalmente contó.
+</div>
+
+<h2>RS1.3 Los dos árboles: current, work in progress y alternate</h2>
+
+<p>React mantiene <strong>dos árboles de fibers a la vez</strong>. Es la misma técnica que usan los motores gráficos con el <em>double buffering</em>: dibujás en un búfer mientras se muestra el otro, y al final los intercambiás.</p>
+
+<pre><code class="lang-text">   FiberRoot
+   ├─ current ──────────────┐
+   │                        ▼
+   │   ÁRBOL CURRENT                    ÁRBOL WORK IN PROGRESS
+   │   (lo que está en pantalla)        (el que se está construyendo)
+   │   ─────────────────────────        ────────────────────────────
+   │        HostRoot  ◄──── alternate ────►  HostRoot'
+   │           │ child                          │ child
+   │           ▼                                ▼
+   │          App     ◄──── alternate ────►    App'
+   │           │                                │
+   │           ▼                                ▼
+   │        Header    ◄──── alternate ────►  (no se tocó:
+   │                                           se clonó o se
+   │                                           saltó entero)
+   │
+   └─ Al terminar el commit:  root.current = workInProgressTree
+      El árbol viejo pasa a ser el "alternate" y se recicla en el próximo render.</code></pre>
+
+<p>Cuando llega una actualización, React empieza a construir el árbol <em>work in progress</em> clonando nodos del <em>current</em> sobre la marcha:</p>
+
+<pre><code class="lang-js">// react-reconciler/src/ReactFiber.js — createWorkInProgress, simplificado
+function createWorkInProgress(current, pendingProps) {
+  let wip = current.alternate;
+
+  if (wip === null) {
+    // Primera vez: creamos el gemelo y los enlazamos para siempre
+    wip = createFiber(current.tag, pendingProps, current.key, current.mode);
+    wip.stateNode = current.stateNode;   // el nodo del DOM se COMPARTE
+    wip.alternate = current;
+    current.alternate = wip;
+  } else {
+    // Ya existe: lo reciclamos en vez de alocar un objeto nuevo
+    wip.pendingProps = pendingProps;
+    wip.flags = NoFlags;                 // se limpian los efectos del render anterior
+    wip.deletions = null;
+  }
+
+  wip.child = current.child;             // se copian los punteros
+  wip.memoizedProps = current.memoizedProps;
+  wip.memoizedState = current.memoizedState;
+  wip.updateQueue = current.updateQueue;
+  return wip;
+}</code></pre>
+
+<p>Dos consecuencias que importan de verdad:</p>
+
+<div class="step"><strong>1. Mientras React renderiza, la pantalla sigue mostrando lo viejo.</strong> El árbol <code>current</code> describe exactamente lo que hay en el DOM en este instante. Por eso React puede tirar a la basura un work in progress a medio construir sin que el usuario vea absolutamente nada — no hubo ninguna mutación del DOM.</div>
+
+<div class="step"><strong>2. Solo hay dos fibers vivos por nodo, no uno por render.</strong> Se reciclan. Un componente que renderizó ochocientas veces no dejó ochocientos objetos: dejó dos, que se van pasando la pelota. Eso es lo que hace que renderizar sea barato.</div>
+
+<div class="mistake">
+  <strong>El error que se deduce de acá:</strong> leer el DOM durante el render y esperar ver lo nuevo. En la fase de render el DOM todavía es el del árbol <code>current</code>; tu <code>ref.current.offsetHeight</code> te devuelve la medida <em>vieja</em>. Medir el DOM es trabajo de commit — y para eso está <code>useLayoutEffect</code> (RS1.11).
+</div>
+
+<h2>RS1.4 Las dos fases: render y commit</h2>
+
+<p>Esta es la distinción más importante del módulo. Una actualización de React pasa siempre por dos fases con reglas opuestas.</p>
+
+<table>
+<thead><tr><th></th><th>Fase de <em>render</em></th><th>Fase de <em>commit</em></th></tr></thead>
+<tbody>
+<tr><td><strong>Qué hace</strong></td><td>Llama a tus componentes, compara árboles, marca <em>flags</em></td><td>Aplica al DOM lo que se marcó, corre refs y efectos</td></tr>
+<tr><td><strong>¿Interrumpible?</strong></td><td>Sí (según la prioridad)</td><td><strong>No.</strong> Sincrónica, de principio a fin</td></tr>
+<tr><td><strong>¿Se puede descartar?</strong></td><td>Sí: se tira y se rehace</td><td>No: una vez que arrancó, termina</td></tr>
+<tr><td><strong>¿Puede correr 2 veces?</strong></td><td>Sí, y en desarrollo lo hace a propósito</td><td>No para la misma actualización</td></tr>
+<tr><td><strong>Efectos permitidos</strong></td><td><strong>Ninguno.</strong> Tiene que ser pura</td><td>Todos: DOM, red, timers, logs</td></tr>
+<tr><td><strong>Tu código que corre acá</strong></td><td>Cuerpo del componente, <code>useMemo</code>, <code>useState(inicializador)</code>, reducers</td><td><code>useLayoutEffect</code>, <code>useEffect</code>, callbacks de <code>ref</code>, <code>componentDidMount</code></td></tr>
+</tbody>
+</table>
+
+<h3>Qué NO podés hacer en la fase de render</h3>
+
+<pre><code class="lang-jsx">let contadorDeVisitas = 0;                    // ⛔ estado fuera de React
+const yaAvisados = new Set();
+
+function Tarjeta({ item, onVisto }) {
+  contadorDeVisitas++;                        // ⛔ 1. mutás una variable de módulo
+  item.visitas = (item.visitas ?? 0) + 1;     // ⛔ 2. mutás una prop
+  if (!yaAvisados.has(item.id)) {
+    yaAvisados.add(item.id);
+    fetch('/api/visto', { method: 'POST' });  // ⛔ 3. efecto de red en el render
+  }
+  const alto = document.getElementById('caja')?.offsetHeight;  // ⛔ 4. leés el DOM
+  onVisto(item.id);                           // ⛔ 5. avisás al padre (setState ajeno)
+
+  return &lt;div className="caja"&gt;{item.titulo}&lt;/div&gt;;
+}</code></pre>
+
+<p>Nada de eso es "mala práctica" en abstracto: <strong>es incompatible con la arquitectura</strong>. React puede llamar a <code>Tarjeta</code> tres veces y quedarse con el resultado de la tercera. Puede llamarla, abandonar el render a mitad porque llegó algo más urgente, y volver a llamarla desde cero. Tu contador va a contar renders descartados. Tu <code>fetch</code> va a disparar peticiones por renders que nunca llegaron a la pantalla. Tu <code>Set</code> va a impedir que el segundo intento —el bueno— haga lo suyo.</p>
+
+<pre><code class="lang-jsx">// La versión pura: mismas props → mismo resultado, cero efectos
+function Tarjeta({ item }) {
+  return &lt;div className="caja"&gt;{item.titulo}&lt;/div&gt;;
+}
+
+// Y el efecto donde corresponde: en el commit, con limpieza
+function TarjetaConTelemetria({ item }) {
+  useEffect(() =&gt; {
+    const ac = new AbortController();
+    fetch('/api/visto', {
+      method: 'POST',
+      body: JSON.stringify({ id: item.id }),
+      signal: ac.signal,
+    }).catch(() =&gt; {});
+    return () =&gt; ac.abort();   // ⬅️ si el efecto se rehace, se cancela lo anterior
+  }, [item.id]);
+
+  return &lt;Tarjeta item={item} /&gt;;
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 La pureza no es una preferencia estética: es un requisito.</strong> "Mismas props y mismo estado producen el mismo JSX, y no pasa nada más" es el contrato que le permite a React descartar un render sin consecuencias. El día que lo rompés, el precio no lo pagás ese día: lo pagás cuando activás una transición, o Suspense, o simplemente cuando alguien mueve tu componente adentro de otro que renderiza más seguido.
+</div>
+
+<h3>El commit por dentro</h3>
+
+<p>El commit no es un solo bloque: son tres sub-fases sincrónicas, en este orden exacto. Saberlo es lo que te permite explicar por qué tu tooltip parpadea o por qué el <code>ref</code> vale <code>null</code>.</p>
+
+<pre><code class="lang-js">// react-reconciler/src/ReactFiberCommitWork.js — el orden, muy simplificado
+function commitRoot(root, finishedWork) {
+
+  // ── 1. BEFORE MUTATION ─────────────────────────────────────────
+  //     El DOM todavía es el VIEJO. Última chance de medirlo.
+  //     Acá corre getSnapshotBeforeUpdate (clases).
+  //     Acá se AGENDAN (no se ejecutan) los efectos pasivos: useEffect.
+  commitBeforeMutationEffects(root, finishedWork);
+
+  // ── 2. MUTATION ────────────────────────────────────────────────
+  //     Se toca el DOM: insertar, actualizar atributos, borrar nodos.
+  //     Antes de cada mutación corre la LIMPIEZA de useLayoutEffect
+  //     y se desenganchan los refs (pasan a null).
+  //     También corre useInsertionEffect, antes que nada de esto.
+  commitMutationEffects(root, finishedWork);
+
+  // ── AQUÍ SE INTERCAMBIAN LOS ÁRBOLES ───────────────────────────
+  root.current = finishedWork;
+
+  // ── 3. LAYOUT ──────────────────────────────────────────────────
+  //     El DOM ya es el NUEVO, pero el navegador TODAVÍA NO PINTÓ.
+  //     Se enganchan los refs y corre useLayoutEffect / componentDidMount.
+  //     Si acá hacés setState, React re-renderiza ANTES de pintar.
+  commitLayoutEffects(finishedWork, root);
+
+  // ── El navegador pinta ─────────────────────────────────────────
+  // ── Después, asincrónicamente: los efectos pasivos (useEffect) ──
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ El commit no se puede interrumpir, y eso es a propósito.</strong> Si React pudiera pausar a mitad de aplicar mutaciones, el usuario vería un DOM inconsistente: media lista actualizada, media vieja. Por eso todo el commit es sincrónico. Y por eso <strong>el trabajo caro que metas en <code>useLayoutEffect</code> bloquea el pintado</strong>: estás dentro de la parte no interrumpible.
+</div>
+
+<h2>RS1.5 StrictMode: por qué tu código corre dos veces</h2>
+
+<p>Si la fase de render tiene que ser pura, hace falta una forma de detectar cuándo no lo es. <code>&lt;StrictMode&gt;</code> es esa forma: <strong>en desarrollo</strong>, invoca dos veces todo lo que debería ser puro, y remonta los efectos, para que las impurezas se rompan ruidosamente en tu máquina y no en silencio en producción.</p>
+
+<pre><code class="lang-jsx">import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+
+createRoot(document.getElementById('root')).render(
+  &lt;StrictMode&gt;
+    &lt;App /&gt;
+  &lt;/StrictMode&gt;
+);</code></pre>
+
+<table>
+<thead><tr><th>Qué duplica StrictMode (solo en desarrollo)</th><th>Qué bug busca</th></tr></thead>
+<tbody>
+<tr><td>El cuerpo del componente</td><td>Mutaciones, contadores, efectos escondidos en el render</td></tr>
+<tr><td>Los inicializadores de <code>useState</code> y <code>useMemo</code></td><td>Inicializadores con efectos secundarios o no deterministas</td></tr>
+<tr><td>Las funciones actualizadoras (<code>setX(prev =&gt; …)</code>) y los reducers</td><td>Reducers que mutan el estado en vez de devolver uno nuevo</td></tr>
+<tr><td>Los callbacks de <code>ref</code> (y su limpieza, desde React 19)</td><td>Refs que se enganchan sin desengancharse</td></tr>
+<tr><td><strong>Monta → desmonta → vuelve a montar</strong> los efectos</td><td>Efectos sin función de limpieza</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">// El bug clásico que StrictMode saca a la luz en cinco segundos
+function Sala({ salaId }) {
+  useEffect(() =&gt; {
+    const conexion = crearConexion(salaId);
+    conexion.conectar();
+    // ⛔ falta el return con la desconexión
+  }, [salaId]);
+}
+
+// Con StrictMode: monta (conecta) → desmonta (NO desconecta) → monta (conecta)
+// Resultado observable: DOS conexiones abiertas, y en la consola dos "conectado a…".
+// Sin StrictMode el bug existe igual, pero recién lo ves en producción cuando
+// el usuario navega diez veces y tenés diez sockets colgados.
+
+function SalaCorrecta({ salaId }) {
+  useEffect(() =&gt; {
+    const conexion = crearConexion(salaId);
+    conexion.conectar();
+    return () =&gt; conexion.desconectar();   // ✅ simétrico
+  }, [salaId]);
+}</code></pre>
+
+<div class="tip">
+  <strong>Si tu app se rompe con StrictMode, el bug es tuyo, no de StrictMode.</strong> "Lo apagué porque me duplicaba las peticiones" es la decisión que te garantiza que el mismo problema va a reaparecer en producción, disfrazado de otra cosa, seis meses después. La duplicación de peticiones se arregla con una limpieza que aborte, o con una librería de datos que deduplique (RS5).
+</div>
+
+<div class="info">
+  StrictMode no hace <strong>nada</strong> en el build de producción: no duplica, no remonta, no cuesta un milisegundo. Y ojo con esto al perfilar: si medís tiempos en desarrollo con StrictMode activo, estás midiendo dos renders por cada uno real.
+</div>
+
+<h2>RS1.6 Qué dispara un re-render de verdad</h2>
+
+<p>Un componente de función se vuelve a ejecutar por exactamente <strong>tres</strong> razones. No hay una cuarta.</p>
+
+<div class="step"><strong>1. Su propio estado cambió.</strong> Un <code>setState</code>, un <code>dispatch</code>, o una <em>store</em> externa que notificó vía <code>useSyncExternalStore</code>.</div>
+
+<div class="step"><strong>2. Su padre se re-renderizó.</strong> Por defecto, si el padre corre, los hijos corren. Sin importar si sus props cambiaron.</div>
+
+<div class="step"><strong>3. Un contexto que consume cambió de valor.</strong> Y esto atraviesa cualquier <code>memo</code> que haya en el medio.</div>
+
+<p>Repasemos las trampas de cada uno.</p>
+
+<h3>Estado que "cambia" sin cambiar</h3>
+
+<pre><code class="lang-jsx">const [n, setN] = useState(0);
+
+setN(0);        // n ya era 0 → React compara con Object.is → no agenda trabajo
+setN(n);        // idem
+
+const [user, setUser] = useState({ nombre: 'Ada' });
+user.nombre = 'Grace';       // ⛔ mutaste: MISMA referencia
+setUser(user);               // Object.is(user, user) === true → no pasa nada
+setUser({ ...user, nombre: 'Grace' });   // ✅ objeto nuevo → re-render</code></pre>
+
+<div class="info">
+  React compara con <code>Object.is</code>, no con igualdad profunda. Y hay un detalle honesto de la implementación: al llamar a <code>setN(0)</code>, React <strong>puede llegar a ejecutar tu componente una vez más</strong> antes de decidir que no hay nada que hacer (el <em>eager state</em> solo se calcula si la cola está vacía). No debería afectar a tu código — si te afecta, tu componente no es puro.
+</div>
+
+<h3>El padre re-renderizó</h3>
+
+<pre><code class="lang-jsx">function Padre() {
+  const [n, setN] = useState(0);
+  return (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; setN(n + 1)}&gt;{n}&lt;/button&gt;
+      &lt;Hijo texto="constante" /&gt;   {/* la prop NUNCA cambia… */}
+    &lt;/&gt;
+  );
+}
+
+function Hijo({ texto }) {
+  console.log('Hijo renderizó');   // …y sin embargo esto se imprime en CADA click
+  return &lt;p&gt;{texto}&lt;/p&gt;;
+}</code></pre>
+
+<p>La razón, en términos de fibers: cada vez que <code>Padre</code> corre, el JSX crea un <strong>elemento nuevo</strong> para <code>&lt;Hijo /&gt;</code>, con un objeto de props nuevo. Cuando React llega al fiber de <code>Hijo</code>, compara <code>current.memoizedProps</code> con <code>workInProgress.pendingProps</code> y son objetos distintos —aunque tengan el mismo contenido— así que no puede saltear nada y llama a la función. La comparación es por <strong>referencia</strong>, y sale barata justamente porque es por referencia.</p>
+
+<h3>El contexto</h3>
+
+<pre><code class="lang-jsx">function App() {
+  const [usuario, setUsuario] = useState(null);
+  const [tema, setTema] = useState('oscuro');
+
+  // ⛔ objeto literal: referencia nueva en CADA render de App
+  return (
+    &lt;SesionContext value={{ usuario, setUsuario, tema }}&gt;
+      &lt;TodoElArbol /&gt;
+    &lt;/SesionContext&gt;
+  );
+}</code></pre>
+
+<p>Cambiar el tema hace que <code>App</code> renderice, que se cree un objeto <code>value</code> nuevo, y que <strong>todos</strong> los consumidores del contexto se re-rendericen — incluidos los que solo leen <code>usuario</code>, que no cambió. Y no los salva ningún <code>memo</code> intermedio: la propagación de contexto recorre los fibers marcando a los consumidores directamente, saltándose los bailouts.</p>
+
+<div class="rule">
+  <strong>📌 Los tres arreglos del contexto, en orden de preferencia:</strong> (1) partir el contexto en varios más chicos y estables (uno de datos, uno de acciones); (2) poner el contexto lo más abajo posible en el árbol; (3) recién ahí, estabilizar el <code>value</code>. La arquitectura de estado en serio es <strong>RS6</strong>.
+</div>
+
+<h3>Y la aclaración más importante de todo el módulo</h3>
+
+<div class="concept">
+  <strong>💡 Que un componente re-renderice NO significa que el DOM cambie.</strong> "Renderizar" es llamar a tu función y obtener elementos. React compara esos elementos contra el fiber actual; si las props del nodo host son iguales, <strong>no marca ningún flag</strong>, y en el commit ese nodo recibe cero trabajo. Cero mutaciones, cero recálculo de layout, cero repintado. El navegador ni se entera.
+</div>
+
+<pre><code class="lang-jsx">function Reloj() {
+  const [, forzar] = useState(0);
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; forzar(n =&gt; n + 1), 16);  // ~60 renders/s
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  // Este JSX es idéntico en cada render.
+  // React lo va a comparar 60 veces por segundo y no va a tocar el DOM ni una vez.
+  return &lt;p className="titulo"&gt;Hola&lt;/p&gt;;
+}</code></pre>
+
+<p>Comprobalo vos: activá <em>Paint flashing</em> en Chrome DevTools (Rendering) y no vas a ver ni un parpadeo. El costo de esos 60 renders por segundo es real pero minúsculo: llamar una función y comparar dos objetos.</p>
+
+<div class="analogy">
+  <strong>🔗</strong> Es la diferencia entre <em>recalcular</em> una planilla y <em>reimprimirla</em>. Recalcular ochocientas celdas cuesta microsegundos. Reimprimir la hoja cuesta papel, tinta y tiempo. React recalcula seguido justamente para poder imprimir poco.
+</div>
+
+<p>De acá sale la regla práctica que ordena el 90% de las discusiones de rendimiento en React: <strong>el problema casi nunca es "renderiza mucho", es "cada render hace algo caro"</strong>. Un <code>.filter().sort()</code> sobre 50.000 items, un <code>JSON.parse</code>, un cálculo de fechas por fila, o un árbol de 5.000 nodos que se recorre entero. Eso es lo que hay que buscar en el perfil.</p>
+
+<h2>RS1.7 Reconciliación: el heurístico del tipo</h2>
+
+<p>Comparar dos árboles cualesquiera es un problema de complejidad O(n³). React lo resuelve en O(n) haciendo dos suposiciones que en interfaces reales se cumplen casi siempre:</p>
+
+<div class="step"><strong>Suposición 1.</strong> Dos elementos de <strong>tipo distinto</strong> en la misma posición producen árboles distintos. No se comparan: se destruye lo viejo y se construye lo nuevo.</div>
+
+<div class="step"><strong>Suposición 2.</strong> El desarrollador puede indicar, con una <code>key</code>, qué hijos se mantienen estables entre renders aunque cambien de posición.</div>
+
+<p>La segunda es RS1.8. Vamos con la primera, que es la que produce los bugs más desconcertantes.</p>
+
+<pre><code class="lang-text">Render anterior          Render nuevo            Qué hace React
+──────────────────       ─────────────────       ─────────────────────────────
+&lt;div&gt;&lt;Input/&gt;&lt;/div&gt;      &lt;div&gt;&lt;Input/&gt;&lt;/div&gt;     mismo tipo → reutiliza el nodo,
+                                                 actualiza solo lo que cambió,
+                                                 CONSERVA el estado
+
+&lt;div&gt;&lt;Input/&gt;&lt;/div&gt;      &lt;span&gt;&lt;Input/&gt;&lt;/span&gt;   tipo distinto → DESMONTA todo
+                                                 el subárbol y lo vuelve a montar:
+                                                 estado PERDIDO
+
+&lt;Perfil user="a" /&gt;      &lt;Perfil user="b" /&gt;     mismo tipo → conserva el estado
+                                                 aunque el usuario sea otro (!)</code></pre>
+
+<div class="danger">
+  <strong>⚠️ "Desmontar el subárbol" es más caro y más destructivo de lo que suena.</strong> Se pierde el estado local de <em>todos</em> los descendientes; los refs se ponen en <code>null</code>; corren todas las limpiezas de efectos; los nodos del DOM se destruyen y se crean de nuevo, y con ellos se va el foco, la selección de texto, la posición del scroll, el estado de un <code>&lt;video&gt;</code> que estaba reproduciendo y cualquier animación CSS en curso. Un cambio de tipo en el nodo equivocado es un bug de UX, no de performance.
+</div>
+
+<h3>El caso 1: el condicional que cambia la forma del árbol</h3>
+
+<pre><code class="lang-jsx">function Campo({ editando }) {
+  return (
+    &lt;&gt;
+      {editando
+        ? &lt;div className="marco"&gt;&lt;input /&gt;&lt;/div&gt;   {/* posición 0: div  */}
+        : &lt;input /&gt;                                {/* posición 0: input */}
+      }
+    &lt;/&gt;
+  );
+}
+// Al pasar editando de false a true, en la posición 0 había un `input`
+// y ahora hay un `div`. React desmonta el input y monta uno nuevo adentro
+// del div: lo que el usuario había escrito desaparece.</code></pre>
+
+<pre><code class="lang-jsx">// ✅ Misma estructura en las dos ramas: el input nunca cambia de posición ni de tipo
+function Campo({ editando }) {
+  return (
+    &lt;div className={editando ? 'marco' : 'marco--plano'}&gt;
+      &lt;input /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h3>El caso 2: el componente definido adentro de otro</h3>
+
+<p>Este es <em>el</em> bug que separa a quien entendió el reconciliador de quien no. Se ve así:</p>
+
+<pre><code class="lang-jsx">function Formulario() {
+  const [nombre, setNombre] = useState('');
+
+  // ⛔ Se define en CADA render: cada vez es una FUNCIÓN DISTINTA
+  function CampoNombre() {
+    return &lt;input value={nombre} onChange={e =&gt; setNombre(e.target.value)} /&gt;;
+  }
+
+  return &lt;CampoNombre /&gt;;
+}</code></pre>
+
+<p>Síntoma: <strong>el input pierde el foco después de cada tecla</strong>. Causa, en términos de fibers: el <code>type</code> del elemento es la referencia a la función <code>CampoNombre</code>. Como la función se crea de nuevo en cada render, <code>tipoViejo !== tipoNuevo</code>, y React aplica la suposición 1: desmonta el subárbol entero y monta uno nuevo. El nodo <code>&lt;input&gt;</code> del DOM se destruye y se crea otro — y un nodo recién creado no tiene el foco.</p>
+
+<pre><code class="lang-jsx">// ✅ Opción A: sacarlo afuera (la función es la misma para siempre)
+function CampoNombre({ valor, onChange }) {
+  return &lt;input value={valor} onChange={onChange} /&gt;;
+}
+
+function Formulario() {
+  const [nombre, setNombre] = useState('');
+  return &lt;CampoNombre valor={nombre} onChange={e =&gt; setNombre(e.target.value)} /&gt;;
+}
+
+// ✅ Opción B: si de verdad necesitás componer al vuelo, pasá ELEMENTOS, no componentes
+function Formulario() {
+  const [nombre, setNombre] = useState('');
+  return &lt;Marco contenido={&lt;input value={nombre} onChange={/* … */} /&gt;} /&gt;;
+}</code></pre>
+
+<div class="mistake">
+  <strong>La misma trampa, disfrazada:</strong> <code>React.lazy(() =&gt; import('./X'))</code> llamado dentro del cuerpo de un componente, o un <code>styled.div`…`</code> creado adentro del render, o cualquier HOC aplicado en línea (<code>withAuth(MiComponente)</code> dentro del JSX). Todos producen un tipo nuevo por render y todos desmontan el subárbol en cada tecla. La regla general: <strong>los tipos de componente se definen a nivel de módulo</strong>.
+</div>
+
+<h3>El corolario útil: el estado vive en la posición</h3>
+
+<div class="rule">
+  <strong>📌 El estado se identifica por la terna (posición en el árbol, tipo, key).</strong> No por "el componente". Si esa terna se mantiene, el estado sobrevive; si cambia cualquiera de los tres, el estado se destruye.
+</div>
+
+<p>Y eso se puede usar <strong>a propósito</strong>, que es una de las técnicas más limpias y menos usadas de React:</p>
+
+<pre><code class="lang-jsx">// ⛔ El patrón que se ve por todos lados: "sincronizar" estado con un efecto
+function Perfil({ userId }) {
+  const [borrador, setBorrador] = useState('');
+  useEffect(() =&gt; { setBorrador(''); }, [userId]);   // render de más + flash visual
+  // …
+}
+
+// ✅ Cambiar la key remonta el subárbol: el estado se reinicia solo,
+//    sin efecto, sin render extra, sin nada que mantener sincronizado.
+function Pagina({ userId }) {
+  return &lt;Perfil key={userId} userId={userId} /&gt;;
+}</code></pre>
+
+<h2>RS1.8 Keys: la identidad de un elemento</h2>
+
+<p>Dentro de un mismo padre, la <code>key</code> le dice a React <strong>qué hijo del render anterior corresponde a qué hijo del render nuevo</strong>. Nada más, y nada menos. Sin keys, React empareja por posición: el primero con el primero, el segundo con el segundo.</p>
+
+<p>El algoritmo de listas hace una pasada en orden mientras las keys coinciden; en cuanto dejan de coincidir, arma un <code>Map</code> con los hijos viejos restantes indexados por key y busca ahí. Lo que encuentra, lo <strong>mueve</strong>; lo que no aparece en el nuevo, lo borra; lo nuevo que no estaba, lo inserta.</p>
+
+<pre><code class="lang-text">Anterior:  [a] [b] [c]          Nuevo:  [c] [a] [b]
+
+Con keys estables ("a","b","c"):
+   c → ya existía: MOVER (el nodo del DOM y su estado se conservan)
+   a → ya existía: MOVER
+   b → ya existía: MOVER
+   Resultado: 3 movimientos, 0 destrucciones. El estado viaja con el item.
+
+Sin keys (empareja por posición 0,1,2):
+   pos 0: era "a", ahora "c" → actualizar props del nodo 0
+   pos 1: era "b", ahora "a" → actualizar props del nodo 1
+   pos 2: era "c", ahora "b" → actualizar props del nodo 2
+   Resultado: 3 actualizaciones. El DOM queda bien…
+   …pero el ESTADO LOCAL de cada fila se quedó en su posición vieja.</code></pre>
+
+<h3>El caso reproducible: el índice como key</h3>
+
+<p>Escribí esto y probalo, porque leerlo no alcanza:</p>
+
+<pre><code class="lang-jsx">function ListaRota() {
+  const [items, setItems] = useState([
+    { id: 'a', texto: 'Comprar café' },
+    { id: 'b', texto: 'Llamar al banco' },
+    { id: 'c', texto: 'Reservar mesa' },
+  ]);
+
+  return (
+    &lt;ul&gt;
+      {items.map((item, i) =&gt; (
+        &lt;Fila
+          key={i}                                        {/* ⛔ el índice */}
+          item={item}
+          onBorrar={() =&gt; setItems(xs =&gt; xs.filter(x =&gt; x.id !== item.id))}
+        /&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}
+
+function Fila({ item, onBorrar }) {
+  const [nota, setNota] = useState('');    // ⬅️ estado LOCAL, vive en el fiber
+  return (
+    &lt;li&gt;
+      {item.texto}
+      &lt;input value={nota} onChange={e =&gt; setNota(e.target.value)} placeholder="nota" /&gt;
+      &lt;button onClick={onBorrar}&gt;✕&lt;/button&gt;
+    &lt;/li&gt;
+  );
+}</code></pre>
+
+<p><strong>Para reproducir el bug:</strong> escribí <code>urgente</code> en la nota de "Reservar mesa" (la tercera) y después borrá "Comprar café" (la primera). Resultado: quedan dos filas, y la palabra <code>urgente</code> ahora está pegada a <strong>"Llamar al banco"</strong>.</p>
+
+<p><strong>Por qué.</strong> Antes había keys <code>0, 1, 2</code>. Después de borrar quedan <code>0, 1</code>. React ve que la key <code>0</code> existía y sigue existiendo, así que <strong>reutiliza ese fiber</strong>: le cambia las props (ahora el item es "Llamar al banco") pero le deja el <code>memoizedState</code> — que es el estado local de la fila que antes estaba en la posición 0. Lo mismo con la 1. La fila que se destruye es la <em>última</em>, la key <code>2</code>, que no tiene nada que ver con la que vos borraste.</p>
+
+<div class="concept">
+  <strong>💡 Dicho de otra forma:</strong> con <code>key={i}</code> le estás diciendo a React "la identidad de esta fila es <em>su posición</em>". Entonces, cuando borrás un elemento del medio, para React no se borró ese elemento: se borró el último, y todos los demás <em>cambiaron de contenido</em>. Las props viajan; el estado, los refs, el foco y el DOM se quedan.
+</div>
+
+<pre><code class="lang-jsx">// ✅ La corrección: la identidad es del DATO, no de la posición
+{items.map(item =&gt; (
+  &lt;Fila key={item.id} item={item} onBorrar={/* … */} /&gt;
+))}
+// Ahora borrar "a" borra el fiber de "a". Los otros dos se mueven con su estado intacto.</code></pre>
+
+<h3>Cuándo el índice SÍ está bien</h3>
+
+<table>
+<thead><tr><th>Situación</th><th>¿<code>key={i}</code>?</th><th>Por qué</th></tr></thead>
+<tbody>
+<tr><td>Lista estática que nunca cambia de orden ni de tamaño</td><td>✅ Sí</td><td>La posición <em>es</em> la identidad: nunca se desincroniza</td></tr>
+<tr><td>Solo se agregan items al final (append-only), sin estado por fila</td><td>✅ Aceptable</td><td>Los índices existentes nunca se reasignan</td></tr>
+<tr><td>Filas sin estado local, sin inputs, sin refs, sin animaciones</td><td>🟡 Funciona</td><td>No hay nada que se pueda desincronizar… hasta que alguien agregue un input</td></tr>
+<tr><td>Se puede borrar, reordenar, filtrar o insertar en el medio</td><td>❌ No</td><td>El estado se pega a la posición y salta de fila</td></tr>
+<tr><td>Hay <code>&lt;input&gt;</code>, foco, scroll, video, o transiciones CSS por fila</td><td>❌ Nunca</td><td>Se rompe aunque no tengas <code>useState</code>: el DOM también guarda estado</td></tr>
+</tbody>
+</table>
+
+<div class="mistake">
+  <strong>Y el peor de todos: <code>key={Math.random()}</code> o <code>key={crypto.randomUUID()}</code> generado en el render.</strong> Es peor que no poner key. Como la key cambia en cada render, ninguna coincide con la anterior: React <strong>destruye y vuelve a crear la lista entera, siempre</strong>. Pierde el estado, pierde el foco, pierde el scroll y hace el máximo trabajo posible en el DOM. Si no tenés un id estable, generalo <em>cuando creás el dato</em>, no cuando lo renderizás.
+</div>
+
+<div class="info">
+  Dos precisiones que se preguntan mucho: las keys tienen que ser únicas <strong>entre hermanos</strong>, no en toda la app — dos listas distintas pueden usar las mismas keys sin problema. Y <code>key</code> <strong>no llega como prop</strong>: si el hijo necesita el id, pasáselo también como <code>id={item.id}</code>.
+</div>
+
+<h2>RS1.9 Bailing out: cuándo React corta la rama</h2>
+
+<p>Ya vimos que por defecto un padre que renderiza arrastra a sus hijos. "Por defecto" quiere decir: <em>salvo que React pueda hacer un bailout</em>. Acá está la lógica, que es sorprendentemente corta:</p>
+
+<pre><code class="lang-js">// react-reconciler/src/ReactFiberBeginWork.js — muy simplificado
+function beginWork(current, workInProgress, renderLanes) {
+  if (current !== null) {
+    const oldProps = current.memoizedProps;
+    const newProps = workInProgress.pendingProps;
+
+    // ¿Las props son EL MISMO OBJETO? (comparación por referencia, no por contenido)
+    if (oldProps === newProps &amp;&amp; !hasContextChanged()) {
+      // ¿Hay algún setState agendado en ESTE fiber?
+      if (!includesSomeLane(renderLanes, workInProgress.lanes)) {
+        return bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes);
+      }
+    }
+  }
+  // Si no hubo bailout: acá se llama de verdad a TU función componente.
+}
+
+function bailoutOnAlreadyFinishedWork(current, workInProgress, renderLanes) {
+  // ¿Hay trabajo agendado en algún lugar MÁS ABAJO del subárbol?
+  if (!includesSomeLane(renderLanes, workInProgress.childLanes)) {
+    return null;                    // ⬅️ se corta la rama ENTERA: ni se clonan los hijos
+  }
+  cloneChildFibers(current, workInProgress);
+  return workInProgress.child;      // hay trabajo abajo: bajamos, pero sin renderizar acá
+}</code></pre>
+
+<p>Hay dos niveles de ahorro, y conviene distinguirlos:</p>
+
+<table>
+<thead><tr><th>Nivel</th><th>Condición</th><th>Qué ahorra</th></tr></thead>
+<tbody>
+<tr><td><strong>Bailout del nodo</strong></td><td>Mismas props por referencia y sin trabajo propio</td><td>No se llama a tu función. Se clonan los hijos y se sigue bajando</td></tr>
+<tr><td><strong>Corte de la rama</strong></td><td>Lo anterior <em>y</em> <code>childLanes</code> vacío</td><td>No se toca <strong>nada</strong> del subárbol: ni un fiber, ni una comparación</td></tr>
+</tbody>
+</table>
+
+<p>La clave está en <code>oldProps === newProps</code>. Cuando el padre re-renderiza, el JSX crea un objeto de props nuevo, así que esa condición es falsa y no hay bailout. <strong>Salvo que el elemento sea literalmente el mismo objeto</strong> — y eso pasa cuando el elemento se creó más arriba y baja como <code>children</code>:</p>
+
+<pre><code class="lang-jsx">// ✅ El bailout "gratis" por composición
+function Pagina() {
+  return (
+    &lt;Contador&gt;
+      &lt;ArbolCarisimo /&gt;   {/* este elemento se crea acá, en Pagina */}
+    &lt;/Contador&gt;
+  );
+}
+
+function Contador({ children }) {
+  const [n, setN] = useState(0);
+  return (
+    &lt;div&gt;
+      &lt;button onClick={() =&gt; setN(n + 1)}&gt;{n}&lt;/button&gt;
+      {children}   {/* ⬅️ el MISMO objeto elemento que en el render anterior */}
+    &lt;/div&gt;
+  );
+}
+// Al hacer click, Pagina no renderiza (su estado no cambió), así que el elemento
+// &lt;ArbolCarisimo /&gt; es exactamente el mismo objeto. React compara por referencia,
+// da igual, y corta la rama. Sin memo, sin useMemo, sin arrays de dependencias.</code></pre>
+
+<h3>Por qué <code>React.memo</code> a veces no sirve para nada</h3>
+
+<p><code>React.memo</code> agrega un paso más: si el bailout por referencia no aplica, compara las props <strong>superficialmente</strong> (clave por clave, con <code>Object.is</code>) y, si son iguales, hace el bailout igual. Muy útil… cuando se dan las condiciones. Estas son las cinco razones por las que no se dan:</p>
+
+<pre><code class="lang-jsx">const Lista = React.memo(function Lista({ items, filtros, onSeleccion }) {
+  /* caro */
+});
+
+function Padre() {
+  const [n, setN] = useState(0);
+  return (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; setN(n + 1)}&gt;{n}&lt;/button&gt;
+
+      {/* ⛔ 1. objeto literal: referencia nueva en cada render */}
+      {/* ⛔ 2. array derivado: idem */}
+      {/* ⛔ 3. función inline: idem */}
+      &lt;Lista
+        filtros={{ activos: true }}
+        items={datos.filter(d =&gt; d.activo)}
+        onSeleccion={(id) =&gt; console.log(id)}
+      /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-jsx">// ⛔ 4. children como JSX: SIEMPRE es un objeto elemento nuevo,
+//       así que la comparación superficial de props nunca da igual
+&lt;Panel memoizado&gt;
+  &lt;p&gt;hola&lt;/p&gt;
+&lt;/Panel&gt;
+
+// ⛔ 5. el componente consume un contexto que cambió:
+//       la propagación de contexto marca a los consumidores directamente
+//       y se saltea cualquier memo que haya en el camino
+const Panel = React.memo(function Panel() {
+  const { tema } = useContext(TemaContext);   // ⬅️ memo no te protege de esto
+  return &lt;div className={tema} /&gt;;
+});</code></pre>
+
+<div class="warn">
+  <strong>Y la sexta razón, la más común: no hacía falta.</strong> <code>memo</code> no es gratis: cuesta una comparación de props por render, memoria para retener el resultado anterior, y —el costo real— obliga a mantener estables todas las props río arriba, lo que contamina el código de padres y abuelos con <code>useMemo</code> y <code>useCallback</code>. Si el componente rinde 0,3 ms, acabás de pagar complejidad permanente por nada.
+</div>
+
+<div class="rule">
+  <strong>📌 En 2026 la memoización manual no es la respuesta por defecto.</strong> El <strong>React Compiler</strong> memoiza automáticamente a partir del análisis del código, sin arrays de dependencias que se desincronicen. Cómo funciona, qué garantiza y cómo se adopta en un proyecto que ya existe es todo <strong>RS3</strong>. La regla para hoy: primero arreglá <em>dónde vive el estado</em> y <em>la forma del árbol</em>; <code>memo</code> es el último recurso, no el primero.
+</div>
+
+<h2>RS1.10 Batching automático</h2>
+
+<p>React agrupa varios <code>setState</code> en un solo render. Hasta React 17 eso solo pasaba dentro de manejadores de eventos de React; en cualquier otro lado —una promesa, un <code>setTimeout</code>, un evento nativo— cada <code>setState</code> provocaba su propio render. Desde <strong>React 18</strong> el agrupamiento es <strong>automático en todos lados</strong>.</p>
+
+<pre><code class="lang-jsx">function Formulario() {
+  const [cargando, setCargando] = useState(false);
+  const [datos, setDatos] = useState(null);
+  const [error, setError] = useState(null);
+
+  async function enviar() {
+    setCargando(true);              // ── dentro de un handler: 1 render (igual en 17 y 18)
+    try {
+      const r = await fetch('/api/guardar');
+      const json = await r.json();
+
+      // ── DESPUÉS del await: acá está la diferencia
+      setDatos(json);
+      setError(null);
+      setCargando(false);
+      // React 17: TRES renders, y dos de ellos con estado inconsistente
+      //           (datos cargados pero cargando todavía en true)
+      // React 18+: UN render, con los tres valores ya coherentes
+    } catch (e) {
+      setError(e);
+      setCargando(false);           // React 18+: un solo render
+    }
+  }
+}</code></pre>
+
+<p>El mecanismo: React no re-renderiza en el momento del <code>setState</code>. Encola la actualización y agenda un <em>microtask</em> para vaciar la cola. Todo lo que se encole en el mismo tick termina en el mismo render. De ahí sale el malentendido más frecuente de todos:</p>
+
+<pre><code class="lang-jsx">const [n, setN] = useState(0);
+
+function alClickear() {
+  setN(n + 1);
+  setN(n + 1);
+  setN(n + 1);
+  console.log(n);   // 0 — `n` es una CONSTANTE de este render, no cambia nunca
+}
+// Resultado: n pasa a 1, no a 3. Las tres llamadas calcularon 0 + 1.
+
+function alClickearBien() {
+  setN(prev =&gt; prev + 1);
+  setN(prev =&gt; prev + 1);
+  setN(prev =&gt; prev + 1);
+}
+// Resultado: 3. Las funciones actualizadoras se aplican en orden sobre la cola.</code></pre>
+
+<h3>La salida de emergencia: <code>flushSync</code></h3>
+
+<pre><code class="lang-jsx">import { flushSync } from 'react-dom';
+
+function agregarYBajar(texto) {
+  flushSync(() =&gt; {
+    setMensajes(ms =&gt; [...ms, texto]);
+  });
+  // Al salir de flushSync, React YA renderizó y commiteó: el DOM tiene el mensaje.
+  listaRef.current.scrollTop = listaRef.current.scrollHeight;
+}</code></pre>
+
+<div class="danger">
+  <strong>⚠️ Cuándo NO usar <code>flushSync</code>.</strong> Fuerza un render y un commit sincrónicos, tirando abajo el agrupamiento y el sistema de prioridades: es exactamente lo contrario de lo que React quiere hacer. Usarlo en un <code>onChange</code> de un input, o dentro de un loop, es la forma más rápida de convertir una app fluida en una app trabada. Se justifica en tres casos: medir el DOM inmediatamente después de un cambio, integrarte con una librería no-React que exige el DOM actualizado ya, y algún caso de impresión o exportación. Si lo estás usando para "arreglar" un estado que llega tarde, el problema es otro.
+</div>
+
+<h2>RS1.11 Efectos: dónde cae cada uno respecto del commit</h2>
+
+<p>Con el commit desarmado en RS1.4, la tabla de tiempos deja de ser algo para memorizar y pasa a ser algo que se deduce:</p>
+
+<table>
+<thead><tr><th>#</th><th>Momento</th><th>Qué corre</th><th>¿El DOM ya cambió?</th><th>¿Bloquea el pintado?</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Render</td><td>Cuerpo del componente, <code>useMemo</code></td><td>No (es el DOM viejo)</td><td>—</td></tr>
+<tr><td>2</td><td>Commit · insertion</td><td><code>useInsertionEffect</code></td><td>Todavía no</td><td>Sí</td></tr>
+<tr><td>3</td><td>Commit · mutation</td><td>Limpieza de <code>useLayoutEffect</code>, refs a <code>null</code>, mutaciones del DOM</td><td>Durante</td><td>Sí</td></tr>
+<tr><td>4</td><td>Commit · layout</td><td>Refs enganchados, <code>useLayoutEffect</code>, <code>componentDidMount</code></td><td><strong>Sí</strong></td><td><strong>Sí</strong></td></tr>
+<tr><td>5</td><td><strong>El navegador pinta</strong></td><td>—</td><td>Sí</td><td>—</td></tr>
+<tr><td>6</td><td>Pasivo (después del pintado)</td><td>Limpieza de <code>useEffect</code> y <code>useEffect</code></td><td>Sí</td><td><strong>No</strong></td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-jsx">function Orden() {
+  console.log('1 · render');
+
+  useInsertionEffect(() =&gt; { console.log('2 · insertion'); });
+  useLayoutEffect(()   =&gt; { console.log('3 · layout (el DOM ya está, no se pintó)'); });
+  useEffect(()         =&gt; { console.log('4 · pasivo (ya se pintó)'); });
+
+  return &lt;div ref={() =&gt; console.log('3b · ref enganchado')} /&gt;;
+}
+// Consola: 1 · render → 2 · insertion → 3b · ref → 3 · layout → [pintado] → 4 · pasivo</code></pre>
+
+<h3>El caso legítimo de <code>useLayoutEffect</code></h3>
+
+<p>Hay uno solo, en el fondo: <strong>necesitás medir el DOM y ajustarlo antes de que el usuario lo vea</strong>.</p>
+
+<pre><code class="lang-jsx">function Tooltip({ anclaRef, children }) {
+  const tooltipRef = useRef(null);
+  const [arriba, setArriba] = useState(true);
+
+  useLayoutEffect(() =&gt; {
+    const t = tooltipRef.current.getBoundingClientRect();
+    const a = anclaRef.current.getBoundingClientRect();
+    // ¿Entra arriba del ancla, o hay que darlo vuelta?
+    setArriba(a.top - t.height &gt;= 0);
+    // Con useLayoutEffect: el usuario nunca ve la posición equivocada.
+    // Con useEffect: se pinta mal, y en el cuadro siguiente salta. Eso es el "flash".
+  }, [anclaRef, children]);
+
+  return &lt;div ref={tooltipRef} className={arriba ? 'arriba' : 'abajo'}&gt;{children}&lt;/div&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong>Cuándo NO usar <code>useLayoutEffect</code>:</strong> para pedir datos, para suscribirte a algo, para loguear, para sincronizar con una store, o "porque parece más rápido". Corre dentro del bloque sincrónico que bloquea el pintado: cada milisegundo que le metas es un milisegundo de pantalla congelada, y si adentro hacés <code>setState</code>, React tiene que renderizar y commitear <em>otra vez</em> antes de dejar pintar. Además <strong>no corre en el servidor</strong> (React te avisa con un warning en SSR), así que un componente que depende de él para posicionarse va a hidratar distinto — eso es RS4.
+</div>
+
+<div class="info">
+  <code>useInsertionEffect</code> existe casi exclusivamente para librerías de CSS-in-JS: es el único lugar donde se pueden inyectar reglas <code>&lt;style&gt;</code> antes de que alguien mida el layout. No tenés refs disponibles y no deberías tocar el estado. Si no estás escribiendo una librería de estilos, no es para vos.
+</div>
+
+<div class="tip">
+  React 19.2 sumó <code>useEffectEvent</code>, que separa <em>lo que un efecto lee</em> de <em>lo que lo dispara</em>, y elimina buena parte de los arrays de dependencias con valores que no querías como disparadores. No cambia nada de los tiempos de esta tabla; se cubre junto con los patrones de efectos en <strong>RS7</strong>.
+</div>
+
+<h2>RS1.12 Cómo verlo con tus propios ojos</h2>
+
+<p>Todo lo anterior es verificable en tu propia app, en cinco minutos. La herramienta es <strong>React DevTools</strong>, y hay tres cosas que la mayoría de la gente nunca activa.</p>
+
+<div class="step"><strong>1. Highlight updates.</strong> En la pestaña <em>Components</em>, engranaje → <em>General</em> → <strong>"Highlight updates when components render"</strong>. Cada componente que renderiza se dibuja con un borde de color; el color va de azul (poco frecuente) a rojo (muy frecuente). Es la forma más rápida de ver que al tipear en un input se enciende media pantalla. Ojo con la interpretación: <strong>el borde dice "renderizó", no dice "cambió el DOM"</strong> (RS1.6).</div>
+
+<div class="step"><strong>2. Why did this render?</strong> En la pestaña <em>Profiler</em>, engranaje → <em>Profiler</em> → <strong>"Record why each component rendered while profiling"</strong>. Después de grabar, al seleccionar un componente te dice el motivo: <em>"Props changed: (items)"</em>, <em>"Hook 1 changed"</em>, <em>"Context changed"</em> o <em>"The parent component rendered"</em>. Ese último mensaje es el diagnóstico completo del 80% de los problemas de este módulo.</div>
+
+<div class="step"><strong>3. Los commits, no los componentes.</strong> La barra de arriba del Profiler muestra una barra por commit, con su duración. Antes de mirar el flamegraph, mirá esa barra: <strong>¿hay un commit caro, o hay ochenta commits baratos?</strong> Son dos problemas distintos. Uno se arregla haciendo menos trabajo por render; el otro, renderizando menos veces (o agrupando).</div>
+
+<pre><code class="lang-jsx">// Medición programática: el mismo dato que ves en el Profiler, pero en tu código
+import { Profiler } from 'react';
+
+function alRenderizar(id, fase, duracionReal, duracionBase, inicio, commit) {
+  // fase: 'mount' | 'update' | 'nested-update'
+  // duracionReal: cuánto tardó ESTE render (con los bailouts ya aplicados)
+  // duracionBase: cuánto tardaría SIN ningún bailout ni memoización
+  if (duracionReal &gt; 16) {
+    console.warn(`[perf] ${id} · ${fase} · ${duracionReal.toFixed(1)}ms ` +
+                 `(base ${duracionBase.toFixed(1)}ms)`);
+  }
+}
+
+&lt;Profiler id="TablaProductos" onRender={alRenderizar}&gt;
+  &lt;TablaProductos items={items} /&gt;
+&lt;/Profiler&gt;</code></pre>
+
+<div class="tip">
+  <strong>La relación entre <code>duracionReal</code> y <code>duracionBase</code> es la métrica que casi nadie mira, y es la buena.</strong> Si son parecidas, tus bailouts no están sirviendo: React está haciendo todo el trabajo posible. Si <code>duracionReal</code> es mucho menor, la composición está funcionando. Es la forma de responder con un número a "¿este <code>memo</code> hace algo?".
+</div>
+
+<p>Además, <strong>React 19.2</strong> agregó <em>performance tracks</em> propias al panel <em>Performance</em> de Chrome: pistas dedicadas que muestran el planificador y los componentes junto al resto de la línea de tiempo del navegador. Sirve para lo que el Profiler de React no puede mostrarte: cómo se intercala el trabajo de React con el layout, el pintado, la red y el resto del JavaScript de la página.</p>
+
+<div class="warn">
+  <strong>Los números de desarrollo son mentira, pero son mentira útil.</strong> El build de desarrollo es entre 2 y 5 veces más lento, y con StrictMode cada render se cuenta dos veces. Sirven perfectamente para comparar <em>antes y después</em> de un cambio, o para ver <em>qué</em> renderiza. No sirven para prometerle a nadie un número absoluto: eso se mide en un build de producción, con datos reales y en un dispositivo parecido al del usuario.
+</div>
+
+<h2>RS1.13 Cuándo esto importa (y cuándo no)</h2>
+
+<p>Saber internals no es para escribir React más raro. Es para tomar bien tres o cuatro decisiones que después salen caras de revertir:</p>
+
+<div class="step"><strong>1. Dónde vive cada pedazo de estado.</strong> Es la decisión más barata de tomar, la más cara de cambiar después, y la que más determina el rendimiento. Un estado que se actualiza en cada tecla y vive tres niveles más arriba de lo necesario arrastra medio árbol con él. Esto es el 90% de los problemas reales.</div>
+
+<div class="step"><strong>2. La forma del árbol.</strong> Composición con <code>children</code> vs. props que bajan tres niveles. La primera te da bailouts gratis y componentes que se leen solos; la segunda te da <em>prop drilling</em> y renders en cascada.</div>
+
+<div class="step"><strong>3. Qué tiene identidad estable.</strong> Keys derivadas del dato, tipos de componente definidos a nivel de módulo, y <code>key</code> usada a propósito cuando querés reiniciar un subárbol. Esto no es rendimiento: es corrección.</div>
+
+<div class="step"><strong>4. Cuándo no hacer absolutamente nada.</strong> Si un commit tarda 3 ms, cualquier <code>memo</code> que agregues es deuda técnica con interés: complejidad permanente a cambio de cero milisegundos.</div>
+
+<div class="danger">
+  <strong>⚠️ El antipatrón senior más caro es memoizar preventivamente.</strong> "Por las dudas" se paga con memoria retenida, con arrays de dependencias que se desincronizan del cuerpo de la función, con bugs de valores viejos que aparecen una vez cada mil renders, y con revisiones de código donde nadie se anima a tocar nada. Y con el React Compiler (RS3), buena parte de ese trabajo manual queda directamente obsoleto. Medí, encontrá el commit caro, arreglá <em>ese</em>.
+</div>
+
+<h2>🧑‍🎓 Worked Example — "la lista se pone lenta cuando tipeo"</h2>
+
+<blockquote>Un panel de administración tiene un buscador arriba y varias secciones abajo. Escribir en el buscador se siente pegajoso: entre que apretás la tecla y aparece la letra pasan unos 130 ms. El equipo asume que el problema es la tabla de productos, que tiene 800 filas, y propone virtualizarla. ¿Es eso?</blockquote>
+
+<p><strong>Paso 0 — El código, tal como está.</strong></p>
+
+<pre><code class="lang-jsx">function Panel() {
+  const [query, setQuery] = useState('');
+  const [productos] = useState(() =&gt; cargarProductos());   // 800 items
+
+  const visibles = productos.filter(p =&gt;
+    p.nombre.toLowerCase().includes(query.toLowerCase())
+  );
+
+  return (
+    &lt;div className="panel"&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} placeholder="Buscar…" /&gt;
+
+      &lt;GraficoAnual datos={productos} /&gt;      {/* no usa query */}
+      &lt;ResumenDeStock datos={productos} /&gt;    {/* no usa query */}
+      &lt;TablaProductos items={visibles} /&gt;     {/* sí usa query */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<p><strong>Paso 1 — No adivinar: grabar.</strong> Profiler → activar <em>"Record why each component rendered"</em> → grabar → escribir cinco letras → parar.</p>
+
+<pre><code class="lang-text">COMMITS: 5 barras, ~128 ms cada una.  (una por tecla: el batching no aplica,
+                                       son cinco eventos distintos)
+
+Ranked chart del commit #3:
+  ┌───────────────────────────────────────────────────┐
+  │ GraficoAnual        94.1 ms   ← ¿?                │
+  │ TablaProductos      21.6 ms                       │
+  │ ResumenDeStock       9.8 ms   ← ¿?                │
+  │ Panel                2.1 ms                       │
+  │ input                0.2 ms                       │
+  └───────────────────────────────────────────────────┘
+
+"Why did this render?" sobre GraficoAnual:
+  → "The parent component rendered."     ← ⬅️ EL DIAGNÓSTICO
+     (no dice "Props changed", porque `datos` es el mismo array de siempre)</code></pre>
+
+<p><strong>Paso 2 — Leer el resultado.</strong> El 82% del tiempo se va en <code>GraficoAnual</code>, que <strong>no depende del buscador</strong>: recibe <code>productos</code>, un array que no cambió ni una vez. Renderiza porque su padre renderizó, y su padre renderiza porque ahí vive <code>query</code>.</p>
+
+<p>La tabla de 800 filas, la sospechosa original, aporta 21 ms. Virtualizarla —un cambio de una tarde, con dependencias nuevas y riesgo de romper el scroll y la accesibilidad— sacaría 21 de 128 ms. El problema estaba en otro lado.</p>
+
+<div class="rule">
+  <strong>📌 El diagnóstico no es "la lista es lenta". Es "el estado está en el lugar equivocado".</strong> <code>query</code> vive en el ancestro común de todo el panel, así que cada tecla invalida todo el panel. La pregunta correcta no es "¿cómo hago que rendericen menos?", es <strong>"¿cuál es el componente más chico que necesita este estado?"</strong>.
+</div>
+
+<p><strong>Paso 3 — Las tres soluciones, con su costo real.</strong></p>
+
+<pre><code class="lang-jsx">// ── SOLUCIÓN 1: bajar el estado ────────────────────────────────────────
+// El estado se muda al subárbol más chico que lo necesita.
+function Panel() {
+  const [productos] = useState(() =&gt; cargarProductos());
+  return (
+    &lt;div className="panel"&gt;
+      &lt;BuscadorDeProductos productos={productos} /&gt;   {/* query vive ACÁ adentro */}
+      &lt;GraficoAnual datos={productos} /&gt;
+      &lt;ResumenDeStock datos={productos} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+function BuscadorDeProductos({ productos }) {
+  const [query, setQuery] = useState('');
+  const visibles = productos.filter(p =&gt;
+    p.nombre.toLowerCase().includes(query.toLowerCase())
+  );
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} placeholder="Buscar…" /&gt;
+      &lt;TablaProductos items={visibles} /&gt;
+    &lt;/&gt;
+  );
+}
+// Ahora una tecla re-renderiza BuscadorDeProductos y su subárbol. Panel ni se entera:
+// su estado no cambió, así que GraficoAnual y ResumenDeStock ni se visitan.</code></pre>
+
+<pre><code class="lang-jsx">// ── SOLUCIÓN 2: componer con children ──────────────────────────────────
+// query se queda arriba, pero lo caro entra como children desde MÁS arriba.
+function Panel() {
+  const [productos] = useState(() =&gt; cargarProductos());
+  return (
+    &lt;ConBuscador productos={productos}&gt;
+      &lt;GraficoAnual datos={productos} /&gt;
+      &lt;ResumenDeStock datos={productos} /&gt;
+    &lt;/ConBuscador&gt;
+  );
+}
+
+function ConBuscador({ productos, children }) {
+  const [query, setQuery] = useState('');
+  const visibles = productos.filter(p =&gt; p.nombre.includes(query));
+  return (
+    &lt;div className="panel"&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;TablaProductos items={visibles} /&gt;
+      {children}   {/* mismo objeto elemento → bailout → rama cortada */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-jsx">// ── SOLUCIÓN 3: React.memo ─────────────────────────────────────────────
+// No se toca la estructura: se envuelve lo caro y se estabilizan las props.
+const GraficoAnual   = React.memo(function GraficoAnual({ datos }) { /* … */ });
+const ResumenDeStock = React.memo(function ResumenDeStock({ datos }) { /* … */ });
+
+// Y ojo, hay que sostenerlo hacia arriba: cualquier prop nueva tiene que ser estable.
+function Panel() {
+  const [query, setQuery] = useState('');
+  const [productos] = useState(() =&gt; cargarProductos());
+  const rango = useMemo(() =&gt; ({ desde: '2026-01-01', hasta: '2026-12-31' }), []);
+  const onBarra = useCallback((id) =&gt; abrirDetalle(id), []);
+  return (
+    &lt;div className="panel"&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;GraficoAnual datos={productos} rango={rango} onBarra={onBarra} /&gt;
+      &lt;ResumenDeStock datos={productos} /&gt;
+      &lt;TablaProductos items={productos.filter(p =&gt; p.nombre.includes(query))} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<table>
+<thead><tr><th>Opción</th><th>Commit por tecla</th><th>Qué cuesta</th><th>Cómo se degrada</th></tr></thead>
+<tbody>
+<tr><td><strong>1. Bajar el estado</strong></td><td>128 ms → <strong>~6 ms</strong></td><td>Un refactor chico: mover dos componentes y un <code>useState</code></td><td>No se degrada: el grafico está fuera del alcance del estado. Es estructural</td></tr>
+<tr><td><strong>2. Componer con children</strong></td><td>128 ms → ~6 ms</td><td>Un nivel más de indirección; el árbol pasa a tener la forma que pide el rendimiento, no el dominio</td><td>Silenciosamente: el día que alguien "simplifica" y vuelve a poner el JSX en línea, se pierde el bailout sin ningún aviso</td></tr>
+<tr><td><strong>3. <code>React.memo</code></strong></td><td>128 ms → ~8 ms</td><td>Comparación por render + <code>useMemo</code>/<code>useCallback</code> en todo lo que baje; no cubre contextos</td><td>Constantemente: cualquiera que agregue una prop inline lo desarma, y nada falla, solo se pone lento otra vez</td></tr>
+</tbody>
+</table>
+
+<p><strong>Paso 4 — Por qué gana la primera casi siempre.</strong> Las tres bajan de 128 ms a menos de 10. La diferencia no está en el número: está en <em>qué queda escrito</em>.</p>
+
+<div class="step"><strong>Elimina la causa, no el síntoma.</strong> El estado estaba en el lugar equivocado. Las otras dos lo dejan ahí y agregan maquinaria para compensar.</div>
+
+<div class="step"><strong>No agrega costo en tiempo de ejecución.</strong> Cero comparaciones extra, cero memoria retenida, cero arrays de dependencias.</div>
+
+<div class="step"><strong>No se puede romper por accidente.</strong> Un bailout por identidad de elemento y una comparación de props son invisibles en el código: se desarman sin que falle nada. Un estado que vive dentro del componente que lo usa no se desarma solo — habría que <em>mudarlo</em> a propósito.</div>
+
+<div class="step"><strong>El código queda mejor por razones que no son de rendimiento.</strong> <code>BuscadorDeProductos</code> es una unidad con sentido propio: se lee sola, se testea sola, se reusa. Ese es el mejor indicador de que el arreglo era el correcto.</div>
+
+<div class="info">
+  <strong>¿Y si después de mudar el estado la tabla <em>sigue</em> lenta?</strong> Entonces sí tenés un problema de lista, y ahora es un problema <em>distinto</em> y aislado: la respuesta es <code>useDeferredValue</code> o una transición para que el tipeo no espere al filtrado (<strong>RS2</strong>), y virtualización si las filas son miles (<strong>RS7</strong>). Fijate el orden: primero se ubica bien el estado, después se aplican las herramientas. Al revés, terminás virtualizando una tabla que no era el problema.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>¿Por qué la fase de render tiene que ser pura, en términos de la arquitectura y no de "buenas prácticas"?</summary>
+<p>Porque React construye el árbol <em>work in progress</em> en paralelo al que está en pantalla, y se reserva el derecho de <strong>descartarlo y rehacerlo</strong>: si llega una actualización más urgente, si una transición queda obsoleta, o si el trabajo se troceó y algo cambió en el medio. Descartar un árbol es seguro únicamente si construirlo no dejó rastros fuera de React. En el momento en que tu componente incrementa un contador de módulo, dispara un <code>fetch</code>, muta una prop o llama al <code>setState</code> de otro componente, ese render dejó de ser descartable: el rastro queda aunque el resultado se tire. StrictMode duplica el render en desarrollo justamente para que eso se rompa en tu máquina y no en producción.</p></details>
+
+<details><summary>Un componente aparece marcado 40 veces por segundo con "Highlight updates". ¿Es un problema?</summary>
+<p>Todavía no se sabe: <strong>renderizar no es cambiar el DOM</strong>. Ese borde de color dice que React llamó a la función y comparó elementos, no que haya emitido una sola mutación. Si el JSX resultante es igual, el commit para ese nodo es cero trabajo. Lo que hay que mirar es la duración del commit en el Profiler y qué hace el componente <em>durante</em> el render: un <code>filter().sort()</code> sobre miles de items, un <code>JSON.parse</code>, un cálculo por fila. Si el commit tarda 0,4 ms, 40 renders por segundo son 16 ms por segundo: irrelevante. Si tarda 90 ms, el problema no es la cantidad de renders sino lo que cada uno hace.</p></details>
+
+<details><summary>Tenés una lista donde se pueden borrar filas y cada fila tiene un input. ¿Por qué <code>key={index}</code> hace que el texto termine en la fila equivocada?</summary>
+<p>Porque la <code>key</code> es la identidad con la que React empareja los fibers entre renders, y el estado local vive en el fiber. Con el índice como key, la identidad de una fila es <em>su posición</em>. Al borrar la primera de tres, antes había keys 0, 1, 2 y ahora hay 0, 1: para React no desapareció la primera, desapareció <strong>la última</strong>, y las otras dos "cambiaron de contenido". Entonces reutiliza los fibers 0 y 1 —con su <code>memoizedState</code>, es decir con el texto que vos escribiste— y les cambia solo las props. Las props viajan con el dato; el estado, los refs, el foco y el nodo del DOM se quedan en la posición. Con <code>key={item.id}</code> React borra el fiber que corresponde y mueve los otros con su estado intacto.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li><strong>Fiber</strong> convirtió la recursión del reconciliador en un bucle sobre una lista enlazada (<code>child</code>, <code>sibling</code>, <code>return</code>). Eso es lo que permite pausar, retomar, descartar y priorizar el trabajo.</li>
+  <li>Hay <strong>dos árboles</strong> unidos por <code>alternate</code>: el <em>current</em>, que describe la pantalla, y el <em>work in progress</em>, que se está construyendo. Se intercambian en un solo instante, dentro del commit.</li>
+  <li>La fase de <strong>render</strong> es pura, interrumpible y descartable. La de <strong>commit</strong> es sincrónica e imposible de interrumpir. Toda la disciplina de React sale de ahí, y <strong>StrictMode</strong> existe para que las violaciones aparezcan en desarrollo.</li>
+  <li>Un componente re-renderiza por <strong>tres</strong> razones: su estado, su padre, o un contexto que consume. Y <strong>re-renderizar no es cambiar el DOM</strong>: el costo real está en lo que hace cada render, no en cuántos hay.</li>
+  <li>La reconciliación es O(n) gracias a dos heurísticos: <strong>tipo distinto en la misma posición ⇒ se desmonta el subárbol entero</strong> (estado, refs, foco, scroll y nodos incluidos), y las <strong>keys</strong> para la identidad entre hermanos.</li>
+  <li><strong>El estado vive en la terna (posición, tipo, key)</strong>, no "en el componente". De ahí salen el bug del componente definido adentro de otro, el del índice como key, y la técnica de cambiar la <code>key</code> a propósito para reiniciar un subárbol.</li>
+  <li>El <strong>bailout</strong> se apoya en identidad por referencia: mismas props (mismo objeto) y sin trabajo agendado ⇒ no se llama a tu función; si además <code>childLanes</code> está vacío, se corta la rama entera. Componer con <code>children</code> te da ese bailout gratis; <code>React.memo</code> te lo da pagando comparaciones y estabilidad río arriba, y no te protege de los contextos.</li>
+  <li>Desde React 18 el <strong>batching es automático</strong> en todos lados; <code>flushSync</code> es la salida de emergencia y hay que justificarla.</li>
+  <li>Orden de los efectos: <code>useInsertionEffect</code> → mutación del DOM → refs → <code>useLayoutEffect</code> → <strong>pintado</strong> → <code>useEffect</code>. <code>useLayoutEffect</code> bloquea el pintado: solo para medir y ajustar antes de que se vea.</li>
+  <li>Se diagnostica con el <strong>Profiler</strong> (<em>"why did this render"</em>, duración real vs. base) y con las <em>performance tracks</em> de React 19.2 en Chrome. Primero se mira <em>cuántos commits y cuán caros</em>; recién después, el flamegraph.</li>
+  <li>La memoización manual <strong>no</strong> es la respuesta por defecto en 2026: primero el lugar del estado, después la forma del árbol, y el <strong>React Compiler</strong> (RS3) para el resto.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li><strong>Ver los fibers.</strong> En una app tuya, con React DevTools abierto, seleccioná un componente con estado en la pestaña <em>Components</em> y usá <code>$r</code> en la consola. Explorá <code>$r</code> y su fiber: buscá <code>memoizedState</code> y recorré la lista de hooks con <code>.next</code> hasta el final. Contá cuántos hooks tiene y verificá que el orden coincide con el de tu código.</li>
+  <li><strong>Reproducir el bug de las keys.</strong> Escribí la <code>ListaRota</code> de RS1.8 tal cual. Escribí una nota en la tercera fila, borrá la primera y documentá lo que ves. Después cambiá a <code>key={item.id}</code> y comprobá que el problema desaparece. Escribí en dos oraciones, con la palabra "fiber", por qué pasaba.</li>
+  <li><strong>Render sin commit.</strong> Armá un componente que se re-renderice 60 veces por segundo devolviendo siempre el mismo JSX. Activá <em>Paint flashing</em> en Chrome DevTools y grabá el Profiler. Documentá cuántos commits hubo, cuánto duraron y cuántas veces se repintó la pantalla.</li>
+  <li><strong>Cambiar el tipo a mano.</strong> Escribí un formulario con un <code>&lt;input&gt;</code> y un botón que alterne entre <code>&lt;div&gt;&lt;input/&gt;&lt;/div&gt;</code> y <code>&lt;section&gt;&lt;input/&gt;&lt;/section&gt;</code>. Escribí algo, alternalo y anotá qué se pierde exactamente: el valor, el foco, la posición del cursor. Después arreglalo manteniendo la estructura estable.</li>
+  <li><strong>El bailout por composición.</strong> Armá el ejemplo de <code>Contador</code> + <code>ArbolCarisimo</code> de RS1.9 en sus dos versiones (children vs. JSX en línea). Poné un <code>console.count</code> en el árbol caro, hacé diez clicks y compará. Después medilo con <code>&lt;Profiler&gt;</code> y compará <code>duracionReal</code> contra <code>duracionBase</code> en cada versión.</li>
+  <li><strong>El worked example completo.</strong> Reproducí el panel de RS1: un input y tres secciones, una de ellas artificialmente cara (un bucle de unos 80 ms). Perfilá el estado inicial, aplicá <em>las tres</em> soluciones en ramas separadas y armá tu propia tabla con los milisegundos reales de tu máquina. ¿Coinciden los órdenes de magnitud con los del módulo?</li>
+  <li><strong>Orden de los efectos.</strong> Escribí el componente <code>Orden</code> de RS1.11 y verificá la secuencia en la consola. Después agregá un <code>setState</code> adentro del <code>useLayoutEffect</code> y otro adentro del <code>useEffect</code>: grabá el Profiler y explicá por qué uno produce un commit anidado antes del pintado y el otro no.</li>
+  <li><strong>Auditoría en tu propio código.</strong> Elegí la pantalla más pesada de un proyecto real y grabá 5 segundos de interacción con <em>"why did this render"</em> activado. Listá los tres componentes con más tiempo acumulado y, para cada uno, escribí el motivo exacto que reporta DevTools. Para cada motivo "The parent component rendered", proponé dónde debería vivir el estado.</li>
+</ol>
+
+<section class="quiz" id="quizRS1">
+  <style>
+    #quizRS1{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS1 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS1 .q{margin-bottom:1.5rem}
+    #quizRS1 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS1 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS1 .opt:hover{border-color:var(--accent)}
+    #quizRS1 .opt:disabled{cursor:default}
+    #quizRS1 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS1 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS1 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS1 .exp.show{display:block}
+    #quizRS1 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tenés <code>{editando ? &lt;div className="marco"&gt;&lt;input /&gt;&lt;/div&gt; : &lt;input /&gt;}</code>. El usuario escribe algo y recién ahí pasás <code>editando</code> de <code>false</code> a <code>true</code>. ¿Qué pasa con lo que escribió?</p>
+    <button class="opt">Se conserva: es el mismo componente <code>input</code> en las dos ramas</button>
+    <button class="opt">Se pierde: en esa posición del árbol cambió el tipo, así que React desmonta el subárbol y lo vuelve a montar</button>
+    <button class="opt">Se conserva si le ponés una <code>key</code> al <code>&lt;div&gt;</code></button>
+    <div class="exp">La identidad de un nodo es la terna (posición, tipo, key). En la posición 0 antes había un <code>input</code> y ahora hay un <code>div</code>: React aplica el heurístico del tipo, destruye el subárbol viejo —con su estado, sus refs y sus nodos del DOM— y monta uno nuevo. El <code>input</code> resultante es un nodo recién creado: vacío y sin foco. Poner una <code>key</code> no cambia nada, porque el tipo sigue siendo distinto. El arreglo es mantener la estructura estable en las dos ramas y cambiar solo el <code>className</code>.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Envolviste una lista pesada en <code>React.memo</code> y sigue re-renderizando con cada tecla que se escribe en un input del padre. ¿Cuál es la causa más probable?</p>
+    <button class="opt"><code>React.memo</code> solo funciona con componentes de clase</button>
+    <button class="opt">Falta envolver también al padre en <code>React.memo</code></button>
+    <button class="opt">Alguna prop es un objeto, un array o una función creada en línea, así que la comparación superficial siempre da distinto</button>
+    <div class="exp"><code>memo</code> compara las props clave por clave con <code>Object.is</code>. Un <code>{...}</code>, un <code>.filter()</code> o una arrow function escritos en el JSX del padre producen una referencia nueva en cada render, y con eso la comparación falla siempre: <code>memo</code> paga el costo de comparar y no ahorra nada. Los otros dos sospechosos habituales son <code>children</code> como JSX (siempre es un objeto elemento nuevo) y un contexto que cambió, que se salta cualquier <code>memo</code> intermedio. Antes de estabilizar props a mano, preguntate si el estado no debería vivir más abajo — y acordate de que el React Compiler (RS3) existe justamente para no hacer esto a mano.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Necesitás medir el ancho de un tooltip recién montado y darlo vuelta si no entra, sin que el usuario vea el salto. ¿Dónde va esa medición?</p>
+    <button class="opt">En <code>useLayoutEffect</code>: corre después de mutar el DOM y antes del pintado, así que el reposicionamiento no parpadea</button>
+    <button class="opt">En <code>useEffect</code>, que es el recomendado por defecto y corre igual de rápido</button>
+    <button class="opt">En el cuerpo del componente, porque necesitás el valor durante el render</button>
+    <div class="exp"><code>useLayoutEffect</code> corre en la sub-fase de <em>layout</em> del commit: el DOM ya tiene los nodos nuevos, pero el navegador todavía no pintó. Si hacés <code>setState</code> ahí, React vuelve a renderizar y commitear antes de dejar pintar, así que el usuario nunca ve la posición equivocada. Con <code>useEffect</code> la medición ocurre <em>después</em> del pintado: se ve un cuadro con el tooltip mal ubicado y al siguiente salta — el clásico "flash". Y en el cuerpo del componente no sirve: durante el render el DOM todavía es el del árbol <em>current</em>, así que medirías el nodo viejo (o ninguno).</div>
+  </div>
+
+  <div class="score" id="scoreRS1"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS1');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS1').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS2.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../index.html">← React Senior</a>
+  <a href="../rs2-concurrent/lecture.html">RS2: Concurrent React →</a>
+</nav>
+
+</div>
+</body>
+</html>

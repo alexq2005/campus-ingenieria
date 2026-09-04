@@ -1,0 +1,1171 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RNS3 — Animaciones y gestos a 60fps · React Native Senior</title>
+  <meta name="description" content="Por qué una animación salta: qué hilo la ejecuta. useNativeDriver y su techo, worklets de Reanimated, shared values, runOnJS, la física de withSpring, Gesture Handler y composición de gestos, layout animations, reduce motion y cómo medir en qué hilo corre todo.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Native Senior</a>
+  <a href="../../index.html">📱 Curso de React Native</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RNS3</span>
+  <span class="badge">⏱ 50–140 min</span>
+  <span class="badge">🎯 Pre-req: RNS2</span>
+  <span class="badge">✨ Interacción</span>
+</div>
+
+<article>
+
+<h1>RNS3 — Animaciones y gestos a 60fps</h1>
+
+<h2>RNS3.0 Por qué este módulo</h2>
+
+<p>Una animación a 45fps no se ve "un poco más lenta". Se ve <strong>rota</strong>. El ojo humano no cuenta cuadros, pero detecta con una precisión brutal la <em>irregularidad</em>: si de cada tres cuadros uno tarda el doble, no percibís "menos fluidez", percibís un tirón. Y un tirón en el momento en que el usuario tiene el dedo apoyado en la pantalla es de las cosas que más rápido hacen que una app se sienta barata.</p>
+
+<p>Lo desconcertante es que la animación <em>funciona</em>. No hay error, no hay warning, no hay excepción. El código es correcto. Simplemente se ejecuta en el lugar equivocado.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> La calidad de una animación en React Native casi nunca depende de la animación. Depende de <strong>qué hilo la ejecuta</strong>. Si depende del hilo de JavaScript, hereda todo lo que ese hilo tenga que hacer: tu render, tu deserialización de JSON, tu reduce sobre 4.000 elementos. Si corre en el hilo de UI, es indiferente a todo eso. Todo el resto del módulo —worklets, shared values, Gesture Handler— son herramientas para lograr ese traslado.
+</div>
+
+<p>Empecemos por el número. A 60fps tenés <strong>16,67 milisegundos</strong> por cuadro para hacer todo: procesar el toque, calcular la posición nueva, aplicarla a la vista y componer la pantalla. A 120fps —y prácticamente todo gama media/alta desde 2023 tiene panel de 120 Hz— tenés <strong>8,33 ms</strong>.</p>
+
+<pre><code class="lang-tsx">// El presupuesto por cuadro, sin misterio
+const presupuesto = (hz: number) =&gt; 1000 / hz;
+
+presupuesto(60);   // 16.67 ms
+presupuesto(90);   // 11.11 ms
+presupuesto(120);  //  8.33 ms
+
+// Si un frame tarda 20 ms en una pantalla de 60 Hz, no perdés 3,33 ms:
+// perdés el cuadro entero. El sistema muestra el anterior otra vez
+// y el próximo llega a los 33 ms. Un salto visible de 2 cuadros.</code></pre>
+
+<div class="rule">
+  <strong>📌 Los cuadros no se pierden "un poco".</strong> El compositor del sistema operativo tiene una cita fija con la pantalla (el <em>vsync</em>). Si tu contenido no está listo cuando llega esa cita, no se muestra tarde: <strong>no se muestra</strong>. Por eso el costo de pasarse 1 ms del presupuesto es idéntico al de pasarse 15 ms. No hay degradación gradual, hay un umbral.
+</div>
+
+<h2>RNS3.1 El problema de fondo: quién ejecuta tu animación</h2>
+
+<p>Acá hace falta una aclaración de época, porque la explicación que vas a encontrar en la mitad de los blogs describe una arquitectura que ya no existe. Durante años la respuesta canónica era "la animación pasa por el <em>puente</em> y el puente es lento". Con la Nueva Arquitectura —que viste en <strong>RNS1</strong> y es el default desde RN 0.76, con el modo legacy ya eliminado en <strong>RN 0.82</strong>— <strong>el puente no existe</strong>. JSI permite que JavaScript llame funciones nativas de forma sincrónica, sin serializar nada a JSON.</p>
+
+<div class="warn">
+  <strong>Y sin embargo el problema sigue ahí.</strong> Porque nunca fue realmente el puente: era, y es, que <strong>el hilo de JavaScript es uno solo y hace muchas cosas</strong>. Eliminar la serialización bajó el costo de cada cruce, pero no multiplicó el hilo. Si tu animación necesita que JS calcule una posición 60 veces por segundo, y JS está ocupado 120 ms haciendo otra cosa, tu animación se congela 120 ms. Con puente o sin puente.
+</div>
+
+<p>Los hilos que te importan hoy son estos:</p>
+
+<table>
+  <thead>
+    <tr><th>Hilo</th><th>Qué hace</th><th>Quién lo bloquea</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>JS</strong></td><td>Tu código React: render, efectos, handlers, fetch, parseo</td><td>Vos. Un <code>map</code> caro, un JSON grande, un render en cascada</td></tr>
+    <tr><td><strong>UI (main)</strong></td><td>Dibuja las vistas nativas, procesa los toques, corre el compositor</td><td>Medición de layout costosa, imágenes gigantes, vistas nativas pesadas</td></tr>
+    <tr><td><strong>UI runtime</strong> (Reanimated)</td><td>Ejecuta worklets: un segundo runtime de JS <em>montado sobre el hilo de UI</em></td><td>Un worklet lento — y ahí sí bloqueás el dibujo</td></tr>
+    <tr><td><strong>Shadow / background</strong></td><td>Calcula layout con Yoga, arma el árbol de sombra</td><td>Árboles muy profundos, cambios de layout por cuadro</td></tr>
+  </tbody>
+</table>
+
+<p>El experimento que resuelve la discusión en diez segundos es este: bloquear el hilo de JS a propósito y mirar qué le pasa a la animación.</p>
+
+<pre><code class="lang-tsx">// Ponelo detrás de un botón, en desarrollo, y tocalo mientras algo se anima.
+function bloquearJS(ms = 800) {
+  const fin = Date.now() + ms;
+  while (Date.now() &lt; fin) {
+    // ocupación deliberada del hilo de JS
+  }
+}
+
+// Resultado esperado:
+//  · Animación en el hilo de JS  → se CONGELA 800 ms y después salta al final.
+//  · Animación en el hilo de UI  → sigue perfecta. Ni se entera.
+// Esta es la prueba definitiva. No hay opinión posible después de correrla.</code></pre>
+
+<div class="analogy">
+  <strong>La analogía útil.</strong> El hilo de JS es el director de orquesta y el hilo de UI son los músicos. Una animación "en JS" es un director que le marca cada nota a cada músico, uno por uno, sesenta veces por segundo: si el director se distrae atendiendo el teléfono, la música se detiene. Una animación "en UI" es entregarles la partitura y dejarlos tocar. El director puede irse a atender el teléfono, contestar tres mails y volver: la música siguió.
+</div>
+
+<h2>RNS3.2 <code>Animated</code> y <code>useNativeDriver</code>: el techo de la API incluida</h2>
+
+<p>React Native trae su propia API de animaciones, <code>Animated</code>, y trae también la primera solución histórica al problema de los hilos: <code>useNativeDriver: true</code>. Lo que hace es <strong>declarar la animación por adelantado</strong> —origen, destino, duración, curva— y entregársela al lado nativo para que la ejecute sin volver a consultar a JS.</p>
+
+<pre><code class="lang-tsx">import { Animated, Easing } from 'react-native';
+import { useRef, useEffect } from 'react';
+
+export function Aparecer({ children }: { children: React.ReactNode }) {
+  const opacidad = useRef(new Animated.Value(0)).current;
+
+  useEffect(() =&gt; {
+    Animated.timing(opacidad, {
+      toValue: 1,
+      duration: 300,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,     // ← sin esto, cada frame vuelve a JS
+    }).start();
+  }, [opacidad]);
+
+  return &lt;Animated.View style={{ opacity: opacidad }}&gt;{children}&lt;/Animated.View&gt;;
+}</code></pre>
+
+<p>Con <code>useNativeDriver: true</code>, JS dice una vez "llevá esta opacidad de 0 a 1 en 300 ms con esta curva" y se desentiende. Es una animación en el hilo de UI, y es genuinamente buena para lo que cubre. El problema es <em>qué</em> cubre.</p>
+
+<h3>Qué propiedades acepta el driver nativo (y por qué)</h3>
+
+<table>
+  <thead>
+    <tr><th>Propiedad</th><th>¿Driver nativo?</th><th>Por qué</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>opacity</code></td><td>✅ Sí</td><td>Es una propiedad de composición. La GPU la aplica sin recalcular nada</td></tr>
+    <tr><td><code>transform</code>: <code>translateX/Y</code>, <code>scale</code>, <code>rotate</code>, <code>skew</code>, <code>perspective</code></td><td>✅ Sí</td><td>Es una matriz aplicada a una capa ya dibujada. No cambia el layout</td></tr>
+    <tr><td><code>width</code>, <code>height</code></td><td>❌ No</td><td>Cambian el tamaño de la caja → hay que <strong>recalcular el layout</strong> del árbol</td></tr>
+    <tr><td><code>top</code>, <code>left</code>, <code>right</code>, <code>bottom</code></td><td>❌ No</td><td>Ídem: son propiedades de layout, no de composición</td></tr>
+    <tr><td><code>margin*</code>, <code>padding*</code>, <code>flex</code>, <code>gap</code></td><td>❌ No</td><td>Ídem, y encima afectan a los hermanos</td></tr>
+    <tr><td><code>backgroundColor</code>, <code>borderColor</code></td><td>⚠️ Depende</td><td>Algunas versiones lo soportan; no lo des por hecho sin probarlo en tu versión</td></tr>
+  </tbody>
+</table>
+
+<div class="concept">
+  <strong>💡 La regla detrás de la tabla.</strong> El corte no es arbitrario ni es una limitación de React Native: es la misma frontera que existe en la web entre propiedades que disparan <em>layout</em> y propiedades que solo disparan <em>composite</em>. <code>transform</code> y <code>opacity</code> se aplican sobre una capa ya renderizada — la GPU la mueve, la escala o le baja el alfa sin preguntar nada. <code>width</code> obliga a preguntar de nuevo <em>cuánto mide todo lo demás</em>: Yoga tiene que recorrer el árbol, recolocar hermanos, quizá reflowear texto. Eso no es una operación de GPU, es trabajo de CPU sobre una estructura de datos, y no se puede empaquetar y mandar al hilo de UI de forma trivial.
+</div>
+
+<p>Si te olvidás la bandera y animás una propiedad de layout, el fallo es explícito:</p>
+
+<pre><code class="lang-tsx">Animated.timing(altura, {
+  toValue: 200,
+  duration: 300,
+  useNativeDriver: true,     // 💥 explota en runtime
+}).start();
+
+// Error: Style property 'height' is not supported by native animated module
+
+// El "arreglo" que hace todo el mundo — y que es el bug:
+useNativeDriver: false      // ← ahora sí anda... a 30fps y bloqueándose
+                            //    cada vez que el hilo de JS esté ocupado</code></pre>
+
+<div class="mistake">
+  <strong>El antipatrón más común de todos.</strong> Poner <code>useNativeDriver: false</code> para silenciar el error. No silenciaste nada: aceptaste que <em>cada cuadro</em> vuelva al hilo de JS a preguntar el valor siguiente. La solución correcta casi siempre es <strong>reformular la animación en términos de <code>transform</code></strong> — <code>scaleY</code> en vez de <code>height</code>, <code>translateX</code> en vez de <code>left</code>— o, si de verdad necesitás animar layout, usar Reanimated, que puede hacerlo comprometiendo el árbol de sombra desde el hilo de UI. Sigue costando más que un transform, pero al menos no depende de que JS esté libre.
+</div>
+
+<p><code>Animated.event</code> permite además atar un gesto o un scroll directamente a un valor animado, también sin pasar por JS:</p>
+
+<pre><code class="lang-tsx">const scrollY = useRef(new Animated.Value(0)).current;
+
+const onScroll = Animated.event(
+  [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+  { useNativeDriver: true },
+);
+
+// &lt;Animated.ScrollView onScroll={onScroll} scrollEventThrottle={16} /&gt;</code></pre>
+
+<div class="info">
+  <strong>Entonces, ¿<code>Animated</code> sirve o no sirve?</strong> Sirve, y no requiere ninguna dependencia. Para <em>animaciones declarativas simples y disparadas por estado</em> —un fade in, un modal que entra, un botón que hace <code>scale</code> al presionarse— es perfectamente adecuada y una dependencia menos. Su techo aparece cuando la animación tiene que <strong>seguir a un gesto de forma continua</strong>, cuando necesitás lógica condicional por cuadro, o cuando tenés que combinar varios valores derivados entre sí. Ahí empieza Reanimated.
+</div>
+
+<h2>RNS3.3 Worklets: el concepto central de Reanimated</h2>
+
+<p>Reanimated resuelve el problema de raíz con una idea más ambiciosa que "declarar la animación por adelantado": <strong>crear un segundo runtime de JavaScript que viva en el hilo de UI</strong>. No un truco, no un intérprete de expresiones limitado: un runtime de Hermes completo, con su propio heap y su propio contexto global, corriendo sobre el hilo que dibuja.</p>
+
+<p>Un <strong>worklet</strong> es una función marcada para ejecutarse en ese runtime.</p>
+
+<pre><code class="lang-tsx">function calcularEscala(distancia: number) {
+  'worklet';                      // ← la marca. El plugin de Babel la ve
+  const k = 1 - Math.abs(distancia) / 600;
+  return Math.max(0.85, Math.min(1, k));
+}</code></pre>
+
+<p>La directiva <code>'worklet'</code> no es una convención decorativa: el plugin de Babel de Reanimated la detecta en tiempo de compilación y <strong>reescribe la función</strong> para que su código y las variables que captura puedan copiarse al otro runtime. Por eso el plugin tiene que ir <strong>último</strong> en la lista de plugins de Babel — es un requisito, no una recomendación.</p>
+
+<pre><code class="lang-tsx">// babel.config.js
+module.exports = {
+  presets: ['babel-preset-expo'],
+  plugins: [
+    // ...otros plugins...
+    'react-native-worklets/plugin',   // ← SIEMPRE el último
+  ],
+};
+
+// Si ves "Reanimated: worklet is not a function" o valores que no
+// se actualizan nunca, revisá esto antes que cualquier otra cosa.
+// En Reanimated 3.x el plugin se llamaba 'react-native-reanimated/plugin'.</code></pre>
+
+<div class="warn">
+  <strong>Versiones, 2026.</strong> <strong>Reanimated 3.5.1+</strong> y <strong>Gesture Handler 2.16.2+</strong> son los pisos de compatibilidad con la Nueva Arquitectura. <strong>Reanimated 4</strong> ya <em>exige</em> Nueva Arquitectura —no corre en la legacy— y movió el motor de worklets a un paquete aparte, <code>react-native-worklets</code>, que se instala junto. La API que ves en este módulo (<code>useSharedValue</code>, <code>useAnimatedStyle</code>, <code>withTiming</code>) es la misma en ambas mayores; lo que cambia es el nombre del plugin de Babel y algunas funciones periféricas. Fijá versiones exactas y leé el changelog de la mayor antes de subir.
+</div>
+
+<p>La mayoría de los worklets no los escribís explícitamente: los hooks de Reanimated convierten en worklet la función que les pasás. Podés verificar dónde está corriendo tu código con la variable global <code>_WORKLET</code>:</p>
+
+<pre><code class="lang-tsx">const estilo = useAnimatedStyle(() =&gt; {
+  console.log('¿corro en el UI runtime?', global._WORKLET);  // true
+  return { transform: [{ translateX: x.value }] };
+});
+
+// En un handler normal de React → undefined (estás en el runtime de JS).
+// Es la forma más barata de comprobar una sospecha.</code></pre>
+
+<h3>La consecuencia que hay que entender: dos memorias separadas</h3>
+
+<p>El worklet no <em>referencia</em> las variables de tu componente. Las <strong>copia</strong> al otro runtime en el momento en que se crea. Son dos heaps distintos: no hay memoria compartida entre el runtime de JS y el runtime de UI, salvo por un mecanismo explícito que vemos en la sección siguiente.</p>
+
+<pre><code class="lang-tsx">function Roto() {
+  let contador = 0;                        // variable JS común
+
+  const tap = Gesture.Tap().onEnd(() =&gt; {
+    'worklet';
+    contador += 1;                         // ← incrementa la COPIA del UI runtime
+    console.log(contador);                 // sube: 1, 2, 3...
+  });
+
+  // ...pero acá, en el runtime de JS, `contador` sigue valiendo 0 para siempre.
+  // Y si el componente re-renderiza, se crea un worklet NUEVO con una copia
+  // nueva desde 0. No hay error, no hay warning: simplemente miente.
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Todo estado que cruza la frontera de hilos tiene que ser un <em>shared value</em>.</strong> Una variable común capturada por un worklet es una foto congelada, no un enlace. Este es el origen de la clase entera de bugs "el valor no se actualiza" en Reanimated, y es la razón por la que existe <code>useSharedValue</code>.
+</div>
+
+<h2>RNS3.4 Shared values: el estado que viven los dos hilos</h2>
+
+<p>Un <strong>shared value</strong> es una caja que ambos runtimes pueden leer y escribir. Se crea con <code>useSharedValue</code> y se accede siempre por <code>.value</code>.</p>
+
+<pre><code class="lang-tsx">import Animated, {
+  useSharedValue, useAnimatedStyle, withTiming, useDerivedValue,
+} from 'react-native-reanimated';
+
+function Panel() {
+  const abierto  = useSharedValue(0);   // 0 = cerrado, 1 = abierto
+
+  const estilo = useAnimatedStyle(() =&gt; ({
+    opacity: abierto.value,
+    transform: [{ translateY: (1 - abierto.value) * 24 }],
+  }));
+
+  return (
+    &lt;&gt;
+      &lt;Pressable onPress={() =&gt; { abierto.value = withTiming(1, { duration: 220 }); }}&gt;
+        &lt;Text&gt;Abrir&lt;/Text&gt;
+      &lt;/Pressable&gt;
+      &lt;Animated.View style={estilo} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p>Lo importante de este código es lo que <strong>no</strong> tiene: no hay <code>useState</code>, no hay re-render. Escribir <code>abierto.value</code> no dispara ningún ciclo de React. El <code>useAnimatedStyle</code> queda suscrito a los shared values que lee, y cuando alguno cambia, el estilo se recalcula <strong>en el hilo de UI</strong> y se aplica directamente a la vista nativa.</p>
+
+<div class="concept">
+  <strong>💡 Reanimated no anima React: lo esquiva.</strong> El árbol de React se renderiza una vez y queda quieto. Los valores que cambian sesenta veces por segundo viven fuera de React, en un canal paralelo que va directo a la vista nativa. Por eso una animación de Reanimated puede correr sobre una pantalla con doscientos componentes montados sin costo adicional: React ni se entera de que está pasando.
+</div>
+
+<h3><code>useDerivedValue</code>: valores que dependen de otros valores</h3>
+
+<p>Cuando necesitás un valor calculado a partir de otros, y ese cálculo lo consume más de un lugar, <code>useDerivedValue</code> lo memoriza en el UI runtime:</p>
+
+<pre><code class="lang-tsx">const x = useSharedValue(0);
+
+// Se recalcula solo cuando x cambia, una vez por cuadro, no por consumidor.
+const progreso = useDerivedValue(() =&gt; {
+  'worklet';
+  return Math.min(1, Math.abs(x.value) / ANCHO_PANTALLA);
+});
+
+const sombra  = useAnimatedStyle(() =&gt; ({ opacity: progreso.value * 0.4 }));
+const escala  = useAnimatedStyle(() =&gt; ({ transform: [{ scale: 1 - progreso.value * 0.1 }] }));</code></pre>
+
+<div class="tip">
+  <strong>Cuándo NO usar <code>useDerivedValue</code>.</strong> Si el cálculo lo consume un solo <code>useAnimatedStyle</code>, ponelo adentro y listo: un derived value de más es un nodo de más en el grafo de dependencias. La regla práctica es la misma que con <code>useMemo</code> en React — se justifica cuando hay varios consumidores o cuando el cálculo es realmente caro, no "por prolijidad".
+</div>
+
+<h3>Leer un shared value desde React</h3>
+
+<p>Tarde o temprano necesitás mostrar en la UI algo que vive en el UI runtime: el índice actual de un carrusel, por ejemplo. La forma correcta es <code>useAnimatedReaction</code>, que observa un valor y reacciona solo cuando <em>realmente</em> cambia lo que te interesa:</p>
+
+<pre><code class="lang-tsx">const [indice, setIndice] = useState(0);
+
+useAnimatedReaction(
+  () =&gt; Math.round(-x.value / ANCHO),        // qué observo (worklet)
+  (actual, anterior) =&gt; {                    // qué hago cuando cambia (worklet)
+    if (actual !== anterior) {
+      runOnJS(setIndice)(actual);            // ← 1 vez por cambio de tarjeta,
+    }                                        //   no 60 veces por segundo
+  },
+);</code></pre>
+
+<h2>RNS3.5 Cruzar la frontera: <code>runOnJS</code> y <code>runOnUI</code></h2>
+
+<p>Los dos runtimes están aislados, así que llamar de uno al otro necesita un cruce explícito. Hay dos direcciones:</p>
+
+<table>
+  <thead>
+    <tr><th>Función</th><th>Dirección</th><th>Uso típico</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>runOnJS(fn)(args)</code></td><td>UI → JS</td><td>Navegar, <code>setState</code>, disparar un fetch, feedback háptico</td></tr>
+    <tr><td><code>runOnUI(fn)()</code></td><td>JS → UI</td><td>Arrancar una animación imperativa desde un handler común</td></tr>
+  </tbody>
+</table>
+
+<p>Ambos son <strong>asincrónicos</strong>: encolan el trabajo en el otro hilo y vuelven. No devuelven el resultado de la función y no podés esperarlos. Y cada cruce tiene un costo: hay que copiar los argumentos entre heaps y despertar al otro hilo.</p>
+
+<pre><code class="lang-tsx">// ❌ El error clásico: setState desde un worklet, en cada cuadro
+const pan = Gesture.Pan().onUpdate((e) =&gt; {
+  'worklet';
+  x.value = e.translationX;
+  runOnJS(setPosicion)(e.translationX);   // 💥 60 renders de React por segundo
+});</code></pre>
+
+<p>Ese <code>runOnJS</code> convierte una animación que corría perfecta en el hilo de UI en una animación que <em>además</em> martilla al hilo de JS con sesenta ciclos de render por segundo. Y como el hilo de JS se satura, todo lo demás de la app —incluidos los toques que React tiene que procesar— empieza a llegar tarde. La animación en sí sigue fluida (vive en UI), pero la app se siente trabada. Es el peor de los diagnósticos: el síntoma aparece lejos de la causa.</p>
+
+<pre><code class="lang-tsx">// ✅ Correcto: cruzar en los bordes del gesto, no en el medio
+const pan = Gesture.Pan()
+  .onStart(() =&gt; {
+    'worklet';
+    inicio.value = x.value;
+  })
+  .onUpdate((e) =&gt; {
+    'worklet';
+    x.value = inicio.value + e.translationX;   // solo UI. Cero cruces.
+  })
+  .onEnd((e) =&gt; {
+    'worklet';
+    x.value = withDecay({ velocity: e.velocityX, clamp: [MIN, MAX] });
+    runOnJS(registrarSwipe)(e.velocityX);      // 1 cruce por gesto completo
+  });</code></pre>
+
+<div class="rule">
+  <strong>📌 Regla de los bordes.</strong> Los cruces de hilo van en <code>onStart</code> y <code>onEnd</code> — nunca en <code>onUpdate</code>. Un gesto de dos segundos son ~120 <code>onUpdate</code> y exactamente 2 bordes. Si necesitás avisarle a React de algo intermedio, hacelo con <code>useAnimatedReaction</code> sobre una condición discreta (cambió de página, cruzó un umbral), que dispara una vez por transición y no una vez por cuadro.
+</div>
+
+<p>En la dirección contraria, <code>runOnUI</code> te deja empujar trabajo al UI runtime desde un handler normal:</p>
+
+<pre><code class="lang-tsx">function sacudir() {
+  runOnUI(() =&gt; {
+    'worklet';
+    offset.value = withSequence(
+      withTiming(-8, { duration: 50 }),
+      withRepeat(withTiming(8, { duration: 100 }), 3, true),
+      withTiming(0,  { duration: 50 }),
+    );
+  })();                                   // ← ojo: se invoca dos veces
+}</code></pre>
+
+<div class="info">
+  En la práctica casi nunca necesitás <code>runOnUI</code>: asignar directamente <code>offset.value = withTiming(...)</code> desde el hilo de JS ya funciona, porque Reanimated se encarga del traslado. <code>runOnUI</code> se justifica cuando querés que <strong>varias</strong> operaciones ocurran juntas en el mismo cuadro del UI runtime, sin quedar partidas entre dos cuadros distintos.
+</div>
+
+<h2>RNS3.6 <code>withTiming</code>, <code>withSpring</code>, <code>withDecay</code>: elegir, no copiar</h2>
+
+<p>Reanimated tiene tres motores de animación, y la diferencia entre ellos no es estética: cada uno modela un fenómeno físico distinto y por eso "se siente" bien en contextos distintos.</p>
+
+<table>
+  <thead>
+    <tr><th>Motor</th><th>Modelo</th><th>Se siente natural para</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>withTiming</code></td><td>Duración fija + curva de easing</td><td>Cambios de estado sin gesto: fade, expandir, aparecer un modal</td></tr>
+    <tr><td><code>withSpring</code></td><td>Masa, resorte y amortiguación reales</td><td>Todo lo que responde a un dedo: soltar una tarjeta, snap a una posición</td></tr>
+    <tr><td><code>withDecay</code></td><td>Fricción sobre una velocidad inicial</td><td>Inercia: soltar con impulso y dejar que frene solo</td></tr>
+  </tbody>
+</table>
+
+<h3><code>withTiming</code>: cuando vos decidís cuánto dura</h3>
+
+<pre><code class="lang-tsx">import { withTiming, Easing } from 'react-native-reanimated';
+
+opacidad.value = withTiming(1, {
+  duration: 250,
+  easing: Easing.bezier(0.25, 0.1, 0.25, 1),   // ease estándar
+});
+
+// Curvas y para qué sirven:
+// Easing.out(Easing.cubic)   → entra rápido y frena. Para cosas que APARECEN.
+// Easing.in(Easing.cubic)    → arranca lento y acelera. Para cosas que SE VAN.
+// Easing.inOut(Easing.cubic) → simétrica. Para cosas que se MUEVEN de A a B.
+// Easing.linear              → mecánico. Solo para rotaciones infinitas.</code></pre>
+
+<div class="tip">
+  <strong>Duraciones que funcionan.</strong> 150–200 ms para micro-interacciones (un botón que responde), 250–300 ms para transiciones de elementos dentro de la pantalla, 300–400 ms para entradas y salidas de pantalla completa. Arriba de 500 ms la animación deja de ser retroalimentación y pasa a ser espera: el usuario ya sabe lo que va a pasar y tu app le está haciendo mirar cómo pasa.
+</div>
+
+<h3><code>withSpring</code>: la física que sí conviene entender</h3>
+
+<p>La razón por la que casi todo el mundo copia y pega parámetros de spring es que parecen arbitrarios. No lo son: son los tres coeficientes de la ecuación del oscilador armónico amortiguado, y con una sola fórmula podés predecir cómo se va a ver la animación antes de correrla.</p>
+
+<pre><code class="lang-tsx">x.value = withSpring(destino, {
+  mass: 1,          // inercia: cuánto "pesa" el objeto
+  stiffness: 100,   // rigidez del resorte: cuánto tira hacia el destino
+  damping: 10,      // amortiguación: cuánto se opone al movimiento (el freno)
+
+  overshootClamping: false,        // true = prohibido pasarse del destino
+  restDisplacementThreshold: 0.01, // qué tan cerca es "llegó"
+  restSpeedThreshold: 2,           // qué tan lento es "se detuvo"
+});</code></pre>
+
+<p>El único número que importa de verdad es el <strong>factor de amortiguación</strong>, ζ (zeta), que combina los tres:</p>
+
+<pre><code class="lang-tsx">// ζ = damping / (2 · √(stiffness · mass))
+const zeta = (damping: number, stiffness: number, mass = 1) =&gt;
+  damping / (2 * Math.sqrt(stiffness * mass));
+
+zeta(10, 100);   // 0.50 → los valores por defecto de Reanimated: rebota bastante
+zeta(15, 100);   // 0.75 → un rebote apenas perceptible. El más usado en producto
+zeta(20, 100);   // 1.00 → crítico: llega lo más rápido posible SIN pasarse
+zeta(30, 100);   // 1.50 → sobreamortiguado: llega lento, se siente pesado</code></pre>
+
+<table>
+  <thead>
+    <tr><th>ζ</th><th>Régimen</th><th>Cómo se percibe</th><th>Dónde usarlo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>&lt; 0,4</td><td>Muy subamortiguado</td><td>Rebota varias veces, "de juguete"</td><td>Juegos, celebraciones, onboarding lúdico</td></tr>
+    <tr><td>0,5 – 0,8</td><td>Subamortiguado</td><td>Un rebote sutil: se siente <em>vivo</em></td><td>Soltar una tarjeta, snap de carrusel, bottom sheet</td></tr>
+    <tr><td>≈ 1,0</td><td>Crítico</td><td>Directo y firme, sin oscilación</td><td>Cerrar un modal, volver a posición, cosas serias</td></tr>
+    <tr><td>&gt; 1,2</td><td>Sobreamortiguado</td><td>Pesado, casi lánguido</td><td>Elementos grandes, paneles de mucha superficie</td></tr>
+  </tbody>
+</table>
+
+<p>Y la otra intuición: <code>stiffness</code> gobierna la <em>velocidad</em> y <code>mass</code> la <em>inercia</em>. Si subís <code>stiffness</code> tenés que subir <code>damping</code> proporcionalmente a la raíz para conservar la misma sensación — por eso "acelerar" un spring cambiando un solo número casi siempre lo arruina.</p>
+
+<pre><code class="lang-tsx">// La API moderna te deja saltear la aritmética por completo:
+x.value = withSpring(destino, { duration: 500, dampingRatio: 0.7 });
+
+// Y el detalle que separa un swipe bueno de uno mediocre:
+// pasarle la velocidad REAL del dedo al soltar.
+.onEnd((e) =&gt; {
+  'worklet';
+  x.value = withSpring(destinoSnap, {
+    velocity: e.velocityX,        // ← el resorte CONTINÚA el movimiento del dedo
+    damping: 18, stiffness: 140,
+  });
+})
+
+// Sin `velocity`, la tarjeta se detiene en seco al levantar el dedo y
+// después arranca de nuevo. Se percibe como un corte, aunque no sepas por qué.</code></pre>
+
+<h3><code>withDecay</code>: inercia pura</h3>
+
+<pre><code class="lang-tsx">.onEnd((e) =&gt; {
+  'worklet';
+  x.value = withDecay({
+    velocity: e.velocityX,
+    deceleration: 0.997,        // 0.998 ≈ scroll de iOS; más bajo = frena antes
+    clamp: [-anchoMaximo, 0],   // límites duros
+    rubberBandEffect: true,     // resistencia elástica al pasarse del límite
+    rubberBandFactor: 0.6,
+  });
+});</code></pre>
+
+<div class="tip">
+  <strong>La combinación que se siente cara:</strong> <code>withDecay</code> para el impulso libre y <code>withSpring</code> para el <em>snap</em> a una posición concreta. Un carrusel con páginas usa spring (querés que caiga en una página); una lista con desplazamiento libre usa decay (querés que frene donde el impulso la deje). Elegir mal acá es la diferencia entre "se siente nativo" y "se siente web".
+</div>
+
+<h2>RNS3.7 Gesture Handler: por qué <code>PanResponder</code> no alcanza</h2>
+
+<p>React Native trae <code>PanResponder</code>, y tiene un defecto que ninguna cantidad de código propio arregla: <strong>los eventos de toque llegan al hilo de JS</strong>. Cada movimiento del dedo se convierte en una llamada a tu handler de JS, con lo cual el gesto entero hereda la salud de ese hilo. Si JS está ocupado, el gesto se atrasa.</p>
+
+<p>Peor: la decisión de <em>quién se queda con el gesto</em> —el scroll de la lista o tu componente arrastrable— también se toma en JS, un cuadro tarde, cuando el sistema nativo de reconocimiento ya tomó su decisión. Ahí nacen los conflictos irresolubles.</p>
+
+<div class="rule">
+  <strong>📌 Gesture Handler no es "un PanResponder mejor".</strong> Es un binding al <strong>sistema nativo de reconocimiento de gestos</strong> de cada plataforma — <code>UIGestureRecognizer</code> en iOS, el sistema de touch de Android. Los gestos se reconocen, compiten entre sí y se resuelven en el hilo nativo, con las mismas reglas que usan las apps nativas. Y sus callbacks son worklets, así que corren en el UI runtime. El toque nunca toca el hilo de JS.
+</div>
+
+<pre><code class="lang-tsx">// El setup obligatorio: la raíz de la app tiene que ser GestureHandlerRootView
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+
+export default function App() {
+  return (
+    &lt;GestureHandlerRootView style={{ flex: 1 }}&gt;
+      &lt;Navegacion /&gt;
+    &lt;/GestureHandlerRootView&gt;
+  );
+}
+
+// Si te olvidás: en Android los gestos simplemente NO responden, sin error.
+// Es el primer lugar donde mirar cuando "funciona en iOS pero no en Android".</code></pre>
+
+<pre><code class="lang-tsx">import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, { useSharedValue, useAnimatedStyle, withSpring } from 'react-native-reanimated';
+
+function Arrastrable() {
+  const x = useSharedValue(0);
+  const y = useSharedValue(0);
+  const ini = useSharedValue({ x: 0, y: 0 });
+
+  const pan = Gesture.Pan()
+    .onStart(() =&gt; { ini.value = { x: x.value, y: y.value }; })
+    .onUpdate((e) =&gt; {
+      x.value = ini.value.x + e.translationX;
+      y.value = ini.value.y + e.translationY;
+    })
+    .onEnd(() =&gt; {
+      x.value = withSpring(0);
+      y.value = withSpring(0);
+    });
+
+  const estilo = useAnimatedStyle(() =&gt; ({
+    transform: [{ translateX: x.value }, { translateY: y.value }],
+  }));
+
+  return (
+    &lt;GestureDetector gesture={pan}&gt;
+      &lt;Animated.View style={[styles.caja, estilo]} /&gt;
+    &lt;/GestureDetector&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>El envoltorio directo de <code>GestureDetector</code> debe ser una vista.</strong> Si adentro ponés un fragmento, un componente que devuelve <code>null</code> en algún caso, o un componente que no reenvía la ref, el gesto no se adjunta a nada. En iOS puede parecer que funciona por herencia de toques; en Android no.
+</div>
+
+<h3>Composición: <code>Race</code>, <code>Simultaneous</code>, <code>Exclusive</code></h3>
+
+<p>Un componente real casi nunca tiene un solo gesto. Gesture Handler te deja combinarlos declarativamente, y las tres formas de combinar responden a tres preguntas distintas:</p>
+
+<table>
+  <thead>
+    <tr><th>Composición</th><th>Semántica</th><th>Ejemplo canónico</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Gesture.Race(a, b)</code></td><td>Compiten; el primero que se activa <strong>cancela</strong> al otro</td><td>Arrastrar <em>o</em> hacer scroll: uno de los dos, nunca los dos</td></tr>
+    <tr><td><code>Gesture.Simultaneous(a, b)</code></td><td>Corren <strong>a la vez</strong>, ambos reciben eventos</td><td>Pinch + rotate + pan en un visor de imágenes</td></tr>
+    <tr><td><code>Gesture.Exclusive(a, b)</code></td><td>Prioridad fija: <code>b</code> solo se activa si <code>a</code> <strong>falla</strong></td><td>Doble tap tiene prioridad sobre tap simple</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="lang-tsx">// Visor de imágenes: zoom, rotación y desplazamiento simultáneos
+const pinch = Gesture.Pinch().onUpdate((e) =&gt; { escala.value = base.value * e.scale; });
+const rot   = Gesture.Rotation().onUpdate((e) =&gt; { angulo.value = baseAng.value + e.rotation; });
+const arr   = Gesture.Pan().onUpdate((e) =&gt; { x.value = iniX.value + e.translationX; });
+
+const combinado = Gesture.Simultaneous(pinch, rot, arr);
+
+// Doble tap para zoom, tap simple para abrir: Exclusive resuelve la ambigüedad
+const doble  = Gesture.Tap().numberOfTaps(2).onEnd(() =&gt; { escala.value = withSpring(2); });
+const simple = Gesture.Tap().onEnd(() =&gt; { runOnJS(abrirDetalle)(); });
+
+const taps = Gesture.Exclusive(doble, simple);
+// Sin Exclusive, el tap simple se dispararía SIEMPRE, y además dos veces
+// al hacer doble tap. Con Exclusive, el simple espera a que el doble falle
+// (~200 ms) antes de activarse.</code></pre>
+
+<div class="info">
+  Ese "~200 ms de espera" no es gratis: el tap simple se siente levemente perezoso. Por eso las apps buenas usan <code>Exclusive</code> solo donde el doble tap existe de verdad. Si en esa zona no hay doble tap, no pongas la espera — la latencia percibida en un tap es de las cosas que más rápido se notan.
+</div>
+
+<h3>El conflicto clásico: gesto vs. scroll</h3>
+
+<p>Una tarjeta arrastrable horizontalmente dentro de una lista que scrollea verticalmente. Es el caso que rompe todas las implementaciones caseras, y en Gesture Handler se resuelve declarando <strong>desde qué umbral</strong> tu gesto se considera intencional:</p>
+
+<pre><code class="lang-tsx">const swipe = Gesture.Pan()
+  // Solo me activo si el dedo se movió 10 px en horizontal.
+  .activeOffsetX([-10, 10])
+  // Y me RINDO si antes se movió 12 px en vertical: eso era scroll.
+  .failOffsetY([-12, 12]);
+
+// El orden importa conceptualmente:
+//   activeOffsetX = "esto sí es lo mío"
+//   failOffsetY   = "esto claramente no es lo mío, dejalo pasar"
+// Sin failOffsetY, un swipe diagonal secuestra el scroll y la lista
+// se traba a mitad de camino. Es EXACTAMENTE el bug que hace que una
+// app se sienta rota sin que nadie sepa explicar por qué.</code></pre>
+
+<pre><code class="lang-tsx">// Cuando necesitás que tu gesto y un componente nativo scrollable
+// convivan, referenciás el gesto nativo explícitamente:
+const scrollRef = useAnimatedRef&lt;Animated.ScrollView&gt;();
+
+const pan = Gesture.Pan()
+  .simultaneousWithExternalGesture(scrollRef)   // conviven
+  // .blocksExternalGesture(scrollRef)          // el mío gana y bloquea al scroll
+  // .requireExternalGestureToFail(scrollRef)   // el mío espera a que el scroll falle
+  .onUpdate((e) =&gt; { x.value = e.translationX; });</code></pre>
+
+<div class="mistake">
+  <strong>Lo que NO hay que hacer.</strong> Resolver el conflicto midiendo ángulos a mano en <code>onUpdate</code> y decidiendo con <code>if</code>s si "esto era scroll". Llegás tarde por diseño: cuando tu primer <code>onUpdate</code> se ejecuta, el reconocedor nativo del scroll ya tomó su decisión. <code>activeOffsetX</code> / <code>failOffsetY</code> se evalúan <em>dentro</em> del sistema de reconocimiento, antes de que ninguno de los dos gane. Es la diferencia entre participar de la negociación y quejarse después.
+</div>
+
+<h2>RNS3.8 Interpolación y efectos ligados al scroll</h2>
+
+<p><code>interpolate</code> mapea un rango de entrada a un rango de salida. Es la herramienta que convierte "cuánto se movió el dedo" o "cuánto scrolleó" en cualquier propiedad visual.</p>
+
+<pre><code class="lang-tsx">import { interpolate, Extrapolation } from 'react-native-reanimated';
+
+const estilo = useAnimatedStyle(() =&gt; {
+  const opacidad = interpolate(
+    x.value,                    // valor de entrada
+    [0, 100, 200],              // puntos de entrada
+    [1, 0.5, 0],                // puntos de salida (mismo largo)
+    Extrapolation.CLAMP,        // qué pasa FUERA del rango
+  );
+  return { opacity: opacidad };
+});
+
+// Extrapolation.CLAMP    → se queda en el borde. El default seguro.
+// Extrapolation.EXTEND   → sigue la recta al infinito (opacidad de -3: bug visual)
+// Extrapolation.IDENTITY → devuelve la entrada sin transformar</code></pre>
+
+<div class="mistake">
+  <strong>No poner <code>CLAMP</code> es un bug esperando su momento.</strong> Con <code>EXTEND</code> (el comportamiento por defecto), un scroll que llega a 900 px cuando tu rango llegaba a 200 produce escalas negativas, opacidades mayores a 1 y rotaciones absurdas. Suele descubrirse en producción, en el dispositivo de alguien que scrolleó más rápido que vos durante las pruebas.
+</div>
+
+<p>Para atar animaciones al scroll, <code>useAnimatedScrollHandler</code> hace lo mismo que un gesto: recibe los eventos <strong>en el UI runtime</strong>.</p>
+
+<pre><code class="lang-tsx">import Animated, { useAnimatedScrollHandler, useSharedValue } from 'react-native-reanimated';
+
+function ListaConHeader() {
+  const scrollY = useSharedValue(0);
+
+  const onScroll = useAnimatedScrollHandler({
+    onScroll: (e) =&gt; { scrollY.value = e.contentOffset.y; },
+    onBeginDrag: () =&gt; { arrastrando.value = 1; },
+    onMomentumEnd: () =&gt; { arrastrando.value = 0; },
+  });
+
+  const header = useAnimatedStyle(() =&gt; ({
+    height: interpolate(scrollY.value, [0, 120], [200, 64], Extrapolation.CLAMP),
+    opacity: interpolate(scrollY.value, [0, 90], [1, 0], Extrapolation.CLAMP),
+  }));
+
+  return (
+    &lt;&gt;
+      &lt;Animated.View style={[styles.header, header]} /&gt;
+      &lt;Animated.FlatList onScroll={onScroll} scrollEventThrottle={16} data={datos} /* ... */ /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>Ese <code>height</code> del header es una decisión, no un descuido.</strong> Animar <code>height</code> obliga a recalcular layout en cada cuadro — Reanimated puede hacerlo desde el UI runtime, pero cuesta bastante más que un transform. Si el header es simple, <code>translateY</code> + <code>scaleY</code> logran el mismo efecto visual sin tocar el layout. Si adentro hay texto que tiene que reacomodarse de verdad, entonces sí necesitás <code>height</code>: solo asegurate de que sea una elección consciente y de medirla en un dispositivo de gama media.
+</div>
+
+<h2>RNS3.9 Layout animations y transiciones entre pantallas</h2>
+
+<p>Hay una categoría de animación que no podés escribir a mano razonablemente: la que ocurre cuando un elemento <strong>se monta, se desmonta o cambia de posición</strong> porque cambió la lista. Reanimated la resuelve declarativamente.</p>
+
+<pre><code class="lang-tsx">import Animated, {
+  FadeIn, FadeOut, SlideInRight, LinearTransition,
+} from 'react-native-reanimated';
+
+{tareas.map((t) =&gt; (
+  &lt;Animated.View
+    key={t.id}
+    entering={SlideInRight.duration(220).springify()}
+    exiting={FadeOut.duration(150)}
+    layout={LinearTransition.springify().damping(18)}
+  &gt;
+    &lt;Tarea {...t} /&gt;
+  &lt;/Animated.View&gt;
+))}
+
+// entering → cuando el elemento se monta
+// exiting  → cuando se desmonta (Reanimated retrasa la baja hasta terminar)
+// layout   → cuando cambia de posición porque otro entró o salió</code></pre>
+
+<p><code>layout</code> es el que hace el trabajo invisible: si borrás el tercer ítem de una lista, los de abajo <em>se deslizan</em> hacia arriba en vez de saltar. Es una línea de código y cambia por completo la percepción de calidad.</p>
+
+<pre><code class="lang-tsx">// Animaciones de entrada a medida, con Keyframe
+import { Keyframe } from 'react-native-reanimated';
+
+const entrada = new Keyframe({
+  0:   { opacity: 0, transform: [{ scale: 0.8 }, { translateY: 20 }] },
+  60:  { opacity: 1, transform: [{ scale: 1.03 }, { translateY: 0 }] },
+  100: { opacity: 1, transform: [{ scale: 1 }, { translateY: 0 }] },
+}).duration(320);
+
+// &lt;Animated.View entering={entrada}&gt; ... &lt;/Animated.View&gt;
+// Ese pico en 60 —pasarse apenas y volver— es el truco que hace que
+// una entrada se sienta física en vez de mecánica.</code></pre>
+
+<div class="warn">
+  <strong>Transiciones compartidas entre pantallas: cuidado.</strong> La API <code>sharedTransitionTag</code> de Reanimated 3 fue siempre <strong>experimental</strong> y quedó fuera de Reanimated 4 a la espera de un rediseño. Para transiciones entre pantallas en producción, apoyate en lo que ofrezca tu librería de navegación (React Navigation con <code>react-native-screens</code> y las transiciones nativas del stack) y reservá el efecto "elemento compartido" para casos donde puedas absorber el riesgo. Es exactamente el tipo de dependencia que no querés en el camino crítico de tu app.
+</div>
+
+<h2>RNS3.10 Los errores clásicos</h2>
+
+<h3>1. Animar <code>width</code>/<code>height</code> cuando querías <code>transform</code></h3>
+
+<pre><code class="lang-tsx">// ❌ Recalcula layout de todo el subárbol, 60 veces por segundo
+const malo = useAnimatedStyle(() =&gt; ({
+  width:  ancho.value,
+  height: alto.value,
+}));
+
+// ✅ Mismo efecto visual, cero layout: solo composición en GPU
+const bueno = useAnimatedStyle(() =&gt; ({
+  transform: [{ scaleX: ancho.value / ANCHO_BASE },
+              { scaleY: alto.value  / ALTO_BASE  }],
+}));</code></pre>
+
+<div class="tip">
+  <strong>La advertencia honesta:</strong> <code>scale</code> escala <em>todo</em>, incluido el texto y los bordes. Si el contenido tiene que quedar del mismo tamaño mientras la caja crece, <code>scale</code> no sirve y necesitás <code>height</code>. El truco intermedio es escalar solo el fondo (una <code>View</code> absoluta detrás) y dejar el contenido quieto: conseguís el efecto sin pagar el layout.
+</div>
+
+<h3>2. Worklets que capturan valores obsoletos</h3>
+
+<pre><code class="lang-tsx">function Roto({ limite }: { limite: number }) {
+  const pan = Gesture.Pan().onUpdate((e) =&gt; {
+    'worklet';
+    x.value = Math.min(limite, e.translationX);   // ⚠️ `limite` es una COPIA
+  });
+  // El worklet se creó con el `limite` del primer render. Si el prop cambia,
+  // el worklet sigue usando el viejo hasta que se vuelva a crear.
+}
+
+// ✅ Estado que cambia y cruza hilos → shared value
+function Bien({ limite }: { limite: number }) {
+  const limiteSV = useSharedValue(limite);
+  useEffect(() =&gt; { limiteSV.value = limite; }, [limite, limiteSV]);
+
+  const pan = useMemo(() =&gt;
+    Gesture.Pan().onUpdate((e) =&gt; {
+      'worklet';
+      x.value = Math.min(limiteSV.value, e.translationX);   // siempre actual
+    }), []);
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Envolvé la definición del gesto en <code>useMemo</code>.</strong> Sin memorizar, cada render construye un objeto de gesto nuevo, <code>GestureDetector</code> lo reconfigura, y en el peor caso un gesto en curso se cancela a mitad de camino. El síntoma es "el arrastre se corta solo a veces" — de los bugs más difíciles de reproducir, porque depende de que algo dispare un render justo mientras el dedo está apoyado.
+</div>
+
+<h3>3. Animaciones que no se cancelan al desmontar</h3>
+
+<pre><code class="lang-tsx">import { cancelAnimation } from 'react-native-reanimated';
+
+useEffect(() =&gt; {
+  rotacion.value = withRepeat(withTiming(360, { duration: 1200 }), -1);
+  return () =&gt; { cancelAnimation(rotacion); };    // ← obligatorio
+}, [rotacion]);
+
+// Sin cancelar, un `withRepeat(-1)` sigue corriendo en el UI runtime
+// después de que el componente se fue. Multiplicalo por cada vez que
+// el usuario entra y sale de la pantalla: son animaciones acumulándose
+// sobre vistas que ya no existen. Consumo de CPU permanente y silencioso.</code></pre>
+
+<pre><code class="lang-tsx">// La variante venenosa: un callback que toca React después del desmontaje
+opacidad.value = withTiming(0, { duration: 300 }, (terminada) =&gt; {
+  'worklet';
+  if (terminada) runOnJS(cerrarModal)();   // 💥 si ya se desmontó, actualizás
+});                                        //    estado de un componente muerto
+
+// ✅ Guardá un flag vivo/muerto en un shared value
+const vivo = useSharedValue(1);
+useEffect(() =&gt; () =&gt; { vivo.value = 0; }, [vivo]);
+
+opacidad.value = withTiming(0, { duration: 300 }, (terminada) =&gt; {
+  'worklet';
+  if (terminada &amp;&amp; vivo.value) runOnJS(cerrarModal)();
+});</code></pre>
+
+<h3>4. Animar dentro de una lista virtualizada sin pensarlo</h3>
+
+<pre><code class="lang-tsx">// Cada fila con su propio useSharedValue + useAnimatedStyle es un nodo
+// en el grafo del UI runtime. Con 8 filas visibles no pasa nada.
+// Con 60 filas montadas por un windowSize alto (ver RNS2), el UI runtime
+// evalúa 60 estilos por cuadro y ahí sí bloqueás el hilo de dibujo.
+//
+// Estrategia: UN shared value en el contenedor (el scroll) y filas que
+// derivan su estilo de ese único valor, en vez de 60 valores independientes.</code></pre>
+
+<div class="danger">
+  <strong>El worklet lento es el peligro que nadie ve venir.</strong> Todo este módulo trata de mover trabajo al hilo de UI, pero ese hilo <strong>también es el que dibuja</strong>. Un worklet que hace un <code>filter</code> sobre 5.000 elementos en cada <code>onUpdate</code> no "corre en paralelo": bloquea el dibujo, exactamente igual que un handler pesado bloquea JS. Los worklets tienen que ser aritmética barata. Si necesitás una decisión costosa, calculala una vez en JS y pasá el resultado por un shared value.
+</div>
+
+<h2>RNS3.11 Accesibilidad: <em>reduce motion</em> no es opcional</h2>
+
+<p>Para una parte real de tus usuarios —trastornos vestibulares, migraña vestibular, sensibilidad al movimiento— una animación de paralaje agresiva no es "un detalle lindo": produce mareo, náusea o dolor de cabeza. Y esas personas ya te lo dijeron: activaron <em>Reducir movimiento</em> en la configuración del sistema operativo. Ignorar esa preferencia es ignorar una instrucción explícita del usuario.</p>
+
+<pre><code class="lang-tsx">import { useReducedMotion } from 'react-native-reanimated';
+
+function Tarjeta() {
+  const reducir = useReducedMotion();
+
+  const estilo = useAnimatedStyle(() =&gt; ({
+    transform: [{
+      // Sin movimiento reducido: paralaje completo.
+      // Con movimiento reducido: sin desplazamiento, solo el fade.
+      translateY: reducir ? 0 : desplazamiento.value * 0.4,
+    }],
+    opacity: opacidad.value,
+  }));
+
+  return &lt;Animated.View style={estilo} /&gt;;
+}</code></pre>
+
+<pre><code class="lang-tsx">// A nivel de app, Reanimated respeta la preferencia del sistema por defecto
+// en las layout animations. Podés forzar el comportamiento explícitamente:
+import { ReducedMotionConfig, ReduceMotion } from 'react-native-reanimated';
+
+&lt;ReducedMotionConfig mode={ReduceMotion.System} /&gt;
+//  ReduceMotion.System  → seguir la configuración del SO (lo correcto)
+//  ReduceMotion.Always  → todo reducido (útil para probar)
+//  ReduceMotion.Never   → ignorar la preferencia (evitalo)
+
+// Y la API cruda, si necesitás la preferencia fuera de Reanimated:
+import { AccessibilityInfo } from 'react-native';
+const reducido = await AccessibilityInfo.isReduceMotionEnabled();</code></pre>
+
+<div class="rule">
+  <strong>📌 "Reducir movimiento" no significa "sacar toda la animación".</strong> Significa <strong>sacar el desplazamiento espacial grande</strong> — paralaje, zoom, deslizamientos de pantalla completa, rotación. Un <em>fade</em> o un cambio de color no producen mareo y siguen comunicando el cambio de estado. Eliminar toda la animación deja una interfaz donde las cosas aparecen y desaparecen sin explicación, y eso es peor para todos, incluida la persona que activó la preferencia.
+</div>
+
+<div class="mini-ex">
+  <strong>Probalo ahora, tarda un minuto.</strong> iOS: Ajustes → Accesibilidad → Movimiento → Reducir movimiento. Android: Configuración → Accesibilidad → Eliminar animaciones. Recorré tu app entera con eso activado. Si algo se rompe visualmente, si una transición desaparece y te deja sin saber qué pasó, o si el paralaje sigue moviéndose, tenés un bug de accesibilidad — con la misma severidad que cualquier otro bug.
+</div>
+
+<h2>RNS3.12 Medir: confirmar en qué hilo corre, con evidencia</h2>
+
+<p>Todo lo anterior es teoría hasta que lo verificás en un dispositivo. Y "se ve fluido en mi iPhone en modo desarrollo" no es una medición: es una anécdota tomada en las peores condiciones posibles para sacar conclusiones.</p>
+
+<div class="step">
+  <strong>Cómo medir en serio.</strong><br>
+  <strong>1.</strong> <em>Release build</em>, no dev. El modo desarrollo agrega verificaciones, no optimiza el bundle y no representa nada.<br>
+  <strong>2.</strong> <em>Dispositivo físico de gama media</em>, no el simulador ni tu teléfono nuevo. El simulador usa la CPU de tu computadora y miente por exceso.<br>
+  <strong>3.</strong> <em>Dos números, no uno</em>: FPS del hilo de UI y FPS del hilo de JS. La combinación es el diagnóstico completo.
+</div>
+
+<pre><code class="lang-bash"># Android: Perf Monitor del menú de desarrollo (agitar / adb shell input keyevent 82)
+#   UI 60 · JS 60  → todo bien
+#   UI 60 · JS 18  → la animación está en UI, pero algo satura JS (¿setState por frame?)
+#   UI 32 · JS 60  → el hilo de UI está saturado: worklet caro, layout por frame,
+#                    imágenes gigantes o demasiadas vistas animadas
+
+# Medición externa, sin instrumentar la app y sobre un build de release:
+npx flashlight test --bundleId com.tuapp --testCommand "..."
+# Devuelve FPS reales y uso de CPU medidos desde afuera del proceso.
+
+# React Native DevTools trae el profiler de React: útil para ver si hay
+# renders por cuadro (el síntoma de un runOnJS mal puesto).</code></pre>
+
+<pre><code class="lang-tsx">// La prueba binaria, que no requiere ninguna herramienta y no admite discusión:
+&lt;Pressable onPress={() =&gt; { const t = Date.now(); while (Date.now() - t &lt; 1000); }}&gt;
+  &lt;Text&gt;Bloquear JS 1 segundo&lt;/Text&gt;
+&lt;/Pressable&gt;
+
+// Arrancá la animación, tocá el botón y mirá:
+//   Sigue perfecta        → corre en el UI runtime. ✅
+//   Se congela y salta    → depende del hilo de JS. Ahí está el problema.
+//
+// Esta prueba responde en 5 segundos la pregunta que la intuición
+// no puede responder nunca. Dejala en un menú de debug.</code></pre>
+
+<div class="tip">
+  <strong>El complemento de RNS2.</strong> Un hilo de JS saturado también degrada la respuesta al toque, aunque la animación esté en UI: el <code>onPress</code> tarda en ejecutarse porque la cola de JS está llena. Por eso las dos disciplinas van juntas — mover la animación al UI runtime resuelve la fluidez, pero no te exime de mantener el hilo de JS liviano.
+</div>
+
+<h2>🧑‍🎓 Worked Example — el carrusel con paralaje que va a 40fps</h2>
+
+<p>Un carrusel de tarjetas: se arrastra horizontalmente, cada tarjeta se escala según su distancia al centro y la imagen de fondo se mueve a otra velocidad (paralaje). En el iPhone del desarrollador se ve bien. En un Android de gama media va a 38–45fps y el arrastre "se siente pegajoso". El reporte de QA dice, literalmente: <em>"anda pero se siente mal"</em>.</p>
+
+<h3>Paso 1 — El código que existe</h3>
+
+<pre><code class="lang-tsx">// ❌ ANTES
+function Carrusel({ items }: { items: Item[] }) {
+  const [x, setX] = useState(0);                     // ⚠️ posición en estado de React
+  const pan = useRef(new Animated.Value(0)).current;
+
+  const responder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: () =&gt; true,
+      onPanResponderMove: (_, g) =&gt; {
+        setX(g.dx);                                  // ⚠️ un render POR CUADRO
+        pan.setValue(g.dx);                          // ⚠️ sin driver nativo
+      },
+      onPanResponderRelease: (_, g) =&gt; {
+        const destino = Math.round(-g.dx / ANCHO) * ANCHO;
+        Animated.spring(pan, { toValue: destino, useNativeDriver: false }).start();
+        setX(destino);
+      },
+    }),
+  ).current;
+
+  return (
+    &lt;View {...responder.panHandlers} style={styles.pista}&gt;
+      {items.map((it, i) =&gt; {
+        const d = x - i * ANCHO;                     // ⚠️ recalculado en JS, por tarjeta
+        return (
+          &lt;Tarjeta
+            key={it.id}
+            item={it}
+            paralaje={d * 0.35}
+            escala={1 - Math.min(0.15, Math.abs(d) / (ANCHO * 6))}
+          /&gt;
+        );
+      })}
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+<h3>Paso 2 — Diagnóstico con números, no con sospechas</h3>
+
+<p>Perf Monitor en un Pixel 6a, build de release, mientras se arrastra:</p>
+
+<table>
+  <thead>
+    <tr><th>Métrica</th><th>Antes</th><th>Lectura</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>FPS hilo de UI</td><td>58–60</td><td>El hilo de dibujo está bien: no es un problema de layout ni de imágenes</td></tr>
+    <tr><td>FPS hilo de JS</td><td>19–24</td><td>🔴 Acá está. JS no llega a producir un valor nuevo por cuadro</td></tr>
+    <tr><td>Renders por segundo</td><td>~60 del carrusel × 5 tarjetas</td><td>~300 renders/s de React durante el arrastre</td></tr>
+    <tr><td>Prueba de bloqueo de JS</td><td>La animación se congela 1 s</td><td>Confirmado: la animación <strong>depende</strong> del hilo de JS</td></tr>
+  </tbody>
+</table>
+
+<p>La cadena causal completa: <code>onPanResponderMove</code> llega al hilo de JS → llama a <code>setX</code> → React re-renderiza el carrusel → recalcula <code>paralaje</code> y <code>escala</code> de cada tarjeta → reconcilia y comitea cinco subárboles. Todo eso tiene que caber en 16,67 ms, sesenta veces por segundo, mientras el hilo de JS <em>además</em> atiende los eventos de toque siguientes. No cabe. Se pierden cuadros, y como se pierden de forma irregular, se percibe como pegajosidad y no como lentitud.</p>
+
+<div class="rule">
+  <strong>📌 El bug no es <code>PanResponder</code> ni es <code>useNativeDriver: false</code>.</strong> El bug es <strong>usar estado de React como posición de un gesto</strong>. Los otros dos son consecuencias de esa decisión. Por eso la corrección no es cambiar una bandera: es cambiar dónde vive la posición.
+</div>
+
+<h3>Paso 3 — Reescritura: la posición vive en el UI runtime</h3>
+
+<pre><code class="lang-tsx">// ✅ DESPUÉS — el contenedor
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue, useAnimatedReaction, runOnJS, withSpring,
+} from 'react-native-reanimated';
+
+function Carrusel({ items, onCambioPagina }: Props) {
+  const x     = useSharedValue(0);   // posición: fuera de React
+  const ini   = useSharedValue(0);
+  const vivo  = useSharedValue(1);
+  useEffect(() =&gt; () =&gt; { vivo.value = 0; }, [vivo]);
+
+  const maxX = -(items.length - 1) * ANCHO;
+
+  const pan = useMemo(() =&gt;
+    Gesture.Pan()
+      .activeOffsetX([-10, 10])       // solo me activo si el movimiento es horizontal
+      .failOffsetY([-14, 14])         // y me rindo si era scroll vertical
+      .onStart(() =&gt; {
+        'worklet';
+        ini.value = x.value;
+      })
+      .onUpdate((e) =&gt; {
+        'worklet';
+        x.value = ini.value + e.translationX;   // ← 0 cruces de hilo. 0 renders.
+      })
+      .onEnd((e) =&gt; {
+        'worklet';
+        // La proyección con velocidad: el snap sigue el impulso del dedo,
+        // no la posición donde el dedo quedó. Esto es lo que se siente "nativo".
+        const proyectada = x.value + e.velocityX * 0.15;
+        const pagina = Math.round(-proyectada / ANCHO);
+        const destino = Math.max(maxX, Math.min(0, -pagina * ANCHO));
+
+        x.value = withSpring(destino, {
+          velocity: e.velocityX,       // el resorte CONTINÚA el gesto
+          damping: 18, stiffness: 140, // ζ ≈ 0,76 → un rebote apenas perceptible
+        });
+      }),
+  [items.length]);
+
+  // Avisarle a React solo cuando cambia la PÁGINA: ~1 vez por gesto, no 60/s
+  useAnimatedReaction(
+    () =&gt; Math.round(-x.value / ANCHO),
+    (actual, anterior) =&gt; {
+      'worklet';
+      if (actual !== anterior &amp;&amp; vivo.value) runOnJS(onCambioPagina)(actual);
+    },
+  );
+
+  return (
+    &lt;GestureDetector gesture={pan}&gt;
+      &lt;View style={styles.pista}&gt;
+        {items.map((it, i) =&gt; (
+          &lt;Tarjeta key={it.id} item={it} indice={i} x={x} /&gt;
+        ))}
+      &lt;/View&gt;
+    &lt;/GestureDetector&gt;
+  );
+}</code></pre>
+
+<pre><code class="lang-tsx">// ✅ DESPUÉS — la tarjeta. Recibe el shared value y deriva TODO de él.
+import Animated, {
+  useAnimatedStyle, interpolate, Extrapolation, useReducedMotion,
+} from 'react-native-reanimated';
+
+const Tarjeta = React.memo(function Tarjeta({ item, indice, x }: TarjetaProps) {
+  const reducir = useReducedMotion();
+  const centro = indice * ANCHO;
+
+  const cuerpo = useAnimatedStyle(() =&gt; {
+    const d = -x.value - centro;                       // distancia al centro
+    return {
+      transform: [
+        { translateX: x.value },
+        { scale: interpolate(d, [-ANCHO, 0, ANCHO], [0.88, 1, 0.88], Extrapolation.CLAMP) },
+      ],
+      opacity: interpolate(d, [-ANCHO, 0, ANCHO], [0.55, 1, 0.55], Extrapolation.CLAMP),
+    };
+  });
+
+  const fondo = useAnimatedStyle(() =&gt; {
+    const d = -x.value - centro;
+    return {
+      // Respeta reduce motion: sin paralaje, la tarjeta sigue funcionando.
+      transform: [{ translateX: reducir ? 0 : d * 0.35 }],
+    };
+  });
+
+  return (
+    &lt;Animated.View style={[styles.tarjeta, cuerpo]}&gt;
+      &lt;Animated.Image source={item.img} style={[styles.fondo, fondo]} /&gt;
+      &lt;Texto item={item} /&gt;
+    &lt;/Animated.View&gt;
+  );
+});</code></pre>
+
+<h3>Paso 4 — La medición después</h3>
+
+<table>
+  <thead>
+    <tr><th>Métrica</th><th>Antes</th><th>Después</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>FPS hilo de UI (arrastrando)</td><td>58–60</td><td>🟢 60</td></tr>
+    <tr><td>FPS hilo de JS (arrastrando)</td><td>🔴 19–24</td><td>🟢 60 (ocioso)</td></tr>
+    <tr><td>Renders de React por gesto</td><td>~120–300</td><td>🟢 1–2 (solo al cambiar de página)</td></tr>
+    <tr><td>Cruces de hilo por gesto</td><td>~120</td><td>🟢 1</td></tr>
+    <tr><td>Prueba: bloquear JS 1 s mientras se arrastra</td><td>🔴 Se congela</td><td>🟢 Sin efecto visible</td></tr>
+  </tbody>
+</table>
+
+<p>Esa última fila es la que importa, y conviene entender exactamente por qué cambió. En la versión nueva, <strong>el hilo de JS ya no participa del gesto</strong>. El toque lo reconoce el sistema nativo, el <code>onUpdate</code> corre como worklet en el UI runtime, <code>x.value</code> se escribe en memoria compartida y los <code>useAnimatedStyle</code> se reevalúan en el mismo hilo que va a dibujar el cuadro. En ningún punto de esa cadena hay una cola de JS.</p>
+
+<div class="concept">
+  <strong>💡 Lo que esto habilita de verdad.</strong> Ahora el hilo de JS <em>puede</em> estar ocupado sin que se note: podés precargar la pantalla siguiente, deserializar la respuesta de la API o hidratar la caché <strong>mientras el usuario arrastra el carrusel</strong>, y la animación no pierde un solo cuadro. Antes, cualquiera de esas tareas convertía el arrastre en un tirón. El beneficio no es solo "la animación va a 60fps": es que <strong>desacoplaste dos cosas que nunca debieron estar acopladas</strong>, y eso te devuelve el hilo de JS para hacer trabajo útil en el momento exacto en que antes tenías que quedarte quieto.
+</div>
+
+<div class="mistake">
+  <strong>Y el error que sigue acechando.</strong> Si mañana alguien agrega un <code>runOnJS(setProgreso)(x.value)</code> dentro del <code>onUpdate</code> "para mostrar un indicador", la regresión completa vuelve en una línea, sin romper ningún test y sin generar ningún warning. Por eso conviene dejar la prueba de bloqueo de JS en el menú de debug y un comentario explícito arriba del <code>onUpdate</code>: la decisión de arquitectura tiene que ser visible en el lugar donde se puede deshacer.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Si el puente ya no existe en RN 0.82+, ¿por qué sigue importando en qué hilo corre la animación?</summary>
+<p>Porque el puente nunca fue el único problema — era un síntoma caro de uno más profundo: <strong>el hilo de JavaScript es uno solo</strong>. JSI eliminó la serialización, así que cada cruce entre JS y nativo hoy es mucho más barato; pero si tu animación necesita que JS calcule una posición sesenta veces por segundo, sigue dependiendo de que ese hilo esté libre sesenta veces por segundo. Y ese hilo también corre tu render, tus efectos, tu parseo de JSON y tus handlers. La solución nunca fue "hacer el cruce más rápido": es <strong>no cruzar</strong>. Que el gesto se reconozca en nativo, que el valor viva en memoria compartida y que el estilo se calcule en el UI runtime. Cero participación de JS durante el gesto.</p></details>
+
+<details><summary>Tu animación de Reanimated corre en el UI runtime y aun así la app se siente trabada durante el gesto. ¿Qué revisás?</summary>
+<p>Dos hipótesis, en este orden. <strong>(1) Un <code>runOnJS</code> dentro de <code>onUpdate</code>:</strong> la animación va fluida —vive en UI— pero estás martillando al hilo de JS con 60 llamadas por segundo, típicamente un <code>setState</code>. La app se siente trabada porque todo <em>lo demás</em> (toques, navegación, otros componentes) se atrasa. Se arregla moviendo el cruce a <code>onEnd</code> o usando <code>useAnimatedReaction</code> sobre una condición discreta. <strong>(2) Un worklet caro:</strong> el UI runtime corre sobre el hilo que dibuja, así que un cálculo pesado dentro de un <code>useAnimatedStyle</code> —un <code>filter</code> sobre miles de elementos, una operación con strings— bloquea el dibujo igual que un handler pesado bloquea JS. Se distinguen con Perf Monitor: en el caso (1) ves UI 60 / JS 20; en el (2), UI 30 / JS 60.</p></details>
+
+<details><summary>¿Por qué <code>useNativeDriver</code> no soporta <code>width</code> y <code>height</code>, y qué hacés cuando de verdad necesitás animarlas?</summary>
+<p>Porque son propiedades de <strong>layout</strong>, no de composición. <code>transform</code> y <code>opacity</code> se aplican sobre una capa ya renderizada: la GPU la mueve o le cambia el alfa sin preguntar nada. Cambiar <code>width</code> obliga a recalcular el layout del árbol con Yoga —recolocar hermanos, quizá reflowear texto—, que es trabajo de CPU sobre una estructura de datos y no se puede delegar como una animación declarativa simple. Cuando de verdad necesitás animar tamaño, tenés tres caminos, de menor a mayor costo: <strong>(a)</strong> reformularlo como <code>scaleX</code>/<code>scaleY</code>, si escalar el contenido junto con la caja es aceptable; <strong>(b)</strong> escalar solo un fondo absoluto y dejar el contenido quieto, que da el efecto sin tocar el layout; <strong>(c)</strong> usar Reanimated, que sí puede animar propiedades de layout comprometiendo el árbol de sombra desde el UI runtime — cuesta más que un transform, pero al menos no depende de que el hilo de JS esté libre. Lo que nunca es la respuesta es <code>useNativeDriver: false</code>.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>A 60fps tenés <strong>16,67 ms por cuadro</strong>; a 120fps, 8,33. Pasarse por poco cuesta lo mismo que pasarse por mucho: el cuadro se pierde entero.</li>
+  <li>El puente ya no existe (RN 0.82+), pero <strong>el hilo de JS sigue siendo uno solo</strong>. Ese, y no la serialización, es el problema de hoy.</li>
+  <li><code>useNativeDriver: true</code> resuelve bien las animaciones declarativas de <code>transform</code> y <code>opacity</code>. No soporta layout porque layout implica recalcular el árbol, no componer una capa. Poner <code>false</code> para callar el error es el antipatrón.</li>
+  <li>Un <strong>worklet</strong> es una función que corre en un segundo runtime de JS montado sobre el hilo de UI. Captura las variables <strong>por copia</strong>: todo lo que cambia y cruza hilos tiene que ser un <code>useSharedValue</code>.</li>
+  <li>Los cruces (<code>runOnJS</code>, <code>runOnUI</code>) van <strong>en los bordes</strong> del gesto, jamás en <code>onUpdate</code>. Para avisos intermedios, <code>useAnimatedReaction</code> sobre una condición discreta.</li>
+  <li>Elegí el motor por el fenómeno: <code>withTiming</code> para cambios de estado, <code>withSpring</code> para respuestas a un dedo (y pasale la <code>velocity</code> real), <code>withDecay</code> para inercia. El factor ζ = <code>damping</code>/(2√(<code>stiffness</code>·<code>mass</code>)) predice cómo se va a sentir antes de correrlo.</li>
+  <li><strong>Gesture Handler</strong> reconoce los gestos en el sistema nativo, no en JS. <code>activeOffsetX</code> + <code>failOffsetY</code> resuelven el conflicto con el scroll <em>dentro</em> de la negociación; los <code>if</code>s en <code>onUpdate</code> llegan siempre tarde.</li>
+  <li>Cancelá las animaciones al desmontar (<code>cancelAnimation</code>) y protegé los callbacks con un flag de vida. Un <code>withRepeat(-1)</code> huérfano consume CPU en silencio para siempre.</li>
+  <li><strong>Respetá <em>reduce motion</em>.</strong> Reducir movimiento es quitar el desplazamiento espacial grande, no toda la animación. Una animación que marea es un bug con la misma severidad que cualquier otro.</li>
+  <li>Medí en <strong>release, en un dispositivo de gama media</strong>, mirando los dos FPS. La prueba definitiva: bloqueá el hilo de JS un segundo. Si la animación no se inmuta, está donde tiene que estar.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Armá una pantalla con dos cuadrados que se muevan idénticamente: uno con <code>Animated</code> y <code>useNativeDriver: false</code>, otro con Reanimated. Agregá un botón que bloquee el hilo de JS 1.500 ms y grabá la pantalla mientras lo tocás. Explicá cuadro a cuadro qué le pasó a cada uno.</li>
+  <li>Escribí una tabla propia de <code>withSpring</code>: cinco combinaciones de <code>damping</code>/<code>stiffness</code>, con su ζ calculado y una descripción en tus palabras de cómo se siente cada una en el dispositivo. Después elegí cuál usarías para (a) un bottom sheet, (b) un botón de "me gusta", (c) cerrar un modal — y justificá con el ζ.</li>
+  <li>Implementá una tarjeta con <em>swipe to delete</em> dentro de una <code>FlatList</code> vertical. Hacela funcionar <strong>sin</strong> <code>failOffsetY</code>, documentá el bug con un video, y después arreglala. El objetivo es que veas el fallo, no que lo evites.</li>
+  <li>Tomá el carrusel del Worked Example y agregale, a propósito, un <code>runOnJS(setProgreso)(x.value)</code> dentro del <code>onUpdate</code>. Medí los dos FPS antes y después. Después reescribilo con <code>useAnimatedReaction</code> y volvé a medir. Presentá las tres mediciones en una tabla.</li>
+  <li>Construí un visor de imágenes con <code>Gesture.Simultaneous(pinch, rotation, pan)</code> que vuelva a su posición con <code>withSpring</code> al soltar. Agregale límites de escala (0,8×–4×) con <code>rubberBandEffect</code> al pasarse.</li>
+  <li>Auditá una pantalla real de tu app con <em>Reducir movimiento</em> activado en el sistema. Listá cada animación que no respeta la preferencia, clasificá cuáles son desplazamiento espacial (hay que reducirlas) y cuáles no (fades, colores), y corregí las primeras.</li>
+  <li>Escribí un componente que arranque un <code>withRepeat(withTiming(...), -1)</code> y <strong>no</strong> lo cancele al desmontar. Entrá y salí de esa pantalla veinte veces midiendo el uso de CPU en reposo. Después agregá <code>cancelAnimation</code> y repetí. Reportá los dos números.</li>
+</ol>
+
+<section class="quiz" id="quizRNS3">
+  <style>
+    #quizRNS3{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRNS3 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRNS3 .q{margin-bottom:1.5rem}
+    #quizRNS3 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRNS3 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRNS3 .opt:hover{border-color:var(--accent)}
+    #quizRNS3 .opt:disabled{cursor:default}
+    #quizRNS3 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRNS3 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRNS3 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRNS3 .exp.show{display:block}
+    #quizRNS3 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="2">
+    <p>1. Tu animación de Reanimated se ve perfecta, pero la app se siente trabada mientras el usuario arrastra. Perf Monitor muestra UI 60 / JS 20. ¿Cuál es la primera hipótesis?</p>
+    <button class="opt">El worklet del <code>useAnimatedStyle</code> es demasiado caro y bloquea el dibujo</button>
+    <button class="opt">Falta <code>useNativeDriver: true</code> en la configuración de Reanimated</button>
+    <button class="opt">Hay un <code>runOnJS</code> dentro de <code>onUpdate</code> disparando un <code>setState</code> por cuadro</button>
+    <div class="exp">La firma del diagnóstico está en los dos números: <strong>UI en 60</strong> significa que el hilo de dibujo está sano, así que la animación efectivamente vive en el UI runtime; <strong>JS en 20</strong> significa que algo lo está saturando 60 veces por segundo, y el sospechoso número uno es un cruce de hilo en <code>onUpdate</code>. La animación no se rompe (no depende de JS), pero todo lo demás —toques, navegación, otros componentes— se atrasa. Si fuera un worklet caro verías lo inverso: UI 30 / JS 60. Y <code>useNativeDriver</code> no existe en Reanimated: es de la API <code>Animated</code>.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>2. Un worklet lee una variable común de tu componente (<code>const limite = props.limite</code>) y usa ese valor en <code>onUpdate</code>. El prop cambia, pero el gesto sigue usando el valor viejo. ¿Por qué?</p>
+    <button class="opt">Porque el worklet captura las variables <strong>por copia</strong> en el otro runtime: no hay memoria compartida salvo con shared values</button>
+    <button class="opt">Porque falta envolver el componente en <code>React.memo</code></button>
+    <button class="opt">Porque los props no se pueden leer dentro de un gesto: hay que pasarlos por contexto</button>
+    <div class="exp">El runtime de UI tiene su propio heap. Cuando el plugin de Babel convierte la función en worklet, serializa el código <em>y las variables que captura</em> para copiarlas al otro lado. Esa copia es una foto del momento en que se creó el worklet: no es un enlace vivo. Por eso el valor queda congelado, sin error ni warning — es la clase entera de bugs "el valor no se actualiza". La solución es un <code>useSharedValue</code>, que es la única memoria que los dos runtimes leen y escriben de verdad; y conviene además memorizar la definición del gesto con <code>useMemo</code>, porque reconstruirlo en cada render puede cancelar un gesto en curso.</div>
+  </div>
+
+  <div class="q" data-c="1">
+    <p>3. Una tarjeta arrastrable horizontalmente vive dentro de una <code>FlatList</code> vertical. Al hacer un swipe diagonal, el scroll se traba a mitad de camino. ¿Cuál es la corrección?</p>
+    <button class="opt">Calcular el ángulo del movimiento en <code>onUpdate</code> y devolver temprano si es mayormente vertical</button>
+    <button class="opt">Declarar <code>activeOffsetX([-10, 10])</code> y <code>failOffsetY([-12, 12])</code> en el gesto</button>
+    <button class="opt">Desactivar el scroll de la lista mientras el gesto está activo con <code>setState</code></button>
+    <div class="exp">La decisión de quién se queda con el toque la toma el <strong>sistema nativo de reconocimiento</strong>, y la toma antes de que tu primer <code>onUpdate</code> se ejecute. Medir ángulos ahí adentro es participar de una negociación que ya terminó — por eso el bug persiste por más <code>if</code>s que agregues. <code>activeOffsetX</code> declara desde qué umbral el movimiento cuenta como tuyo y <code>failOffsetY</code> declara cuándo te rendís explícitamente; ambos se evalúan dentro del reconocedor, mientras los gestos todavía compiten. La opción del <code>setState</code> es peor aún: agrega un render de React en medio de un gesto y llega un cuadro tarde.</div>
+  </div>
+
+  <div class="score" id="scoreRNS3"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRNS3');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRNS3').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RNS4.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rns2-rendimiento/lecture.html">← RNS2: Rendimiento nativo</a>
+  <a href="../rns4-modulos-nativos/lecture.html">RNS4: Módulos nativos propios →</a>
+</nav>
+
+</div>
+</body>
+</html>

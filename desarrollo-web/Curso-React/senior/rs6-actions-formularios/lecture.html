@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RS6 — Actions, formularios y mutaciones · React Senior</title>
+  <meta name="description" content="El modelo de Actions de React 19: useActionState, useFormStatus y useOptimistic, formularios que funcionan sin JavaScript, validación de cliente y de servidor, Server Functions como mutación, revalidación de caché, accesibilidad de formularios y los errores clásicos.">
+  <link rel="stylesheet" href="../../assets/lecture.css">
+</head>
+<body>
+<div class="wrap">
+
+<nav class="topbar">
+  <a href="../index.html">← React Senior</a>
+  <a href="../../index.html">⚛️ Curso de React</a>
+  <a href="../../../../index.html">🏠 Campus CS-FE</a>
+</nav>
+
+<div class="meta">
+  <span class="badge primary">RS6</span>
+  <span class="badge">⏱ 45–120 min</span>
+  <span class="badge">🎯 Pre-req: RS4, RS5</span>
+  <span class="badge">📝 Mutaciones</span>
+</div>
+
+<article>
+
+<h1>RS6 — Actions, formularios y mutaciones</h1>
+
+<h2>RS6.0 Por qué este módulo</h2>
+
+<p>Durante diez años React no tuvo opinión sobre los formularios. Te daba <code>onSubmit</code>, <code>value</code> y <code>onChange</code>, y el resto era problema tuyo. Como el problema era real y recurrente, cada equipo escribió su propia solución — y todas las soluciones caseras terminaron pareciéndose entre sí, incluidos los bugs.</p>
+
+<p>Si trabajaste en una base de código React de cierto tamaño, ya viste este componente. Probablemente lo escribiste vos:</p>
+
+<pre><code class="lang-jsx">const [email, setEmail] = useState("");
+const [cargando, setCargando] = useState(false);
+const [error, setError] = useState(null);
+const [exito, setExito] = useState(false);
+const [errores, setErrores] = useState({});</code></pre>
+
+<p>Cinco <code>useState</code> para <em>un</em> formulario. Y con los cinco puestos, el componente todavía tiene: doble submit si el usuario hace clic dos veces rápido, pérdida de lo tipeado cuando el servidor devuelve un error, una condición de carrera si el usuario envía dos veces y la primera respuesta llega última, y cero accesibilidad — el error aparece en pantalla y ningún lector de pantalla lo anuncia.</p>
+
+<div class="concept">
+  <strong>💡 La tesis del módulo.</strong> Enviar datos al servidor y esperar la respuesta es una <strong>máquina de estados</strong>, no cinco variables sueltas. Tiene estados (inactivo, enviando, error, éxito), transiciones legales e ilegales, y una regla de concurrencia. Antes de React 19 esa máquina la escribías vos, mal, una vez por formulario. Las <strong>Actions</strong> son esa máquina, hecha por React, integrada con transiciones, Suspense, error boundaries y —el detalle que nadie esperaba— con el <code>&lt;form&gt;</code> de HTML de 1995.
+</div>
+
+<p>A septiembre de 2026 esto ya no es material de vanguardia: <strong>React 19.2 es la versión estable</strong>, y tanto las Actions como las Server Functions son API estables, no experimentales. Lo que sigue siendo experimental es el conocimiento del equipo promedio sobre ellas.</p>
+
+<div class="warn">
+  <strong>Lo que este módulo no es.</strong> No es "dejá de usar react-hook-form". Hay formularios donde la librería sigue ganando por goleada y en RS6.9 los vamos a nombrar con precisión. Lo que sí es: entender qué resuelve React de fábrica, para que la decisión de agregar una dependencia sea una decisión y no un reflejo.
+</div>
+
+<h2>RS6.1 Qué es una Action, exactamente</h2>
+
+<p>El término "Action" se usa con tres significados en la documentación y en las charlas, y conviene separarlos ya:</p>
+
+<table>
+<thead><tr><th>Término</th><th>Qué es</th><th>Dónde corre</th></tr></thead>
+<tbody>
+<tr><td><strong>Action</strong> (convención)</td><td>Una función <code>async</code> pasada a <code>action</code>, <code>formAction</code> o <code>startTransition</code></td><td>Cliente</td></tr>
+<tr><td><strong>Server Function</strong></td><td>Una función marcada con <code>"use server"</code>, invocable desde el cliente</td><td>Servidor</td></tr>
+<tr><td><strong>Server Action</strong></td><td>Nombre viejo de lo anterior. Sobrevive en blogs y en el ecosistema</td><td>Servidor</td></tr>
+</tbody>
+</table>
+
+<div class="rule">
+  <strong>📌 Una Action no es un tipo especial de función.</strong> Es una función <code>async</code> común que React ejecuta <em>dentro de una transición</em>. Eso es todo el truco: al estar en una transición, React sabe cuándo empezó y cuándo terminó, y de ahí saca el <code>pending</code>, el orden de las respuestas y la reversión de lo optimista. No hay magia; hay contabilidad que antes hacías vos.
+</div>
+
+<p>La forma más simple es pasar la función directo al <code>&lt;form&gt;</code>. React la llama con el <code>FormData</code> y previene el submit nativo por vos:</p>
+
+<pre><code class="lang-jsx">function Suscribirse() {
+  async function suscribir(formData) {
+    await fetch("/api/newsletter", {
+      method: "POST",
+      body: JSON.stringify({ email: formData.get("email") }),
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return (
+    &lt;form action={suscribir}&gt;
+      &lt;input name="email" type="email" required /&gt;
+      &lt;button&gt;Suscribirme&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<p>Comparalo con lo que había que escribir antes para lo mismo, y contá cuántas líneas son <em>lógica de negocio</em> y cuántas son plomería:</p>
+
+<pre><code class="lang-jsx">// La versión pre-19
+function Suscribirse() {
+  const [email, setEmail] = useState("");
+  const [enviando, setEnviando] = useState(false);
+
+  async function onSubmit(e) {
+    e.preventDefault();          // se olvida constantemente
+    setEnviando(true);           // y hay que acordarse del finally
+    try {
+      await fetch("/api/newsletter", { /* … */ });
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  return (
+    &lt;form onSubmit={onSubmit}&gt;
+      &lt;input value={email} onChange={(e) =&gt; setEmail(e.target.value)} /&gt;
+      &lt;button disabled={enviando}&gt;Suscribirme&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<h3>Dos comportamientos que hay que saber de entrada</h3>
+
+<p>El <code>&lt;form action&gt;</code> de React tiene dos conductas propias que sorprenden la primera vez:</p>
+
+<ol>
+  <li><strong>React resetea el formulario</strong> cuando la acción termina, si los campos son <em>no controlados</em>. Es lo correcto para el caso feliz (enviaste un comentario, el textarea queda limpio) y es exactamente lo que te arruina el día cuando el servidor devuelve un error de validación: el usuario ve el error <em>y</em> el formulario vacío.</li>
+  <li><strong>La acción corre en una transición.</strong> Eso significa que la UI queda interactiva mientras se envía, y que React puede priorizar otras actualizaciones por encima del render que dispare la respuesta.</li>
+</ol>
+
+<pre><code class="lang-jsx">import { requestFormReset } from "react-dom";
+
+// Si necesitás controlar el reseteo vos mismo —por ejemplo, resetear
+// SOLO cuando la respuesta fue exitosa— usás la API explícita.
+async function enviar(formData) {
+  const r = await guardar(formData);
+  if (r.ok) requestFormReset(document.forms.comentario);
+}</code></pre>
+
+<div class="tip">
+  En la práctica casi nunca vas a llamar <code>requestFormReset</code> a mano: la solución idiomática al problema "se me borró lo que había tipeado" es <strong>devolver los valores enviados en el estado de la acción</strong> y usarlos como <code>defaultValue</code>. Lo vemos con código en RS6.2 y lo aplicamos completo en el Worked Example.
+</div>
+
+<h2>RS6.2 <code>useActionState</code>: la firma completa</h2>
+
+<p>El <code>&lt;form action&gt;</code> pelado no te devuelve nada: no sabés si falló, ni por qué. <code>useActionState</code> es la pieza que convierte una acción en una máquina de estados con resultado.</p>
+
+<pre><code class="lang-tsx">const [estado, accion, pendiente] = useActionState(
+  fn,            // (estadoPrevio, formData) =&gt; nuevoEstado
+  estadoInicial, // el valor de `estado` antes del primer envío
+  permalink?     // URL de fallback para progressive enhancement
+);</code></pre>
+
+<p>Tres cosas de esa firma importan y suelen pasarse por alto:</p>
+
+<h3>1. La función recibe el estado previo como primer argumento</h3>
+
+<p>No es decorativo. Habilita acumular información entre envíos: contar intentos fallidos, mantener un historial, aplicar un backoff, o —el caso más común— conservar lo que el usuario ya había tipeado.</p>
+
+<pre><code class="lang-tsx">type Estado = {
+  errores?: Record&lt;string, string&gt;;
+  valores?: Record&lt;string, string&gt;;
+  intentos: number;
+  ok?: boolean;
+};
+
+const [estado, accion, pendiente] = useActionState&lt;Estado, FormData&gt;(
+  async (previo, formData) =&gt; {
+    const valores = Object.fromEntries(formData) as Record&lt;string, string&gt;;
+    const r = await registrar(valores);
+
+    if (!r.ok) {
+      return {
+        errores: r.errores,
+        valores,                       // ← lo tipeado vuelve al formulario
+        intentos: previo.intentos + 1, // ← el estado previo, usado de verdad
+      };
+    }
+    return { ok: true, intentos: previo.intentos };
+  },
+  { intentos: 0 }
+);</code></pre>
+
+<p>Con ese estado en la mano, el formulario se reconstruye sin perder nada:</p>
+
+<pre><code class="lang-tsx">&lt;form action={accion}&gt;
+  &lt;input
+    name="email"
+    defaultValue={estado.valores?.email ?? ""}
+    aria-invalid={!!estado.errores?.email}
+  /&gt;
+  {estado.errores?.email &amp;&amp; &lt;p&gt;{estado.errores.email}&lt;/p&gt;}
+
+  {estado.intentos &gt;= 3 &amp;&amp; (
+    &lt;p&gt;¿Necesitás ayuda? &lt;a href="/soporte"&gt;Escribinos&lt;/a&gt;&lt;/p&gt;
+  )}
+&lt;/form&gt;</code></pre>
+
+<div class="mistake">
+  <strong>El error que ve todo el mundo la primera vez:</strong> escribir <code>async (formData) =&gt; …</code> y encontrarse con que <code>formData.get</code> no existe. La firma es <code>(estadoPrevio, formData)</code>, en ese orden. Si no vas a usar el previo, el idioma es <code>async (_previo, formData) =&gt; …</code>, no borrarlo.
+</div>
+
+<h3>2. El tercer valor de retorno es <code>pending</code></h3>
+
+<p>Existe desde React 19 y evita el <code>useState</code> de <code>cargando</code> por completo. Sirve para el componente que <em>renderiza</em> el <code>&lt;form&gt;</code>. Para el botón de adentro hay una herramienta mejor, y es el tema de RS6.3.</p>
+
+<h3>3. <code>permalink</code>: el argumento que casi nadie usa (y debería)</h3>
+
+<p>Es el eslabón de progressive enhancement. Si el formulario se envía <strong>antes de que el JavaScript haya hidratado</strong> y la acción es una Server Function, React no puede ejecutar la lógica del cliente — entonces el navegador hace el POST nativo y el servidor redirige a la URL del <code>permalink</code>, que renderiza la misma página con el estado ya aplicado.</p>
+
+<pre><code class="lang-tsx">const [estado, accion] = useActionState(
+  actualizarPerfil,        // Server Function, con "use server"
+  { errores: null },
+  "/perfil/editar"         // ← a dónde ir si todavía no hidrató
+);</code></pre>
+
+<div class="info">
+  <strong>Cuándo importa esto de verdad.</strong> No es un caso de laboratorio: la ventana entre "el HTML está pintado" y "el bundle terminó de hidratar" son cientos de milisegundos en un celular de gama media con red 3G. Un usuario que llega, ve el formulario y aprieta rápido cae justo ahí. Sin <code>permalink</code>, ese envío se pierde o se comporta distinto; con él, degrada a una navegación normal.
+</div>
+
+<h2>RS6.3 <code>useFormStatus</code>: el botón que sabe sin que le digan</h2>
+
+<p>Este hook parece redundante — <code>useActionState</code> ya devuelve <code>pending</code>. La razón de su existencia es de <strong>arquitectura de componentes</strong>, no de conveniencia.</p>
+
+<p>Pensá en un design system. Tenés un <code>&lt;BotonEnviar&gt;</code> que se usa en cuarenta formularios distintos. Sin <code>useFormStatus</code>, cada uno de esos cuarenta formularios tiene que pasarle una prop <code>pending</code>, y si el botón está tres niveles abajo, la prop viaja tres niveles. El componente compartido depende de que <em>cada</em> consumidor se acuerde de cablear el estado.</p>
+
+<pre><code class="lang-tsx">"use client";
+import { useFormStatus } from "react-dom";
+
+// Este componente NO recibe ninguna prop de estado.
+// Lee el &lt;form&gt; ancestro más cercano.
+export function BotonEnviar({ children }: { children: React.ReactNode }) {
+  const { pending } = useFormStatus();
+  return (
+    &lt;button type="submit" disabled={pending} aria-busy={pending}&gt;
+      {pending ? "Enviando…" : children}
+    &lt;/button&gt;
+  );
+}</code></pre>
+
+<p>Y ahora cualquier formulario lo usa sin cablear nada:</p>
+
+<pre><code class="lang-tsx">&lt;form action={accion}&gt;
+  &lt;input name="email" /&gt;
+  &lt;BotonEnviar&gt;Crear cuenta&lt;/BotonEnviar&gt;
+&lt;/form&gt;</code></pre>
+
+<div class="rule">
+  <strong>📌 La regla que hace fallar a todos:</strong> <code>useFormStatus</code> lee el <code>&lt;form&gt;</code> <strong>ancestro</strong>. Un componente que renderiza el <code>&lt;form&gt;</code> y llama al hook en el mismo cuerpo va a leer <code>pending: false</code> para siempre. El hook tiene que estar en un componente que sea <em>hijo</em> del <code>&lt;form&gt;</code>, no en el que lo crea.
+</div>
+
+<pre><code class="lang-tsx">// ❌ Siempre pending: false. El hook está en el MISMO componente
+//    que renderiza el form, no adentro de él.
+function Formulario() {
+  const { pending } = useFormStatus();
+  return (
+    &lt;form action={accion}&gt;
+      &lt;button disabled={pending}&gt;Enviar&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}
+
+// ✅ El hook vive en un componente hijo.
+function Formulario() {
+  return (
+    &lt;form action={accion}&gt;
+      &lt;BotonEnviar&gt;Enviar&lt;/BotonEnviar&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<p>El hook devuelve más que <code>pending</code>. El objeto completo es útil para UIs que muestran lo que se está enviando mientras se envía:</p>
+
+<pre><code class="lang-tsx">const { pending, data, method, action } = useFormStatus();
+
+// `data` es el FormData en vuelo — sirve para previsualizar
+if (pending &amp;&amp; data) {
+  return &lt;p&gt;Publicando “{String(data.get("titulo"))}”…&lt;/p&gt;;
+}</code></pre>
+
+<div class="info">
+  <code>useFormStatus</code> se importa de <strong><code>react-dom</code></strong>, no de <code>react</code>. Es un detalle que cuesta media hora de depuración la primera vez, y tiene su lógica: el hook depende del DOM (existe un <code>&lt;form&gt;</code> real), mientras que <code>useActionState</code> es agnóstico del renderer.
+</div>
+
+<h2>RS6.4 <code>useOptimistic</code>: mostrar el futuro y poder retractarse</h2>
+
+<p>La UI optimista es simple de describir y difícil de hacer bien: mostrás el resultado <em>antes</em> de que el servidor confirme, y si falla, lo deshacés. La parte difícil es el "si falla, lo deshacés" — sobre todo cuando hay varias operaciones en vuelo.</p>
+
+<p>Así se hacía a mano, y así fallaba:</p>
+
+<pre><code class="lang-jsx">// ❌ La versión artesanal. Funciona hasta que no.
+async function enviar(texto) {
+  const provisorio = { id: `temp-${Date.now()}`, texto };
+  setMensajes((m) =&gt; [...m, provisorio]);        // optimista
+
+  try {
+    const real = await enviarAlServidor(texto);
+    setMensajes((m) =&gt;
+      m.map((x) =&gt; (x.id === provisorio.id ? real : x))
+    );
+  } catch {
+    // rollback manual: hay que acordarse, y hay que filtrar bien
+    setMensajes((m) =&gt; m.filter((x) =&gt; x.id !== provisorio.id));
+  }
+}</code></pre>
+
+<p>Los problemas de esa versión no son de estilo:</p>
+
+<ul>
+  <li><strong>El rollback es tuyo.</strong> Si te olvidás de un <code>catch</code>, el mensaje fantasma se queda en pantalla para siempre.</li>
+  <li><strong>Con dos envíos concurrentes se rompe.</strong> Si el segundo responde antes que el primero, el <code>map</code> por id todavía anda, pero cualquier reemplazo de lista completa pisa el otro optimista.</li>
+  <li><strong>Los ids temporales se filtran a la UI.</strong> Un <code>key</code> que cambia de <code>temp-123</code> a <code>987</code> desmonta y remonta el nodo: se pierden animaciones, foco y estado local.</li>
+</ul>
+
+<p><code>useOptimistic</code> ataca la raíz: el valor optimista <strong>no es estado que vos administrás</strong>, es una proyección que React descarta sola cuando la transición termina — con éxito o con error.</p>
+
+<pre><code class="lang-tsx">"use client";
+import { useOptimistic, useRef } from "react";
+
+type Mensaje = { id: string; texto: string; enviando?: boolean };
+
+export function Chat({ mensajes, enviar }: {
+  mensajes: Mensaje[];
+  enviar: (fd: FormData) =&gt; Promise&lt;void&gt;;
+}) {
+  const form = useRef&lt;HTMLFormElement&gt;(null);
+
+  const [vista, agregarOptimista] = useOptimistic(
+    mensajes,
+    (actual: Mensaje[], texto: string) =&gt; [
+      ...actual,
+      { id: `opt-${actual.length}`, texto, enviando: true },
+    ]
+  );
+
+  return (
+    &lt;&gt;
+      &lt;ul&gt;
+        {vista.map((m) =&gt; (
+          &lt;li key={m.id} style={{ opacity: m.enviando ? 0.5 : 1 }}&gt;
+            {m.texto} {m.enviando &amp;&amp; &lt;span aria-label="enviando"&gt;⏳&lt;/span&gt;}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+
+      &lt;form
+        ref={form}
+        action={async (fd) =&gt; {
+          agregarOptimista(String(fd.get("texto")));  // dentro de la acción
+          form.current?.reset();
+          await enviar(fd);
+        }}
+      &gt;
+        &lt;input name="texto" required /&gt;
+        &lt;button&gt;Enviar&lt;/button&gt;
+      &lt;/form&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<div class="concept">
+  <strong>💡 El modelo mental correcto.</strong> <code>useOptimistic</code> no guarda nada. Toma el estado <em>real</em> (el primer argumento) y le aplica una función de proyección mientras hay una transición en curso. Cuando la transición termina, la proyección desaparece y volvés a ver el estado real — que para entonces ya incluye el mensaje si salió bien, o no lo incluye si falló. <strong>El rollback no es una acción: es la ausencia de la proyección.</strong> Por eso no puede olvidarse.
+</div>
+
+<div class="warn">
+  <strong>La llamada tiene que ocurrir dentro de una acción o transición.</strong> Si llamás a <code>agregarOptimista</code> desde un <code>onClick</code> común, fuera de <code>startTransition</code> y fuera de un <code>action</code>, React descarta la actualización de inmediato y no vas a ver nada. No es un bug: es la definición.
+</div>
+
+<p>Y una advertencia de producto que los tutoriales omiten: la UI optimista es una <strong>promesa que hacés en nombre del servidor</strong>. Está bien para operaciones que fallan poco y cuyo fracaso es barato (un like, un ítem de una lista, marcar como leído). Está mal para cualquier cosa con consecuencias: no muestres "pago aprobado" de manera optimista. La regla es la reversibilidad percibida, no la técnica.</p>
+
+<h2>RS6.5 Formularios sin JavaScript: por qué esto importa</h2>
+
+<p>Cuando pasás una <strong>Server Function</strong> a <code>action</code>, React emite un <code>&lt;form&gt;</code> con <code>method="post"</code> y un <code>action</code> apuntando a un endpoint. Si el JavaScript nunca llega, el navegador hace lo que hace desde 1995: postea el formulario. El servidor ejecuta la función, responde, y la página se re-renderiza.</p>
+
+<pre><code class="lang-tsx">// app/acciones.ts
+"use server";
+
+export async function crearTarea(formData: FormData) {
+  const titulo = String(formData.get("titulo") ?? "").trim();
+  if (!titulo) return;
+  await db.tarea.create({ data: { titulo, usuarioId: await usuarioActual() } });
+  revalidatePath("/tareas");
+}</code></pre>
+
+<pre><code class="lang-tsx">// app/tareas/page.tsx — Server Component. Ni una línea de "use client".
+import { crearTarea } from "../acciones";
+
+export default async function Tareas() {
+  const tareas = await db.tarea.findMany();
+  return (
+    &lt;&gt;
+      &lt;form action={crearTarea}&gt;
+        &lt;input name="titulo" required /&gt;
+        &lt;button&gt;Agregar&lt;/button&gt;
+      &lt;/form&gt;
+      &lt;ul&gt;{tareas.map((t) =&gt; &lt;li key={t.id}&gt;{t.titulo}&lt;/li&gt;)}&lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<p>Ese formulario funciona con JavaScript deshabilitado. No "más o menos": funciona.</p>
+
+<h3>"Nadie deshabilita JavaScript"</h3>
+
+<p>Es la objeción estándar, y es una respuesta a la pregunta equivocada. Casi nadie lo deshabilita a propósito; lo que pasa todo el tiempo es que <strong>el JavaScript no está disponible</strong>:</p>
+
+<ul>
+  <li>El bundle todavía no terminó de descargar y el usuario ya está tocando la pantalla.</li>
+  <li>Un chunk falló: la CDN tuvo un hipo, el túnel del subte cortó la conexión, un proxy corporativo lo bloqueó.</li>
+  <li>Una extensión del navegador rompió el árbol y el error de hidratación tiró abajo la isla interactiva.</li>
+  <li>El dispositivo se quedó sin memoria y el navegador descartó el contexto de la pestaña.</li>
+  <li>Un bug tuyo en un componente ajeno reventó el error boundary de arriba.</li>
+</ul>
+
+<div class="rule">
+  <strong>📌 El progressive enhancement no es un gesto de caridad hacia usuarios raros: es tolerancia a fallas.</strong> Es la diferencia entre "la app se degradó y el checkout todavía funciona" y "la app se rompió y no se puede comprar". El mismo argumento por el que ponés un timeout y un reintento en una llamada de red aplica acá.
+</div>
+
+<div class="mistake">
+  <strong>Dónde se pierde el beneficio sin darse cuenta.</strong> En el momento en que envolvés la acción en una función de cliente —para agregar un <code>console.log</code>, para mostrar un toast, para leer algo de un store— dejás de tener un <code>&lt;form&gt;</code> que postea solo, porque la lógica ahora vive en el bundle. Si el progressive enhancement te importa, la acción del <code>&lt;form&gt;</code> tiene que ser la Server Function <em>en sí</em>, o un <code>useActionState</code> con <code>permalink</code> sobre una Server Function. Todo lo demás degrada a "no pasa nada al apretar el botón".
+</div>
+
+<h2>RS6.6 Validación: la del cliente es UX, la del servidor es la que cuenta</h2>
+
+<p>Hay tres capas de validación y cada una tiene un trabajo distinto. Confundirlas produce, en un extremo, formularios molestos, y en el otro, agujeros de seguridad.</p>
+
+<table>
+<thead><tr><th>Capa</th><th>Para qué sirve</th><th>Se puede saltear</th></tr></thead>
+<tbody>
+<tr><td><strong>HTML nativo</strong> (<code>required</code>, <code>type</code>, <code>pattern</code>)</td><td>Feedback instantáneo, cero JS, gratis</td><td>Sí — con devtools o <code>curl</code></td></tr>
+<tr><td><strong>JS de cliente</strong> (Zod, react-hook-form)</td><td>Mensajes claros, validación cruzada entre campos</td><td>Sí — es código del atacante</td></tr>
+<tr><td><strong>Servidor</strong></td><td>La verdad. Integridad de datos y seguridad</td><td><strong>No</strong></td></tr>
+</tbody>
+</table>
+
+<div class="danger">
+  <strong>Todo lo que llega del cliente es hostil.</strong> No "puede ser hostil": <em>es</em>. Los campos de un formulario son texto arbitrario que alguien te manda por HTTP; el <code>&lt;input type="number" max="5"&gt;</code> no es una restricción, es una sugerencia dibujada. Esto no es paranoia de módulo de seguridad, es el <strong>A03: Inyección</strong> y el <strong>A04: Diseño inseguro</strong> del OWASP Top 10. Si querés el tratamiento completo —inyección, validación de entrada, control de acceso roto— está en <a href="../../../../sistemas/Curso-Ciberseguridad/m04-owasp-web/lecture.html">M04 de Ciberseguridad</a>.
+</div>
+
+<h3>Un esquema, dos usos</h3>
+
+<p>La forma limpia de no duplicar reglas es definir el esquema una sola vez y usarlo en las dos puntas. El de cliente da inmediatez; el de servidor decide.</p>
+
+<pre><code class="lang-tsx">// lib/esquemas.ts — compartido
+import { z } from "zod";
+
+export const Checkout = z.object({
+  email: z.email("Email inválido"),
+  nombre: z.string().min(2, "Mínimo 2 caracteres"),
+  cantidad: z.coerce.number().int().min(1).max(10),
+  cupon: z.string().optional(),
+});</code></pre>
+
+<pre><code class="lang-tsx">// Lado servidor: la validación que cuenta
+"use server";
+import { Checkout } from "@/lib/esquemas";
+
+export async function comprar(_previo: unknown, formData: FormData) {
+  const parsed = Checkout.safeParse(Object.fromEntries(formData));
+
+  if (!parsed.success) {
+    const errores: Record&lt;string, string&gt; = {};
+    for (const issue of parsed.error.issues) {
+      const campo = String(issue.path[0]);
+      errores[campo] ??= issue.message;     // el primero por campo
+    }
+    return { errores, valores: Object.fromEntries(formData) };
+  }
+
+  // parsed.data está tipado y es seguro de acá para abajo
+  await procesarPago(parsed.data);
+  return { ok: true };
+}</code></pre>
+
+<div class="tip">
+  En Zod 4 hay atajos para eso: <code>z.flattenError(parsed.error)</code> te da <code>{ formErrors, fieldErrors }</code> listo para pintar. El bucle de arriba lo escribí a mano a propósito, porque deja ver la forma de <code>issues</code> — y porque cuando quieras un mensaje por campo en vez de un array, ya sabés dónde tocar.
+</div>
+
+<div class="warn">
+  <strong>Nunca devuelvas el error crudo de la capa de datos.</strong> Un mensaje de excepción de la base filtra nombres de tablas, columnas y a veces fragmentos de la consulta — información gratis para quien esté sondeando. Traducí a mensajes de negocio y logueá el original del lado del servidor con un identificador de correlación.
+</div>
+
+<h3>La validación de servidor no es solo de forma</h3>
+
+<p>Es la trampa sutil: un esquema Zod valida <em>forma</em> (es un string, mide más de 2, es un número entre 1 y 10). No valida <strong>reglas de negocio ni permisos</strong>. Un checkout puede pasar el esquema perfectamente y aun así ser inválido:</p>
+
+<ul>
+  <li>El cupón existe pero venció, o ya se usó, o no aplica a esa categoría.</li>
+  <li>Hay 3 unidades en stock y el <code>FormData</code> pide 10.</li>
+  <li>El precio que mandó el cliente no es el precio real. <strong>Nunca confíes en un precio que viene del formulario</strong> — leelo de tu base por el id del producto.</li>
+  <li>El usuario no tiene permiso sobre ese recurso.</li>
+</ul>
+
+<h2>RS6.7 Server Functions como mutación: el endpoint que no parece uno</h2>
+
+<p>En <a href="../rs4-server-components/lecture.html">RS4</a> estableciste la regla central y acá se aplica en su contexto natural, que es el de las mutaciones:</p>
+
+<div class="danger">
+  <strong>Una Server Function es un endpoint HTTP público.</strong> Al buildear queda expuesta con un identificador que cualquiera puede leer en el payload o en la pestaña Network, y reproducir con <code>curl</code> sin pasar jamás por tu interfaz. Que el botón esté escondido, que el formulario no se renderice, que la ruta esté detrás de un guard — nada de eso protege la función. <strong>El chequeo va adentro.</strong>
+</div>
+
+<p>El orden importa y es siempre el mismo: autenticar → validar → autorizar sobre el recurso concreto → actuar.</p>
+
+<pre><code class="lang-tsx">"use server";
+
+export async function borrarComentario(_previo: unknown, formData: FormData) {
+  // 1. Autenticar: ¿hay sesión válida?
+  const sesion = await getSesion();
+  if (!sesion) return { error: "No autenticado" };
+
+  // 2. Validar: los argumentos vienen del cliente, son hostiles
+  const parsed = z.object({ id: z.uuid() })
+    .safeParse(Object.fromEntries(formData));
+  if (!parsed.success) return { error: "Solicitud inválida" };
+
+  // 3. Autorizar sobre ESTE recurso, no sobre un rol genérico
+  const comentario = await db.comentario.findUnique({
+    where: { id: parsed.data.id },
+  });
+  if (!comentario) return { error: "No encontrado" };
+
+  const esDueño   = comentario.autorId === sesion.usuarioId;
+  const esModerador = sesion.roles.includes("moderador");
+  if (!esDueño &amp;&amp; !esModerador) return { error: "Sin permisos" };
+
+  // 4. Recién ahora, actuar
+  await db.comentario.delete({ where: { id: parsed.data.id } });
+  revalidatePath(`/post/${comentario.postId}`);
+  return { ok: true };
+}</code></pre>
+
+<div class="mistake">
+  <strong>El bug que se repite:</strong> aceptar <code>usuarioId</code> como campo del formulario. Si la función recibe <em>quién sos</em> en vez de deducirlo de la sesión, cualquiera actúa en nombre de otro con un <code>curl</code> de una línea. <strong>La identidad sale siempre de la sesión.</strong> Los argumentos llevan <em>qué</em> hacer, nunca <em>quién</em> lo hace. Fijate en el ejemplo: <code>sesion.usuarioId</code> no aparece jamás en el <code>FormData</code>.
+</div>
+
+<p>Dos detalles operativos que muerden en producción:</p>
+
+<ul>
+  <li><strong>Los ids de las Server Functions cambian entre builds.</strong> Si un usuario tiene la pestaña abierta desde antes de un deploy, su próximo envío puede apuntar a un id que ya no existe. Manejá ese error como "recargá la página", no como un fallo genérico.</li>
+  <li><strong>No hay rate limiting gratis.</strong> Un endpoint público sin límite es un endpoint que se puede martillar. Poné el límite del lado del servidor, por usuario y por IP, en las mutaciones que valgan algo.</li>
+</ul>
+
+<h2>RS6.8 Actions + caché: mutar es la mitad del trabajo</h2>
+
+<p>Una mutación que anda pero deja la pantalla mostrando lo viejo es, para el usuario, una mutación que no anda. Acá se enganchan las Actions con todo lo que viste en <a href="../rs5-data-cache/lecture.html">RS5</a>: la acción cambia el dato, y algo tiene que decirle a la caché que lo que tenía ya no sirve.</p>
+
+<table>
+<thead><tr><th>Entorno</th><th>Cómo invalidás</th><th>Alcance</th></tr></thead>
+<tbody>
+<tr><td>Next.js App Router</td><td><code>revalidateTag("carrito")</code></td><td>Todo lo etiquetado con ese tag, en cualquier ruta</td></tr>
+<tr><td>Next.js App Router</td><td><code>revalidatePath("/carrito")</code></td><td>Esa ruta (o el layout entero con el 2.º argumento)</td></tr>
+<tr><td>Cliente, App Router</td><td><code>router.refresh()</code></td><td>Re-pide el payload RSC de la ruta actual</td></tr>
+<tr><td>TanStack Query</td><td><code>queryClient.invalidateQueries({ queryKey })</code></td><td>Las queries que matcheen la clave</td></tr>
+</tbody>
+</table>
+
+<pre><code class="lang-tsx">"use server";
+import { revalidateTag } from "next/cache";
+
+export async function agregarAlCarrito(_previo: unknown, fd: FormData) {
+  const sesion = await getSesion();
+  if (!sesion) return { error: "No autenticado" };
+
+  await db.carritoItem.create({ /* … */ });
+
+  revalidateTag("carrito");   // el badge del header, el drawer, la página
+  return { ok: true };
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Etiquetá por dato, no por página.</strong> El error clásico es hacer <code>revalidatePath("/carrito")</code> y que el contador del header siga en 2 porque el header vive en el layout y se cacheó aparte. Si el dato "carrito" se lee en tres lugares, esos tres lugares tienen que compartir el <code>tag</code>. Los tags describen <em>qué dato</em>; los paths describen <em>qué pantalla</em>, y los usuarios no ven pantallas: ven datos.
+</div>
+
+<h3>Cuando la mutación convive con caché de cliente</h3>
+
+<p>Si tenés TanStack Query, las Actions no lo reemplazan: se combinan. La Action hace la mutación, el <code>onSuccess</code> invalida.</p>
+
+<pre><code class="lang-tsx">"use client";
+import { useQueryClient } from "@tanstack/react-query";
+import { useActionState } from "react";
+
+export function FormNota() {
+  const qc = useQueryClient();
+
+  const [estado, accion] = useActionState(async (_p, fd) =&gt; {
+    const r = await crearNota(fd);            // Server Function
+    if (r.ok) await qc.invalidateQueries({ queryKey: ["notas"] });
+    return r;
+  }, {});
+
+  return &lt;form action={accion}&gt;{/* … */}&lt;/form&gt;;
+}</code></pre>
+
+<div class="warn">
+  <strong>El orden importa.</strong> Si invalidás <em>antes</em> de que la escritura haya commiteado en la base —o si tu base tiene réplicas de lectura con lag— vas a refetchear el valor viejo y a pintar exactamente lo que querías evitar. Invalidá después del <code>await</code> de la escritura, y si hay réplicas, leé de la primaria inmediatamente después de mutar.
+</div>
+
+<h2>RS6.9 Comparación honesta: Actions vs las librerías</h2>
+
+<p>Las Actions no jubilaron a nadie. Cambiaron el piso: lo que antes justificaba una dependencia en cualquier formulario, ahora la justifica solo en algunos.</p>
+
+<table>
+<thead><tr><th>Criterio</th><th>Actions nativas</th><th>react-hook-form</th><th>Formik</th><th>Manual</th></tr></thead>
+<tbody>
+<tr><td>Peso extra</td><td><strong>0 KB</strong></td><td>~9 KB + resolver</td><td>~13 KB + Yup</td><td>0 KB</td></tr>
+<tr><td>Estado pending</td><td>Integrado</td><td>Integrado</td><td>Integrado</td><td>A mano</td></tr>
+<tr><td>Funciona sin JS</td><td><strong>Sí</strong> (con Server Function)</td><td>No</td><td>No</td><td>No</td></tr>
+<tr><td>Validación campo a campo en vivo</td><td>Pobre</td><td><strong>Excelente</strong></td><td>Buena</td><td>A mano</td></tr>
+<tr><td>Arrays de campos dinámicos</td><td>Pobre</td><td><strong>Excelente</strong> (<code>useFieldArray</code>)</td><td>Buena</td><td>Doloroso</td></tr>
+<tr><td>Re-renders por tecla</td><td>Ninguno (no controlado)</td><td>Ninguno (no controlado)</td><td><strong>Uno por tecla</strong></td><td>Uno por tecla</td></tr>
+<tr><td>Errores del servidor</td><td><strong>Natural</strong></td><td>Manual (<code>setError</code>)</td><td>Manual</td><td>A mano</td></tr>
+<tr><td>UI optimista</td><td><code>useOptimistic</code></td><td>A mano</td><td>A mano</td><td>A mano</td></tr>
+</tbody>
+</table>
+
+<h3>Cuándo cada uno sigue ganando</h3>
+
+<div class="step">
+  <strong>Actions nativas.</strong> Formularios de envío: login, alta, checkout, comentario, contacto, filtros. Todo lo que sea "junto datos, los mando, muestro el resultado". Si además es una app con servidor, el progressive enhancement viene de regalo y no lo pagás.
+</div>
+
+<div class="step">
+  <strong>react-hook-form.</strong> Sigue ganando —y por bastante— en formularios <strong>muy dinámicos</strong>: wizards de varios pasos con estado compartido, arrays de campos que el usuario agrega y borra (ítems de una factura, pasajeros de un vuelo), validación cruzada en vivo ("la fecha de fin tiene que ser posterior a la de inicio", evaluado en cada tecla), campos condicionales que aparecen según respuestas anteriores, y todo lo que integre componentes controlados de una librería de UI. Ahí <code>FormData</code> se te queda corto y armar el equivalente a mano es reescribir la librería peor.
+</div>
+
+<div class="step">
+  <strong>Formik.</strong> Solo por inercia. Está en modo mantenimiento y su modelo controlado re-renderiza el árbol del formulario en cada tecla, cosa que se nota en formularios grandes. Si tenés uno andando y estable, dejalo; no arranques nada nuevo con él.
+</div>
+
+<div class="step">
+  <strong>Manual.</strong> Un campo de búsqueda con debounce, un toggle que persiste, un input que no es realmente un formulario. Meter una máquina de estados de submit ahí es sobrediseño.
+</div>
+
+<div class="tip">
+  <strong>El híbrido existe y es legítimo.</strong> react-hook-form para la experiencia de tipeo en el cliente, y la Action para el envío y los errores del servidor: <code>handleSubmit</code> valida, y si pasa, llama a la Server Function. No tenés que elegir un bando; tenés que saber qué te da cada pieza.
+</div>
+
+<h2>RS6.10 Accesibilidad: un formulario inaccesible está roto</h2>
+
+<p>No "es mejorable": está roto, del mismo modo que lo está uno que pierde los datos. Un formulario existe para que alguien complete una tarea, y si una parte de tus usuarios no puede completarla, no cumple su función. Además, en la mayoría de las jurisdicciones donde vende software una empresa mediana, es un requisito legal.</p>
+
+<p>Son cinco cosas concretas.</p>
+
+<h3>1. Etiquetas de verdad</h3>
+
+<pre><code class="lang-jsx">// ❌ El placeholder desaparece al tipear y no lo lee el lector de pantalla
+&lt;input name="email" placeholder="Tu email" /&gt;
+
+// ✅ Label asociado, y el placeholder como ejemplo, no como etiqueta
+&lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+&lt;input id="email" name="email" type="email" autoComplete="email" /&gt;</code></pre>
+
+<div class="info">
+  El atributo <code>autoComplete</code> no es solo comodidad. Para usuarios con dificultades motrices o cognitivas, el autocompletado del navegador es la diferencia entre completar un checkout y abandonarlo. Es, literalmente, un criterio de la WCAG (1.3.5, <em>Identify Input Purpose</em>).
+</div>
+
+<h3>2. Errores vinculados al campo</h3>
+
+<pre><code class="lang-tsx">&lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+&lt;input
+  id="email"
+  name="email"
+  type="email"
+  defaultValue={estado.valores?.email}
+  aria-invalid={estado.errores?.email ? true : undefined}
+  aria-describedby={estado.errores?.email ? "email-error" : undefined}
+/&gt;
+{estado.errores?.email &amp;&amp; (
+  &lt;p id="email-error" className="error"&gt;{estado.errores.email}&lt;/p&gt;
+)}</code></pre>
+
+<div class="rule">
+  <strong>📌 <code>aria-invalid</code> dice <em>que</em> está mal; <code>aria-describedby</code> dice <em>qué</em> está mal.</strong> Hacen falta los dos. Sin el primero, el lector de pantalla no marca el campo como erróneo al navegarlo. Sin el segundo, dice "inválido" y el usuario tiene que adivinar por qué. Y ponelos condicionalmente: un <code>aria-invalid="false"</code> permanente es ruido, y un <code>aria-describedby</code> que apunta a un id inexistente es peor que no ponerlo.
+</div>
+
+<h3>3. Anuncio del resumen de errores</h3>
+
+<p>Cuando el envío falla, alguien que usa lector de pantalla no ve el error aparecer. Hay que anunciarlo, y el detalle importa:</p>
+
+<pre><code class="lang-tsx">{/* La región vive SIEMPRE en el DOM, aunque esté vacía */}
+&lt;div role="alert" aria-live="assertive" ref={resumen} tabIndex={-1}&gt;
+  {estado.errores &amp;&amp; (
+    &lt;&gt;
+      &lt;h2&gt;No pudimos procesar el formulario&lt;/h2&gt;
+      &lt;ul&gt;
+        {Object.entries(estado.errores).map(([campo, msg]) =&gt; (
+          &lt;li key={campo}&gt;&lt;a href={`#${campo}`}&gt;{msg}&lt;/a&gt;&lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  )}
+&lt;/div&gt;</code></pre>
+
+<div class="mistake">
+  <strong>La trampa fina:</strong> si montás el contenedor <code>role="alert"</code> <em>junto con</em> su contenido, varios lectores de pantalla no anuncian nada — el nodo aparece ya "lleno" y la mutación no dispara el anuncio. La región tiene que existir vacía desde el primer render, y lo que cambia es su contenido. Es el bug de accesibilidad más común en formularios de React, y es invisible en cualquier auditoría automática.
+</div>
+
+<h3>4. Foco al primer error</h3>
+
+<pre><code class="lang-tsx">const resumen = useRef&lt;HTMLDivElement&gt;(null);
+
+useEffect(() =&gt; {
+  if (estado.errores) resumen.current?.focus();  // el div tiene tabIndex={-1}
+}, [estado]);</code></pre>
+
+<p>Sin esto, el usuario que envió con el teclado queda con el foco en el botón, al final del formulario, sin ninguna pista de que arriba pasó algo. Mover el foco al resumen —y que cada ítem del resumen sea un link al campo— resuelve el recorrido completo.</p>
+
+<div class="tip">
+  Depender de <code>[estado]</code> y no de <code>[estado.errores]</code> es intencional: si el usuario reenvía y vuelve a fallar con <em>el mismo</em> error, la referencia del objeto de estado cambia igual y el foco se mueve otra vez. Con la dependencia más fina, el segundo intento fallido no anuncia nada y parece que el botón no hace nada.
+</div>
+
+<h3>5. No dependas solo del color</h3>
+
+<p>Un borde rojo no es un mensaje. Necesitás texto, y un ícono o un cambio de forma que sobreviva a un daltonismo. Es el criterio 1.4.1 de la WCAG y es trivial de cumplir si el error ya está escrito.</p>
+
+<h2>RS6.11 Los errores clásicos</h2>
+
+<h3>Doble submit</h3>
+
+<p>El usuario hace clic dos veces rápido, o aprieta Enter dos veces, y se crean dos pedidos. Con <code>useFormStatus</code> el botón se deshabilita solo apenas arranca la transición, y eso tapa el 95% de los casos. El 5% restante —red lenta, doble tap, un reintento del navegador— se tapa <strong>del lado del servidor</strong>:</p>
+
+<pre><code class="lang-tsx">"use server";
+
+export async function crearPedido(_previo: unknown, fd: FormData) {
+  const clave = String(fd.get("idempotencyKey"));   // generada al renderizar
+
+  const existente = await db.pedido.findUnique({ where: { clave } });
+  if (existente) return { ok: true, id: existente.id };  // ya pasó: no dupliques
+
+  const pedido = await db.pedido.create({ data: { clave, /* … */ } });
+  return { ok: true, id: pedido.id };
+}</code></pre>
+
+<div class="rule">
+  <strong>📌 Deshabilitar el botón es UX; la clave de idempotencia es corrección.</strong> Lo primero evita que el usuario lo intente; lo segundo garantiza que aunque lo intente —o aunque el navegador reintente el POST solo— no le cobres dos veces. En cualquier mutación con consecuencias (cobros, envío de mails, creación de recursos), la clave no es opcional.
+</div>
+
+<h3>Se pierde lo tipeado</h3>
+
+<p>Ya está diagnosticado en RS6.1: React resetea el formulario no controlado cuando la acción termina, incluso si terminó devolviendo un error. La cura es devolver los valores en el estado y usarlos como <code>defaultValue</code>. Es dos líneas, y es la diferencia entre un usuario que corrige un campo y uno que abandona el checkout.</p>
+
+<h3>El spinner que no aparece</h3>
+
+<pre><code class="lang-tsx">// ❌ pending SIEMPRE false: el hook está en el componente que crea el form
+function Checkout() {
+  const { pending } = useFormStatus();
+  return &lt;form action={pagar}&gt;&lt;button disabled={pending}&gt;Pagar&lt;/button&gt;&lt;/form&gt;;
+}
+
+// ✅ Opción A: el tercer valor de useActionState, en este mismo componente
+function Checkout() {
+  const [estado, accion, pendiente] = useActionState(pagar, {});
+  return &lt;form action={accion}&gt;&lt;button disabled={pendiente}&gt;Pagar&lt;/button&gt;&lt;/form&gt;;
+}
+
+// ✅ Opción B: useFormStatus en un hijo, reutilizable en todo el sistema
+function Checkout() {
+  return &lt;form action={pagar}&gt;&lt;BotonPagar /&gt;&lt;/form&gt;;
+}</code></pre>
+
+<h3>Estados imposibles que la UI muestra igual</h3>
+
+<p>Con cinco booleanos hay 32 combinaciones y solo 4 son válidas. <code>cargando &amp;&amp; error</code>, <code>exito &amp;&amp; error</code>, <code>cargando &amp;&amp; exito</code> — todos representables, todos bugs. Un único estado con forma de unión discriminada los vuelve imposibles de escribir:</p>
+
+<pre><code class="lang-tsx">type Estado =
+  | { fase: "inicial" }
+  | { fase: "error"; errores: Record&lt;string, string&gt;; valores: Valores }
+  | { fase: "ok"; pedidoId: string };
+
+// Ya no existe manera de estar en "error" y en "ok" a la vez.</code></pre>
+
+<h3>Tragarse el error</h3>
+
+<p>Una excepción sin capturar dentro de una Server Function llega al cliente <strong>ofuscada</strong> en producción: React la reemplaza por un digest. Está bien para lo inesperado y es pésimo para lo esperable. Los errores de negocio se capturan y se devuelven como valor; los inesperados se dejan subir al error boundary, con su digest, y se correlacionan en el log del servidor.</p>
+
+<h3>Confiar en el precio del formulario</h3>
+
+<p>Merece su propia línea porque cuesta plata. Si tu Action lee <code>fd.get("precio")</code> y cobra eso, ya te robaron: cualquiera edita el <code>value</code> del input oculto. Del formulario viene el <em>id</em> del producto y la cantidad; el precio se lee de tu base, siempre, sin excepciones.</p>
+
+<h2>🧑‍🎓 Worked Example — checkout con validación de servidor</h2>
+
+<p>Un formulario de checkout: email, nombre, cantidad y cupón. El servidor valida forma, stock y cupón. Vamos a escribir la versión que hay en la mayoría de las bases de código, listar sus bugs con precisión, y reescribirla.</p>
+
+<h3>Paso 1 — La versión que hay</h3>
+
+<pre><code class="lang-jsx">function Checkout({ producto }) {
+  const [email, setEmail] = useState("");
+  const [nombre, setNombre] = useState("");
+  const [cantidad, setCantidad] = useState(1);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    setCargando(true);
+    setError(null);
+
+    try {
+      const r = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email, nombre, cantidad,
+          precio: producto.precio,       // ← el cliente manda el precio
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      window.location.href = "/gracias";
+    } catch (err) {
+      setError(err.message);             // ← mensaje crudo del servidor
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  return (
+    &lt;form onSubmit={onSubmit}&gt;
+      &lt;input value={email} onChange={(e) =&gt; setEmail(e.target.value)}
+             placeholder="Email" /&gt;
+      &lt;input value={nombre} onChange={(e) =&gt; setNombre(e.target.value)}
+             placeholder="Nombre" /&gt;
+      &lt;input type="number" value={cantidad}
+             onChange={(e) =&gt; setCantidad(+e.target.value)} /&gt;
+      {error &amp;&amp; &lt;p style={{ color: "red" }}&gt;{error}&lt;/p&gt;}
+      &lt;button disabled={cargando}&gt;
+        {cargando ? "Procesando…" : "Comprar"}
+      &lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<h3>Paso 2 — El inventario de bugs</h3>
+
+<table>
+<thead><tr><th>#</th><th>Bug</th><th>Cómo se manifiesta</th><th>Gravedad</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>El cliente manda el <code>precio</code></td><td>Se edita el payload y se compra a $1</td><td>🔴 Crítico</td></tr>
+<tr><td>2</td><td>Doble submit</td><td>Doble clic en red lenta → dos cobros</td><td>🔴 Crítico</td></tr>
+<tr><td>3</td><td>Sin <code>&lt;label&gt;</code>, sin <code>autoComplete</code></td><td>Ilegible con lector de pantalla</td><td>🟠 Alto</td></tr>
+<tr><td>4</td><td>El error no se anuncia ni recibe foco</td><td>El usuario con teclado no se entera</td><td>🟠 Alto</td></tr>
+<tr><td>5</td><td>Un solo error global</td><td>"Datos inválidos", sin decir cuál</td><td>🟠 Alto</td></tr>
+<tr><td>6</td><td>Mensaje crudo del servidor en pantalla</td><td>Filtra estructura interna</td><td>🟠 Alto</td></tr>
+<tr><td>7</td><td>No funciona sin JS</td><td>Falla el chunk → no se puede comprar</td><td>🟡 Medio</td></tr>
+<tr><td>8</td><td>Re-render por tecla</td><td>Se nota en formularios largos</td><td>🟡 Medio</td></tr>
+<tr><td>9</td><td>Estados imposibles</td><td><code>cargando</code> y <code>error</code> a la vez</td><td>🟡 Medio</td></tr>
+</tbody>
+</table>
+
+<div class="info">
+  Fijate que <strong>los dos bugs críticos no son de React</strong>. Son de confianza en el cliente y de idempotencia — problemas de servidor. Ninguna librería de formularios los arregla. Esto es lo que quiere decir "la validación del cliente es UX": podés tener el mejor formulario del mundo y estar regalando el producto.
+</div>
+
+<h3>Paso 3 — La Server Function</h3>
+
+<pre><code class="lang-tsx">// app/checkout/acciones.ts
+"use server";
+
+import { z } from "zod";
+import { redirect } from "next/navigation";
+import { revalidateTag } from "next/cache";
+
+const Esquema = z.object({
+  email: z.email("Ingresá un email válido"),
+  nombre: z.string().min(2, "El nombre es muy corto"),
+  cantidad: z.coerce.number().int().min(1, "Mínimo 1").max(10, "Máximo 10"),
+  cupon: z.string().trim().optional(),
+  productoId: z.uuid(),
+  clave: z.uuid(),                       // idempotencia
+});
+
+export type EstadoCheckout = {
+  errores?: Record&lt;string, string&gt;;
+  valores?: Record&lt;string, string&gt;;
+  ok?: boolean;
+};
+
+export async function comprar(
+  _previo: EstadoCheckout,
+  fd: FormData
+): Promise&lt;EstadoCheckout&gt; {
+  const crudo = Object.fromEntries(fd) as Record&lt;string, string&gt;;
+
+  // 1. Autenticar
+  const sesion = await getSesion();
+  if (!sesion) return { errores: { _: "Iniciá sesión para comprar" }, valores: crudo };
+
+  // 2. Validar forma
+  const parsed = Esquema.safeParse(crudo);
+  if (!parsed.success) {
+    const errores: Record&lt;string, string&gt; = {};
+    for (const i of parsed.error.issues) {
+      const campo = String(i.path[0]);
+      errores[campo] ??= i.message;
+    }
+    return { errores, valores: crudo };     // ← devolvemos lo tipeado
+  }
+
+  const { productoId, cantidad, cupon, clave } = parsed.data;
+
+  // 3. Idempotencia: si esta clave ya se procesó, no cobres de nuevo
+  const previoPedido = await db.pedido.findUnique({ where: { clave } });
+  if (previoPedido) redirect(`/gracias/${previoPedido.id}`);
+
+  // 4. Reglas de negocio (el esquema NO las valida)
+  const producto = await db.producto.findUnique({ where: { id: productoId } });
+  if (!producto) return { errores: { _: "El producto ya no está disponible" }, valores: crudo };
+  if (producto.stock &lt; cantidad) {
+    return {
+      errores: { cantidad: `Solo quedan ${producto.stock} unidades` },
+      valores: crudo,
+    };
+  }
+
+  let descuento = 0;
+  if (cupon) {
+    const c = await db.cupon.findUnique({ where: { codigo: cupon } });
+    if (!c || c.venceEl &lt; new Date() || c.usos &gt;= c.maxUsos) {
+      return { errores: { cupon: "Cupón inválido o vencido" }, valores: crudo };
+    }
+    descuento = c.porcentaje;
+  }
+
+  // 5. Actuar. El PRECIO sale de la base, jamás del formulario.
+  const total = producto.precio * cantidad * (1 - descuento / 100);
+
+  try {
+    const pedido = await db.pedido.create({
+      data: { clave, productoId, cantidad, total, usuarioId: sesion.usuarioId },
+    });
+    revalidateTag("carrito");
+    redirect(`/gracias/${pedido.id}`);
+  } catch (e) {
+    logger.error({ err: e, usuarioId: sesion.usuarioId }, "checkout falló");
+    return { errores: { _: "No pudimos procesar tu compra. Probá de nuevo." }, valores: crudo };
+  }
+}</code></pre>
+
+<div class="warn">
+  <strong>Ojo con <code>redirect()</code> dentro de un <code>try</code>.</strong> En Next.js, <code>redirect()</code> funciona lanzando una excepción especial. Un <code>catch</code> genérico alrededor se la come y el redirect nunca ocurre: el usuario ve el formulario otra vez y cree que no compró. Sacá el <code>redirect</code> del <code>try</code>, o re-lanzá lo que no sepas manejar. Es un bug real, silencioso y carísimo.
+</div>
+
+<h3>Paso 4 — El formulario</h3>
+
+<pre><code class="lang-tsx">"use client";
+
+import { useActionState, useEffect, useRef } from "react";
+import { useFormStatus } from "react-dom";
+import { comprar, type EstadoCheckout } from "./acciones";
+
+function BotonComprar() {
+  const { pending } = useFormStatus();
+  return (
+    &lt;button type="submit" disabled={pending} aria-busy={pending}&gt;
+      {pending ? "Procesando…" : "Confirmar compra"}
+    &lt;/button&gt;
+  );
+}
+
+export function Checkout({
+  producto,
+  clave,                       // uuid generado en el servidor al renderizar
+}: {
+  producto: { id: string; nombre: string; precio: number };
+  clave: string;
+}) {
+  const [estado, accion] = useActionState&lt;EstadoCheckout, FormData&gt;(
+    comprar,
+    {},
+    `/producto/${producto.id}`          // permalink: PE si no hidrató
+  );
+  const resumen = useRef&lt;HTMLDivElement&gt;(null);
+
+  useEffect(() =&gt; {
+    if (estado.errores) resumen.current?.focus();
+  }, [estado]);
+
+  const err = estado.errores ?? {};
+  const val = estado.valores ?? {};
+
+  return (
+    &lt;form action={accion} noValidate&gt;
+      {/* La región existe SIEMPRE, aunque vacía: si no, no se anuncia */}
+      &lt;div role="alert" aria-live="assertive" ref={resumen} tabIndex={-1}&gt;
+        {estado.errores &amp;&amp; (
+          &lt;&gt;
+            &lt;h2&gt;Revisá estos datos&lt;/h2&gt;
+            &lt;ul&gt;
+              {Object.entries(err).map(([campo, msg]) =&gt; (
+                &lt;li key={campo}&gt;
+                  {campo === "_" ? msg : &lt;a href={`#${campo}`}&gt;{msg}&lt;/a&gt;}
+                &lt;/li&gt;
+              ))}
+            &lt;/ul&gt;
+          &lt;/&gt;
+        )}
+      &lt;/div&gt;
+
+      &lt;input type="hidden" name="productoId" value={producto.id} /&gt;
+      &lt;input type="hidden" name="clave" value={clave} /&gt;
+
+      &lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+      &lt;input
+        id="email" name="email" type="email" autoComplete="email"
+        defaultValue={val.email ?? ""}
+        aria-invalid={err.email ? true : undefined}
+        aria-describedby={err.email ? "email-error" : undefined}
+      /&gt;
+      {err.email &amp;&amp; &lt;p id="email-error"&gt;{err.email}&lt;/p&gt;}
+
+      &lt;label htmlFor="nombre"&gt;Nombre completo&lt;/label&gt;
+      &lt;input
+        id="nombre" name="nombre" autoComplete="name"
+        defaultValue={val.nombre ?? ""}
+        aria-invalid={err.nombre ? true : undefined}
+        aria-describedby={err.nombre ? "nombre-error" : undefined}
+      /&gt;
+      {err.nombre &amp;&amp; &lt;p id="nombre-error"&gt;{err.nombre}&lt;/p&gt;}
+
+      &lt;label htmlFor="cantidad"&gt;Cantidad&lt;/label&gt;
+      &lt;input
+        id="cantidad" name="cantidad" type="number" min={1} max={10}
+        defaultValue={val.cantidad ?? "1"}
+        aria-invalid={err.cantidad ? true : undefined}
+        aria-describedby={err.cantidad ? "cantidad-error" : undefined}
+      /&gt;
+      {err.cantidad &amp;&amp; &lt;p id="cantidad-error"&gt;{err.cantidad}&lt;/p&gt;}
+
+      &lt;label htmlFor="cupon"&gt;Cupón (opcional)&lt;/label&gt;
+      &lt;input
+        id="cupon" name="cupon"
+        defaultValue={val.cupon ?? ""}
+        aria-invalid={err.cupon ? true : undefined}
+        aria-describedby={err.cupon ? "cupon-error" : undefined}
+      /&gt;
+      {err.cupon &amp;&amp; &lt;p id="cupon-error"&gt;{err.cupon}&lt;/p&gt;}
+
+      &lt;BotonComprar /&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+<div class="tip">
+  <code>noValidate</code> apaga los globos nativos del navegador para que <strong>todos</strong> los errores se vean con el mismo diseño y el mismo comportamiento de anuncio. Los atributos <code>type="email"</code>, <code>min</code> y <code>max</code> quedan igual: siguen dando teclado apropiado en móvil y siguen siendo la primera línea de validación cuando no hay JS. Apagás la <em>UI</em> nativa, no la semántica.
+</div>
+
+<h3>Paso 5 — Verificar, que es lo único que cuenta</h3>
+
+<p>Declarar que funciona no es haberlo verificado. Cinco pruebas concretas:</p>
+
+<ol>
+  <li><strong>Sin JavaScript.</strong> DevTools → Settings → Debugger → <em>Disable JavaScript</em>, recargá y comprá. Tiene que funcionar: se pierden el spinner y los mensajes en vivo, pero la compra se hace y el error de validación se muestra en la página recargada.</li>
+  <li><strong>Doble submit.</strong> Network throttling en <em>Slow 3G</em>, doble clic. Un solo pedido en la base. Después probá el caso duro: mandá el mismo <code>curl</code> dos veces con la misma <code>clave</code>. Sigue siendo uno.</li>
+  <li><strong>Precio.</strong> Mandá un <code>curl</code> con un campo <code>precio</code> falso. El total cobrado tiene que ser el de la base, y el campo extra tiene que ser ignorado.</li>
+  <li><strong>Teclado y lector.</strong> Completá y enviá solo con teclado. Al fallar, el foco tiene que saltar al resumen, cada error tiene que ser un link a su campo, y NVDA o VoiceOver tienen que leer el resumen sin que navegues hasta él.</li>
+  <li><strong>Datos preservados.</strong> Llená los cuatro campos, provocá un error de cupón, y confirmá que email, nombre y cantidad siguen ahí.</li>
+</ol>
+
+<div class="rule">
+  <strong>📌 La prueba 1 es la que nadie hace y la que más dice.</strong> Si el checkout anda sin JavaScript, sabés que el servidor es la autoridad, que la validación real está del lado correcto, y que el día que un chunk falle vas a seguir vendiendo. Si no anda, tenés una app cuya facturación depende de que ningún archivo se pierda en el camino.
+</div>
+
+<h3>Checkpoint — ¿lo tenés claro?</h3>
+
+<details><summary>Ponés <code>useFormStatus</code> en tu componente de checkout y <code>pending</code> nunca cambia. ¿Por qué, y cuáles son las dos salidas?</summary>
+<p>Porque <code>useFormStatus</code> lee el <code>&lt;form&gt;</code> <strong>ancestro</strong>, y el componente que llama al hook es el que <em>renderiza</em> el form — no está adentro de él, está afuera creándolo. React no tiene forma de asociarlos. Hay dos salidas y son distintas, no intercambiables. <strong>(a)</strong> Usar el tercer valor de <code>useActionState</code>, <code>pending</code>, que sí está disponible en el componente que crea el form: es lo correcto cuando el indicador vive en ese mismo nivel. <strong>(b)</strong> Extraer el botón a un componente hijo que llame al hook: es lo correcto cuando el botón es compartido por muchos formularios, porque el hijo no necesita recibir ninguna prop de estado y funciona en cualquier form del sistema. La opción (b) es la razón de existir del hook: si <code>useActionState</code> alcanzara siempre, <code>useFormStatus</code> no haría falta.</p></details>
+
+<details><summary>Tu Action valida con Zod, corre en el servidor y el esquema pasa. ¿Alcanza para procesar la compra?</summary>
+<p>No. Zod valida <strong>forma</strong>: que <code>cantidad</code> sea un entero entre 1 y 10, que el email tenga estructura de email. No sabe nada del mundo. Faltan tres capas. <strong>Autorización:</strong> ¿hay sesión?, ¿este usuario puede comprar esto? — y la identidad sale de la sesión, nunca de un campo del formulario. <strong>Reglas de negocio:</strong> ¿hay stock para esa cantidad?, ¿el cupón existe, no venció y no se agotó?, ¿el producto sigue publicado? Todo eso pasa el esquema y aun así es inválido. <strong>Integridad de valores:</strong> el precio se lee de la base por el id del producto; si lo tomás del <code>FormData</code>, cualquiera edita el input oculto y compra a un peso. Regla corta: el esquema decide si los datos <em>tienen la forma</em> correcta; el servidor decide si la operación <em>es</em> correcta.</p></details>
+
+<details><summary>Tu formulario muestra el error en pantalla, con borde rojo y texto claro. ¿Por qué puede seguir estando roto?</summary>
+<p>Porque "mostrar" es una operación visual y una parte de tus usuarios no está mirando. Faltan cuatro cosas. <strong>Anuncio:</strong> el mensaje tiene que estar en una región <code>role="alert"</code> / <code>aria-live</code> que exista en el DOM desde el primer render — si montás el contenedor junto con su contenido, varios lectores de pantalla no anuncian nada, y es el bug más común y más invisible. <strong>Vínculo:</strong> el campo necesita <code>aria-invalid</code> (que algo está mal) y <code>aria-describedby</code> apuntando al id del mensaje (qué está mal); con uno solo, el usuario oye "inválido" y adivina. <strong>Foco:</strong> tras un envío fallido el foco queda en el botón, al final; hay que moverlo al resumen de errores, con cada ítem como link a su campo. <strong>Color:</strong> el borde rojo no es información — el texto sí. Un formulario que una parte de tus usuarios no puede completar no cumple su función; no es un detalle de pulido.</p></details>
+
+<h2>Resumen ejecutivo</h2>
+
+<ul>
+  <li>Una <strong>Action</strong> es una función <code>async</code> que React corre <em>dentro de una transición</em>. De ahí salen gratis el <code>pending</code>, el orden de las respuestas y la reversión de lo optimista. No hay magia: hay contabilidad que antes hacías vos con cinco <code>useState</code>.</li>
+  <li><code>useActionState(fn, inicial, permalink?)</code> devuelve <code>[estado, accion, pendiente]</code>, y <code>fn</code> recibe <strong><code>(estadoPrevio, formData)</code></strong> en ese orden. El estado previo no es decorativo: es lo que te deja acumular intentos y <strong>devolver lo tipeado</strong> para no perderlo.</li>
+  <li>React <strong>resetea</strong> el formulario no controlado cuando la acción termina, también cuando terminó con error. La cura es devolver <code>valores</code> en el estado y usarlos como <code>defaultValue</code>.</li>
+  <li><code>useFormStatus</code> se importa de <strong><code>react-dom</code></strong> y lee el <code>&lt;form&gt;</code> <strong>ancestro</strong>. En el componente que renderiza el form devuelve <code>pending: false</code> para siempre. Existe para que un botón de design system sepa que su formulario está enviando <strong>sin recibir props</strong>.</li>
+  <li><code>useOptimistic</code> proyecta sobre el estado real mientras dura la transición. <strong>El rollback no es una acción: es la ausencia de la proyección</strong>, y por eso no puede olvidarse. Usalo solo en operaciones baratas de deshacer — jamás en un pago.</li>
+  <li>Un <code>&lt;form action={serverFunction}&gt;</code> <strong>funciona sin JavaScript</strong>. No es caridad: es tolerancia a fallas, para el bundle que no cargó, el chunk que se perdió y el usuario que apretó antes de hidratar. <code>permalink</code> cubre esa ventana.</li>
+  <li><strong>La validación de cliente es UX; la de servidor es la que cuenta.</strong> Y la de servidor no termina en el esquema: falta autorización, reglas de negocio y leer los valores sensibles —el precio— de tu base. Ver <a href="../../../../sistemas/Curso-Ciberseguridad/m04-owasp-web/lecture.html">M04 de Ciberseguridad</a>.</li>
+  <li>Una <strong>Server Function es un endpoint público</strong>: autenticar → validar → autorizar sobre el recurso → actuar. La identidad sale de la sesión, nunca de un argumento. Ver <a href="../rs4-server-components/lecture.html">RS4</a>.</li>
+  <li><strong>Mutar es la mitad del trabajo:</strong> hay que invalidar. Etiquetá por dato (<code>revalidateTag</code>), no por pantalla — el contador del header vive en otro lado que la página. Se enlaza con <a href="../rs5-data-cache/lecture.html">RS5</a>.</li>
+  <li><strong>react-hook-form sigue ganando</strong> en formularios muy dinámicos: wizards, <code>useFieldArray</code>, validación cruzada por tecla, campos condicionales. Formik está en mantenimiento. Y el híbrido —librería para tipear, Action para enviar— es legítimo.</li>
+  <li>Accesibilidad, cinco cosas: <code>&lt;label&gt;</code> real y <code>autoComplete</code>, <code>aria-invalid</code> + <code>aria-describedby</code>, región <code>role="alert"</code> <strong>que exista vacía desde el primer render</strong>, foco al resumen tras fallar, y nunca solo color.</li>
+  <li>Deshabilitar el botón es UX; la <strong>clave de idempotencia</strong> es corrección. En cualquier mutación con consecuencias, la clave no es opcional.</li>
+</ul>
+
+<h2>Ejercicios</h2>
+
+<ol>
+  <li>Tomá un formulario tuyo con tres o más <code>useState</code> de plomería y reescribilo con <code>useActionState</code>. Contá las líneas antes y después, y anotá cuáles de los nueve bugs de la tabla del Worked Example tenía la versión original. Si tenía menos de tres, buscá mejor.</li>
+  <li>Reproducí el bug de <code>useFormStatus</code>: llamalo en el componente que renderiza el <code>&lt;form&gt;</code> y comprobá con un <code>console.log</code> que <code>pending</code> nunca cambia. Después arreglalo de las dos maneras (el tercer valor de <code>useActionState</code>, y un componente hijo) y escribí en qué caso elegirías cada una.</li>
+  <li>Implementá una lista de tareas con <code>useOptimistic</code>. Hacé que la Server Function falle a propósito el 50% de las veces con un <code>Math.random()</code> y observá el rollback. Después escribí la misma UI optimista a mano con <code>useState</code> y provocá que queden ítems fantasma en pantalla: documentá exactamente qué secuencia de clics lo logra.</li>
+  <li>Agarrá el checkout del Worked Example y probalo con JavaScript deshabilitado. Anotá qué se pierde (spinner, errores en vivo) y qué se conserva (la compra, el mensaje de validación). Después envolvé la acción en una función de cliente que haga un <code>console.log</code>, volvé a probar sin JS y explicá por qué dejó de funcionar.</li>
+  <li>Atacá tu propia Action con <code>curl</code>, tres veces: (a) sin cookie de sesión, (b) con un <code>precio</code> falso en el body, (c) enviando dos veces la misma clave de idempotencia. Documentá en qué paso frenó cada intento. Si alguno pasó, arreglalo y volvé a probar hasta que los tres frenen.</li>
+  <li>Auditá un formulario existente con lector de pantalla (NVDA en Windows, VoiceOver en Mac): navegalo solo con teclado, provocá un error de servidor y anotá qué se anunció y qué no. Aplicá las cinco cosas de RS6.10 y repetí la prueba. Prestá especial atención a si la región <code>role="alert"</code> se anuncia: probá montarla junto con el contenido y desde el primer render, y compará.</li>
+  <li>Escribí una tabla de decisión para tu equipo: cinco formularios reales de tu producto, y para cada uno la elección entre Action nativa, react-hook-form o híbrido, con la razón concreta (no "es más moderno"). Si los cinco caen del mismo lado, es probable que la razón sea costumbre y no criterio — buscá el que no encaja.</li>
+</ol>
+
+<section class="quiz" id="quizRS6">
+  <style>
+    #quizRS6{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.3rem 1.5rem;margin:2.5rem 0}
+    #quizRS6 h3{margin:0 0 1rem;color:var(--accent)}
+    #quizRS6 .q{margin-bottom:1.5rem}
+    #quizRS6 .q>p{font-weight:600;margin-bottom:.6rem;color:var(--text)}
+    #quizRS6 .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.55rem .85rem;border-radius:8px;margin-bottom:.45rem;cursor:pointer;font-family:inherit;font-size:.95em;transition:all .12s}
+    #quizRS6 .opt:hover{border-color:var(--accent)}
+    #quizRS6 .opt:disabled{cursor:default}
+    #quizRS6 .opt.ok{background:rgba(16,185,129,.16);border-color:var(--success, #10b981)}
+    #quizRS6 .opt.no{background:rgba(239,68,68,.13);border-color:var(--danger, #ef4444);opacity:.65}
+    #quizRS6 .exp{display:none;font-size:.9em;color:var(--muted);margin-top:.55rem;padding:.6rem .85rem;background:var(--bg);border-left:3px solid var(--accent-2);border-radius:0 6px 6px 0}
+    #quizRS6 .exp.show{display:block}
+    #quizRS6 .score{font-weight:700;color:var(--accent);margin-top:1rem;min-height:1.4em}
+  </style>
+  <h3>🧠 Autoevaluación</h3>
+
+  <div class="q" data-c="1">
+    <p>1. Tu componente de checkout llama a <code>useFormStatus()</code> y renderiza el <code>&lt;form&gt;</code>. El <code>pending</code> nunca se pone en <code>true</code>. ¿Cuál es la causa?</p>
+    <button class="opt">Falta importar el hook desde <code>react</code> en vez de <code>react-dom</code></button>
+    <button class="opt">El hook lee el <code>&lt;form&gt;</code> <strong>ancestro</strong>, y ese componente crea el form en vez de estar adentro de él</button>
+    <button class="opt">La acción no es <code>async</code>, así que no hay transición que reportar</button>
+    <div class="exp"><code>useFormStatus</code> lee el <code>&lt;form&gt;</code> ancestro más cercano. Un componente que <em>renderiza</em> el form está afuera de él, así que React no tiene con qué asociarlo y devuelve <code>pending: false</code> para siempre. Las dos salidas: usar el tercer valor de <code>useActionState</code> (correcto cuando el indicador vive en ese mismo componente), o extraer el botón a un hijo que llame al hook (correcto cuando el botón es compartido, porque así no necesita recibir <em>ninguna</em> prop de estado — que es exactamente la razón de existir del hook). El import es de <code>react-dom</code>, sí, pero un import mal no da <code>false</code>: da un error.</div>
+  </div>
+
+  <div class="q" data-c="2">
+    <p>2. Tu Action valida con Zod en el servidor, el esquema pasa y procesás la compra leyendo <code>fd.get("precio")</code>. ¿Qué está mal?</p>
+    <button class="opt">Nada: si el esquema validó en el servidor, los datos son confiables</button>
+    <button class="opt">Habría que validar también en el cliente antes de enviar</button>
+    <button class="opt">El esquema valida <strong>forma</strong>, no verdad: faltan autorización, reglas de negocio, y el precio tiene que salir de la base</button>
+    <div class="exp">Zod confirma que <code>precio</code> es un número, no que sea <em>el</em> precio. Cualquiera edita el input oculto o manda un <code>curl</code> y compra a un peso: el precio se lee de tu base por el id del producto, siempre. Y falta más de lo mismo: autorización (¿hay sesión?, ¿este usuario puede?, con la identidad sacada de la sesión y nunca de un campo) y reglas de negocio que el esquema no conoce (stock disponible, cupón vigente y no agotado, producto todavía publicado). Validar también en el cliente mejora la UX pero no agrega ninguna garantía: es código que corre en la máquina del atacante.</div>
+  </div>
+
+  <div class="q" data-c="0">
+    <p>3. Un usuario llena tu formulario, el servidor devuelve un error de validación y todos los campos aparecen vacíos. ¿Por qué pasa y cómo se arregla?</p>
+    <button class="opt">React resetea el form no controlado al terminar la acción; hay que devolver los valores en el estado y usarlos como <code>defaultValue</code></button>
+    <button class="opt">El <code>FormData</code> se consume al leerlo; hay que clonarlo antes de validar</button>
+    <button class="opt">Es inevitable con <code>&lt;form action&gt;</code>; hay que volver a componentes controlados con <code>useState</code></button>
+    <div class="exp">React resetea los campos no controlados cuando la acción termina — también cuando terminó devolviendo un error, que es justo cuando no querés. La cura idiomática son dos líneas: la Action devuelve <code>valores: Object.fromEntries(fd)</code> junto con los errores, y cada input lee <code>defaultValue={estado.valores?.campo}</code>. El <code>FormData</code> no se "consume" al leerlo. Y volver a componentes controlados es tirar todo el modelo por la borda para arreglar algo que ya tiene solución; si querés control fino del reseteo existe <code>requestFormReset</code> de <code>react-dom</code>.</div>
+  </div>
+
+  <div class="score" id="scoreRS6"></div>
+
+  <script>
+  (function () {
+    var quiz = document.getElementById('quizRS6');
+    var preguntas = quiz.querySelectorAll('.q');
+    var total = preguntas.length, respondidas = 0, bien = 0;
+    preguntas.forEach(function (q) {
+      var correcta = +q.getAttribute('data-c');
+      var opts = q.querySelectorAll('.opt');
+      var exp = q.querySelector('.exp');
+      opts.forEach(function (opt, i) {
+        opt.addEventListener('click', function () {
+          if (q.dataset.done) return;
+          q.dataset.done = '1'; respondidas++;
+          if (i === correcta) { opt.classList.add('ok'); bien++; }
+          else { opt.classList.add('no'); opts[correcta].classList.add('ok'); }
+          opts.forEach(function (o) { o.disabled = true; });
+          exp.classList.add('show');
+          if (respondidas === total) {
+            document.getElementById('scoreRS6').textContent =
+              'Puntaje: ' + bien + ' / ' + total + (bien === total ? '  ¡Perfecto! 🎉 Seguí con RS7.' : '  — repasá las que fallaste y seguí.');
+          }
+        });
+      });
+    });
+  })();
+  </script>
+</section>
+
+</article>
+
+<nav class="lecture-nav">
+  <a href="../rs5-data-cache/lecture.html">← RS5: Data fetching y caché</a>
+  <a href="../rs7-performance/lecture.html">RS7: Performance →</a>
+</nav>
+
+</div>
+</body>
+</html>
